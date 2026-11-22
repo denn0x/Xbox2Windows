@@ -531,7 +531,7 @@ def check_rejections():
         "FCOMP alias DC D9": (attempt(f"{two} dc d9 dd d8 {clear}"), "unsupported x87 encoding"),
         "FCOMP alias DE D1": (attempt(f"{two} de d1 dd d8 {clear}"), "unsupported x87 encoding"),
         "FTST on an empty stack": (attempt(f"d9 e4 {clear}"), "x87 stack underflow"),
-        "FXAM": (attempt(f"{fld} d9 e5 dd d8 {clear}"), "unsupported x87 operation"),
+        "FCOS": (attempt(f"{fld} d9 ff dd d8 {clear}"), "unsupported x87 operation"),
         "FICOM m16 on an empty stack": (attempt(f"de 11 {clear}"), "x87 stack underflow"),
         "FCOMPP with one value": (attempt(f"{fld} de d9 {clear}"), "x87 stack underflow"),
         "FUCOM ST(2) with two values": (attempt(f"{two} dd e2 {pop2} {clear}"), "x87 stack underflow"),

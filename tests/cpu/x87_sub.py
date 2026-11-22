@@ -288,7 +288,7 @@ def check_rejections():
         "fdecstp": (attempt(f"{fld} d9 f6 {fstp} c3"), "unsupported x87 operation"),
         "fxsave": (attempt(f"{fld} 0f ae 01 {fstp} c3"), "unsupported x87 operation"),
         "fnstenv": (attempt(f"{fld} {fld} d9 31 {fstp} {fstp} c3"), "unsupported x87 operation"),
-        "fxam": (attempt(f"{fld} d9 e5 {fstp} c3"), "unsupported x87 operation"),
+        "fptan": (attempt(f"{fld} d9 f2 {fstp} {fstp} c3"), "unsupported x87 operation"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:

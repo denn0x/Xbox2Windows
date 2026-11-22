@@ -1,0 +1,12 @@
+EXPORTS
+    fxam_m80
+    fxam_m64
+    fxam_m32
+    fxam_depth8
+    fxam_st1
+    fxam_signed
+    fchs_fxam
+    fabs_fxam
+    two_records
+    fxam_fcomi
+    joined

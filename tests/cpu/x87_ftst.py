@@ -343,7 +343,7 @@ def check_rejections():
                                          "reads CF, " + unknown),
         "TEST AL, 1 after FTST and FNSTSW": (attempt(f"{fld} {ftst} {sw} a8 01 75 00 {pop} {clear}"),
                                              "reads AX bits 0x00ff, which FNSTSW AX leaves unknown"),
-        "FXAM": (attempt(f"{fld} d9 e5 {sw} {sahf_jb} {pop} {clear}"), "unsupported x87 operation"),
+        "FYL2X": (attempt(f"{fld} {fld} d9 f1 {sw} {sahf_jb} {pop} {clear}"), "unsupported x87 operation"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:

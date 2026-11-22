@@ -336,7 +336,7 @@ def check_rejections():
         "fcom st(1) as DC D1": (attempt(f"{fld} {fld} dc d1 {pop2}"), "unsupported x87 encoding"),
         "fucompp with one value": (attempt(f"{fld} da e9 c3"), "x87 stack underflow"),
         "ftst on an empty stack": (attempt("d9 e4 c3"), "x87 stack underflow"),
-        "fxam": (attempt(f"{fld} d9 e5 dd d8 c3"), "unsupported x87 operation"),
+        "f2xm1": (attempt(f"{fld} d9 f0 dd d8 c3"), "unsupported x87 operation"),
         "ficom m16 on an empty stack": (attempt("de 11 c3"), "x87 stack underflow"),
         "fnstsw m16": (attempt(f"{fld} dd 3a dd d8 c3"), "unsupported x87 operand"),
     }

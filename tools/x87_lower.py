@@ -12,8 +12,8 @@ The profile accepts:
   CF and PF;
 - FCOM and FCOMP with ST(i) or an m32 or m64 operand, FCOMPP, FUCOM and FUCOMP ST(i) and FUCOMPP, FTST,
   which compares ST(0) with +0, and FICOM and FICOMP with an m16 or m32 integer, converted exactly as FILD
-  converts it, which set C0, C2 and C3 of the status word, and FNSTSW AX, which copies the status word to AX
-  (see below);
+  converts it, which set C0, C2 and C3 of the status word, FXAM, which sets C3, C2 and C0 to the class of
+  ST(0) and C1 to its sign, and FNSTSW AX, which copies the status word to AX (see below);
 - FADD, FSUB, FSUBR, FMUL, FDIV and FDIVR with an m32 or m64 operand, with ST(0), ST(i) and with
   ST(i), ST(0), and their popping forms FADDP, FSUBP, FSUBRP, FMULP, FDIVP and FDIVRP ST(i), ST(0) for
   i from 1 to 7;
@@ -38,11 +38,12 @@ CF on into the flags and registers they write. The integer lowering models PF on
 family and an 8-bit TEST or AND, so a reader of PF that another instruction may have written last is
 rejected. SAHF,
 JP and JNP are accepted only in such a function. C0, C2 and C3 are known after a comparison into the
-status word and unknown at the entry. FCOMI, FCOMIP, FUCOMI and FUCOMIP leave them as they were, and
-every other x87 instruction leaves them undefined, as the SDM states, including WAIT (so FSTSW AX, which
-is WAIT and FNSTSW AX, sees none of them), FNSTCW and FNSTSW itself; a call does too. TOP is the depth
-before FNSTSW subtracted from 8, modulo 8. C1, the exception flags, the stack fault and the busy bit are
-never known. FNSTSW AX leaves AX with only the known bits known. Any reader of AL, AH, AX, EAX or RAX that
+status word or FXAM and unknown at the entry. FCOMI, FCOMIP, FUCOMI and FUCOMIP leave them as they were,
+and every other x87 instruction leaves them undefined, as the SDM states, including WAIT (so FSTSW AX,
+which is WAIT and FNSTSW AX, sees none of them), FNSTCW and FNSTSW itself; a call does too. C1 is known
+only after FXAM, until the next x87 instruction (FCOMI sets C1, which is not modelled). TOP is the depth
+before FNSTSW subtracted from 8, modulo 8. The exception flags, the stack fault and the busy bit are never
+known. FNSTSW AX leaves AX with only the known bits known. Any reader of AL, AH, AX, EAX or RAX that
 sees an unknown bit is rejected, and so are a return, a call, an indirect branch and an external edge
 while AX holds one, except:
 - SAHF copies C0 to CF, C2 to PF, C3 to ZF and the busy bit to SF, each defined only when its bit is
@@ -76,15 +77,17 @@ X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FR
                      M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM,
-                     M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW, M.FTST, M.FICOM, M.FICOMP})
+                     M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW, M.FTST, M.FICOM, M.FICOMP,
+                     M.FXAM})
 # Comparisons into C0, C2 and C3 of the status word; FCOMPP and FUCOMPP pop twice, the other P forms once.
 STATUS_COMPARES = frozenset({M.FCOM, M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FTST, M.FICOM, M.FICOMP})
 STATUS_POPS = {M.FCOM: 0, M.FCOMP: 1, M.FCOMPP: 2, M.FUCOM: 0, M.FUCOMP: 1, M.FUCOMPP: 2, M.FTST: 0, M.FICOM: 0,
                M.FICOMP: 1}
 # FICOM and FICOMP compare ST(0) with an m16 or m32 integer, converted exactly as for FILD.
 INTEGER_COMPARES = frozenset({M.FICOM, M.FICOMP})
-# Status-word bits: C0, C2 and C3 (the comparison result), and TOP.
+# Status-word bits: C0, C2 and C3 (the comparison result), C1 (the sign after FXAM), and TOP.
 C_BITS = 0x4500
+C1_BIT = 0x0200
 TOP_BITS = 0x3800
 # The slots and the control word, which the fixed profile keeps at 0x027F.
 DECLARATION = "X87Value x87_slot[8]{}; const uint16_t x87_cw = 0x027f; (void)x87_cw;"
@@ -99,7 +102,7 @@ def declaration(body, checked=None):
     """The x87 locals of a lowered function: the slots, the control word and, in a function that compares
     into the status word or stores it, C0, C2 and C3 of the status word."""
     text = DECLARATION if checked is None else CHECKED_DECLARATION
-    if any(i.mnemonic in STATUS_COMPARES or i.mnemonic == M.FNSTSW for i in body):
+    if any(i.mnemonic in STATUS_COMPARES or i.mnemonic in (M.FNSTSW, M.FXAM) for i in body):
         text += " uint16_t x87_sw = 0; (void)x87_sw;"
     return text
 
@@ -242,7 +245,7 @@ def _effect(i, depth, checked=None):
         if depth == 8:
             raise ValueError(f"x87 stack overflow at {i.ip:#x}: {i}")
         return depth + 1
-    if op in (M.FCHS, M.FABS, M.FSQRT, M.FRNDINT):
+    if op in (M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FXAM):  # FXAM of an empty ST(0) reads a stale sign
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth
@@ -403,7 +406,7 @@ def _ah_immediate(i):
 
 class _State:
     """What is known before an instruction: the defined status flags, the flags left undefined by unknown
-    status-word bits (for the diagnostic), whether the integer lowering models PF, the known C0, C2 and C3
+    status-word bits (for the diagnostic), whether the integer lowering models PF, the known C0, C1, C2 and C3
     bits of the status word, and the known bits of AX."""
     __slots__ = ("flags", "tainted", "parity", "c", "ax")
 
@@ -461,7 +464,11 @@ def _after(i, s):
         ax |= _ax_access(i)[1]
     if op in STATUS_COMPARES:
         c = C_BITS
-    elif op in COMPARES or not (is_x87(i) or call):  # FCOMI and integer instructions leave C0, C2 and C3
+    elif op == M.FXAM:
+        c = C_BITS | C1_BIT
+    elif op in COMPARES:  # FCOMI leaves C0, C2 and C3 and sets C1, which the profile does not track there
+        c = s.c & C_BITS
+    elif not (is_x87(i) or call):  # integer instructions leave the status word
         c = s.c
     else:
         c = 0
@@ -572,6 +579,11 @@ def statement(i, depth, address, checked=None, parity=False):
         stack_top = (8 - depth) & 7
         return (f"rax = (rax & ~0xffffull) | static_cast<uint16_t>(x87_sw | {stack_top << 11:#06x});  "
                 f"// fnstsw ax, top {stack_top}")
+    if op == M.FXAM:  # C1 the sign; C3, C2 and C0: 0 0 0 unsupported, 0 0 1 NaN, 0 1 0 normal,
+        v = f"x87_slot[{top}]"  # 0 1 1 infinity, 1 0 0 zero, 1 1 0 denormal (exponent 0, either integer bit)
+        return (f"x87_sw = static_cast<uint16_t>(({v}.se & 0x8000 ? 0x0200 : 0) | (({v}.se & 0x7fff) == 0 ? "
+                f"({v}.sig == 0 ? 0x4000 : 0x4400) : ({v}.sig >> 63) == 0 ? 0 : ({v}.se & 0x7fff) == 0x7fff ? "
+                f"({v}.sig << 1 == 0 ? 0x0500 : 0x0100) : 0x0400));  // fxam")
     if op in STATUS_COMPARES:  # C3, C2 and C0: 0 0 1 less, 1 0 0 equal, 0 0 0 greater, 1 1 1 unordered
         name = next(n for n, v in vars(M).items() if v == op).lower()
         if op == M.FTST:

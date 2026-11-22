@@ -1562,6 +1562,26 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_ftst COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_ftst.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_ftst>"
         "$<TARGET_FILE:cpu_x87_ftst_lifted>" ${x87_ftst_control_files})
+    cpu_asm_fixture(cpu_x87_fxam x87_fxam)
+    # The lifted DLL and five mutated controls that the check requires to mismatch.
+    set(x87_fxam_control_files "")
+    foreach(variant IN ITEMS lifted nosign denormal unnormal infnan zerodenormal)
+        set(x87_fxam_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_fxam_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_fxam_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fxam.py"
+                emit "$<TARGET_FILE:cpu_x87_fxam>" "${x87_fxam_fixture}" ${variant}
+            DEPENDS cpu_x87_fxam tests/cpu/x87_fxam.py tests/cpu/x87_status.py tests/cpu/x87_compare.py
+                tests/cpu/x87_moves.py tests/cpu/x87_div.py tests/cpu/x87_mul.py tests/cpu/x87_sub.py
+                tests/cpu/x87_add.py tools/ffx_version_query.py tools/x87_lower.py tools/x87_soft.h
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_fxam_${variant} SHARED "${x87_fxam_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_fxam_control_files "$<TARGET_FILE:cpu_x87_fxam_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_fxam COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fxam.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fxam>"
+        "$<TARGET_FILE:cpu_x87_fxam_lifted>" ${x87_fxam_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
