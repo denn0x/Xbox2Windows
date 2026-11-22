@@ -303,7 +303,7 @@ def check_rejections():
         "fisttp m64 on an empty stack": (attempt("dd 0a c3"), "x87 stack underflow"),
         "fist m32 without a pop": (attempt(f"{fld} db 12 c3"), "x87 stack not empty at return"),
         "fldenv": (attempt(f"{fld} d9 21 {fstp} c3"), "unsupported x87 operation"),
-        "ficom m16": (attempt(f"{fld} de 11 {fstp} c3"), "unsupported x87 operation"),
+        "ficom m16 on an empty stack": (attempt("de 11 c3"), "x87 stack underflow"),
         "fbld m80": (attempt(f"df 21 {fstp} c3"), "unsupported x87 operation"),
         "fbstp m80": (attempt(f"{fld} df 32 c3"), "unsupported x87 operation"),
     }

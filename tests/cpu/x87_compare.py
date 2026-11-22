@@ -331,13 +331,13 @@ def check_rejections():
         "fcomi st, st(1) with one value": (attempt(f"{fld} db f1 dd d8 c3"), "x87 stack underflow"),
         "fucomip st, st(2) with two values": (attempt(f"{fld} {fld} df ea dd d8 c3"), "x87 stack underflow"),
         "fcomip on an empty stack": (attempt("df f0 c3"), "x87 stack underflow"),
-        # Comparisons into the status word that stay outside the profile.
-        "ficomp m32": (attempt(f"{fld} da 19 dd d8 c3"), "unsupported x87 operation"),
+        # Comparisons into the status word without enough stack values, and forms outside the profile.
+        "ficomp m32 on an empty stack": (attempt("da 19 c3"), "x87 stack underflow"),
         "fcom st(1) as DC D1": (attempt(f"{fld} {fld} dc d1 {pop2}"), "unsupported x87 encoding"),
         "fucompp with one value": (attempt(f"{fld} da e9 c3"), "x87 stack underflow"),
-        "ftst": (attempt(f"{fld} d9 e4 dd d8 c3"), "unsupported x87 operation"),
+        "ftst on an empty stack": (attempt("d9 e4 c3"), "x87 stack underflow"),
         "fxam": (attempt(f"{fld} d9 e5 dd d8 c3"), "unsupported x87 operation"),
-        "ficom m16": (attempt(f"{fld} de 11 dd d8 c3"), "unsupported x87 operation"),
+        "ficom m16 on an empty stack": (attempt("de 11 c3"), "x87 stack underflow"),
         "fnstsw m16": (attempt(f"{fld} dd 3a dd d8 c3"), "unsupported x87 operand"),
     }
     for case, (message, needle) in rejected.items():

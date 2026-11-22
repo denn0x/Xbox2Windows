@@ -1,0 +1,12 @@
+EXPORTS
+    ftst_m80
+    ftst_m64
+    ftst_m32
+    ftst_depth8
+    ficom_m16
+    ficom_m32
+    ficomp_m16
+    ficomp_m32
+    fild_ficom_m16
+    fild_ficomp_m32
+    joined

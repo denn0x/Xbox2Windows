@@ -266,8 +266,8 @@ def check_rejections():
 
     fld, fstp = "db 29", "db 3a"  # fld tbyte ptr [rcx]; fstp tbyte ptr [rdx]
     rejected = {
-        "ficom m16": (attempt(f"{fld} de 11 {fstp} c3"), "unsupported x87 operation"),
-        "ficomp m32": (attempt(f"{fld} da 19 {fstp} c3"), "unsupported x87 operation"),
+        "ficom m16 on an empty stack": (attempt("de 11 c3"), "x87 stack underflow"),
+        "ficomp m32 on an empty stack": (attempt("da 19 c3"), "x87 stack underflow"),
         "fiadd m32 on an empty stack": (attempt(f"da 01 {fld} {fstp} c3"), "x87 stack underflow"),
         "fidivr m16 on an empty stack": (attempt(f"de 39 {fld} {fstp} c3"), "x87 stack underflow"),
         "fisub m32 with two values and one store": (attempt(f"{fld} {fld} da 21 {fstp} c3"),

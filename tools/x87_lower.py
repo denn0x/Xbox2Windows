@@ -10,8 +10,10 @@ The profile accepts:
   lowering, and PF in a function with a JP, JNP, FCMOVU or FCMOVNU;
 - FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE, FCMOVNBE, FCMOVU and FCMOVNU ST(0), ST(i), which read ZF,
   CF and PF;
-- FCOM and FCOMP with ST(i) or an m32 or m64 operand, FCOMPP, FUCOM and FUCOMP ST(i) and FUCOMPP, which
-  set C0, C2 and C3 of the status word, and FNSTSW AX, which copies the status word to AX (see below);
+- FCOM and FCOMP with ST(i) or an m32 or m64 operand, FCOMPP, FUCOM and FUCOMP ST(i) and FUCOMPP, FTST,
+  which compares ST(0) with +0, and FICOM and FICOMP with an m16 or m32 integer, converted exactly as FILD
+  converts it, which set C0, C2 and C3 of the status word, and FNSTSW AX, which copies the status word to AX
+  (see below);
 - FADD, FSUB, FSUBR, FMUL, FDIV and FDIVR with an m32 or m64 operand, with ST(0), ST(i) and with
   ST(i), ST(0), and their popping forms FADDP, FSUBP, FSUBRP, FMULP, FDIVP and FDIVRP ST(i), ST(0) for
   i from 1 to 7;
@@ -74,10 +76,13 @@ X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FR
                      M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM,
-                     M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW})
+                     M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW, M.FTST, M.FICOM, M.FICOMP})
 # Comparisons into C0, C2 and C3 of the status word; FCOMPP and FUCOMPP pop twice, the other P forms once.
-STATUS_COMPARES = frozenset({M.FCOM, M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP})
-STATUS_POPS = {M.FCOM: 0, M.FCOMP: 1, M.FCOMPP: 2, M.FUCOM: 0, M.FUCOMP: 1, M.FUCOMPP: 2}
+STATUS_COMPARES = frozenset({M.FCOM, M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FTST, M.FICOM, M.FICOMP})
+STATUS_POPS = {M.FCOM: 0, M.FCOMP: 1, M.FCOMPP: 2, M.FUCOM: 0, M.FUCOMP: 1, M.FUCOMPP: 2, M.FTST: 0, M.FICOM: 0,
+               M.FICOMP: 1}
+# FICOM and FICOMP compare ST(0) with an m16 or m32 integer, converted exactly as for FILD.
+INTEGER_COMPARES = frozenset({M.FICOM, M.FICOMP})
 # Status-word bits: C0, C2 and C3 (the comparison result), and TOP.
 C_BITS = 0x4500
 TOP_BITS = 0x3800
@@ -199,10 +204,11 @@ def _effect(i, depth, checked=None):
             raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
         return depth
     if op in STATUS_COMPARES:
-        if i.op_count == 0:  # FCOMPP and FUCOMPP compare ST(0) with ST(1)
-            needed = 2
-        elif i.op_count == 1:  # FCOM and FCOMP m32/m64
-            if i.op0_kind != K.MEMORY or i.memory_size not in OPERANDS:
+        if i.op_count == 0:  # FTST compares ST(0) with +0, FCOMPP and FUCOMPP compare ST(0) with ST(1)
+            needed = 1 if op == M.FTST else 2
+        elif i.op_count == 1:  # FCOM and FCOMP m32/m64, FICOM and FICOMP m16/m32
+            allowed = (S.INT16, S.INT32) if op in INTEGER_COMPARES else OPERANDS
+            if i.op0_kind != K.MEMORY or i.memory_size not in allowed:
                 raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
             needed = 1
         elif i.op0_register == R.ST0:
@@ -568,7 +574,14 @@ def statement(i, depth, address, checked=None, parity=False):
                 f"// fnstsw ax, top {stack_top}")
     if op in STATUS_COMPARES:  # C3, C2 and C0: 0 0 1 less, 1 0 0 equal, 0 0 0 greater, 1 1 1 unordered
         name = next(n for n, v in vars(M).items() if v == op).lower()
-        if i.op_count == 1:
+        if op == M.FTST:
+            prefix, other = "", "X87Value{}"  # +0
+        elif op in INTEGER_COMPARES:
+            signed, unsigned, bits = INTEGERS[i.memory_size]
+            prefix = f"const word a = {address()}; "
+            other = f"x87_from_integer(static_cast<{signed}>(load<{unsigned}>(a)))"
+            name += f" m{bits}"
+        elif i.op_count == 1:
             prefix, other = f"const word a = {address()}; ", OPERANDS[i.memory_size]
         else:
             k = 1 if i.op_count == 0 else i.op1_register - R.ST0
