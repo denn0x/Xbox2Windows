@@ -1,0 +1,19 @@
+EXPORTS
+    m64_roundtrip
+    m32_roundtrip
+    m32_to_m64
+    m64_to_m32
+    m64_to_m80
+    m32_to_m80
+    m80_roundtrip
+    m80_to_m64
+    m80_to_m32
+    m80_fst
+    m80_to_int
+    int_to_m80
+    constants
+    sign_ops
+    stack_moves
+    stack_free
+    stack_overflow
+    stack_underflow

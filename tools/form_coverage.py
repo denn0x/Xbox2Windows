@@ -40,6 +40,8 @@ CPU_FIXTURES = {
     "direct": "cpu_aot_direct_call",
     "chained": "cpu_aot_chained_ranges",
     "callback": "cpu_aot_object_callback",
+    "x87_data": "cpu_aot_x87_data",
+    "x87_state": None,       # native measurement harness for x87_data
     "destroy": "cpu_aot_destroy_contract",
     "create_context": "cpu_aot_context_lifecycle",
     "bink_heap": "cpu_aot_bink_heap",

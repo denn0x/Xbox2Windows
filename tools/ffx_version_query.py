@@ -8,6 +8,7 @@ from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Registe
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
+from x87_lower import X87_OPS, statement as x87_statement
 
 
 LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
@@ -238,6 +239,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = calls[i.ip]
         elif op == M.RET:
             stmt = "return rax;"
+        elif op in X87_OPS:
+            stmt = x87_statement(i, address)
         else:
             raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
         lines.append(f"block_{i.ip:x}: {stmt}")
@@ -246,6 +249,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             if i.next_ip not in allowed:
                 raise ValueError(f"unbound fallthrough at {i.ip:#x}")
             lines.append(f"goto block_{i.next_ip:x};")
+    if any(i.mnemonic in X87_OPS for i in body):
+        lines.insert(3, "X87 fpu;")  # x87_lower.X87_HEADER must precede the generated function
     lines.extend(f"block_{target:x}: {statement}" for target, statement in exits.items())
     return "\n".join("    " + line for line in lines)
 

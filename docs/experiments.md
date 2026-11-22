@@ -699,6 +699,71 @@ The report follows the effect's stored list order. Each entry gives its stored g
 
 Two independently located local effects yielded 5 and 81 candidates across all groups. Their pixel lists contained 2 and 41 candidates respectively, and every pixel-container digest matched an independent decode. Identifying which candidate a draw uses still requires evidence of pass selection.
 
+## x87 in the shared lowering
+
+`lower()` in `tools/ffx_version_query.py` hands x87 instructions to [`tools/x87_lower.py`](../tools/x87_lower.py). That module emits calls into [`tools/x87_soft.h`](../tools/x87_soft.h), which a generated file includes before the lowered functions.
+
+**Register model.**
+- **Values:** each of the eight registers holds an exact extended-precision value: sign, 15-bit exponent and a 64-bit significand with an explicit integer bit. A host `double` cannot stand in, because an m80 operand or a load constant carries 64 significant bits and a wider exponent range.
+- **Stack state:** TOP and the empty/valid tag of each register are tracked.
+- **Exceptions:** all of them are masked.
+  - Reading an empty register (stack underflow), pushing onto a full stack (stack overflow) and an invalid operand all produce the indefinite NaN (`0xFFFF C000000000000000`).
+  - An integer store of a NaN, infinity or out-of-range value writes the integer indefinite.
+
+**Initial state.** A lifted function starts from control word `0x027F` (53-bit precision, round to nearest, all exceptions masked), tag word `0xFFFF` (empty stack) and status word 0. That is the state a native export sees when ctypes calls it on Windows x64. The check measures it on every run, with `fnstenv` in a native-only [probe](../tests/cpu/x87_state.asm) that is not translated, and fails if it differs. A caller that changes the control word before calling the translated code is outside this model.
+
+**Lowered:**
+- `fld`, `fst` and `fstp` for m32, m64, m80 and ST(i);
+- `fild`, `fist`, `fistp` and `fisttp` for m16, m32 and m64;
+- `fxch`, `fchs`, `fabs`;
+- `fld1`, `fldz`, `fldpi`, `fldl2e`, `fldl2t`, `fldlg2` and `fldln2`;
+- `ffree`, `ffreep`, `fincstp`, `fdecstp`, `fnop` and `wait`.
+
+**Load and store semantics.**
+- **m32 and m64 loads** convert exactly. A signaling NaN is quieted.
+- **m80 loads and stores** copy the 80 bits unchanged, including NaNs and unnormals.
+- **m32 and m64 stores** round by the rounding control into the destination's precision and exponent range, including its subnormals. An unnormal, pseudo-infinity or pseudo-NaN source is an invalid operand and stores the destination's indefinite.
+- **Load constants** round their exact values by the rounding control.
+
+**Not lowered:**
+- anything that reads or writes the status word, the control word or the environment (`fnstsw`, `fstsw`, `fldcw`, `fnstcw`, `fninit`, `ftst`, `fcom`, `fxam`, `fnstenv`, `fsave`);
+- arithmetic;
+- the transcendental instructions.
+
+`lower()` rejects them as unsupported operations.
+
+**Fixture and reference.** [`tests/cpu/x87_data.py`](../tests/cpu/x87_data.py) generates [the MASM fixture](../tests/cpu/x87_data.asm) from one table of instruction sequences. Regenerate it with `python tests/cpu/x87_data.py asm tests/cpu/x87_data.asm tests/cpu/x87_data.def`. The 18 exports cover:
+- conversions between every pair of m32, m64 and m80;
+- `fst` without a pop;
+- the integer stores, rounding to nearest (`fist`, `fistp`) and toward zero (`fisttp`);
+- integer loads, the constants and sign changes;
+- `fxch`, `fst st(i)` and `fstp st(i)` reordering four values;
+- `ffree`, `ffreep`, `fincstp` and `fdecstp` around an empty register;
+- a ninth push onto a full stack;
+- a sequence of stores, loads and exchanges on an empty stack.
+
+The inputs include:
+- zeros, denormals and pseudo-denormals;
+- m80 values with low significand bits set, at the m32 and m64 rounding and subnormal boundaries;
+- values beyond the m64 and m32 exponent ranges;
+- infinities, quiet and signaling NaNs with payloads, and unnormals, pseudo-infinities and pseudo-NaNs;
+- integer rounding ties.
+
+The check compares each 192-byte output block, prefilled with `0xcc`, against the native DLL and an independent Python model that uses exact rational arithmetic. It covers 3000 cases.
+
+**Negative controls.** Six controls mutate the generated C++ and must mismatch:
+
+| Control | Mutation | Mismatches |
+|---|---|---|
+| `truncate` | stores round toward zero | 556/3000 |
+| `nodenormal` | no denormalization | 535/3000 |
+| `noquiet` | signaling NaNs stay signaling | 6/3000 |
+| `nounderflow` | an empty register reads its stale contents | 41/3000 |
+| `nooverflow` | a push onto a full stack keeps its value | 20/3000 |
+| `constants` | constants truncated | 1/3000 |
+
+The check also requires `lower()` to reject `fnstsw` (alone and after `wait`), `fldcw`, `fnstcw`, `fsin`, `fadd`, `fninit` and `ftst`. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_x87_data$' -V`.
+
 ## Offline pixel shader recompilation
 
 `tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)

@@ -653,6 +653,23 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
     add_library(cpu_destroy_provider SHARED tests/cpu/destroy_provider.cpp)
+    cpu_asm_fixture(cpu_x87_data x87_data)
+    # The lifted DLL and six mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted truncate nodenormal noquiet nounderflow nooverflow constants)
+        set(x87_data_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_data_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_data_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_data.py"
+                emit "$<TARGET_FILE:cpu_x87_data>" "${x87_data_fixture}" ${variant}
+            DEPENDS cpu_x87_data tests/cpu/x87_data.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_data_${variant} SHARED "${x87_data_fixture}")
+    endforeach()
+    cpu_asm_fixture(cpu_x87_state x87_state)
+    add_test(NAME cpu_aot_x87_data COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_data.py"
+        check "$<TARGET_FILE:cpu_x87_state>" "$<TARGET_FILE:cpu_x87_data>" "$<TARGET_FILE:cpu_x87_data_lifted>"
+        "$<TARGET_FILE:cpu_x87_data_truncate>" "$<TARGET_FILE:cpu_x87_data_nodenormal>"
+        "$<TARGET_FILE:cpu_x87_data_noquiet>" "$<TARGET_FILE:cpu_x87_data_nounderflow>"
+        "$<TARGET_FILE:cpu_x87_data_nooverflow>" "$<TARGET_FILE:cpu_x87_data_constants>")
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
