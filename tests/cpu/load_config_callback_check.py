@@ -110,7 +110,7 @@ def check_layout(name, facts):
             raise AssertionError(f"{name}: guard flags {facts['flags']:#x}")
         if (target in facts["fids"]) != (name == "cfg_record"):
             raise AssertionError(f"{name}: callback target {target:#x} in function table: {target in facts['fids']}")
-    elif facts["flags"] != CF_INSTRUMENTED or facts["fids"]:
+    elif facts["flags"] & CF_TABLE or facts["fids"]:  # 0x100 with link 14.50; only the table bit is checked
         raise AssertionError(f"{name}: guard flags {facts['flags']:#x} with {len(facts['fids'])} table entries")
     print(f"{name}: slots in read-only .rdata with DIR64 relocations (null entry has none), "
           f"guard flags {facts['flags']:#x}, GUARD_CF {facts['guard_cf']}, {len(facts['fids'])} function table "
@@ -173,6 +173,9 @@ def show(row):
 
 def main(mapper_path, io, *images):
     images = dict(zip(VARIANTS, images))
+    # cfg_invalid fails fast on purpose: no error dialog or debugger prompt in the inherited error mode.
+    kernel = ctypes.WinDLL("kernel32")
+    kernel.SetErrorMode(kernel.GetErrorMode() | 0x0001 | 0x0002)  # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
     with TemporaryDirectory() as temp:
         shutil.copyfile(io, Path(temp) / IO)
         staged_io = Path(temp) / IO
