@@ -359,6 +359,29 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
     }
     std::uint32_t strides[32] = {};
+    // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
+    // The shader adds the "base vertex" entry value to the vertex index, so that value is biased by
+    // -vertex_first and each stream's view starts at vertex_first.
+    const UINT index_bytes = pass.ib.Format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+    const u64 index_address = pass.ib.BufferLocation + u64{start} * index_bytes;
+    const std::size_t index_total = std::size_t{count} * index_bytes;
+    const bool indices_ok = indexed && pass.ib.BufferLocation && readable_window(index_address, index_total) >= index_total;
+    INT vertex_first = indexed ? 0 : static_cast<INT>(start);
+    UINT vertex_count = indexed ? 0 : count;
+    if (indices_ok) {
+        std::uint32_t low = ~0u, high = 0;
+        for (UINT k = 0; k < count; ++k) {
+            const std::uint32_t value = index_bytes == 2 ? reinterpret_cast<const std::uint16_t*>(index_address)[k]
+                                                         : reinterpret_cast<const std::uint32_t*>(index_address)[k];
+            if (value < low) low = value;
+            if (value > high) high = value;
+        }
+        if (low <= high) {
+            vertex_first = base_vertex + static_cast<INT>(low);
+            vertex_count = high - low + 1;
+        }
+    }
+    if (vertex_first < 0) vertex_first = 0;
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -368,6 +391,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             address = pass.vb[srv.a].BufferLocation;
             bytes = pass.vb[srv.a].SizeInBytes;
             strides[i] = pass.vb[srv.a].StrideInBytes;
+            const u64 skip = u64{static_cast<UINT>(vertex_first)} * strides[i];
+            if (strides[i] && vertex_count && skip < bytes) {
+                const u64 wanted = u64{vertex_count} * strides[i];
+                address += skip;
+                bytes = static_cast<std::size_t>(wanted < bytes - skip ? wanted : bytes - skip);
+            }
         } else if (srv.source == 2 && srv.a < 16) {
             address = pass.root_address[srv.a];
             bytes = readable_window(address, 0x10000);
@@ -457,11 +486,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 have ? "bound" : "NULL", head);
         }
     }
-    check_device("translated draw views", 0);
+    static LONG checks;
+    if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated draw views", 0);
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; i < tr->uds.size(); ++i) {
         const Translation::Ud& ud = tr->uds[i];
-        values[i] = ud.kind == 0 ? (rect ? 1u : 0u) : ud.kind == 1 ? static_cast<std::uint32_t>(indexed ? base_vertex : static_cast<INT>(start))
+        values[i] = ud.kind == 0 ? (rect ? 1u : 0u) : ud.kind == 1 ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
             : ud.kind == 2 ? start_instance : ud.kind == 3 ? ((ud.a < 16 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
             : (ud.a >= 0 && ud.a < 32 ? strides[ud.a] : 0);
     }
@@ -476,11 +506,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
     if (indexed) {
-        const UINT index_bytes = pass.ib.Format == DXGI_FORMAT_R16_UINT ? 2 : 4;
         u64 offset = 0;
-        const u64 address = pass.ib.BufferLocation + u64{start} * index_bytes;
-        const std::size_t bytes = std::size_t{count} * index_bytes;
-        if (pass.ib.BufferLocation && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset)) {
+        const u64 address = index_address;
+        const std::size_t bytes = index_total;
+        if (indices_ok && frame_copy(address, bytes, &offset)) {
             const D3D12_INDEX_BUFFER_VIEW view{upload_ring->GetGPUVirtualAddress() + offset, static_cast<UINT>(bytes),
                                                index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
             list->IASetIndexBuffer(&view);

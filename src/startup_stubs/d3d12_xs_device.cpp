@@ -18,6 +18,7 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
+#include <dxgi1_4.h>
 
 #include <array>
 #include <cstdarg>
@@ -115,6 +116,7 @@ enum { time_list, time_device_noop, time_forward, time_create, time_view, time_q
 const char* const time_names[time_count] = {"list", "device-noop", "forward", "create", "view", "queue", "present", "wait",
                                             "pipeline", "heap", "copy"};
 volatile LONG64 time_ticks[time_count], time_calls[time_count];
+volatile LONG64 list_slot_ticks[256], list_slot_calls[256];  // per command-list slot
 struct Timed {
     int category;
     LARGE_INTEGER start;
@@ -345,6 +347,19 @@ template <int K, int N>
 __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3)
 {
     Timed timed(K == list_kind ? time_list : K == queue_kind ? time_queue : time_device_noop);
+    struct SlotTimed {
+        LARGE_INTEGER start;
+        SlotTimed() { QueryPerformanceCounter(&start); }
+        ~SlotTimed()
+        {
+            LARGE_INTEGER end;
+            QueryPerformanceCounter(&end);
+            if (K == list_kind) {
+                InterlockedAdd64(&list_slot_ticks[N & 255], end.QuadPart - start.QuadPart);
+                InterlockedIncrement64(&list_slot_calls[N & 255]);
+            }
+        }
+    } slot_timed;
     if (K == list_kind) InterlockedIncrement(&draw_calls_seen);
     if (K == list_kind && capture_active) {
         const u64 stack[4] = {s0, s1, s2, s3};
@@ -358,8 +373,11 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
             arg_kind(r8), r9, *arg_kind(r9) ? ":" : "", arg_kind(r9), s0, s1, s2, s3, ret);
     }
     if (K == list_kind && list_typed[N]) return list_typed[N](rcx, rdx, r8, r9, s0, s1, s2, s3);
-    // Register arguments only: stale caller stack words often still point at an IID.
-    if (create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
+    // Register arguments only: stale caller stack words often still point at an IID. The probe
+    // costs over a millisecond per call in this process (memory queries), so only the first calls
+    // of each slot are checked.
+    static LONG shape_checks;
+    if (shape_checks < 32 && InterlockedIncrement(&shape_checks) <= 32 && create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
         char name[64];
         std::snprintf(name, sizeof(name), "%s::slot%d(passes an IID)", kind_names[K], N);
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, rcx, rdx, r8, r9, _ReturnAddress());
@@ -386,7 +404,8 @@ template <int N>
 __declspec(noinline) u64 device_noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3)
 {
     Timed timed(time_device_noop);
-    if (create_shaped(rdx, r8, r9, s0, s1, s2, s3)) {
+    static LONG shape_checks;
+    if (shape_checks < 32 && InterlockedIncrement(&shape_checks) <= 32 && create_shaped(rdx, r8, r9, s0, s1, s2, s3)) {
         char name[64];
         std::snprintf(name, sizeof(name), "Device::slot%d(passes an IID)", N);
         char first[3 * 64 + 1];
@@ -1273,16 +1292,7 @@ bool ring_copy(u64 title_address, std::size_t bytes, u64* offset)
 // Number of contiguous readable bytes at address, up to wanted.
 std::size_t readable_window(u64 address, std::size_t wanted)
 {
-    std::size_t bytes = 0;
-    while (bytes < wanted) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(address + bytes), &info, sizeof(info))) break;
-        const DWORD protect = info.Protect & 0xff;
-        if (info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) || protect == PAGE_NOACCESS || protect == 0) break;
-        const u64 end = reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize;
-        bytes = static_cast<std::size_t>(end - address);
-    }
-    return bytes < wanted ? bytes : wanted;
+    return x2w_local::probe_readable(static_cast<std::uintptr_t>(address), wanted);
 }
 
 // Per-list state while recording.
@@ -1860,8 +1870,10 @@ HRESULT __stdcall device_frame_interval(Wrapper*, void* output, UINT length_us, 
         period, flags);
     return S_OK;
 }
+UINT frame_event_offset_us[4];
 HRESULT __stdcall device_frame_event(Wrapper*, UINT type, UINT offset_us, void* reserved, UINT flags)
 {
+    if (type < 4) frame_event_offset_us[type] = offset_us;
     log("x2w-d3d12 Device::slot79(frame event?) type=%u offset=%u us reserved=%p flags=0x%x -> S_OK", type, offset_us,
         reserved, flags);
     return S_OK;
@@ -2259,21 +2271,37 @@ LONG64 frame_wait_ms;
 HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, void* reserved, UINT flags, UINT64* token)
 {
     Timed timed(time_wait);
-    static LARGE_INTEGER frequency, next;
+    // One timeline: the origin event (type 0) fires once per frame interval; any other event type
+    // fires at the current origin plus the offset it was scheduled with, so waiting for it after the
+    // origin does not cost another whole interval.
+    static LARGE_INTEGER frequency, origin;
     static SRWLOCK lock = SRWLOCK_INIT;
     AcquireSRWLockExclusive(&lock);
     if (!frequency.QuadPart) {
         QueryPerformanceFrequency(&frequency);
-        QueryPerformanceCounter(&next);
+        QueryPerformanceCounter(&origin);
     }
     const LONGLONG interval = frequency.QuadPart * (frame_interval_us ? frame_interval_us : 33333) / 1000000;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (next.QuadPart <= now.QuadPart) next.QuadPart = now.QuadPart + interval;
-    const LONGLONG wait_ticks = next.QuadPart - now.QuadPart;
-    next.QuadPart += interval;
+    LONGLONG target;
+    if (type == 0) {
+        target = origin.QuadPart + interval;
+        if (target < now.QuadPart) target = now.QuadPart;  // running late: start a new timeline here
+        origin.QuadPart = target;
+    } else {
+        target = origin.QuadPart + frequency.QuadPart * frame_event_offset_us[type < 4 ? type : 3] / 1000000;
+    }
+    const LONGLONG wait_ticks = target > now.QuadPart ? target - now.QuadPart : 0;
     ReleaseSRWLockExclusive(&lock);
-    if (timeout != 0) Sleep(static_cast<DWORD>(wait_ticks * 1000 / frequency.QuadPart));
+    if (timeout != 0 && wait_ticks > 0) {
+        // High-resolution timer where available (Sleep is too coarse for a 33 ms frame).
+        static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* high resolution */, TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -(wait_ticks * 10000000 / frequency.QuadPart);
+        if (timer && due.QuadPart < 0 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, 1000);
+        else Sleep(static_cast<DWORD>(wait_ticks * 1000 / frequency.QuadPart));
+    }
     InterlockedIncrement(&frame_waits[type < 4 ? type : 3]);
     InterlockedExchangeAdd64(&frame_wait_ms, timeout != 0 ? wait_ticks * 1000 / frequency.QuadPart : 0);
     const UINT64 value = static_cast<UINT64>(InterlockedIncrement64(&frame_token));
@@ -2369,6 +2397,8 @@ void draw_overlay(LONG frame, double seconds)
     ReleaseDC(window, dc);
 }
 
+#include "startup_stubs/d3d12_present.inl"
+
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
@@ -2392,12 +2422,16 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             log("x2w-frame ---- end frame %ld", wanted);
         }
     }
+    bool shown_in_window = false;
     {
         Wrapper* surface = nullptr;
         const auto* words = static_cast<const u64*>(plane_parameters);
         if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
             surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
         capture::present(frame, surface);
+        // Render mode: the presented surface goes to the title's window through a swap chain.
+        if (render_mode() && surface && surface->own().kind == resource_kind && surface->own().real)
+            shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
     }
     const ULONGLONG now = GetTickCount64();
     if (frame == 1) started = last_report = now;
@@ -2407,7 +2441,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         hex_text(present_parameters, 0x40, b, sizeof(b));
         log("x2w-d3d12 CommandQueue::slot32(present) planes=%u plane=[%s] present=[%s]", planes, a, b);
     }
-    if (render_mode() && frame % 6 == 0 && planes && plane_parameters) {
+    if (render_mode() && frame % (shown_in_window ? 60 : 6) == 0 && planes && plane_parameters) {
         // Plane parameters: +0x00 frame token, +0x08 resource count, +0x10 pointer to the resources.
         const auto* words = static_cast<const u64*>(plane_parameters);
         if (x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8)) {
@@ -2419,7 +2453,16 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
                               *reinterpret_cast<void* const*>(words[2]));
         }
     }
-    if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) draw_overlay(frame, (now - started) / 1000.0);
+    if (shown_in_window) {
+        if (frame % 30 == 0) {
+            wchar_t text[200];
+            swprintf(text, 200, L"Xbox2Windows local experiment - frame %ld, %.1f fps, %ld translated draws (title bar is diagnostics, picture is game output)",
+                     frame, frame * 1000.0 / (now - started ? now - started : 1), translated_draws);
+            SetWindowTextW(output_window(), text);
+        }
+    } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
+        draw_overlay(frame, (now - started) / 1000.0);
+    }
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld", render_resets,
@@ -2441,6 +2484,15 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
                                           static_cast<long long>(ticks * 1000 / frequency.QuadPart), static_cast<long long>(calls));
             }
             log("x2w-d3d12 time inside the stand-in since the last report (ms/calls):%s", text);
+            used = 0;
+            text[0] = 0;
+            for (int i = 0; i < 256; ++i) {
+                const LONG64 ticks = InterlockedExchange64(&list_slot_ticks[i], 0), calls = InterlockedExchange64(&list_slot_calls[i], 0);
+                if (calls && ticks * 1000 / frequency.QuadPart >= 20 && used < 440)
+                    used += std::snprintf(text + used, sizeof(text) - used, " slot%d %lld ms/%lld", i,
+                                          static_cast<long long>(ticks * 1000 / frequency.QuadPart), static_cast<long long>(calls));
+            }
+            if (used) log("x2w-d3d12 command-list slots over 20 ms:%s", text);
         }
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),

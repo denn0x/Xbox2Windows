@@ -43,12 +43,44 @@ inline void logf(const char* format, ...) noexcept
 
 inline bool first_calls(LONG& counter, LONG limit) noexcept { return InterlockedIncrement(&counter) <= limit; }
 
-// Readability check without IsBadReadPtr (which probes by faulting: a first-chance exception per
-// call, very slow under a debugger). One VirtualQuery per check; nothing is cached, since regions can be freed.
+// Number of contiguous readable bytes at start, up to bytes, found by touching one byte per page.
+// VirtualQuery is not used for this: on the title's multi-gigabyte regions one query takes about a
+// millisecond (it walks the region to size it). A bad pointer costs a first-chance exception, so
+// callers on hot paths should pass values that normally are pointers. A guard page that the probe
+// trips is re-armed.
+inline std::size_t probe_readable(std::uintptr_t start, std::size_t bytes) noexcept
+{
+    if (start < 0x10000 || start > 0x00007FFFFFFEFFFFull || bytes == 0) return 0;
+    std::size_t done = 0;
+    DWORD code = 0;
+    std::uintptr_t at = start;
+    const std::uintptr_t end = start + bytes;
+    __try {
+        volatile unsigned char sink = 0;
+        while (at < end) {
+            sink = *reinterpret_cast<const volatile unsigned char*>(at);
+            const std::uintptr_t next = (at | 0xFFF) + 1;
+            done = static_cast<std::size_t>((next < end ? next : end) - start);
+            at = next;
+        }
+        (void)sink;
+    } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        if (code == 0x80000001u) {  // STATUS_GUARD_PAGE_VIOLATION: the system dropped the guard bit
+            MEMORY_BASIC_INFORMATION info{};
+            DWORD old = 0;
+            if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) && info.State == MEM_COMMIT)
+                VirtualProtect(reinterpret_cast<void*>(at & ~std::uintptr_t{0xFFF}), 0x1000, info.Protect | PAGE_GUARD, &old);
+        }
+    }
+    return done;
+}
+
+// Readability by probing (see probe_readable); writability by one VirtualQuery (rare callers).
 inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexcept
 {
     const auto start = reinterpret_cast<std::uintptr_t>(pointer);
     if (start < 0x10000 || start > 0x00007FFFFFFEFFFFull || bytes == 0) return false;
+    if (!write) return probe_readable(start, bytes) == bytes;
     MEMORY_BASIC_INFORMATION info{};
     if (!VirtualQuery(pointer, &info, sizeof(info)) || info.State != MEM_COMMIT) return false;
     const DWORD protect = info.Protect & 0xFF;
