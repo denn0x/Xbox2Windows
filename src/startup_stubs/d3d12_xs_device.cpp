@@ -1393,13 +1393,27 @@ void draw_overlay(LONG frame, double seconds)
     DeleteObject(background);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(230, 232, 236));
-    char text[512];
+    // The title's main state variable (image offset found by tracing this build; 0 at start, 1 while
+    // loading, 3 once its start-up flow is waiting). Read only, to show whether the game advances.
+    static const volatile LONG* const game_state =
+        reinterpret_cast<const volatile LONG*>(reinterpret_cast<const char*>(GetModuleHandleW(nullptr)) + 0x98F828C);
+    static LONG last_state = -1;
+    static ULONGLONG state_since;
+    const LONG state = x2w_local::readable(const_cast<const LONG*>(game_state), 4) ? *game_state : -1;
+    if (state != last_state) {
+        log("x2w-d3d12 title main state %ld -> %ld at frame %ld", last_state, state, frame);
+        last_state = state;
+        state_since = GetTickCount64();
+    }
+    char text[640];
     std::snprintf(text, sizeof(text),
                   "Xbox2Windows local startup experiment (diagnostic overlay, not game output)\n\n"
                   "The title is running: frame %ld presented, %.1f s since the first, %.1f fps.\n"
                   "%ld draw and state calls recorded so far and dropped: there is no translation of\n"
-                  "the console GPU commands and shaders yet, so no picture. No audio output either.",
-                  frame, seconds, seconds > 0 ? frame / seconds : 0.0, draw_calls_seen);
+                  "the console GPU commands and shaders yet, so no picture. No audio output either.\n\n"
+                  "Title main state: %ld (for %.0f s).  0 start, 1 loading, 3 start-up flow waiting.",
+                  frame, seconds, seconds > 0 ? frame / seconds : 0.0, draw_calls_seen, state,
+                  (GetTickCount64() - state_since) / 1000.0);
     RECT area{client.left + 24, client.top + 24, client.right - 24, client.bottom - 24};
     DrawTextA(dc, text, -1, &area, DT_LEFT | DT_TOP | DT_WORDBREAK);
     ReleaseDC(window, dc);
