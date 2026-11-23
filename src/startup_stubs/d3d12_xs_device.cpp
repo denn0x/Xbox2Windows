@@ -19,11 +19,13 @@
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 
+#include <array>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -106,6 +108,25 @@ std::uint64_t desktop_cpu_handle(std::uint64_t handle)
 
 void* tables[kind_count][slot_count];
 Wrapper* the_device;
+
+// Time spent inside the stand-in per entry-point family, reported with the heartbeat.
+enum { time_list, time_device_noop, time_forward, time_create, time_view, time_queue, time_present, time_wait,
+       time_pipeline, time_heap, time_copy, time_count };
+const char* const time_names[time_count] = {"list", "device-noop", "forward", "create", "view", "queue", "present", "wait",
+                                            "pipeline", "heap", "copy"};
+volatile LONG64 time_ticks[time_count], time_calls[time_count];
+struct Timed {
+    int category;
+    LARGE_INTEGER start;
+    explicit Timed(int c) : category(c) { QueryPerformanceCounter(&start); }
+    ~Timed()
+    {
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        InterlockedAdd64(&time_ticks[category], end.QuadPart - start.QuadPart);
+        InterlockedIncrement64(&time_calls[category]);
+    }
+};
 
 void log(const char* format, ...)
 {
@@ -310,6 +331,10 @@ extern LONG draw_calls_seen;
 // with its slot, the kinds of any wrapped objects among its arguments, and stack arguments.
 LONG trace_frame_active;
 extern LONG capture_active;
+// Command-list methods with a real implementation (render mode). Every list call enters through
+// noop_slot, which times, captures and traces it, then hands over to the entry here if there is one.
+using ListTyped = u64(__stdcall*)(u64, u64, u64, u64, u64, u64, u64, u64);
+ListTyped list_typed[slot_count];
 namespace capture { void list_call(int slot, u64 list, u64 rdx, u64 r8, u64 r9, const u64* stack, u64 ret); }
 const char* arg_kind(u64 value)
 {
@@ -319,6 +344,7 @@ const char* arg_kind(u64 value)
 template <int K, int N>
 __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3)
 {
+    Timed timed(K == list_kind ? time_list : K == queue_kind ? time_queue : time_device_noop);
     if (K == list_kind) InterlockedIncrement(&draw_calls_seen);
     if (K == list_kind && capture_active) {
         const u64 stack[4] = {s0, s1, s2, s3};
@@ -331,6 +357,7 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
             GetCurrentThreadId(), rcx, N, rdx, *arg_kind(rdx) ? ":" : "", arg_kind(rdx), r8, *arg_kind(r8) ? ":" : "",
             arg_kind(r8), r9, *arg_kind(r9) ? ":" : "", arg_kind(r9), s0, s1, s2, s3, ret);
     }
+    if (K == list_kind && list_typed[N]) return list_typed[N](rcx, rdx, r8, r9, s0, s1, s2, s3);
     // Register arguments only: stale caller stack words often still point at an IID.
     if (create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
         char name[64];
@@ -358,6 +385,7 @@ bool device_noop()
 template <int N>
 __declspec(noinline) u64 device_noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3)
 {
+    Timed timed(time_device_noop);
     if (create_shaped(rdx, r8, r9, s0, s1, s2, s3)) {
         char name[64];
         std::snprintf(name, sizeof(name), "Device::slot%d(passes an IID)", N);
@@ -423,6 +451,7 @@ Method method_of(IUnknown* real, int slot) { return reinterpret_cast<Method>((*r
 template <int K, int N>
 __declspec(noinline) u64 forward_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h)
 {
+    Timed timed(time_forward);
     const u64 result = method_of(self->own().real, N)(self->own().real, unwrap(a), unwrap(b), unwrap(c), unwrap(d), unwrap(e),
                                                 unwrap(f), unwrap(g), unwrap(h));
     static LONG calls;
@@ -492,6 +521,7 @@ D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
 template <int K, int N, int R, int Desc = -1>
 __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h)
 {
+    Timed timed(time_create);
     u64 args[8] = {a, b, c, d, e, f, g, h};
     for (int i = 0; i < R; ++i) args[i] = unwrap(args[i]);
     D3D12_RESOURCE_DESC desc_copy{};
@@ -1168,10 +1198,17 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 
 // Transient data the title addresses by GPU address (fetch tables, vertices, constants) is copied
 // from its memory into a desktop upload buffer; the copy's GPU address is bound instead.
+ID3D12Resource* upload_ring;
+bool ring_copy(u64 title_address, std::size_t bytes, u64* offset);
 D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes)
 {
-    constexpr u64 ring_bytes = u64{64} << 20;
-    static ID3D12Resource* ring;
+    u64 offset = 0;
+    return ring_copy(title_address, bytes, &offset) ? upload_ring->GetGPUVirtualAddress() + offset : 0;
+}
+bool ring_copy(u64 title_address, std::size_t bytes, u64* offset)
+{
+    constexpr u64 ring_bytes = u64{256} << 20;
+    ID3D12Resource*& ring = upload_ring;
     static unsigned char* mapped;
     static volatile LONG64 cursor;
     static SRWLOCK lock = SRWLOCK_INIT;
@@ -1197,12 +1234,13 @@ D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes
         }
         ReleaseSRWLockExclusive(&lock);
     }
-    if (!ring || bytes == 0 || bytes > ring_bytes / 4) return 0;
+    if (!ring || bytes == 0 || bytes > ring_bytes / 4) return false;
     const u64 rounded = (bytes + 255) & ~u64{255};
     u64 start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded))) % ring_bytes;
     if (start + rounded > ring_bytes) start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded) + (ring_bytes - start))) % ring_bytes, start = 0;
     std::memcpy(mapped + start, reinterpret_cast<const void*>(title_address), bytes);
-    return ring->GetGPUVirtualAddress() + start;
+    *offset = start;
+    return true;
 }
 
 // Number of contiguous readable bytes at address, up to wanted.
@@ -1227,7 +1265,18 @@ struct Pass {
     bool topology_ok = false;
     unsigned srv_bound = 0;          // bit per root parameter with a desktop address bound
     const std::vector<RootParameter>* root = nullptr;
-    std::vector<ID3D12Resource*> as_target;  // resources this list moved to RENDER_TARGET
+    std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
+    // What the title bound, kept for draws through translated pipelines:
+    Wrapper* pipeline = nullptr;
+    UINT topology = 0;
+    u64 table_address[16] = {};      // title descriptor memory of each bound table
+    u64 root_address[16] = {};       // title address of each root descriptor
+    std::uint32_t constants[16][8] = {};
+    D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
+    D3D12_INDEX_BUFFER_VIEW ib = {};
+    DXGI_FORMAT target_formats[8] = {};
+    UINT target_count = 0;
+    bool heap_set = false;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 
@@ -1237,29 +1286,36 @@ Pass& pass_of(Wrapper* self)
     if (!self->own().pass) self->own().pass = new Pass;
     return *static_cast<Pass*>(self->own().pass);
 }
-void use_as_target(Wrapper* self, ID3D12Resource* resource)
+// Desktop resources rest in COMMON between lists; a list moves them as it needs and back at Close.
+void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state)
 {
     Pass& pass = pass_of(self);
-    for (ID3D12Resource* known : pass.as_target)
-        if (known == resource) return;
-    transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    pass.as_target.push_back(resource);
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    for (auto& known : pass.states) {
+        if (known.first != resource) continue;
+        if (known.second != state) {
+            transition(list, resource, known.second, state);
+            known.second = state;
+        }
+        return;
+    }
+    transition(list, resource, D3D12_RESOURCE_STATE_COMMON, state);
+    pass.states.emplace_back(resource, state);
 }
+void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
 void release_targets(Wrapper* self)
 {
     Pass& pass = pass_of(self);
-    for (ID3D12Resource* resource : pass.as_target)
-        transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), resource, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
-    pass.as_target.clear();
-    pass.pipeline_real = pass.targets_bound = pass.topology_ok = false;
-    pass.srv_bound = 0;
-    pass.root = nullptr;
+    for (const auto& known : pass.states)
+        transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
+    pass = Pass{};
 }
 
 // List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list (no desktop draw yet).
 void __stdcall list_topology(Wrapper* self, UINT topology)
 {
     pass_of(self).topology_ok = topology >= 1 && topology <= 5;
+    pass_of(self).topology = topology;
     if (auto* list = recording(self); list && pass_of(self).topology_ok) list->IASetPrimitiveTopology(static_cast<D3D12_PRIMITIVE_TOPOLOGY>(topology));
 }
 // List slot 25, SetPipelineState.
@@ -1268,6 +1324,7 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
     Wrapper* w = as_wrapper(pipeline);
     Pass& pass = pass_of(self);
     pass.pipeline_real = w && w->own().kind == pipeline_kind && w->own().real;
+    pass.pipeline = w && w->own().kind == pipeline_kind ? w : nullptr;
     InterlockedIncrement(pass.pipeline_real ? &render_pipelines_real : &render_pipelines_missing);
     if (auto* list = recording(self); list && pass.pipeline_real) list->SetPipelineState(static_cast<ID3D12PipelineState*>(w->own().real));
 }
@@ -1293,7 +1350,17 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         ID3D12Resource* target = view_target(desktop[i].ptr);
         if (!target) return;
         use_as_target(self, target);
+        DXGI_FORMAT format = target->GetDesc().Format;
+        if (const std::uint32_t id = shadow_id(desktop[i].ptr)) {
+            AcquireSRWLockShared(&note_lock);
+            DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
+            if (id - 1 < view_records().size() && view_records()[id - 1].desc_bytes >= 4) std::memcpy(&view_format, view_records()[id - 1].desc, 4);
+            ReleaseSRWLockShared(&note_lock);
+            if (view_format != DXGI_FORMAT_UNKNOWN) format = desktop_format(view_format);
+        }
+        pass.target_formats[i] = format;
     }
+    pass.target_count = count;
     list->OMSetRenderTargets(count, desktop, FALSE, nullptr);
     pass.targets_bound = true;
 }
@@ -1318,6 +1385,7 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     if (parameter < 32) pass.srv_bound &= ~(1u << parameter);
+    if (parameter < 16) pass.root_address[parameter] = address;
     if (!list || !pass.root || parameter >= pass.root->size() || parameter >= 32 ||
         (*pass.root)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV)
         return;
@@ -1333,13 +1401,20 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
     list->SetGraphicsRootShaderResourceView(parameter, desktop);
     pass.srv_bound |= 1u << parameter;
 }
+extern LONG translated_draws, untranslated_draws, frame_number;
+bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
 // List slot 12, DrawInstanced.
 void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
+    if (list && !pass.pipeline_real) {
+        InterlockedIncrement(draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance) ? &translated_draws
+                                                                                                                : &untranslated_draws);
+        return;
+    }
     // The translated vertex shaders read their fetch table through root parameter 0.
-    if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && (pass.srv_bound & 1)) {
+    if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
         const LONG n = InterlockedIncrement(&render_draws);
         if (n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
@@ -1347,6 +1422,8 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
         InterlockedIncrement(&render_draws_skipped);
     }
 }
+
+#include "startup_stubs/d3d12_draw.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
 void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
@@ -1417,6 +1494,7 @@ HRESULT __stdcall queue_timestamp_frequency(Wrapper* self, UINT64* frequency)
 template <int N>
 __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
 {
+    Timed timed(time_queue);
     static LONG calls;
     const bool log_it = first_calls(calls, 2);
     if (Wrapper* fence = as_wrapper(reinterpret_cast<void*>(rdx)); fence && fence->own().kind == fence_kind) {
@@ -1566,6 +1644,7 @@ std::uint64_t __stdcall descriptor_heap_cpu_start(void* a, void* b)
 HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const GUID* iid,
                                                 void** out)
 {
+    Timed timed(time_heap);
     char text[48];
     guid_text(iid, text, sizeof(text));
     if (!out || !desc || !iid) return E_POINTER;
@@ -1608,6 +1687,7 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
 template <int N, int D>
 __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
 {
+    Timed timed(time_view);
     u64 args[4] = {unwrap(a), unwrap(b), unwrap(c), unwrap(d)};
     const u64 title_dest = args[D];
     args[D] = desktop_cpu_handle(args[D]);
@@ -1658,6 +1738,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
 // Device slot 24, desktop CopyDescriptorsSimple(count, dest, src, type).
 void __stdcall device_copy_descriptors_simple(Wrapper* self, UINT count, u64 dest, u64 src, D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
+    Timed timed(time_copy);
     device_of(self)->CopyDescriptorsSimple(count, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop_cpu_handle(dest))},
                                            D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop_cpu_handle(src))}, type);
     note_copy(dest, src, desktop_cpu_handle(dest), desktop_cpu_handle(src), count, device_of(self)->GetDescriptorHandleIncrementSize(type));
@@ -2049,6 +2130,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
 template <int N>
 HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc, const GUID* iid, void** out)
 {
+    Timed timed(time_pipeline);
     char text[48];
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
@@ -2071,6 +2153,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
 HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, u64 count, const void* desc, const GUID* iid,
                                                  void** out)
 {
+    Timed timed(time_pipeline);
     char text[48];
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
@@ -2142,6 +2225,7 @@ LONG frame_waits[4];
 LONG64 frame_wait_ms;
 HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, void* reserved, UINT flags, UINT64* token)
 {
+    Timed timed(time_wait);
     static LARGE_INTEGER frequency, next;
     static SRWLOCK lock = SRWLOCK_INIT;
     AcquireSRWLockExclusive(&lock);
@@ -2256,9 +2340,11 @@ void draw_overlay(LONG frame, double seconds)
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
 {
+    Timed timed(time_present);
     static LONG frames;
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
+    frame_number = frame;
     {
         static const LONG wanted = [] {
             char value[16]{};
@@ -2303,11 +2389,26 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) draw_overlay(frame, (now - started) / 1000.0);
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, executes %ld, draws %ld (skipped %ld), "
-            "pipeline binds real %ld / untranslated %ld", render_resets, render_reset_failures, render_closes, render_clears,
-            render_executes, render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing);
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld", render_resets,
+            render_reset_failures, render_closes, render_clears, render_executes, render_draws, render_draws_skipped,
+            translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings);
     if (now - last_report >= 5000) {
         last_report = now;
-        log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld", views_noted, views_distinct, descriptors_copied);
+        log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu", views_noted, views_distinct,
+            descriptors_copied, static_cast<u64>(heap_infos().size()));
+        {
+            LARGE_INTEGER frequency;
+            QueryPerformanceFrequency(&frequency);
+            char text[512];
+            int used = 0;
+            for (int i = 0; i < time_count; ++i) {
+                const LONG64 ticks = InterlockedExchange64(&time_ticks[i], 0), calls = InterlockedExchange64(&time_calls[i], 0);
+                if (calls)
+                    used += std::snprintf(text + used, sizeof(text) - used, " %s %lld ms/%lld", time_names[i],
+                                          static_cast<long long>(ticks * 1000 / frequency.QuadPart), static_cast<long long>(calls));
+            }
+            log("x2w-d3d12 time inside the stand-in since the last report (ms/calls):%s", text);
+        }
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
@@ -2400,20 +2501,25 @@ void build_tables()
         tables[list_kind][7] = reinterpret_cast<void*>(&child_get_device);
     }
     if (render_mode()) {
-        tables[list_kind][9] = reinterpret_cast<void*>(&list_close);
-        tables[list_kind][52] = reinterpret_cast<void*>(&list_clear_target);
-        tables[list_kind][139] = reinterpret_cast<void*>(&list_reset);
-        tables[list_kind][12] = reinterpret_cast<void*>(&list_draw);
-        tables[list_kind][20] = reinterpret_cast<void*>(&list_topology);
-        tables[list_kind][21] = reinterpret_cast<void*>(&list_viewports);
-        tables[list_kind][22] = reinterpret_cast<void*>(&list_scissors);
-        tables[list_kind][23] = reinterpret_cast<void*>(&list_blend_factor);
-        tables[list_kind][25] = reinterpret_cast<void*>(&list_pipeline);
-        tables[list_kind][34] = reinterpret_cast<void*>(&list_graphics_root);
-        tables[list_kind][44] = reinterpret_cast<void*>(&list_root_srv);
-        tables[list_kind][50] = reinterpret_cast<void*>(&list_targets);
-        tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
+        list_typed[9] = reinterpret_cast<ListTyped>(&list_close);
+        list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
+        list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
+        list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
+        list_typed[20] = reinterpret_cast<ListTyped>(&list_topology);
+        list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
+        list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
+        list_typed[23] = reinterpret_cast<ListTyped>(&list_blend_factor);
+        list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
+        list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
+        list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
+        list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
+        list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
+        list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
+        list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
+        list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
+        list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
     }
+    tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
 
     // Queue: not the desktop order (slot 18 is GetTimestampFrequency, desktop 16). Slots are
     // dispatched by argument shape until the order is known; see queue_dynamic.
@@ -2443,7 +2549,18 @@ void build_tables()
     if (device_noop()) fill_all_remaining_noops(std::make_index_sequence<kind_count>{});
 }
 
+SRWLOCK written_lock = SRWLOCK_INIT;
+std::unordered_map<u64, u64>& written_textures() { static std::unordered_map<u64, u64> m; return m; }  // title base -> generation
 }  // namespace
+
+// Called by the XG stand-in after it filled texture memory at a title address.
+extern "C" __declspec(dllexport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes)
+{
+    (void)bytes;
+    AcquireSRWLockExclusive(&written_lock);
+    ++written_textures()[reinterpret_cast<u64>(base)];
+    ReleaseSRWLockExclusive(&written_lock);
+}
 
 bool x2w_d3d12_permissive()
 {

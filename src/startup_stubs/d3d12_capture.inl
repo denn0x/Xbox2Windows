@@ -180,8 +180,8 @@ LONG capture_active;
 namespace capture {
 HANDLE file = INVALID_HANDLE_VALUE;
 SRWLOCK lock = SRWLOCK_INIT;
-std::unordered_set<u64> objects, views;
-std::unordered_map<u64, u64> memory_seen;  // address -> largest size written
+std::unordered_set<u64> objects, views, followed;
+std::unordered_map<u64, u64> memory_seen;  // address -> hash of the content last written
 LONG sequence, frame_now, first_frame = -1, frame_count = 1;
 u64 total_bytes;
 
@@ -223,13 +223,24 @@ void memory(u64 address, std::size_t wanted, int depth = 0, std::uint32_t why = 
     if (address < 0x10000 || !wanted) return;
     const std::size_t bytes = readable_window(address, wanted);
     if (!bytes) return;
+    // Written again whenever the content differs from what was last written for this address
+    // (stack and transient memory is reused between calls); readers take the latest block.
+    u64 hash = 1469598103934665603ull ^ bytes;
+    {
+        std::vector<unsigned char> probe(bytes);
+        SIZE_T got = 0;
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), probe.data(), bytes, &got);
+        for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ probe[i]) * 1099511628211ull;
+    }
     const auto seen = memory_seen.find(address);
-    if (seen == memory_seen.end() || seen->second < bytes) {
-        memory_seen[address] = bytes;
+    if (seen == memory_seen.end() || seen->second != hash) {
+        memory_seen[address] = hash;
         struct { u64 address, bytes, wanted; std::uint32_t why, sequence; } header{address, bytes, wanted, why, static_cast<std::uint32_t>(sequence)};
         chunk("MEM ", &header, sizeof(header), reinterpret_cast<const void*>(address), bytes);
     }
     if (depth <= 0) return;
+    // Each address is expanded once per depth, and a capture follows a bounded number of pointers.
+    if (!followed.insert(address * 4 + static_cast<u64>(depth)).second || followed.size() > 20000) return;
     const std::size_t scan = bytes < 0x400 ? bytes : 0x400;
     std::vector<u64> words(scan / 8);
     SIZE_T got = 0;
@@ -240,7 +251,7 @@ void memory(u64 address, std::size_t wanted, int depth = 0, std::uint32_t why = 
         if (Wrapper* w = as_wrapper(reinterpret_cast<const void*>(value))) { object(w); continue; }
         if (readable_window(value, 16) < 16) continue;
         const u64 next = i + 1 < words.size() ? words[i + 1] : 0;
-        memory(value, next > 0 && next <= (32u << 20) ? static_cast<std::size_t>(next) : 0x100, depth - 1, why);
+        memory(value, next > 0 && next <= (4u << 20) ? static_cast<std::size_t>(next) : 0x100, depth - 1, why);
     }
 }
 

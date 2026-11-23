@@ -169,6 +169,58 @@ void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INF
 }
 
 // Slot 1: called when the title is done with the computer.
+// Slot 8, CopyIntoSubresource(tiled base, plane, subresource, linear data, row pitch, slice pitch)
+// (argument order as in DirectXTex's use of the public XG header). The stand-in's layout is the
+// desktop copyable-footprint layout reported by slot 2, so the "tiled" memory is filled row by row
+// at those offsets; the D3D12 stand-in is told so that it can refresh its desktop texture.
+long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned plane, unsigned subresource,
+                                  const unsigned char* linear, unsigned row_pitch, unsigned slice_pitch)
+{
+    static LONG calls, refused;
+    ID3D12Device* device = layout_device();
+    const D3D12_RESOURCE_DESC desc = desktop_desc(self->desc);
+    const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const unsigned slices = volume ? 1 : desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
+    unsigned mips = desc.MipLevels ? desc.MipLevels : 1;
+    if (mips > max_mips) mips = max_mips;
+    const unsigned mip = subresource % mips, slice = subresource / mips;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mips);
+    std::vector<UINT> rows(mips);
+    std::vector<UINT64> row_bytes(mips);
+    UINT64 slice_total = ~0ull;
+    if (device) device->GetCopyableFootprints(&desc, 0, mips, 0, footprints.data(), rows.data(), row_bytes.data(), &slice_total);
+    if (!device || !base || !linear || plane != 0 || slice >= slices || slice_total == ~0ull || !slice_total || !row_pitch) {
+        if (x2w_local::first_calls(refused, 8))
+            x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) refused: base=%p plane=%u subresource=%u linear=%p pitch=%u/%u",
+                            static_cast<void*>(base), plane, subresource, static_cast<const void*>(linear), row_pitch, slice_pitch);
+        return static_cast<long>(0x80070057);
+    }
+    const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
+    const auto& fp = footprints[mip].Footprint;
+    const u64 used = row_bytes[mip] < row_pitch ? row_bytes[mip] : row_pitch;
+    unsigned char* target = base + stride * slice + footprints[mip].Offset;
+    const u64 target_bytes = u64{fp.RowPitch} * rows[mip] * fp.Depth;
+    const u64 source_slice = slice_pitch ? slice_pitch : u64{row_pitch} * rows[mip];
+    const bool ok = x2w_local::writable(target, target_bytes) &&
+                    x2w_local::readable(linear, source_slice * (fp.Depth - 1) + u64{row_pitch} * (rows[mip] - 1) + used);
+    if (ok) {
+        for (unsigned z = 0; z < fp.Depth; ++z)
+            for (unsigned y = 0; y < rows[mip]; ++y)
+                std::memcpy(target + (u64{z} * rows[mip] + y) * fp.RowPitch, linear + z * source_slice + u64{y} * row_pitch, used);
+        using Notify = void (*)(void*, unsigned long long);
+        static const Notify notify = [] {
+            const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
+            return d3d ? reinterpret_cast<Notify>(GetProcAddress(d3d, "x2w_d3d12_texture_written")) : nullptr;
+        }();
+        if (notify) notify(base, stride * slices);
+    }
+    if (x2w_local::first_calls(calls, 12) || !ok)
+        x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) base=%p subresource=%u (mip %u slice %u) %ux%u fmt=%d rows=%u "
+                        "pitch %u->%u -> %s", static_cast<void*>(base), subresource, mip, slice, fp.Width, fp.Height, desc.Format,
+                        rows[mip], row_pitch, fp.RowPitch, ok ? "copied" : "MEMORY NOT ACCESSIBLE");
+    return ok ? 0 : static_cast<long>(0x80004005);
+}
+
 u64 __stdcall computer_release(Computer* self)
 {
     if (InterlockedDecrement(&self->refs) == 0) delete self;
@@ -205,6 +257,7 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
     if (!ready) {
         table[1] = reinterpret_cast<void*>(&computer_release);
         table[2] = reinterpret_cast<void*>(&computer_layout);
+        table[8] = reinterpret_cast<void*>(&computer_copy_into);
         table[10] = reinterpret_cast<void*>(&computer_tiling);
         ready = true;
     }

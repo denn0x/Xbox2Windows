@@ -75,8 +75,7 @@ endforeach()
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
-    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp
-    src/startup_stubs/xmem_traps.cpp)
+    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
 # those ordinals in the DLL and build the consumer library with names.
@@ -149,6 +148,7 @@ endforeach()
 # link the shims statically so they never use its runtime (constexpr std::mutex layout).
 target_link_libraries(startup_stub_xg_xs PRIVATE d3d12 dxguid)
 target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler)
+target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_executable(startup_stub_consumer tests/startup_stub_consumer.cpp)
