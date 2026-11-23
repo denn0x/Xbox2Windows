@@ -148,7 +148,7 @@ endforeach()
 # The title package ships an older MSVCP140.dll that the loader picks from the application directory;
 # link the shims statically so they never use its runtime (constexpr std::mutex layout).
 target_link_libraries(startup_stub_xg_xs PRIVATE d3d12 dxguid)
-target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32)
+target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler)
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_executable(startup_stub_consumer tests/startup_stub_consumer.cpp)
