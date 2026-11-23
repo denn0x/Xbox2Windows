@@ -134,7 +134,7 @@ target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
 # LOCAL (local/startup-v2, never pushed): trap-by-default desktop DLLs for startup imports without a
 # public ABI yet (src/startup_stubs/trap.h), plus opt-in permissive paths for local startup runs.
 set(startup_stub_targets)
-foreach(stub IN ITEMS acphal:AcpHal chad:chad xapu:xapu xcrdapi:XCRDAPI xg_xs:xg_xs)
+foreach(stub IN ITEMS acphal:AcpHal chad:chad xapu:xapu xcrdapi:XCRDAPI xg_xs:xg_xs gameinput:GameInput)
     string(REPLACE ":" ";" stub_parts "${stub}")
     list(GET stub_parts 0 stub_stem)
     list(GET stub_parts 1 stub_output)
@@ -147,6 +147,8 @@ endforeach()
 # The title package ships an older MSVCP140.dll that the loader picks from the application directory;
 # link the shims statically so they never use its runtime (constexpr std::mutex layout).
 target_link_libraries(startup_stub_xg_xs PRIVATE d3d12 dxguid)
+target_link_libraries(startup_stub_gameinput PRIVATE user32)
+target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
 target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi)
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES

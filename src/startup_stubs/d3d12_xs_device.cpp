@@ -1010,7 +1010,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     {
         static wchar_t dump_path[MAX_PATH];
         static const bool dump = GetEnvironmentVariableW(L"X2W_D3D12_DUMP_SURFACE", dump_path, MAX_PATH) != 0;
-        if (dump && (shown_frames % 40) == 20 && desc.Width <= 8192 && desc.Height <= 8192) {
+        if (dump && (shown_frames % 4) == 3 && desc.Width <= 8192 && desc.Height <= 8192) {
             const UINT width = static_cast<UINT>(desc.Width), height = desc.Height;
             std::vector<unsigned char> file(54 + std::size_t{width} * height * 4);
             const std::uint32_t header[] = {static_cast<std::uint32_t>(file.size()), 0, 54, 40, width, static_cast<std::uint32_t>(-static_cast<int>(height)),
