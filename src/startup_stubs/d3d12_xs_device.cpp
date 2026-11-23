@@ -287,9 +287,11 @@ bool list_noop()
 }
 
 // With X2W_D3D12_LIST_NOOP=1: an unknown command-list method records nothing and returns 0.
+extern LONG draw_calls_seen;
 template <int K, int N>
 __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9)
 {
+    if (K == list_kind) InterlockedIncrement(&draw_calls_seen);
     // Register arguments only: stale caller stack words often still point at an IID.
     if (create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
         char name[64];
@@ -1110,7 +1112,17 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     const UINT64 offset = static_cast<char*>(address) - static_cast<char*>(base);
     ID3D12Heap* heap = nullptr;
     HRESULT hr = S_OK;
-    {
+    // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
+    // that lies inside that one allocation. Attempts that cannot succeed are skipped: each failure
+    // throws inside D3D12Core.
+    MEMORY_BASIC_INFORMATION region{};
+    SIZE_T allocation_bytes = 0;
+    for (auto* cursor = static_cast<char*>(base);
+         VirtualQuery(cursor, &region, sizeof(region)) && region.AllocationBase == base && region.State == MEM_COMMIT;
+         cursor += region.RegionSize)
+        allocation_bytes += region.RegionSize;
+    if ((offset & 0xFFFF) || offset + desc->Width > allocation_bytes || info.Type != MEM_PRIVATE) hr = E_INVALIDARG;
+    if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
         for (auto& [known, h] : existing_heaps)
             if (known == base) heap = h;
@@ -1348,6 +1360,51 @@ HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, voi
     return S_OK;
 }
 
+// Diagnostic overlay: while nothing is rendered, the title window would stay blank. Every few
+// presents a status text is drawn into it with GDI so the state is visible. This is not game output.
+LONG draw_calls_seen;
+HWND title_window()
+{
+    static HWND window = nullptr;
+    if (window && IsWindow(window)) return window;
+    window = nullptr;
+    EnumWindows([](HWND candidate, LPARAM out) -> BOOL {
+        DWORD process = 0;
+        GetWindowThreadProcessId(candidate, &process);
+        if (process == GetCurrentProcessId() && IsWindowVisible(candidate) && !GetWindow(candidate, GW_OWNER)) {
+            *reinterpret_cast<HWND*>(out) = candidate;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&window));
+    return window;
+}
+
+void draw_overlay(LONG frame, double seconds)
+{
+    HWND window = title_window();
+    if (!window) return;
+    HDC dc = GetDC(window);
+    if (!dc) return;
+    RECT client{};
+    GetClientRect(window, &client);
+    HBRUSH background = CreateSolidBrush(RGB(16, 18, 24));
+    FillRect(dc, &client, background);
+    DeleteObject(background);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(230, 232, 236));
+    char text[512];
+    std::snprintf(text, sizeof(text),
+                  "Xbox2Windows local startup experiment (diagnostic overlay, not game output)\n\n"
+                  "The title is running: frame %ld presented, %.1f s since the first, %.1f fps.\n"
+                  "%ld draw and state calls recorded so far and dropped: there is no translation of\n"
+                  "the console GPU commands and shaders yet, so no picture. No audio output either.",
+                  frame, seconds, seconds > 0 ? frame / seconds : 0.0, draw_calls_seen);
+    RECT area{client.left + 24, client.top + 24, client.right - 24, client.bottom - 24};
+    DrawTextA(dc, text, -1, &area, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    ReleaseDC(window, dc);
+}
+
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper*, UINT planes, const void* plane_parameters, const void* present_parameters)
@@ -1363,6 +1420,7 @@ HRESULT __stdcall queue_present(Wrapper*, UINT planes, const void* plane_paramet
         hex_text(present_parameters, 0x40, b, sizeof(b));
         log("x2w-d3d12 CommandQueue::slot32(present) planes=%u plane=[%s] present=[%s]", planes, a, b);
     }
+    if (frame % 10 == 1) draw_overlay(frame, (now - started) / 1000.0);
     if (now - last_report >= 5000) {
         last_report = now;
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
