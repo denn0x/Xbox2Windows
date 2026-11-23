@@ -901,6 +901,7 @@ LONG shown_frames;
 SRWLOCK shown_lock = SRWLOCK_INIT;
 char shown_note[160] = "no frame read back yet";
 
+void write_file(const wchar_t* path, const void* data, std::size_t bytes);
 void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
 {
     static ID3D12CommandAllocator* allocator;
@@ -985,6 +986,32 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
         }
     }
     ReleaseSRWLockExclusive(&shown_lock);
+    // X2W_D3D12_DUMP_SURFACE=<file>: every 40th read-back is also written at full resolution as a
+    // 32-bit BMP (overwritten each time), for looking at detail the reduced overlay copy loses.
+    {
+        static wchar_t dump_path[MAX_PATH];
+        static const bool dump = GetEnvironmentVariableW(L"X2W_D3D12_DUMP_SURFACE", dump_path, MAX_PATH) != 0;
+        if (dump && (shown_frames % 40) == 20 && desc.Width <= 8192 && desc.Height <= 8192) {
+            const UINT width = static_cast<UINT>(desc.Width), height = desc.Height;
+            std::vector<unsigned char> file(54 + std::size_t{width} * height * 4);
+            const std::uint32_t header[] = {static_cast<std::uint32_t>(file.size()), 0, 54, 40, width, static_cast<std::uint32_t>(-static_cast<int>(height)),
+                                            1 | (32u << 16), 0, width * height * 4, 2835, 2835, 0, 0};
+            file[0] = 'B';
+            file[1] = 'M';
+            std::memcpy(file.data() + 2, header, sizeof(header));
+            for (UINT y = 0; y < height; ++y) {
+                const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset + UINT64{y} * footprint.Footprint.RowPitch;
+                unsigned char* out = file.data() + 54 + std::size_t{y} * width * 4;
+                for (UINT x = 0; x < width; ++x) {
+                    out[x * 4 + 0] = rgba ? row[x * 4 + 2] : row[x * 4 + 0];
+                    out[x * 4 + 1] = row[x * 4 + 1];
+                    out[x * 4 + 2] = rgba ? row[x * 4 + 0] : row[x * 4 + 2];
+                    out[x * 4 + 3] = 255;
+                }
+            }
+            write_file(dump_path, file.data(), file.size());
+        }
+    }
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
     const LONG count = InterlockedIncrement(&shown_frames);
@@ -1663,17 +1690,23 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     Wrapper* w = wrap(heap, descriptor_heap_kind);
     const std::uint64_t bytes = static_cast<std::uint64_t>(desc->NumDescriptors) *
                                 device_of(self)->GetDescriptorHandleIncrementSize(desc->Type);
-    note_heap(w, desc->Type, desc->NumDescriptors, device_of(self)->GetDescriptorHandleIncrementSize(desc->Type),
-              extra[0] >= 0x10000 && extra[1] == bytes ? extra[0] : 0, desktop,
-              (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0);
     // Some callers pass the 16-byte desktop descriptor; the words after it are then unrelated stack
     // data. The extension is taken only when it holds a pointer and exactly the heap's size.
-    if (extra[0] >= 0x10000 && extra[1] == bytes) {
-        w->own().title_cpu = extra[0];
+    std::uint64_t title_memory = extra[0] >= 0x10000 && extra[1] == bytes ? extra[0] : 0;
+    // The title copies descriptors between heaps with its own memory copies. A view heap without
+    // title memory therefore gets plain memory of ours as its CPU side, so that the view ids written
+    // there (note_view) travel with those copies; the desktop heap behind it is still filled.
+    if (!title_memory && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && bytes)
+        title_memory = reinterpret_cast<std::uint64_t>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (title_memory) {
+        w->own().title_cpu = title_memory;
         AcquireSRWLockExclusive(&descriptor_lock);
-        descriptor_ranges.push_back({extra[0], bytes, desktop});
+        descriptor_ranges.push_back({title_memory, bytes, desktop});
         ReleaseSRWLockExclusive(&descriptor_lock);
     }
+    note_heap(w, desc->Type, desc->NumDescriptors, device_of(self)->GetDescriptorHandleIncrementSize(desc->Type),
+              title_memory, desktop,
+              (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0);
     *out = w;
     return S_OK;
 }

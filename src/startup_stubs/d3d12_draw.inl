@@ -21,10 +21,43 @@ struct Translation {
     ID3D12RootSignature* root = nullptr;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     u64 key = 0;
+    LONG logged_draws = 0, logged_bindings = 0;  // diagnostics budget per translation
 };
 
+// Per title pipeline: its translation and the blend state found in its state block (if any).
+struct BoundPipeline {
+    Translation* translation = nullptr;
+    bool has_blend = false;
+    D3D12_BLEND_DESC blend{};
+    std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
+};
+
+// Looks for a desktop-layout D3D12_BLEND_DESC inside a state block: two flags, then eight render
+// target entries whose fields are all inside their enumerations.
+bool find_blend(const std::vector<unsigned char>& block, D3D12_BLEND_DESC* out, std::size_t* where)
+{
+    for (std::size_t at = 0; at + sizeof(D3D12_BLEND_DESC) <= block.size(); at += 4) {
+        D3D12_BLEND_DESC d;
+        std::memcpy(&d, block.data() + at, sizeof(d));
+        bool ok = (d.AlphaToCoverageEnable == 0 || d.AlphaToCoverageEnable == 1) && (d.IndependentBlendEnable == 0 || d.IndependentBlendEnable == 1);
+        for (int i = 0; ok && i < 8; ++i) {
+            const auto& t = d.RenderTarget[i];
+            ok = (t.BlendEnable == 0 || t.BlendEnable == 1) && (t.LogicOpEnable == 0 || t.LogicOpEnable == 1) && t.SrcBlend >= 1 &&
+                 t.SrcBlend <= 19 && t.DestBlend >= 1 && t.DestBlend <= 19 && t.BlendOp >= 1 && t.BlendOp <= 5 && t.SrcBlendAlpha >= 1 &&
+                 t.SrcBlendAlpha <= 19 && t.DestBlendAlpha >= 1 && t.DestBlendAlpha <= 19 && t.BlendOpAlpha >= 1 && t.BlendOpAlpha <= 5 &&
+                 static_cast<unsigned>(t.LogicOp) <= 15 && t.RenderTargetWriteMask <= 15;
+        }
+        if (ok) {
+            *out = d;
+            *where = at;
+            return true;
+        }
+    }
+    return false;
+}
+
 SRWLOCK draw_lock = SRWLOCK_INIT;
-std::unordered_map<const Wrapper*, Translation*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, Translation*> m; return m; }
+std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
 LONG frame_number;
@@ -151,14 +184,44 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
 }
 
 // draw_lock held.
-Translation* translation_for(Wrapper* pipeline)
+BoundPipeline* translation_for(Wrapper* pipeline)
 {
     auto& by_pipeline = translation_by_pipeline();
     const auto known = by_pipeline.find(pipeline);
     if (known != by_pipeline.end()) return known->second;
-    Translation* result = nullptr;
+    auto* bound = new BoundPipeline;
+    Translation*& result = bound->translation;
     const PipelineInfo* info = pipeline_info(pipeline);
+    const PipelineInfo* own = info;
     for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth) info = pipeline_info(info->base);
+    {
+        // The pipeline's own description first (a derived pipeline overrides state), then its base's state block.
+        std::size_t where = 0;
+        const char* from = "none";
+        if (own && own != info && find_blend(own->desc, &bound->blend, &where)) from = "derived description";
+        else if (info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
+        else if (info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
+        bound->has_blend = from[0] != 'n';
+        static LONG logged;
+        if (first_calls(logged, 24)) {
+            const auto& t = bound->blend.RenderTarget[0];
+            log("x2w-draw pipeline %p (creation slot %d, base slot %d): blend from %s at +0x%zx: enable %d src %d dest %d op %d / alpha %d %d %d "
+                "mask 0x%x; blocks %zu + %zu bytes", static_cast<void*>(pipeline), own ? own->path : 0, info ? info->path : 0, from, where,
+                t.BlendEnable, t.SrcBlend, t.DestBlend, t.BlendOp, t.SrcBlendAlpha, t.DestBlendAlpha, t.BlendOpAlpha, t.RenderTargetWriteMask,
+                info ? info->state_a.size() : 0, info ? info->state_b.size() : 0);
+            if (info && !bound->has_blend) {
+                char hex[3 * 0x1a0 + 1];
+                hex_text(info->state_a.data(), info->state_a.size() < 0x1a0 ? info->state_a.size() : 0x1a0, hex, sizeof(hex));
+                log("x2w-draw   state A: %s", hex);
+                hex_text(info->state_b.data(), info->state_b.size() < 0x1a0 ? info->state_b.size() : 0x1a0, hex, sizeof(hex));
+                log("x2w-draw   state B: %s", hex);
+                if (own != info && own) {
+                    hex_text(own->desc.data(), own->desc.size() < 0x100 ? own->desc.size() : 0x100, hex, sizeof(hex));
+                    log("x2w-draw   derived: %s", hex);
+                }
+            }
+        }
+    }
     if (info && info->path == 57 && info->desc.size() >= 0x60) {
         u64 words[12];
         std::memcpy(words, info->desc.data(), sizeof(words));
@@ -188,25 +251,27 @@ Translation* translation_for(Wrapper* pipeline)
             }
         }
     }
-    by_pipeline[pipeline] = result;
-    return result;
+    by_pipeline[pipeline] = bound;
+    return bound;
 }
 
-ID3D12PipelineState* pipeline_for(Translation& tr, const Pass& pass)
+ID3D12PipelineState* pipeline_for(BoundPipeline& bound, const Pass& pass)
 {
+    Translation& tr = *bound.translation;
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
-    const auto found = tr.pipelines.find(key);
-    if (found != tr.pipelines.end()) return found->second;
+    const auto found = bound.pipelines.find(key);
+    if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root;
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
     desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
-    // The console pipeline's own state blocks are not decoded yet: plain alpha blending, no culling,
-    // no depth. (A guess that suits the 2D start-up screens.)
+    // Blend state as found in the pipeline's state block, else opaque. Raster and depth state are
+    // not decoded yet: no culling, no depth (enough for the 2D start-up screens).
     for (auto& target : desc.BlendState.RenderTarget)
-        target = {TRUE, FALSE, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE,
-                  D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+        target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
+                  D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+    if (bound.has_blend) desc.BlendState = bound.blend;
     desc.SampleMask = ~0u;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -220,7 +285,7 @@ ID3D12PipelineState* pipeline_for(Translation& tr, const Pass& pass)
     log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx", tr.key, pass.target_count,
         pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr));
     check_device("translated CreateGraphicsPipelineState", 0);
-    tr.pipelines[key] = pipeline;
+    bound.pipelines[key] = pipeline;
     return pipeline;
 }
 
@@ -280,8 +345,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const bool rect = pass.topology == 0x11;
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
     AcquireSRWLockExclusive(&draw_lock);
-    Translation* tr = translation_for(pass.pipeline);
-    ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap() ? pipeline_for(*tr, pass) : nullptr;
+    BoundPipeline* bound = translation_for(pass.pipeline);
+    Translation* tr = bound ? bound->translation : nullptr;
+    ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap() ? pipeline_for(*bound, pass) : nullptr;
     if (!pipeline) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
@@ -332,8 +398,36 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             if (texture) require_state(self, texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             else InterlockedIncrement(&null_bindings);
+            static LONG shown;
+            if (first_calls(shown, 6))
+                log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
+                    tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
+        }
+        if (srv.source == 0 && words[0] == view_token_magic && entry) {
+            // A view the title created: a constant buffer view names its memory directly; a buffer
+            // shader-resource view names a range of its resource's title memory.
+            ViewRecord record{};
+            AcquireSRWLockShared(&note_lock);
+            if (words[1] < view_records().size()) record = view_records()[words[1]];
+            ReleaseSRWLockShared(&note_lock);
+            if (record.slot == 17 && record.desc_bytes >= 12) {
+                std::uint32_t size = 0;
+                std::memcpy(&address, record.desc, 8);
+                std::memcpy(&size, record.desc + 8, 4);
+                bytes = size;
+            } else if (record.slot == 18 && record.desc_bytes >= 40) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC view;
+                std::memcpy(&view, record.desc, 40);
+                Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
+                if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && resource && resource->own().title_memory) {
+                    const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride : 4;
+                    address = reinterpret_cast<u64>(resource->own().title_memory) + view.Buffer.FirstElement * element;
+                    bytes = std::size_t{view.Buffer.NumElements} * element;
+                    strides[i] = view.Buffer.StructureByteStride;
+                }
+            }
         }
         if (srv.source == 0 && words[0] != view_token_magic && entry) {
             // A hardware buffer descriptor the title wrote itself: base address, stride and record count.
@@ -342,8 +436,26 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
         if (bytes > (16u << 20)) bytes = 16u << 20;
-        const bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset);
+        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset);
+        // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
+        // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
+        // slot the title leaves empty here; why is not known yet.
+        static const bool identity_for_null = x2w_local::env_on("X2W_DRAW_NULL_IDENTITY");
+        if (!have && identity_for_null) {
+            static float identity[64];
+            for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
+            address = reinterpret_cast<u64>(identity);
+            bytes = sizeof(identity);
+            have = frame_copy(address, bytes, &offset);
+        }
         buffer_view(dest, have, offset, bytes);
+        if (InterlockedIncrement(&tr->logged_bindings) <= 8) {
+            char head[3 * 48 + 1] = "";
+            if (have) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
+            log("x2w-draw   %016llx srv %u buffer source %d(%d,%d): entry 0x%llx words %08x %08x %08x %08x -> address 0x%llx, %zu bytes, stride %u: %s [%s]",
+                tr->key, i, srv.source, srv.a, srv.b, entry, words[0], words[1], words[2], words[3], address, bytes, strides[i],
+                have ? "bound" : "NULL", head);
+        }
     }
     check_device("translated draw views", 0);
     std::uint32_t values[32] = {};
@@ -380,11 +492,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         drawn = true;
     }
     ReleaseSRWLockExclusive(&draw_lock);
-    static LONG logged;
-    if (first_calls(logged, 12))
-        log("x2w-draw %s(%u, %u, start %u, base %d) pipeline %016llx topology 0x%x -> %s; entry [%x %x %x %x %x %x]", indexed ? "indexed" : "draw",
-            count, instances, start, base_vertex, tr->key, pass.topology, drawn ? "drawn" : "skipped (index data)", values[0], values[1],
-            values[2], values[3], values[4], values[5]);
+    if (InterlockedIncrement(&tr->logged_draws) <= 10) {
+        char indices[3 * 24 + 1] = "";
+        if (indexed && pass.ib.BufferLocation) hex_text(reinterpret_cast<const void*>(pass.ib.BufferLocation + u64{start} * 2), 24, indices, sizeof(indices));
+        log("x2w-draw %s(%u, %u, start %u, base %d) pipeline %016llx topology 0x%x -> %s; entry [%x %x %x %x %x %x]; ib 0x%llx+%u fmt %d [%s]; "
+            "vb 0x%llx %u/%u; targets %u", indexed ? "indexed" : "draw", count, instances, start, base_vertex, tr->key, pass.topology,
+            drawn ? "drawn" : "skipped (index data)", values[0], values[1], values[2], values[3], values[4], values[5], pass.ib.BufferLocation,
+            pass.ib.SizeInBytes, pass.ib.Format, indices, pass.vb[0].BufferLocation, pass.vb[0].SizeInBytes, pass.vb[0].StrideInBytes,
+            pass.target_count);
+    }
     return drawn;
 }
 
