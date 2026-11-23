@@ -1196,6 +1196,36 @@ void* title_resource_memory(UINT64 size, UINT64 alignment)
     return memory;
 }
 
+// X2W_D3D12_DUMP_PSO=1: the first pipeline descriptions of each creation slot are written to the
+// log: the description itself and, for every qword in it that points at readable memory, the first
+// bytes there (shader containers start with "DXBC"). Local diagnostics for the translation work.
+void dump_pipeline(const char* what, int slot, const void* desc, std::size_t bytes)
+{
+    static const bool enabled = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_D3D12_DUMP_PSO", value, sizeof(value)) && value[0] == '1';
+    }();
+    static LONG dumped[512];
+    if (!enabled || !desc || InterlockedIncrement(&dumped[slot & 511]) > 4) return;
+    if (!x2w_local::readable(desc, bytes)) return;
+    const auto* words = static_cast<const u64*>(desc);
+    log("x2w-pso %s slot %d desc %p, %llu bytes", what, slot, desc, static_cast<unsigned long long>(bytes));
+    for (std::size_t i = 0; i < bytes / 8; i += 4)
+        log("x2w-pso   +0x%03llx: %016llx %016llx %016llx %016llx", static_cast<unsigned long long>(i * 8), words[i],
+            i + 1 < bytes / 8 ? words[i + 1] : 0, i + 2 < bytes / 8 ? words[i + 2] : 0, i + 3 < bytes / 8 ? words[i + 3] : 0);
+    for (std::size_t i = 0; i < bytes / 8; ++i) {
+        const auto* target = reinterpret_cast<const unsigned char*>(words[i]);
+        if (words[i] < 0x10000 || as_wrapper(target) || !x2w_local::readable(target, 64)) continue;
+        char hex[3 * 48 + 1], text[49];
+        hex_text(target, 48, hex, sizeof(hex));
+        for (int c = 0; c < 48; ++c) text[c] = target[c] >= 0x20 && target[c] < 0x7f ? static_cast<char>(target[c]) : '.';
+        text[48] = 0;
+        const u64 next = i + 1 < bytes / 8 ? words[i + 1] : 0;
+        log("x2w-pso   [+0x%03llx] -> %p (next word 0x%llx) %s |%s|", static_cast<unsigned long long>(i * 8),
+            static_cast<const void*>(target), next, hex, text);
+    }
+}
+
 // Placeholder objects (no desktop object behind the wrapper): ID3D12Object methods succeed and do nothing.
 HRESULT __stdcall placeholder_ok(Wrapper*, u64, u64, u64) { return S_OK; }
 
@@ -1210,6 +1240,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
     guid_text(iid, text, sizeof(text));
     if (!out || !desc || !iid) return E_POINTER;
     *out = nullptr;
+    dump_pipeline("compute", 62, desc, sizeof(*desc));
     char bytes[3 * 32 + 1];
     hex_text(desc->CS.pShaderBytecode, desc->CS.BytecodeLength < 32 ? desc->CS.BytecodeLength : 32, bytes, sizeof(bytes));
     static LONG calls;
@@ -1232,6 +1263,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     guid_text(iid, text, sizeof(text));
     if (!out || !desc || !iid) return E_POINTER;
     *out = nullptr;
+    dump_pipeline("stream", 86, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x400 ? desc->SizeInBytes : 0x400);
     static LONG calls;
     if (first_calls(calls, 8))
         log("x2w-d3d12 Device::slot86(CreatePipelineState?) stream=%p bytes=0x%llx riid=%s -> placeholder",
@@ -1250,6 +1282,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
+    dump_pipeline("pipeline", N, desc, 0x300);
     static LONG calls;
     if (first_calls(calls, 2)) {
         char bytes[3 * 96 + 1];
@@ -1270,6 +1303,7 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, u64 count
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
+    dump_pipeline("derived", 55, desc, 0x100);
     static LONG calls;
     if (first_calls(calls, 3)) {
         Wrapper* w = as_wrapper(base);
