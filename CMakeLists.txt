@@ -75,7 +75,8 @@ endforeach()
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
-    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp)
+    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/xmem_mapped_pages.cpp
+    src/startup_stubs/xmem_traps.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 # LINK uses explicit export ordinals in the generated import library. Keep
 # those ordinals in the DLL and build the consumer library with names.
@@ -124,10 +125,33 @@ target_link_libraries(windows_placeholder_partition_check PRIVATE OneCore)
 add_test(NAME windows_placeholder_partition COMMAND windows_placeholder_partition_check)
 
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
-add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12_xs_shim.def)
+add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12_xs_shim.def src/startup_stubs/d3d12_xs_traps.cpp
+    src/startup_stubs/d3d12_xs_device.cpp)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
+target_include_directories(d3d12_xs_shim PRIVATE src)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
+
+# LOCAL (local/startup-v2, never pushed): trap-by-default desktop DLLs for startup imports without a
+# public ABI yet (src/startup_stubs/trap.h), plus opt-in permissive paths for local startup runs.
+set(startup_stub_targets)
+foreach(stub IN ITEMS acphal:AcpHal chad:chad xapu:xapu xcrdapi:XCRDAPI xg_xs:xg_xs)
+    string(REPLACE ":" ";" stub_parts "${stub}")
+    list(GET stub_parts 0 stub_stem)
+    list(GET stub_parts 1 stub_output)
+    add_library(startup_stub_${stub_stem} SHARED src/startup_stubs/${stub_stem}.cpp src/startup_stubs/${stub_stem}.def)
+    set_target_properties(startup_stub_${stub_stem} PROPERTIES OUTPUT_NAME ${stub_output})
+    target_include_directories(startup_stub_${stub_stem} PRIVATE src)
+    target_compile_features(startup_stub_${stub_stem} PRIVATE cxx_std_17)
+    list(APPEND startup_stub_targets startup_stub_${stub_stem})
+endforeach()
+# The title package ships an older MSVCP140.dll that the loader picks from the application directory;
+# link the shims statically so they never use its runtime (constexpr std::mutex layout).
+set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_executable(startup_stub_consumer tests/startup_stub_consumer.cpp)
+target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
+target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
 
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)

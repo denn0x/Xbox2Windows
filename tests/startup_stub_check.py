@@ -1,0 +1,101 @@
+"""Check the local startup trap stubs.
+
+usage: startup_stub_check.py <consumer.exe> <src/startup_stubs> <stub dll>... <xmem.dll> <d3d12_xs.dll>
+
+1. Each stub DLL loads on its own and every name in its .def resolves.
+2. The consumer traps with the documented exit code and log line, for a stub DLL and for the
+   trap exports added to xmem.dll and d3d12_xs.dll. The line also lands in X2W_TRAP_LOG.
+3. Controls: the 'none' scenario exits 0 and writes no trap line; the physical-page round trip
+   in xmem.dll still works next to the traps.
+"""
+import ctypes
+import ctypes.wintypes as wt
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+consumer, stub_src, *dlls = sys.argv[1:]
+failures = []
+
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.LoadLibraryExW.restype = wt.HMODULE
+k32.LoadLibraryExW.argtypes = [wt.LPCWSTR, wt.HANDLE, wt.DWORD]
+k32.GetProcAddress.restype = ctypes.c_void_p
+k32.GetProcAddress.argtypes = [wt.HMODULE, ctypes.c_char_p]
+k32.FreeLibrary.argtypes = [wt.HMODULE]
+LOAD_WITH_ALTERED_SEARCH_PATH = 0x8
+
+defs = {}
+for name in os.listdir(stub_src):
+    if name.endswith(".def"):
+        text = open(os.path.join(stub_src, name), encoding="ascii").read()
+        library = re.search(r"^LIBRARY\s+(\S+)", text, re.M).group(1)
+        defs[library.lower() + ".dll"] = re.findall(r"^\s{4}(\w+)\s*$", text, re.M)
+extra = {"xmem.dll": ["XMemIsToolsMemAvailable", "XMemMapPhysicalPages", "XMemMapPhysicalPagesScatter",
+                      "XMemTransferMemory", "XMemVirtualAlloc", "XMemAllocatePhysicalPages",
+                      "XMemFreePhysicalPages"],
+         "d3d12_xs.dll": ["D3D12ConfigureVirtualMemoryX"]}
+
+seen = set()
+for path in dlls:
+    base = os.path.basename(path).lower()
+    names = defs.get(base) or extra.get(base)
+    if not names:
+        failures.append(f"no export list for {base}")
+        continue
+    seen.add(base)
+    handle = k32.LoadLibraryExW(os.path.abspath(path), None, LOAD_WITH_ALTERED_SEARCH_PATH)
+    if not handle:
+        failures.append(f"{base}: LoadLibrary failed ({ctypes.get_last_error()})")
+        continue
+    missing = [n for n in names if not k32.GetProcAddress(handle, n.encode())]
+    if missing:
+        failures.append(f"{base}: unresolved {missing}")
+    k32.FreeLibrary(handle)
+    print(f"load {base}: {len(names) - len(missing)}/{len(names)} exports")
+for want in list(defs) + list(extra):
+    if want not in seen:
+        failures.append(f"{want} was not checked")
+
+env = dict(os.environ)
+env["PATH"] = os.pathsep.join(sorted({os.path.dirname(os.path.abspath(p)) for p in dlls})) + os.pathsep + env["PATH"]
+log = os.path.join(tempfile.mkdtemp(prefix="x2w_trap_"), "trap.log")
+env["X2W_TRAP_LOG"] = log
+
+cases = [
+    ("chad", "chad.dll!XDspActivate", 0xE2570200, "rcx=0x11 rdx=0x22 r8=0x33 r9=0x44"),
+    ("xg_xs", "xg_xs.dll!XGSuggestSwizzleMode", 0xE2570501, "rcx=0x55 rdx=0x0"),
+    ("xmem", "xmem.dll!XMemTransferMemory", 0xE2570603, "rcx=0x0 rdx=0x10000 r8=0x3000 r9=0x4"),
+    ("d3d12", "d3d12_xs.dll!D3D12ConfigureVirtualMemoryX", 0xE2570700, "rcx=0x66 rdx=0x77"),
+]
+consumer_name = os.path.basename(consumer).lower()
+for scenario, symbol, code, regs in cases:
+    run = subprocess.run([consumer, scenario], capture_output=True, text=True, env=env, timeout=20)
+    line = f"x2w-trap {symbol} {regs}"
+    ok = (run.returncode & 0xFFFFFFFF) == code and line in run.stderr \
+        and f"ret={consumer_name}+0x" in run.stderr.lower()
+    print(f"{scenario}: exit=0x{run.returncode & 0xFFFFFFFF:08x} {'ok' if ok else 'MISMATCH'}")
+    if not ok:
+        failures.append(f"{scenario}: exit 0x{run.returncode & 0xFFFFFFFF:08x}, stderr {run.stderr.strip()!r}")
+
+logged = open(log, encoding="ascii").read() if os.path.exists(log) else ""
+if logged.count("x2w-trap ") != len(cases):
+    failures.append(f"log has {logged.count('x2w-trap ')} trap lines, expected {len(cases)}")
+
+for scenario, stdout in (("none", ""), ("physical", "physical ok")):
+    before = os.path.getsize(log) if os.path.exists(log) else 0
+    run = subprocess.run([consumer, scenario], capture_output=True, text=True, env=env, timeout=20)
+    after = os.path.getsize(log) if os.path.exists(log) else 0
+    ok = run.returncode == 0 and stdout in run.stdout and "x2w-trap" not in run.stderr and before == after
+    print(f"{scenario} control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+    if not ok:
+        failures.append(f"{scenario} control: exit {run.returncode}, stderr {run.stderr.strip()!r}")
+
+if failures:
+    print("FAIL")
+    for f in failures:
+        print("  " + f)
+    sys.exit(1)
+print("PASS")

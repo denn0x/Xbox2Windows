@@ -3,6 +3,9 @@
 #include <windows.h>
 
 #include "era_physical.h"
+#include "startup_stubs/local_log.h"
+
+#include <vector>
 
 #include <iterator>
 #include <limits>
@@ -183,15 +186,165 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
 }
 }
 
+// ---------------------------------------------------------------------------------------------
+// LOCAL EXPERIMENT ONLY (local/startup-v2, never pushed). With X2W_XMEM_PERMISSIVE=1 the exports
+// below accept the call shapes of a local startup run on top of the section-backed pages above.
+// Observations behind it:
+// - Page numbers: the caller rebuilds them as (21-bit entry << 4), so it expects 4 KiB frame numbers
+//   with the low four bits clear. Callers get page << 4 and pass it back.
+// - XMemAllocatePhysicalPages flags other than MEM_64K_PAGES occur (0x280) and are served the same.
+// - XMemVirtualAlloc: commits (type 0x20003000/0x20403000) become plain commits; reservations become
+//   placeholders that pages can be mapped into; a "replace placeholder" call (0x20406000) on a piece
+//   the caller split from its own placeholder keeps the placeholder and records it for mapping.
+// - Scatter mapping passes page 0 to unmap and may name pages that are already mapped elsewhere
+//   (a second view; the sections give real sharing).
+namespace {
+bool local_permissive() noexcept { return x2w_local::env_on("X2W_XMEM_PERMISSIVE"); }
+
+void record_reservation(void* base, SIZE_T bytes)
+{
+    const std::lock_guard guard(memory.mutex);
+    memory.reservations.insert_or_assign(reinterpret_cast<ULONG_PTR>(base), bytes);
+}
+
+void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG attributes, DWORD protection)
+{
+    const DWORD low = protection & 0xFF;
+    const bool accessible = low == PAGE_READONLY || low == PAGE_READWRITE || low == PAGE_EXECUTE_READ ||
+                            low == PAGE_EXECUTE_READWRITE;
+    const DWORD protect = accessible ? low : PAGE_READWRITE;
+    void* result = nullptr;
+    const char* how = "";
+    if ((type & MEM_REPLACE_PLACEHOLDER) && address) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(address, &info, sizeof(info)) && info.State == MEM_RESERVE) {
+            record_reservation(address, bytes);
+            result = address;
+        }
+        how = "placeholder kept for page mapping";
+    } else if (type & MEM_COMMIT) {
+        if (!address) {
+            result = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, protect);
+            how = "commit";
+        } else {
+            result = VirtualAlloc(address, bytes, MEM_COMMIT, protect);
+            if (!result) {
+                VirtualFree(address, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                result = VirtualAlloc2(GetCurrentProcess(), address, bytes,
+                                       MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0);
+            }
+            how = "commit at address";
+        }
+    } else {
+        result = VirtualAlloc2(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+                               nullptr, 0);
+        // A caller that asks for a placeholder splits it itself; other reservations are split here on mapping.
+        if (result && !(type & MEM_RESERVE_PLACEHOLDER)) record_reservation(result, bytes);
+        how = "placeholder reserve";
+    }
+    const DWORD error = result ? 0 : GetLastError();
+    x2w_local::logf("x2w-xmem XMemVirtualAlloc addr=%p size=0x%llx type=0x%lx attr=0x%llx prot=0x%lx -> %p (%s, err %lu)",
+                    address, static_cast<unsigned long long>(bytes), static_cast<unsigned long>(type),
+                    static_cast<unsigned long long>(attributes), static_cast<unsigned long>(protection), result, how,
+                    static_cast<unsigned long>(error));
+    SetLastError(error);
+    return result;
+}
+
+// Applies (address, page) pairs; page 0 unmaps. An address that already shows the requested page is
+// left alone; one that shows another page is unmapped first.
+BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages, const char* what)
+{
+    std::map<ULONG_PTR, ULONG_PTR> want;
+    for (ULONG_PTR i = 0; i < count; ++i) want[addresses[i]] = pages[i];
+    std::vector<ULONG_PTR> unmap, map_at, map_page;
+    {
+        const std::lock_guard guard(memory.mutex);
+        for (const auto& [address, page] : want) {
+            const auto live = memory.views.find(address);
+            if (!page) {
+                if (live != memory.views.end()) unmap.push_back(address);
+                continue;
+            }
+            if (live != memory.views.end()) {
+                if (live->second == page) continue;
+                unmap.push_back(address);
+            }
+            map_at.push_back(address);
+            map_page.push_back(page);
+        }
+    }
+    BOOL ok = TRUE;
+    DWORD error = 0;
+    if (!unmap.empty() && !map_pages(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; })) {
+        ok = FALSE;
+        error = GetLastError();
+    }
+    if (ok && !map_at.empty() &&
+        !map_pages(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; })) {
+        ok = FALSE;
+        error = GetLastError();
+    }
+    static LONG calls;
+    if (!ok || x2w_local::first_calls(calls, 16))
+        x2w_local::logf("x2w-xmem %s count=0x%llx first=%p map=%llu unmap=%llu -> %d (err %lu)", what,
+                        static_cast<unsigned long long>(count), count ? reinterpret_cast<void*>(addresses[0]) : nullptr,
+                        static_cast<unsigned long long>(map_at.size()), static_cast<unsigned long long>(unmap.size()), ok,
+                        static_cast<unsigned long>(error));
+    SetLastError(error);
+    return ok;
+}
+
+bool to_pages(ULONG_PTR count, const ULONG_PTR* tokens, std::vector<ULONG_PTR>& pages)
+{
+    pages.resize(count);
+    for (ULONG_PTR i = 0; i < count; ++i) {
+        if (tokens[i] & 0xF) return false;
+        pages[i] = tokens[i] >> 4;
+    }
+    return true;
+}
+}  // namespace
+
+namespace {
+BOOL free_pages(ULONG_PTR count, PULONG_PTR pages);
+}
+
 extern "C" BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR count, PULONG_PTR pages)
 {
     static_assert(sizeof(ULONG_PTR) == sizeof(std::uint64_t));
+    if (local_permissive()) {
+        const ULONG_PTR requested = count ? *count : 0;
+        era_physical::Status status;
+        {
+            const std::lock_guard guard(memory.mutex);
+            status = era_physical::allocate(era_physical::mem_64k_pages, reinterpret_cast<std::uint64_t*>(count),
+                                            reinterpret_cast<std::uint64_t*>(pages));
+        }
+        if (status == era_physical::Status::ok)
+            for (ULONG_PTR i = 0; i < *count; ++i) pages[i] <<= 4;
+        x2w_local::logf("x2w-xmem XMemAllocatePhysicalPages flags=0x%llx pages=0x%llx -> %d",
+                        static_cast<unsigned long long>(flags), static_cast<unsigned long long>(requested),
+                        status == era_physical::Status::ok);
+        return physical_result(status);
+    }
     const std::lock_guard guard(memory.mutex);
     return physical_result(era_physical::allocate(flags, reinterpret_cast<std::uint64_t*>(count),
                                                   reinterpret_cast<std::uint64_t*>(pages)));
 }
 
 extern "C" BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages)
+{
+    if (local_permissive() && pages && count && count <= era_physical::capacity_pages) {
+        std::vector<ULONG_PTR> converted;
+        if (!to_pages(count, pages, converted)) return physical_result(era_physical::Status::invalid);
+        return free_pages(count, converted.data());
+    }
+    return free_pages(count, pages);
+}
+
+namespace {
+BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
 {
     if (!pages || !count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
@@ -213,6 +366,7 @@ extern "C" BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages)
     }
     return physical_result(status);
 }
+}  // namespace
 
 extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const ULONG_PTR* tokens)
 {
@@ -221,6 +375,17 @@ extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const 
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
+    if (local_permissive()) {
+        // A null array unmaps (seen on a cleanup path, also with a zero count).
+        std::vector<ULONG_PTR> addresses(count), pages(count, 0);
+        for (ULONG_PTR i = 0; i < count; ++i) addresses[i] = address + i * page_bytes;
+        if (tokens && !to_pages(count, tokens, pages)) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        if (!count) return base;
+        return local_apply(count, addresses.data(), pages.data(), "XMemMapPhysicalPages") ? base : nullptr;
+    }
     return map_pages(count, tokens, [=](ULONG_PTR i) { return address + i * page_bytes; }) ? base : nullptr;
 }
 
@@ -228,6 +393,12 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
                                                    const ULONG_PTR* tokens)
 {
     if (!addresses) return physical_result(era_physical::Status::invalid);
+    if (local_permissive() && tokens) {
+        std::vector<ULONG_PTR> pages;
+        if (!to_pages(count, tokens, pages)) return physical_result(era_physical::Status::invalid);
+        return local_apply(count, reinterpret_cast<const ULONG_PTR*>(addresses), pages.data(),
+                           "XMemMapPhysicalPagesScatter");
+    }
     return map_pages(count, tokens, [=](ULONG_PTR i) { return reinterpret_cast<ULONG_PTR>(addresses[i]); });
 }
 
@@ -240,6 +411,7 @@ extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allo
     const bool supported = (attributes == 0x21 && protection == PAGE_READWRITE)
                            || (attributes == 3 && protection == (0x800 | PAGE_NOACCESS));
     if (address || (bytes != 16 * gib && bytes != 24 * gib) || allocation_type != startup_reserve || !supported) {
+        if (local_permissive()) return local_virtual_alloc(address, bytes, allocation_type, attributes, protection);
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }

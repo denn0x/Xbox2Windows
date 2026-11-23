@@ -73,6 +73,9 @@ extern "C" HRESULT WINAPI d3d12_xs_CreateRootSignatureDeserializer(
         src_data, src_data_size_in_bytes, deserializer_interface, deserializer);
 }
 
+bool x2w_d3d12_permissive();
+HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parameters, REFIID iid, void** device);
+
 extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     IUnknown* adapter, const void* parameters, REFIID iid, void** device)
 {
@@ -80,6 +83,9 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     *device = nullptr;
     // This entry supports an explicit desktop consumer of the returned interface.
     // The Xbox parameter block and the Xbox device vtable require their own implementation.
+    // LOCAL (local/startup-v2): opt-in recording wrapper, src/startup_stubs/d3d12_xs_device.cpp.
+    if (parameters && x2w_d3d12_permissive())
+        return x2w_d3d12_permissive_create_device(adapter, parameters, iid, device);
     if (parameters) return E_INVALIDARG;
     if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
     AcquireSRWLockExclusive(&vm_state.lock);
