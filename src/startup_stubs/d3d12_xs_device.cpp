@@ -1314,6 +1314,64 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     return S_OK;
 }
 
+// Device slot 80 (Xbox order): (type, timeout, 0, flags, &token) -> HRESULT, the frame-event wait
+// that hands out a frame token (called with type 2 / timeout -1 and type 0 / timeout 0, flags 0/2).
+// Paces to the interval from slot 78 (33.3 ms by default) and returns increasing tokens.
+LONG64 frame_token;
+LONG frame_waits[4];
+LONG64 frame_wait_ms;
+HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, void* reserved, UINT flags, UINT64* token)
+{
+    static LARGE_INTEGER frequency, next;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    if (!frequency.QuadPart) {
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&next);
+    }
+    const LONGLONG interval = frequency.QuadPart * (frame_interval_us ? frame_interval_us : 33333) / 1000000;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (next.QuadPart <= now.QuadPart) next.QuadPart = now.QuadPart + interval;
+    const LONGLONG wait_ticks = next.QuadPart - now.QuadPart;
+    next.QuadPart += interval;
+    ReleaseSRWLockExclusive(&lock);
+    if (timeout != 0) Sleep(static_cast<DWORD>(wait_ticks * 1000 / frequency.QuadPart));
+    InterlockedIncrement(&frame_waits[type < 4 ? type : 3]);
+    InterlockedExchangeAdd64(&frame_wait_ms, timeout != 0 ? wait_ticks * 1000 / frequency.QuadPart : 0);
+    const UINT64 value = static_cast<UINT64>(InterlockedIncrement64(&frame_token));
+    if (token) *token = value;
+    static LONG calls;
+    if (first_calls(calls, 4))
+        log("x2w-d3d12 Device::slot80(frame event wait) type=%u timeout=0x%x reserved=%p flags=0x%x -> token %llu", type, timeout,
+            reserved, flags, value);
+    return S_OK;
+}
+
+// Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
+// console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
+HRESULT __stdcall queue_present(Wrapper*, UINT planes, const void* plane_parameters, const void* present_parameters)
+{
+    static LONG frames;
+    static ULONGLONG started, last_report;
+    const LONG frame = InterlockedIncrement(&frames);
+    const ULONGLONG now = GetTickCount64();
+    if (frame == 1) started = last_report = now;
+    if (frame <= 2) {
+        char a[3 * 0x50 + 1], b[3 * 0x40 + 1];
+        hex_text(plane_parameters, 0x50, a, sizeof(a));
+        hex_text(present_parameters, 0x40, b, sizeof(b));
+        log("x2w-d3d12 CommandQueue::slot32(present) planes=%u plane=[%s] present=[%s]", planes, a, b);
+    }
+    if (now - last_report >= 5000) {
+        last_report = now;
+        log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
+            "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
+            frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
+    }
+    return S_OK;
+}
+
 template <int K, int N>
 void enable_forward() { tables[K][N] = reinterpret_cast<void*>(&forward_slot<K, N>); }
 template <int K, int N, int R, int Desc = -1>
@@ -1382,6 +1440,7 @@ void build_tables()
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);
+    tables[device_kind][80] = reinterpret_cast<void*>(&device_wait_frame_event);
     tables[device_kind][55] = reinterpret_cast<void*>(&device_create_derived_pipeline);
     tables[device_kind][57] = reinterpret_cast<void*>(&device_create_pipeline_placeholder<57>);
     tables[device_kind][67] = reinterpret_cast<void*>(&device_create_pipeline_placeholder<67>);
@@ -1402,6 +1461,7 @@ void build_tables()
     // dispatched by argument shape until the order is known; see queue_dynamic.
     fill_queue_dynamic(tables[queue_kind], std::make_index_sequence<64>{});
     tables[queue_kind][18] = reinterpret_cast<void*>(&queue_timestamp_frequency);
+    tables[queue_kind][32] = reinterpret_cast<void*>(&queue_present);
 
     // Fence: GetCompletedValue, SetEventOnCompletion, Signal, GetCreationFlags.
     tables[fence_kind][8] = reinterpret_cast<void*>(&fence_completed_value);
