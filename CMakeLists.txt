@@ -2823,6 +2823,31 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_load_cookie COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/load_cookie_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_cookie_dll>" "$<TARGET_FILE:cpu_cookie_exe>" "$<TARGET_FILE:cpu_exe_io>")
+    # A typed callback called through the load config's dispatch slot (#903). The same objects are linked
+    # without and with /guard:cf. OTHER is the negative control; INVALID calls a target inside a function.
+    foreach(variant IN ITEMS record other invalid cfg_record cfg_invalid)
+        add_executable(cpu_load_callback_${variant} tests/cpu/load_config_callback.asm
+            tests/cpu/load_config_callback.cpp tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_load_callback_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_compile_options(cpu_load_callback_${variant} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/guard:cf /GS- /Zl>)
+        target_link_options(cpu_load_callback_${variant} PRIVATE /ENTRY:native_startup
+            /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_load_callback_${variant} PRIVATE cpu_exe_io)
+        if(variant MATCHES "^cfg_")
+            target_link_options(cpu_load_callback_${variant} PRIVATE /guard:cf)
+        endif()
+        if(variant MATCHES "other")
+            target_compile_definitions(cpu_load_callback_${variant} PRIVATE OTHER)
+        elseif(variant MATCHES "invalid")
+            target_compile_definitions(cpu_load_callback_${variant} PRIVATE INVALID)
+        endif()
+    endforeach()
+    add_test(NAME cpu_native_load_config_callback COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/load_config_callback_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_load_callback_record>"
+        "$<TARGET_FILE:cpu_load_callback_other>" "$<TARGET_FILE:cpu_load_callback_invalid>"
+        "$<TARGET_FILE:cpu_load_callback_cfg_record>" "$<TARGET_FILE:cpu_load_callback_cfg_invalid>")
+    set_tests_properties(cpu_native_load_config_callback PROPERTIES TIMEOUT 120)
     foreach(variant IN ITEMS original no_tls)
         add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)

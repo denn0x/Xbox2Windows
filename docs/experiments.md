@@ -1415,6 +1415,21 @@ startup or use of this relocation by a particular title is established.
 
 `ctest --preset release --no-tests=error -R '^cpu_native_load_cookie$' -V`
 
+### A callback through the load-config dispatch slot
+
+`cpu_native_load_config_callback` (#903) starts a CRT-free EXE under the Windows loader and under `pe_map_run`, and compares the results. A C++ caller compiled with `/guard:cf` calls the two entries of a callback table through `__guard_dispatch_icall_fptr`, the slot that `GuardCFDispatchFunctionPointer` in the hand-written load config names. The table and both guard slots are in `.rdata`, which has no write access, and each address in them has a DIR64 relocation. The first entry is a typed `int (int, int, int, void*)` callback. It records its arguments and the number of calls, and the EXE writes them out through `cpu_exe_io.dll`. The second entry is null, and the caller tests and skips it. The check reads from each image's own PE:
+- the load-config size (0x138);
+- the guard flags and the `GUARD_CF` characteristic;
+- the relocations of the slots and the table, and the null entry, which has none;
+- the two `call [dispatch slot]` instructions in `.text`;
+- the `/guard:cf` function table.
+
+Before the entry runs, it also checks that `pe_map` mapped every slot read-only and relocated.
+
+Without `/guard:cf` at link time (guard flags `0x100`, no `GUARD_CF`), both loaders keep the image's own `jmp rax` dispatcher. The callback then sees `0x11`, `0x22`, `0x33` and the relocated address of a `.data` variable, exactly once, and returns `0x55`. The absent entry makes no call. Binding a different callback (the control) changes both the trace and the result, and a target inside a function runs on both loaders. The same objects linked with `/guard:cf` (flags `0x17500`, `GUARD_CF` set) behave differently. Windows replaces both slots before the entry, so the valid callback runs with the same trace and the slot bits set. A call to the target inside a function, which the function table leaves out, fails fast with `0xC0000409` before any output. Every function in the fixture starts on a 16-byte boundary, so no bitmap block that holds that target is valid as a whole. `pe_map` does not implement CFG: it keeps the image's own slots, so the valid callback runs unchanged, and so does the call that Windows rejects. The test asserts this current behavior, so a loader-policy change for `GUARD_CF` images has to update it.
+
+`ctest --preset dev --no-tests=error -R '^cpu_native_load_config_callback$' -V`
+
 ### TLS callbacks and the entry point
 
 `tls_route` has an entry point and a TLS directory whose callback list holds one routine and whose data template is empty. Both routines report each call to `cpu_tls_sink.dll`, which outlives the image, so calls made during release stay visible. `cpu_native_tls` loads the image with `LoadLibraryW` and maps it with `pe_map`, each in its own child process, and compares the process notifications:
