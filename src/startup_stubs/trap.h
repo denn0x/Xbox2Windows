@@ -37,10 +37,10 @@ inline void write_all(HANDLE handle, const char* text, DWORD length) noexcept
 
 // Local experiment switch: %X2W_TRAP_CONTINUE% lists export names (comma-separated, or *) whose
 // trap logs the call with "x2w-continue" and returns 0 instead of terminating. Off when unset.
-inline bool continues(const char* name) noexcept
+inline bool listed(const char* variable, const char* name) noexcept
 {
     char list[2048];
-    const DWORD n = GetEnvironmentVariableA("X2W_TRAP_CONTINUE", list, sizeof(list));
+    const DWORD n = GetEnvironmentVariableA(variable, list, sizeof(list));
     if (!n || n >= sizeof(list)) return false;
     if (list[0] == '*' && list[1] == 0) return true;
     const std::size_t want = std::strlen(name);
@@ -52,6 +52,10 @@ inline bool continues(const char* name) noexcept
     }
     return false;
 }
+
+inline bool continues(const char* name) noexcept { return listed("X2W_TRAP_CONTINUE", name); }
+// %X2W_TRAP_FAIL% lists export names whose trap logs "x2w-fail" and returns E_FAIL (0x80004005).
+inline bool fails(const char* name) noexcept { return listed("X2W_TRAP_FAIL", name); }
 
 __declspec(noinline) inline void record(const char* tag, const char* module, unsigned module_id,
     const char* name, unsigned index, std::uint64_t rcx, std::uint64_t rdx, std::uint64_t r8,
@@ -116,6 +120,11 @@ __declspec(noinline) inline void record(const char* tag, const char* module, uns
             x2w_trap::record("x2w-continue", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, #name, index,    \
                 rcx, rdx, r8, r9, _ReturnAddress());                                               \
             return 0;                                                                              \
+        }                                                                                          \
+        if (x2w_trap::fails(#name)) {                                                              \
+            x2w_trap::record("x2w-fail", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, #name, index,        \
+                rcx, rdx, r8, r9, _ReturnAddress());                                               \
+            return 0x80004005u;                                                                    \
         }                                                                                          \
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, #name, index, rcx, rdx, r8, r9,            \
             _ReturnAddress());                                                                         \
