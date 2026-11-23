@@ -43,4 +43,24 @@ inline void logf(const char* format, ...) noexcept
 
 inline bool first_calls(LONG& counter, LONG limit) noexcept { return InterlockedIncrement(&counter) <= limit; }
 
+// Readability check without IsBadReadPtr (which probes by faulting: a first-chance exception per
+// call, very slow under a debugger). One VirtualQuery per check; nothing is cached, since regions can be freed.
+inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexcept
+{
+    const auto start = reinterpret_cast<std::uintptr_t>(pointer);
+    if (start < 0x10000 || start > 0x00007FFFFFFEFFFFull || bytes == 0) return false;
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(pointer, &info, sizeof(info)) || info.State != MEM_COMMIT) return false;
+    const DWORD protect = info.Protect & 0xFF;
+    if ((info.Protect & PAGE_GUARD) || protect == PAGE_NOACCESS || protect == 0) return false;
+    const bool writable = protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READWRITE || protect == PAGE_WRITECOPY ||
+                          protect == PAGE_EXECUTE_WRITECOPY;
+    const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+    const auto end = begin + info.RegionSize;
+    if (start + bytes > end || (write && !writable)) return false;
+    return true;
+}
+inline bool readable(const void* pointer, std::size_t bytes) noexcept { return accessible(pointer, bytes, false); }
+inline bool writable(const void* pointer, std::size_t bytes) noexcept { return accessible(pointer, bytes, true); }
+
 }  // namespace x2w_local

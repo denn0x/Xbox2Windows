@@ -14,6 +14,9 @@
 #include "era_query.h"
 #include "era_title_gpu.h"
 #include "xmem_gpu_usage.h"
+#include "startup_stubs/local_log.h"
+
+#include <unordered_set>
 
 #include <cstdint>
 #include <cstring>
@@ -41,9 +44,46 @@ constexpr UINT32 gpu_usage_selector = 0x20000001;
 constexpr std::size_t gpu_usage_offset = 8;
 }
 
+// LOCAL EXPERIMENT ONLY (local/startup-v2, never pushed). With X2W_XMEM_PERMISSIVE=1, attribute
+// words the allocator refuses (seen: 0xf0814000, memory type 7, a physical type, 0x60000 bytes for
+// the audio stream queue) are served from committed process memory at 64 KiB granularity.
+namespace {
+SRWLOCK local_lock = SRWLOCK_INIT;
+std::unordered_set<void*>& local_blocks()
+{
+    static std::unordered_set<void*> blocks;
+    return blocks;
+}
+
+void* local_alloc(SIZE_T bytes, ULONGLONG attributes)
+{
+    void* block = bytes ? VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : nullptr;
+    if (block) {
+        AcquireSRWLockExclusive(&local_lock);
+        local_blocks().insert(block);
+        ReleaseSRWLockExclusive(&local_lock);
+    }
+    static LONG calls;
+    if (x2w_local::first_calls(calls, 16))
+        x2w_local::logf("x2w-xmem XMemAlloc size=0x%llx attributes=0x%llx refused by the allocator -> %p (process memory)",
+                        static_cast<unsigned long long>(bytes), attributes, block);
+    return block;
+}
+
+bool local_free(void* block)
+{
+    AcquireSRWLockExclusive(&local_lock);
+    const bool ours = local_blocks().erase(block) != 0;
+    ReleaseSRWLockExclusive(&local_lock);
+    if (ours) VirtualFree(block, 0, MEM_RELEASE);
+    return ours;
+}
+}  // namespace
+
 extern "C" void* XMemAlloc(SIZE_T bytes, ULONGLONG attributes)
 {
     void* allocation = era_heap::allocate(bytes, attributes);
+    if (!allocation && bytes && x2w_local::env_on("X2W_XMEM_PERMISSIVE")) return local_alloc(bytes, attributes);
     // Desktop policy: graphics memory types count as GPU-intended for XMemVirtualQuery.
     if (allocation && is_graphics(attributes) && !era_title_gpu::track(allocation, bytes)) {
         era_heap::release_with_attributes(allocation, attributes);
@@ -54,6 +94,7 @@ extern "C" void* XMemAlloc(SIZE_T bytes, ULONGLONG attributes)
 
 extern "C" void XMemFree(void* allocation, ULONGLONG attributes)
 {
+    if (allocation && local_free(allocation)) return;
     if (allocation && is_graphics(attributes)) {
         era_title_gpu::untrack(allocation);
     }

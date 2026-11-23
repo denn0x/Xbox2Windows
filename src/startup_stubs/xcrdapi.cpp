@@ -8,6 +8,7 @@
 #define X2W_TRAP_MODULE "XCRDAPI.dll"
 #define X2W_TRAP_MODULE_ID 4
 #include "startup_stubs/trap.h"
+#include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
 
 #include <vector>
@@ -171,7 +172,7 @@ long __stdcall factory_create_queue(Object*, const unsigned char* desc, const GU
         for (int i = 0; i < 40; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", desc[i]);
     const char* name = desc ? *reinterpret_cast<const char* const*>(desc + 0x10) : nullptr;
     log("x2w-dstorage Factory::CreateQueue desc=[%s] name=\"%s\" riid=%s", bytes,
-        name && !IsBadReadPtr(name, 1) ? name : "?", id);
+        name && x2w_local::readable(name, 1) ? name : "?", id);
     if (!out) return E_POINTER;
     Object* object = make(queue);
     object->capacity = desc ? *reinterpret_cast<const std::uint16_t*>(desc + 8) : 0;
@@ -253,6 +254,10 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
         InterlockedIncrement(&requests_failed);
     } else if (!destination || source_size == 0) {
         outcome = "empty";
+    } else if (source_size > destination_size) {
+        // The destination-size field is a guess from one code path; never copy past it.
+        outcome = "refused: source larger than destination";
+        InterlockedIncrement(&requests_failed);
     } else if (memory_source) {
         std::memcpy(destination, reinterpret_cast<const void*>(source + 0), source_size);
         InterlockedIncrement(&requests_done);
@@ -270,7 +275,7 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
             outcome = "read failed";
         }
     }
-    const bool failed = outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u';
+    const bool failed = outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u';  // read/refused, zlib, unknown
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries, failures;
     if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))

@@ -3,9 +3,57 @@
 #define X2W_TRAP_MODULE "chad.dll"
 #define X2W_TRAP_MODULE_ID 2
 #include "startup_stubs/trap.h"
+#include "startup_stubs/local_log.h"
 
-X2W_TRAP_EXPORT(0, XDspActivate)
-X2W_TRAP_EXPORT(1, XDspConnectWithMaximumStreamLimit)
-X2W_TRAP_EXPORT(2, XDspDeactivate)
-X2W_TRAP_EXPORT(3, XDspDisconnect)
-X2W_TRAP_EXPORT(4, XDspSubmitCommand)
+// LOCAL EXPERIMENT ONLY (local/startup-v2, never pushed). With X2W_AUDIO_PERMISSIVE=1 the exports
+// stand in for the DSP stream interface; otherwise they trap. Seen:
+//   XDspConnectWithMaximumStreamLimit(queue memory, 0x60000, 30, 0x80, 1, &handle) -> 0 on success.
+// The others have not been seen yet; they succeed (0) and log their first calls with registers.
+// No stream is processed.
+namespace {
+using u64 = std::uint64_t;
+bool permissive() noexcept { return x2w_local::env_on("X2W_AUDIO_PERMISSIVE"); }
+int connection;
+
+long accept(const char* name, unsigned index, u64 rcx, u64 rdx, u64 r8, u64 r9, void* return_address, LONG& calls)
+{
+    if (!permissive()) x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, index, rcx, rdx, r8, r9, return_address);
+    if (x2w_local::first_calls(calls, 6))
+        x2w_trap::record("x2w-audio", X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, index, rcx, rdx, r8, r9, return_address);
+    return 0;
+}
+}  // namespace
+
+extern "C" __declspec(noinline) long XDspActivate(u64 rcx, u64 rdx, u64 r8, u64 r9)
+{
+    static LONG calls;
+    return accept("XDspActivate", 0, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+}
+
+extern "C" __declspec(noinline) long XDspConnectWithMaximumStreamLimit(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 flag, void** handle)
+{
+    static LONG calls;
+    const long result = accept("XDspConnectWithMaximumStreamLimit", 1, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+    if (handle && x2w_local::writable(handle, sizeof(void*))) *handle = &connection;
+    x2w_local::logf("x2w-audio XDspConnectWithMaximumStreamLimit memory=0x%llx bytes=0x%llx streams=%llu r9=0x%llx flag=%llu "
+                    "handle_out=%p -> 0", rcx, rdx, r8, r9, flag, static_cast<void*>(handle));
+    return result;
+}
+
+extern "C" __declspec(noinline) long XDspDeactivate(u64 rcx, u64 rdx, u64 r8, u64 r9)
+{
+    static LONG calls;
+    return accept("XDspDeactivate", 2, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+}
+
+extern "C" __declspec(noinline) long XDspDisconnect(u64 rcx, u64 rdx, u64 r8, u64 r9)
+{
+    static LONG calls;
+    return accept("XDspDisconnect", 3, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+}
+
+extern "C" __declspec(noinline) long XDspSubmitCommand(u64 rcx, u64 rdx, u64 r8, u64 r9)
+{
+    static LONG calls;
+    return accept("XDspSubmitCommand", 4, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+}

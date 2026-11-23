@@ -13,13 +13,16 @@
 #define X2W_TRAP_MODULE "d3d12_xs.dll"
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
+#include "startup_stubs/local_log.h"
 
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -115,7 +118,7 @@ void log(const char* format, ...)
 
 void guid_text(const GUID* g, char* out, std::size_t size)
 {
-    if (!g || IsBadReadPtr(g, sizeof(GUID))) {
+    if (!g || !x2w_local::readable(g, sizeof(GUID))) {
         std::snprintf(out, size, "%p", static_cast<const void*>(g));
         return;
     }
@@ -127,7 +130,7 @@ void guid_text(const GUID* g, char* out, std::size_t size)
 void hex_text(const void* data, std::size_t bytes, char* out, std::size_t size)
 {
     out[0] = 0;
-    if (!data || IsBadReadPtr(data, bytes)) return;
+    if (!data || !x2w_local::readable(data, bytes)) return;
     const auto* p = static_cast<const unsigned char*>(data);
     std::size_t used = 0;
     for (std::size_t i = 0; i < bytes && used + 4 < size; ++i) used += std::snprintf(out + used, size - used, "%02x ", p[i]);
@@ -135,14 +138,56 @@ void hex_text(const void* data, std::size_t bytes, char* out, std::size_t size)
 
 bool first_calls(LONG& counter, LONG limit = 3) { return InterlockedIncrement(&counter) <= limit; }
 
+// X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
+// calls, tagged with the call that preceded them, and a device removal is reported once with its reason.
+ID3D12InfoQueue* info_queue;
+ID3D12Device* removal_device;
+LONG removal_reported, debug_lines;
+SRWLOCK debug_lock = SRWLOCK_INIT;
+
+void check_device(const char* context, int slot)
+{
+    if (removal_device && !removal_reported) {
+        const HRESULT reason = removal_device->GetDeviceRemovedReason();
+        if (reason != S_OK && InterlockedExchange(&removal_reported, 1) == 0)
+            log("x2w-d3d12 DEVICE REMOVED, reason 0x%08lx, first noticed after %s %d", static_cast<unsigned long>(reason),
+                context, slot);
+    }
+    if (!info_queue) return;
+    AcquireSRWLockExclusive(&debug_lock);
+    const UINT64 count = info_queue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count && debug_lines < 400; ++i) {
+        SIZE_T size = 0;
+        info_queue->GetMessage(i, nullptr, &size);
+        if (!size || size > 8192) continue;
+        alignas(16) char storage[8192];
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage);
+        if (SUCCEEDED(info_queue->GetMessage(i, message, &size))) {
+            ++debug_lines;
+            log("x2w-d3d12-debug [%s %d] sev=%d id=%d %.900s", context, slot, message->Severity, message->ID,
+                message->pDescription);
+        }
+    }
+    info_queue->ClearStoredMessages();
+    ReleaseSRWLockExclusive(&debug_lock);
+}
+
+// Wrapper detection is a registry lookup: no argument is ever dereferenced to find out what it is.
+SRWLOCK registry_lock = SRWLOCK_INIT;
+std::unordered_set<const void*>& registry()
+{
+    static std::unordered_set<const void*> wrappers;
+    return wrappers;
+}
+
 Wrapper* as_wrapper(const void* p)
 {
     const auto value = reinterpret_cast<std::uintptr_t>(p);
-    if (value < 0x10000 || (value & 7) || IsBadReadPtr(p, sizeof(void*))) return nullptr;
-    void* const* vtable = *static_cast<void* const* const*>(p);
-    for (auto& table : tables)
-        if (vtable == table) return const_cast<Wrapper*>(static_cast<const Wrapper*>(p));
-    return nullptr;
+    if (value < 0x10000 || (value & 7)) return nullptr;
+    AcquireSRWLockShared(&registry_lock);
+    const bool known = registry().count(p) != 0;
+    ReleaseSRWLockShared(&registry_lock);
+    return known ? const_cast<Wrapper*>(static_cast<const Wrapper*>(p)) : nullptr;
 }
 
 u64 unwrap(u64 value)
@@ -159,6 +204,9 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->refs = 1;
     w->kind = kind;
     if (kind == fence_kind && real) w->completed = static_cast<LONG64>(static_cast<ID3D12Fence*>(real)->GetCompletedValue());
+    AcquireSRWLockExclusive(&registry_lock);
+    registry().insert(w);
+    ReleaseSRWLockExclusive(&registry_lock);
     return w;
 }
 
@@ -219,6 +267,19 @@ void fill_all_traps(std::index_sequence<K...>)
     (fill_traps<static_cast<int>(K)>(tables[K], std::make_index_sequence<slot_count>{}), ...);
 }
 
+// A call that passes a known interface IID is a creation or query call: a no-op that returned 0
+// would hand the title "success" with no object. Such calls trap instead of being ignored.
+bool names_known_iid(u64 value)
+{
+    if (value < 0x10000 || !x2w_local::readable(reinterpret_cast<const void*>(value), sizeof(GUID))) return false;
+    return kind_for(*reinterpret_cast<const GUID*>(value)) != other_kind;
+}
+bool create_shaped(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g)
+{
+    return names_known_iid(a) || names_known_iid(b) || names_known_iid(c) || names_known_iid(d) ||
+           names_known_iid(e) || names_known_iid(f) || names_known_iid(g);
+}
+
 bool list_noop()
 {
     char value[4]{};
@@ -229,6 +290,12 @@ bool list_noop()
 template <int K, int N>
 __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9)
 {
+    // Register arguments only: stale caller stack words often still point at an IID.
+    if (create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "%s::slot%d(passes an IID)", kind_names[K], N);
+        x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, rcx, rdx, r8, r9, _ReturnAddress());
+    }
     static LONG calls;
     if (first_calls(calls, 1)) {
         char name[64];
@@ -248,8 +315,17 @@ bool device_noop()
 // With X2W_D3D12_DEVICE_NOOP=1: an unimplemented Xbox-order device method (slot 44 and up) logs its
 // first call with the first 48 bytes behind rdx and r8 and returns 0.
 template <int N>
-__declspec(noinline) u64 device_noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9)
+__declspec(noinline) u64 device_noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3)
 {
+    if (create_shaped(rdx, r8, r9, s0, s1, s2, s3)) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "Device::slot%d(passes an IID)", N);
+        char first[3 * 64 + 1];
+        hex_text(reinterpret_cast<const void*>(rdx), 64, first, sizeof(first));
+        log("x2w-d3d12 Device::slot%d passes an IID: rdx=0x%llx r8=0x%llx r9=0x%llx stack=0x%llx,0x%llx,0x%llx,0x%llx [rdx]=[%s]",
+            N, rdx, r8, r9, s0, s1, s2, s3, first);
+        x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, rcx, rdx, r8, r9, _ReturnAddress());
+    }
     static LONG calls;
     if (first_calls(calls, 1)) {
         char name[64];
@@ -312,6 +388,7 @@ __declspec(noinline) u64 forward_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d,
     if (first_calls(calls))
         log("x2w-d3d12 %s::slot%d(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) -> 0x%llx", kind_names[K], N, a, b, c, d, e,
             result);
+    check_device(kind_names[K], N);
     return result;
 }
 
@@ -320,6 +397,26 @@ __declspec(noinline) u64 forward_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d,
 // Resource descriptions: the title sets flag bits desktop D3D12 rejects (0x20000 on buffers,
 // 0x100000 and 0x200000 on render-target textures). Desktop receives only the bits it defines
 // up to ALLOW_SIMULTANEOUS_ACCESS (0x3f); dropped bits are logged once per value.
+// Console-only DXGI format values (116-120 in the console's format extensions: two 10-bit float
+// formats, D16_UNORM_S8_UINT and its two typed views) mapped to the nearest desktop formats. The
+// bit layouts differ, so contents are not interchangeable; this only lets the resources exist.
+DXGI_FORMAT desktop_format(DXGI_FORMAT format)
+{
+    DXGI_FORMAT mapped = format;
+    switch (static_cast<UINT>(format)) {
+    case 116: case 117: mapped = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+    case 118: mapped = DXGI_FORMAT_D24_UNORM_S8_UINT; break;
+    case 119: mapped = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+    case 120: mapped = DXGI_FORMAT_X24_TYPELESS_G8_UINT; break;
+    default: break;
+    }
+    if (mapped != format) {
+        static LONG calls;
+        if (first_calls(calls, 6)) log("x2w-d3d12 console format %u -> desktop format %u", format, mapped);
+    }
+    return mapped;
+}
+
 constexpr UINT desktop_resource_flags = 0x3f;
 D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
 {
@@ -347,6 +444,7 @@ D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
         copy.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }
     if (desc.Alignment != 0 && desc.Alignment != 0x10000 && desc.Alignment != 0x400000) copy.Alignment = 0;
+    copy.Format = desktop_format(desc.Format);
     return copy;
 }
 
@@ -362,6 +460,7 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     }
     const u64 result = method_of(self->real, N)(self->real, args[0], args[1], args[2], args[3], args[4], args[5],
                                                 args[6], args[7]);
+    check_device(kind_names[K], N);
     const auto* iid = reinterpret_cast<const GUID*>(args[R]);
     auto** out = reinterpret_cast<void**>(args[R + 1]);
     Kind kind = other_kind;
@@ -657,7 +756,7 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
                 static_cast<unsigned long>(hr));
         return static_cast<u64>(hr);
     }
-    if (rdx >= 1 && rdx <= 64 && r8 >= 0x10000 && !IsBadReadPtr(reinterpret_cast<void*>(r8), rdx * sizeof(void*))) {
+    if (rdx >= 1 && rdx <= 64 && r8 >= 0x10000 && x2w_local::readable(reinterpret_cast<void*>(r8), rdx * sizeof(void*))) {
         auto* const* lists = reinterpret_cast<void* const*>(r8);
         bool all_lists = true;
         for (u64 i = 0; i < rdx; ++i) {
@@ -669,6 +768,12 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
             queue_execute(self, static_cast<UINT>(rdx), lists);
             return 0;
         }
+    }
+    if (create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "CommandQueue::slot%d(passes an IID)", N);
+        x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, reinterpret_cast<u64>(self), rdx, r8, r9,
+                       _ReturnAddress());
     }
     if (log_it) {
         char name[64];
@@ -703,6 +808,7 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
     void* mapped = self->title_memory;
     if (!mapped) hr = static_cast<ID3D12Resource*>(self->real)->Map(subresource, range, &mapped);
     if (data) *data = SUCCEEDED(hr) ? mapped : nullptr;
+    if (FAILED(hr)) check_device("Resource::Map", 8);
     static LONG calls, failures;
     if (first_calls(calls, 4) || (FAILED(hr) && first_calls(failures, 8)))
         log("x2w-d3d12 Resource::Map subresource=%u title_memory=%p -> 0x%08lx %p", subresource, self->title_memory,
@@ -712,6 +818,21 @@ HRESULT __stdcall resource_map(Wrapper* self, UINT subresource, const D3D12_RANG
 void __stdcall resource_unmap(Wrapper* self, UINT subresource, const D3D12_RANGE* range)
 {
     if (!self->title_memory) static_cast<ID3D12Resource*>(self->real)->Unmap(subresource, range);
+}
+
+// Resource slot 11, desktop GetGPUVirtualAddress() (called with no arguments). On the console a
+// resource placed at an address has that address as its GPU address, so the title gets its own
+// address back; resources without title memory report the desktop address (0 for textures).
+UINT64 __stdcall resource_gpu_address(Wrapper* self)
+{
+    const UINT64 desktop = static_cast<ID3D12Resource*>(self->real)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+        ? static_cast<ID3D12Resource*>(self->real)->GetGPUVirtualAddress() : 0;
+    const UINT64 result = self->title_memory ? reinterpret_cast<UINT64>(self->title_memory) : desktop;
+    static LONG calls;
+    if (first_calls(calls, 4))
+        log("x2w-d3d12 Resource::GetGPUVirtualAddress title_memory=%p desktop=0x%llx -> 0x%llx", self->title_memory, desktop,
+            result);
+    return result;
 }
 
 // Resource slot 10, desktop GetDesc(), returned by value.
@@ -805,12 +926,44 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
 
 // Device view slots: forwarded with the destination CPU handle (argument D, 0-based after the
 // object) translated from title to desktop.
+// Desktop removes the device (DXGI_ERROR_INVALID_CALL) on view calls it rejects, so they are checked
+// first and skipped with a log: a view type the desktop resource's flags do not allow (the console
+// makes unordered-access views of depth textures), and constant-buffer views, whose BufferLocation is
+// a title GPU address. Console format values in the view description are mapped like resource formats.
 template <int N, int D>
 __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
 {
     u64 args[4] = {unwrap(a), unwrap(b), unwrap(c), unwrap(d)};
     args[D] = desktop_cpu_handle(args[D]);
+    const char* skip = nullptr;
+    if (N == 17) skip = "constant buffer view (title GPU address)";
+    if (N >= 18 && N <= 21 && args[0]) {
+        const UINT flags = reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc().Flags;
+        if (N == 18 && (flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) skip = "resource denies shader resource views";
+        if (N == 19 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) skip = "resource lacks unordered access";
+        if (N == 20 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) skip = "resource lacks render target";
+        if (N == 21 && !(flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) skip = "resource lacks depth stencil";
+    }
+    if (skip) {
+        static LONG skipped;
+        if (first_calls(skipped, 6)) log("x2w-d3d12 Device::slot%d view skipped: %s", N, skip);
+        return 0;
+    }
+    // The view descriptions of slots 18-21 start with a DXGI_FORMAT.
+    unsigned char desc_copy[64];
+    const int desc_index = N == 19 ? 2 : 1;
+    if (N >= 18 && N <= 21 && args[desc_index] && x2w_local::readable(reinterpret_cast<const void*>(args[desc_index]), sizeof(desc_copy))) {
+        std::memcpy(desc_copy, reinterpret_cast<const void*>(args[desc_index]), sizeof(desc_copy));
+        DXGI_FORMAT format;
+        std::memcpy(&format, desc_copy, sizeof(format));
+        const DXGI_FORMAT mapped = desktop_format(format);
+        if (mapped != format) {
+            std::memcpy(desc_copy, &mapped, sizeof(mapped));
+            args[desc_index] = reinterpret_cast<u64>(desc_copy);
+        }
+    }
     const u64 result = method_of(self->real, N)(self->real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
+    check_device("Device view", N);
     static LONG calls;
     if (first_calls(calls))
         log("x2w-d3d12 Device::slot%d view(0x%llx, 0x%llx, 0x%llx, 0x%llx) dest 0x%llx -> 0x%llx", N, a, b, c, d,
@@ -823,6 +976,7 @@ void __stdcall device_copy_descriptors_simple(Wrapper* self, UINT count, u64 des
 {
     device_of(self)->CopyDescriptorsSimple(count, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop_cpu_handle(dest))},
                                            D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop_cpu_handle(src))}, type);
+    check_device("Device CopyDescriptorsSimple", 24);
     static LONG calls;
     if (first_calls(calls)) log("x2w-d3d12 Device::CopyDescriptorsSimple count=%u dest=0x%llx src=0x%llx type=%d", count, dest, src, type);
 }
@@ -836,6 +990,7 @@ void __stdcall device_copy_descriptors(Wrapper* self, UINT dest_count, const D3D
     for (UINT i = 0; i < dest_count; ++i) dest[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(dest_starts[i].ptr));
     for (UINT i = 0; i < src_count; ++i) src[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(src_starts[i].ptr));
     device_of(self)->CopyDescriptors(dest_count, dest.data(), dest_sizes, src_count, src.data(), src_sizes, type);
+    check_device("Device CopyDescriptors", 23);
     static LONG calls;
     if (first_calls(calls)) log("x2w-d3d12 Device::CopyDescriptors dest=%u src=%u type=%d", dest_count, src_count, type);
 }
@@ -915,6 +1070,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     guid_text(iid, text, sizeof(text));
     if (!out || !desc || !iid) return E_POINTER;
     *out = nullptr;
+    check_device("Device before slot", 133);
     if (kind_for(*iid) != resource_kind) return E_NOINTERFACE;
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         // Textures cannot be placed on title memory on desktop: a committed default-heap texture
@@ -1093,6 +1249,28 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     return S_OK;
 }
 
+// Device slot 55 (Xbox order): (existing object, 1, desc*, riid, ppv) with the ID3D12PipelineState
+// IID: a pipeline derived from an existing one. Placeholder PipelineState, like the other creators.
+HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, u64 count, const void* desc, const GUID* iid,
+                                                 void** out)
+{
+    char text[48];
+    guid_text(iid, text, sizeof(text));
+    if (!out || !iid) return E_POINTER;
+    *out = nullptr;
+    static LONG calls;
+    if (first_calls(calls, 3)) {
+        Wrapper* w = as_wrapper(base);
+        char bytes[3 * 64 + 1];
+        hex_text(desc, 64, bytes, sizeof(bytes));
+        log("x2w-d3d12 Device::slot55(derived pipeline?) base=%p (%s) count=%llu desc=[%s] riid=%s -> placeholder", base,
+            w ? kind_names[w->kind] : "not a wrapper", count, bytes, text);
+    }
+    if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
+    *out = wrap(nullptr, pipeline_kind);
+    return S_OK;
+}
+
 // Device slot 127 (Xbox order): ten arguments in the CreateCommittedResource3 order: heap properties,
 // heap flags (8, ALLOW_DISPLAY, for the 4K render targets), resource desc, an initial state or
 // layout, clear value, then three zero words (protected session, castable count and formats in the
@@ -1110,6 +1288,7 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     const D3D12_RESOURCE_DESC copy = sanitized(*desc);
     const auto flags = static_cast<D3D12_HEAP_FLAGS>(heap_flags);
     const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(0, 1, &copy);
+    check_device("Device before slot", 127);
     void* const title_memory = info.SizeInBytes != ~0ull ? title_resource_memory(info.SizeInBytes, info.Alignment) : nullptr;
     ID3D12Resource* resource = nullptr;
     HRESULT hr = kind_for(*iid) == resource_kind
@@ -1196,12 +1375,14 @@ void build_tables()
     enable_forward<device_kind, 40>();                   // SetStablePowerState
     tables[device_kind][41] = reinterpret_cast<void*>(&device_create_command_signature);                 // CreateCommandSignature(desc, root, riid, ppv)
     enable_forward<device_kind, 42>();                   // GetResourceTiling
-    tables[device_kind][43] = reinterpret_cast<void*>(&device_adapter_luid);
+    // Slot 43 (desktop GetAdapterLuid) is not installed: no call site has confirmed it.
+    (void)&device_adapter_luid;
     // Xbox order from here.
     tables[device_kind][48] = reinterpret_cast<void*>(&device_create_command_queue_x);
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);
+    tables[device_kind][55] = reinterpret_cast<void*>(&device_create_derived_pipeline);
     tables[device_kind][57] = reinterpret_cast<void*>(&device_create_pipeline_placeholder<57>);
     tables[device_kind][67] = reinterpret_cast<void*>(&device_create_pipeline_placeholder<67>);
     tables[device_kind][62] = reinterpret_cast<void*>(&device_create_compute_pipeline_x);
@@ -1224,9 +1405,8 @@ void build_tables()
 
     // Fence: GetCompletedValue, SetEventOnCompletion, Signal, GetCreationFlags.
     tables[fence_kind][8] = reinterpret_cast<void*>(&fence_completed_value);
-    enable_forward<fence_kind, 9>();
+    // Desktop slots 9 (SetEventOnCompletion) and 11 (GetCreationFlags) wait for a confirming call site.
     tables[fence_kind][10] = reinterpret_cast<void*>(&fence_signal);
-    enable_forward<fence_kind, 11>();
     tables[fence_kind][12] = reinterpret_cast<void*>(&fence_completed_address);
 
     enable_forward<allocator_kind, 8>();                 // Reset
@@ -1234,14 +1414,12 @@ void build_tables()
     // Resource: Map, Unmap, GetDesc, GetGPUVirtualAddress, Write/ReadFromSubresource, GetHeapProperties.
     tables[resource_kind][8] = reinterpret_cast<void*>(&resource_map);
     tables[resource_kind][9] = reinterpret_cast<void*>(&resource_unmap);
-    tables[resource_kind][10] = reinterpret_cast<void*>(&resource_get_desc);
-    enable_forward<resource_kind, 11>();
-    enable_forward<resource_kind, 12>();
-    enable_forward<resource_kind, 13>();
-    enable_forward<resource_kind, 14>();
-
-    tables[heap_kind][8] = reinterpret_cast<void*>(&heap_get_desc);
-    tables[descriptor_heap_kind][8] = reinterpret_cast<void*>(&descriptor_heap_get_desc);
+    tables[resource_kind][11] = reinterpret_cast<void*>(&resource_gpu_address);
+    // Desktop Resource 10 (GetDesc), 12-14, Heap 8 and DescriptorHeap 8 (GetDesc, struct returns) are
+    // not installed until a call site confirms them: the queue's slot 18 showed what a wrong one does.
+    (void)&resource_get_desc;
+    (void)&heap_get_desc;
+    (void)&descriptor_heap_get_desc;
     tables[descriptor_heap_kind][9] = reinterpret_cast<void*>(&descriptor_heap_cpu_start);
     tables[descriptor_heap_kind][10] = reinterpret_cast<void*>(&descriptor_heap_gpu_start);
     if (device_noop()) fill_all_remaining_noops(std::make_index_sequence<kind_count>{});
@@ -1265,6 +1443,17 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     hex_text(parameters, 0x40, block, sizeof(block));
     if (!out) return E_POINTER;
     *out = nullptr;
+    const bool debug = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_D3D12_DEBUG", value, sizeof(value)) && value[0] == '1';
+    }();
+    if (debug) {
+        ID3D12Debug* layer = nullptr;
+        const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&layer));
+        if (SUCCEEDED(debug_hr)) layer->EnableDebugLayer();
+        log("x2w-d3d12 debug layer: 0x%08lx%s", static_cast<unsigned long>(debug_hr),
+            SUCCEEDED(debug_hr) ? " enabled" : " (not installed?)");
+    }
     ID3D12Device* device = nullptr;
     const HRESULT hr = kind_for(iid) == device_kind || iid == __uuidof(IUnknown)
         ? D3D12CreateDevice(adapter ? reinterpret_cast<IUnknown*>(unwrap(reinterpret_cast<u64>(adapter))) : nullptr,
@@ -1273,6 +1462,8 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx", static_cast<void*>(adapter), block,
         text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
+    removal_device = device;
+    if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
     the_device = wrap(device, device_kind);
     *out = the_device;
     return S_OK;
