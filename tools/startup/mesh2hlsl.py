@@ -1378,6 +1378,8 @@ class MeshPipeline(G.Pipeline):
             if not re.search(r'^heap 1$', text, re.M):
                 text += 'heap 1\n'
             text += 'heapwords 1\n'
+        # the multiply-add rule the result was built with (RUNTIME_NEEDS 8), so mixed caches are detectable
+        text += 'fma %s\n' % ('exact' if EXACT_FMA else 'precise')
         return text + 'stage mesh\nms %d %d %d\n' % (GROUP, MAX_VERTICES, MAX_PRIMITIVES)
 
     def manifest_ms_only(self):
