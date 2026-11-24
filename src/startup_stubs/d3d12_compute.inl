@@ -933,7 +933,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
         if (state[i]) InterlockedIncrement(state[i] == 'u' ? (ud.kind == 3 ? &cxe_rootconst : &cxe_descword) : &cxe_null_res);
     }
     static const bool run_unresolved = x2w_local::env_on("X2W_CX_UNRESOLVED_RUN");
-    if (cx_entry_log(key) && InterlockedIncrement(&tr.entry_logged) <= 4) {
+    if (cx_entry_log(key) && x2w_local::first_calls(tr.entry_logged, 4)) {
         char text[1600];
         int used = std::snprintf(text, sizeof(text), "x2w-cx entry %016llx dispatch (%u, %u, %u):", key, x, y, z);
         for (std::size_t i = 0; i < tr.uds.size() && used < static_cast<int>(sizeof(text)) - 80; ++i) {
