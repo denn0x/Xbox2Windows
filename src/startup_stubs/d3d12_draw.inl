@@ -218,6 +218,20 @@ void note_null_texture(u64 key, UINT srv, u64 entry, const std::uint32_t* words,
     AcquireSRWLockShared(&note_lock);
     const std::vector<HeapInfo> heaps = heap_infos();
     ReleaseSRWLockShared(&note_lock);
+    // Which heap holds the entry itself, and what the wrapper last noted there: a view id means a
+    // token was written and later overwritten; none means no view was ever created at that entry.
+    bool in_heap = false;
+    for (std::size_t h = 0; h < heaps.size(); ++h) {
+        const HeapInfo& heap = heaps[h];
+        if (!heap.title_cpu) continue;
+        const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
+        if (entry < heap.title_cpu || entry >= heap.title_cpu + u64{heap.count} * stride) continue;
+        const u64 index = (entry - heap.title_cpu) / stride;
+        log("x2w-draw null texture %016llx srv %u: entry 0x%llx is index 0x%llx of heap %zu (type %u, count %u, title 0x%llx, stride %u); shadow id %u",
+            key, srv, entry, index, h, heap.type, heap.count, heap.title_cpu, stride, heap.shadow ? heap.shadow[index] : 0u);
+        in_heap = true;
+    }
+    if (!in_heap) log("x2w-draw null texture %016llx srv %u: entry 0x%llx is in no title descriptor heap", key, srv, entry);
     int shown = 0;
     for (std::size_t h = 0; h < heaps.size() && shown < 6; ++h) {
         const HeapInfo& heap = heaps[h];
