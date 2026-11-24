@@ -2737,6 +2737,7 @@ extern LONG translated_draws, untranslated_draws, frame_number;
 bool indirect_pending(Wrapper* self);
 bool indirect_draw_issue(Wrapper* self, ID3D12GraphicsCommandList* list, bool indexed);
 void indirect_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z);
+void mesh_note57(const void* desc, const Wrapper* self);  // LOCAL meshrt: d3d12_mesh.inl
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
 extern thread_local u64 last_draw_key;
 extern thread_local const char* last_draw_why;
@@ -4434,6 +4435,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
     if (N == 57) regblob::dump57(desc, static_cast<Wrapper*>(*out));
+    if (N == 57) mesh_note57(desc, static_cast<Wrapper*>(*out));  // LOCAL meshrt: mesh key at creation (X2W_MESH=1)
     if (N == 67 &&x2w_local::readable(desc, 0x28)) {
         u64 words[5];
         std::memcpy(words, desc, sizeof(words));
@@ -4641,6 +4643,7 @@ void draw_overlay(LONG frame, double seconds)
 #include "startup_stubs/d3d12_compute.inl"
 #include "startup_stubs/d3d12_gpu_time.inl"
 #include "startup_stubs/d3d12_indirect.inl"
+#include "startup_stubs/d3d12_mesh.inl"  // LOCAL meshrt
 #include "startup_stubs/d3d12_rawaddr.inl"
 #include "startup_stubs/d3d12_present.inl"
 #include "startup_stubs/d3d12_copy_buffer.inl"
@@ -4773,6 +4776,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("%s", line);
         report_dispatches();
         report_indirect(300);  // LOCAL: d3d12_indirect.inl
+        report_mesh(300);  // LOCAL meshrt: d3d12_mesh.inl (X2W_MESH=1)
         regblob::report();
         report_cx_views();
         gpu_time::report();  // LOCAL: X2W_CX_GPU_TIME

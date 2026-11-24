@@ -134,6 +134,8 @@ LONG indirect_readback_wanted()
 // calls indirect_issue(self, list) and returns true when it issued. Null until mesh provides one.
 using IndirectMeshHook = bool (*)(Wrapper* self, ID3D12GraphicsCommandList* list);
 IndirectMeshHook indirect_mesh_hook = nullptr;
+// LOCAL meshrt (d3d12_mesh.inl): a DispatchMesh call that cannot be issued is refused before it is staged.
+bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list);
 
 // The private argument ring: default heap, rests in COMMON between calls.
 constexpr u64 indirect_ring_bytes = u64{16} << 20, indirect_ring_slot = 256;
@@ -645,6 +647,7 @@ void indirect_run(Wrapper* self, ID3D12GraphicsCommandList* list, int type, Wrap
     if (!indirect_window(arguments, offset, u64{stride} * max_count, &p.args_window, &p.args_at) ||
         (count_resource && !indirect_window(count_resource, count_offset, 4, &p.count_window, &p.count_at)))
         return indirect_skip(type, skip_unresolved_buffer);
+    if (type == itype_mesh && !mesh_prepare(self, list)) return indirect_skip(type, skip_no_pipeline);  // LOCAL meshrt: before staging
     if (!ensure_indirect_ring()) return indirect_skip(type, skip_no_ring);
     if (!indirect_stage(self, list, &p)) return indirect_skip(type, p.refused);
     indirect_current = &p;

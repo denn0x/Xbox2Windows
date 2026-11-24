@@ -27,6 +27,7 @@ struct Translation {
     x2w_startup::TranslatedSamplers samplers;
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
+    ID3DBlob* ms = nullptr;                  // LOCAL meshrt: `stage mesh` manifest (d3d12_mesh.inl): vs is null, ps optional
     ID3D12RootSignature* root = nullptr;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     u64 key = 0;
@@ -43,6 +44,10 @@ struct BoundPipeline {
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
 };
+// LOCAL meshrt (d3d12_mesh.inl): mesh pipelines through draw_translated.
+int load_mesh_stages(Translation& tr, const std::string& manifest);
+bool mesh_issue_active(Wrapper* self);
+ID3D12PipelineState* mesh_pso_for(const Translation& tr);
 
 // Looks for a desktop-layout D3D12_BLEND_DESC inside a state block: two flags, then eight render
 // target entries whose fields are all inside their enumerations.
@@ -709,8 +714,9 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         log("x2w-draw-rt %016llx: not used (X2W_DRAW_RT_OFF)", tr.key);
         return;
     }
-    if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
-    if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
+    const int mesh_stage = load_mesh_stages(tr, manifest);  // LOCAL meshrt: 1 `stage mesh` (.ms.cso, optional .ps.cso), -1 failed, 0 not mesh
+    if (mesh_stage < 0 || (!mesh_stage && (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))))) return;
+    if (!mesh_stage && (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps)))) return;
     const HRESULT hr = create_draw_root(tr);
     if (FAILED(hr)) {
         log("x2w-draw root signature for %016llx failed 0x%08lx", tr.key, static_cast<unsigned long>(hr));
@@ -1014,6 +1020,7 @@ void build_pipeline(const PsoBuild& build)
 // draw_lock held. With `deferred`, a pipeline not built yet is described there and nullptr is returned.
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, PsoBuild* deferred = nullptr)
 {
+    if (tr.ms) return mesh_pso_for(tr);  // LOCAL meshrt: built off draw_lock by mesh_prepare; null outside a mesh call
     const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
@@ -1755,9 +1762,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    const bool rect = pass.topology == 0x11;
+    const bool mesh = mesh_issue_active(self);  // LOCAL meshrt: a DispatchMesh call (d3d12_mesh.inl); no topology, rect entry value 0
+    const bool rect = !mesh && pass.topology == 0x11;
     if (list && pass.pipeline && !pass.targets_bound) InterlockedIncrement(&draws_without_targets);
-    if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
+    if (!list || !pass.pipeline || !pass.targets_bound || !(mesh || rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
     lock_draw(100000 + __LINE__);
     report_draw_rt();
     static const bool pso_locked = x2w_local::env_on("X2W_DRAW_PSO_LOCKED");
