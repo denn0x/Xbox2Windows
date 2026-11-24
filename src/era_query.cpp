@@ -80,7 +80,14 @@ std::size_t query(void* process, const void* address, void* buffer, std::size_t 
         // Desktop policy, not a Scarlett field: mark addresses in registered GPU-intended regions.
         const bool registered = is_current_process(process) &&
                                 is_registered(reinterpret_cast<std::uintptr_t>(address));
-        static_cast<unsigned char*>(buffer)[tail_offset] = registered ? tail_registered : 0;
+        // LOCAL EXPERIMENT (X2W_XMEM_QUERY_READABLE): the BVH callers may read bits 0-1 as "CPU readable";
+        // mark every committed readable region. Behavioural reference: ivall/xcl@91f9a5e (kernelx.rs).
+        static const bool readable_policy = GetEnvironmentVariableA("X2W_XMEM_QUERY_READABLE", nullptr, 0) != 0;
+        const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        const bool cpu_readable = readable_policy && info.State == MEM_COMMIT && (info.Protect & readable) &&
+                                  !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+        static_cast<unsigned char*>(buffer)[tail_offset] = registered || cpu_readable ? tail_registered : 0;
     }
     return sizeof(info);
 }
