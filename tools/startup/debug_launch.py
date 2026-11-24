@@ -143,7 +143,8 @@ def main():
     os.makedirs(logdir, exist_ok=True)
     trap_log = os.path.join(logdir, "trap.log")
     stop_file = os.path.join(logdir, "stop")  # created from outside: end the run as at a timeout
-    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file):  # a reused run directory starts clean
+    snapshot_file = os.path.join(logdir, "snapshot")  # created from outside: write threads_<s>.txt, go on
+    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file, snapshot_file):  # a reused run directory starts clean
         if os.path.exists(stale):
             os.remove(stale)
     if os.path.exists(trap_log):
@@ -782,6 +783,14 @@ def main():
                     stop_requested = True
                     log(f"{time.time() - start:7.3f} stop file {stop_file} found: ending the run")
                     break
+                # <logdir>/snapshot asks for every thread's full stack now, in threads_<seconds>.txt;
+                # the run continues. For a run that stops making progress without faulting.
+                if os.path.exists(snapshot_file):
+                    os.remove(snapshot_file)
+                    when = time.time() - start
+                    taken = dump_threads(os.path.join(logdir, f"threads_{when:.0f}.txt"))
+                    log(f"{when:7.3f} snapshot: {len(taken)} threads -> threads_{when:.0f}.txt "
+                        f"({time.time() - start - when:.2f} s)")
             if dump_at and time.time() - start >= dump_at[0]:
                 dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
             if watches and time.time() >= watch_next:
@@ -939,8 +948,10 @@ def main():
             return function(*args)
         finally:
             close_phases.append((name, time.time() - began))
-    if stop and stop_at:
-        dump_threads(os.path.join(logdir, "threads_stop.txt"))
+    if stop and (stop_at or not stop[3]):
+        # At an X2W_STOP_AT breakpoint and at a second-chance exception: every thread's full stack.
+        dumped = timed("threads_stop.txt", dump_threads, os.path.join(logdir, "threads_stop.txt"))
+        print(f"  {len(dumped)} threads -> threads_stop.txt")
     if stop:
         ex_code, ex_addr, tid, first, params = stop
         print(f"stopped at {NAMES.get(ex_code, hex(ex_code))} ({ex_code:#010x}) at {where(ex_addr)} after {elapsed:.2f} s "
