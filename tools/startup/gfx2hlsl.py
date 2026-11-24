@@ -1628,6 +1628,10 @@ class Stage:
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|f16)(_sdwa)?', base)
         if not m or (m.group(4) and m.group(3) not in ('i32', 'u32') and (m.group(3), m.group(2)) != ('f32', 'class')) \
                 or (m.group(3) == 'f16' and m.group(2) != 'class'):
+            if m and m.group(4) and m.group(3) == 'f32':
+                # The f32 predicates are verified on the plain and e64 forms only (#1920); the SDWA forms
+                # stay refused until they are verified too.
+                raise Unsupported('%s: f32 SDWA compares are not lowered' % base)
             raise Unsupported(base)
         writes_exec, cond, typ = m.group(1) == 'x', m.group(2), m.group(3)
         if len(ops) == 3:
@@ -1679,16 +1683,34 @@ class Stage:
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)
         else:
             x, y = self.u(a), self.u(b)
-        return self.compare_result(base, cond, writes_exec, dst, x, y)
+        ordered = ''
+        if typ == 'f32':
+            def word(tok):
+                # A float source's word before its neg/abs modifiers, as f() reads them; they keep a NaN a NaN.
+                if tok.startswith('-') and not re.match(r'-[\d.]', tok):
+                    tok = tok[1:]
+                if tok.startswith('|') and tok.endswith('|'):
+                    tok = tok[1:-1]
+                return self.u(tok)
+            ordered = ' && '.join('(%s & 0x7fffffffu) <= 0x7f800000u' % word(t) for t in (a, b))
+        return self.compare_result(base, cond, writes_exec, dst, x, y, ordered)
 
-    def compare_result(self, base, cond, writes_exec, dst, x, y):
-        table = {'lt': '{0} < {1}', 'eq': '{0} == {1}', 'le': '{0} <= {1}', 'gt': '{0} > {1}', 'lg': '{0} != {1}', 'ne': '{0} != {1}',
+    def compare_result(self, base, cond, writes_exec, dst, x, y, ordered=''):
+        # f32 lg is ordered and not equal (false when either source is NaN) and nlg its negation (#1920).
+        # HLSL != is unordered, so lg reads as less or greater, behind {2}: both source words not NaN,
+        # tested on their bits. DXC marks float compares fast unless -Gis, and a driver may then fold
+        # less-or-greater into an unordered not-equal.
+        table = {'lt': '{0} < {1}', 'eq': '{0} == {1}', 'le': '{0} <= {1}', 'gt': '{0} > {1}',
+                 'lg': '({2} && ({0} < {1} || {0} > {1}))', 'ne': '{0} != {1}',
                  'ge': '{0} >= {1}', 'neq': '!({0} == {1})', 'nlt': '!({0} < {1})', 'nle': '!({0} <= {1})', 'ngt': '!({0} > {1})',
-                 'nge': '!({0} >= {1})', 'nlg': '!({0} != {1})', 'o': '({0} == {0} && {1} == {1})', 'u': '({0} != {0} || {1} != {1})',
-                 't': 'true', 'f': 'false'}
+                 'nge': '!({0} >= {1})', 'nlg': '!({2} && ({0} < {1} || {0} > {1}))', 'o': '({0} == {0} && {1} == {1})',
+                 'u': '({0} != {0} || {1} != {1})', 't': 'true', 'f': 'false'}
         if cond not in table:
             raise Unsupported(base)
-        return self.write_compare(writes_exec, dst, '((%s) ? 1u : 0u)' % table[cond].format(x, y))
+        if '{2}' in table[cond] and not ordered:
+            # Only the plain and e64 f32 forms supply the source words the ordered test needs.
+            raise Unsupported('%s: no f32 source words for the ordered test' % base)
+        return self.write_compare(writes_exec, dst, '((%s) ? 1u : 0u)' % table[cond].format(x, y, ordered))
 
     def write_compare(self, writes_exec, dst, expr):
         """Store a 0/1 compare result as the lane's bit of exec, vcc or an SGPR mask."""
