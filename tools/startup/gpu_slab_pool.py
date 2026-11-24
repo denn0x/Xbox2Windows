@@ -13,9 +13,11 @@ growing by every moved slab of every run.
   python -B gpu_slab_pool.py hold --count N --mib M          (the holder itself)
 
 Names: Local\\x2w-gpu-slab-<i> (i = 0..N-1), events Local\\x2w-gpu-slab-pool-ready / -quit. Each section is
-SEC_COMMIT, M MiB (xmem's slab size is 256 MiB). xmem opens them in order (X2W_XMEM_GPU_POOL, default on); a run
-that needs more falls back to fresh sections (logged). Only one title runs at a time (machine lock), so no two
-processes use the pool at once.
+SEC_COMMIT, M MiB (xmem's slab size is 256 MiB). xmem opens them in order (X2W_XMEM_GPU_POOL, default on: only slabs
+moved for the GPU; =all: every slab from the start, X2W_XMEM_GPU_POOL_SLABS sections, default 28); a run that needs
+more falls back to fresh sections (logged). xmem claims the pool with the mutex Local\\x2w-gpu-slab-pool-owner, so a
+second process never shares it. ensure with a larger count than the running holder has starts a second holder that
+holds the existing sections too and creates the missing ones (quit ends both).
 """
 import ctypes
 import os
@@ -60,7 +62,7 @@ def hold(count, mib):
         if not h:
             print(f"section {i} failed: {ctypes.get_last_error()}", flush=True)
             break
-        handles.append(h)
+        handles.append(h)  # an existing section (a second holder growing the pool) is just held once more
     ready = k32.CreateEventW(None, True, True, READY)
     print(f"holding {len(handles)} x {mib} MiB sections ({PREFIX}0..{len(handles) - 1})", flush=True)
     k32.WaitForSingleObject(wt.HANDLE(quit_event), 0xFFFFFFFF)
@@ -82,9 +84,12 @@ def reachable():
 
 
 def ensure(count, mib=256):
-    """Starts the holder unless it runs; returns the number of pool sections reachable (0 if it failed)."""
-    if running():
-        return reachable()
+    """Starts the holder unless it runs with at least count sections; returns the number of pool sections reachable
+    (0 if it failed). A holder with fewer sections is not ended (its used sections stay charged anyway): a second
+    holder is started that opens the existing sections and creates the missing ones; quit ends both."""
+    have = reachable() if running() else 0
+    if have >= count:
+        return have
     # Detached, outside any job of the caller, no console: it must outlive the run that started it.
     flags = 0x00000008 | 0x00000200 | 0x01000000  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
     out_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "out"))
@@ -102,10 +107,10 @@ def ensure(count, mib=256):
             subprocess.Popen(args, creationflags=flags & ~0x01000000, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
                              close_fds=True, cwd=cwd)
     for _ in range(100):
-        if running():
+        if running() and reachable() >= count:
             return reachable()
         time.sleep(0.1)
-    return 0
+    return reachable() if running() else 0
 
 
 def main():
