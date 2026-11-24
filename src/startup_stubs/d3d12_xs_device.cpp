@@ -4875,6 +4875,26 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
         log("x2w-d3d12 debug layer: 0x%08lx%s", static_cast<unsigned long>(debug_hr),
             SUCCEEDED(debug_hr) ? " enabled" : " (not installed?)");
     }
+    // LOCAL stall: X2W_BACKGROUND_PRIORITY=1 (the launcher sets it) lowers this process's GPU scheduling
+    // priority class and its CPU priority class to below normal, so the desktop compositor and other
+    // programs win while a run saturates the GPU. Both are allowed for an unelevated process lowering its
+    // own priority; the results are logged. Unset or 0: today's priorities.
+    static const bool background = [] {
+        if (!x2w_local::env_on("X2W_BACKGROUND_PRIORITY")) return false;
+        // gdi32!D3DKMTSetProcessSchedulingPriorityClass(process, D3DKMT_SCHEDULINGPRIORITYCLASS):
+        // 0 idle, 1 below normal, 2 normal (d3dkmthk.h); NTSTATUS result.
+        using SetGpuClass = LONG(APIENTRY*)(HANDLE, int);
+        const HMODULE gdi = LoadLibraryW(L"gdi32.dll");
+        const auto set_gpu = gdi ? reinterpret_cast<SetGpuClass>(GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass")) : nullptr;
+        const LONG gpu = set_gpu ? set_gpu(GetCurrentProcess(), 1) : -1;
+        const BOOL cpu = SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+        const DWORD cpu_error = cpu ? 0 : GetLastError();
+        log("x2w-d3d12 background priority: GPU scheduling class below normal -> 0x%08lx%s; CPU priority class below normal -> %s "
+            "(error %lu, class now 0x%lx)", static_cast<unsigned long>(gpu), set_gpu ? "" : " (entry point not found)",
+            cpu ? "ok" : "refused", cpu_error, GetPriorityClass(GetCurrentProcess()));
+        return true;
+    }();
+    (void)background;
     if (x2w_local::env_on("X2W_D3D12_DRED")) {
         // LOCAL: device-removed extended data (breadcrumbs and page fault), reported by check_device.
         ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
