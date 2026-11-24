@@ -304,6 +304,11 @@ void switch_cases()
     check(!s.cull && !s.flip, "flip needs cull");
     s = parse_switches(nullptr, "10", "yes", "", nullptr);
     check(!s.depth && !s.cull && !s.blend, "only \"1\" turns a group on");
+    check(!s.depth_clear, "depth clears default off");
+    s = parse_switches(nullptr, nullptr, nullptr, nullptr, nullptr, "1");
+    check(s.depth_clear && !s.depth, "depth clears on their own switch");
+    s = parse_switches("0", nullptr, nullptr, nullptr, nullptr, "1");
+    check(!s.depth_clear, "X2W_DRAW_STATE=0 turns depth clears off");
 }
 }  // namespace
 

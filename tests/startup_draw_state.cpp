@@ -194,7 +194,8 @@ int main(int argc, char** argv)
     struct Case {
         const char* name;
         std::vector<std::pair<unsigned, std::uint32_t>> words;
-        bool far_second;  // also draw the far red triangle after the near green one, same state
+        bool far_second;    // also draw the far red triangle after the near green one, same state
+        UINT guest_clear = 0;  // depth pre-cleared to 0 on the desktop, then list slot 51 with these flags and depth 1
     };
     const Case cases[] = {
         {"depth", with({{a_depth, z_less_write}}), true},
@@ -205,6 +206,10 @@ int main(int argc, char** argv)
         {"cull_front", with({{a_mode, cull_front}}), false},
         {"cull_back_face1", with({{a_mode, cull_back | face_cw}}), false},
         {"mask_rg", {{a_shader_mask, 0xF}, {a_target_mask, 0x3}}, false},
+        // List slot 51: a forwarded depth clear to 1 lets the near triangle pass LESS over a depth of 0.
+        {"guest_clear", with({{a_depth, z_less_write}}), false, D3D12_CLEAR_FLAG_DEPTH},
+        // Negative control: a stencil-only clear on a D32 target clears nothing, depth stays 0.
+        {"guest_clear_stencil_only", with({{a_depth, z_less_write}}), false, D3D12_CLEAR_FLAG_STENCIL},
     };
     std::vector<Slot57> keep(2 * std::size(cases));
     std::vector<std::pair<void*, void*>> psos;
@@ -231,10 +236,8 @@ int main(int argc, char** argv)
     ComPtr<ID3D12Resource> depth_tex;
     const D3D12_RESOURCE_DESC dsv_tex_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, DXGI_FORMAT_D32_FLOAT, {1, 0},
                                            D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
-    D3D12_CLEAR_VALUE dsv_clear{};
-    dsv_clear.Format = DXGI_FORMAT_D32_FLOAT;
-    dsv_clear.DepthStencil = {1.0f, 0};
-    if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &dsv_tex_desc, D3D12_RESOURCE_STATE_COMMON, &dsv_clear,
+    // No optimized clear value: the cases clear to 0 and to 1.
+    if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &dsv_tex_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                 IID_PPV_ARGS(&depth_tex)))) return 21;
     const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; Word backing, bytes; } rtv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0},
         dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1}, 0, 0};
@@ -259,7 +262,7 @@ int main(int argc, char** argv)
 
     UINT64 fence_value = 0;
     for (std::size_t i = 0; i < std::size(cases); ++i) {
-        if (const int rc = clear_depth_desktop(desktop.Get(), depth_tex.Get(), 1.0f)) return rc;
+        if (const int rc = clear_depth_desktop(desktop.Get(), depth_tex.Get(), cases[i].guest_clear ? 0.0f : 1.0f)) return rc;
         if (FAILED(static_cast<HRESULT>(invoke(state.allocator, 8)))) return 24;
         if (FAILED(static_cast<HRESULT>(invoke(state.list, 139, ptr_arg(state.allocator))))) return 25;
         invoke(state.list, 52, rtv.ptr, ptr_arg(clear_color));
@@ -267,6 +270,12 @@ int main(int argc, char** argv)
         invoke(state.list, 22, 1, ptr_arg(&rect));
         invoke(state.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         invoke(state.list, 50, 1, ptr_arg(&rtv), FALSE, ptr_arg(&dsv));
+        if (cases[i].guest_clear) {
+            // Typed call: the depth value is a float argument (xmm3), which invoke cannot pass.
+            using ClearDepth = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
+            reinterpret_cast<ClearDepth>((*static_cast<void***>(state.list))[51])(state.list, dsv, static_cast<D3D12_CLEAR_FLAGS>(cases[i].guest_clear),
+                                                                                   1.0f, 0, 0, nullptr);
+        }
         invoke(state.list, 25, ptr_arg(psos[i].first));
         invoke(state.list, 12, 3, 1);
         if (cases[i].far_second) {

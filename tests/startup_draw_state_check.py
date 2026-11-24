@@ -3,7 +3,9 @@ apply_draw_state in d3d12_draw.inl), switched by X2W_DRAW_STATE_DEPTH / _CULL / 
 
 usage: startup_draw_state_check.py <startup_draw_state> <warp|hardware>
 
-The same program runs three times: switches off (the default), all on, and all on with X2W_DRAW_STATE=0.
+The same program runs four times: switches off (the default), all on, on without X2W_DRAW_STATE_DEPTH_CLEAR,
+and all on with X2W_DRAW_STATE=0. List slot 51 (ClearDepthStencilView) is forwarded only with _DEPTH_CLEAR: the
+guest clears a depth of 0 to 1, so the near triangle passes LESS; without the clear it fails (blue).
 Off and master-off must draw as before: no depth test (the far red triangle drawn second covers the near
 green one), no culling, every channel written. On: DB_DEPTH_CONTROL LESS + write keeps the near green,
 PA_SU_SC_MODE_CNTL culls (FACE 0 taken as counter-clockwise front faces: the test triangle, NDC (-1,-1)
@@ -24,15 +26,19 @@ from startup_stream_depth_check import vertex
 from startup_stream_draw_check import pixel
 
 GREEN, RED, BLUE, CYAN = (0, 255, 0, 255), (255, 0, 0, 255), (0, 0, 255, 255), (0, 255, 255, 255)
-SWITCHES = ("X2W_DRAW_STATE", "X2W_DRAW_STATE_DEPTH", "X2W_DRAW_STATE_CULL", "X2W_DRAW_STATE_BLEND", "X2W_DRAW_STATE_CULL_FLIP")
+SWITCHES = ("X2W_DRAW_STATE", "X2W_DRAW_STATE_DEPTH", "X2W_DRAW_STATE_CULL", "X2W_DRAW_STATE_BLEND", "X2W_DRAW_STATE_CULL_FLIP",
+            "X2W_DRAW_STATE_DEPTH_CLEAR")
+GROUPS = {"X2W_DRAW_STATE_DEPTH": "1", "X2W_DRAW_STATE_CULL": "1", "X2W_DRAW_STATE_BLEND": "1"}
 MODES = {
     "off": {},
-    "on": {"X2W_DRAW_STATE_DEPTH": "1", "X2W_DRAW_STATE_CULL": "1", "X2W_DRAW_STATE_BLEND": "1"},
-    "master-off": {"X2W_DRAW_STATE": "0", "X2W_DRAW_STATE_DEPTH": "1", "X2W_DRAW_STATE_CULL": "1", "X2W_DRAW_STATE_BLEND": "1"},
+    "on": dict(GROUPS, X2W_DRAW_STATE_DEPTH_CLEAR="1"),
+    "on-noclear": GROUPS,
+    "master-off": dict(GROUPS, X2W_DRAW_STATE="0", X2W_DRAW_STATE_DEPTH_CLEAR="1"),
 }
 BEFORE = {"depth": RED, "depth_refused": RED, "no_state": RED, "cull_back": GREEN, "cull_front": GREEN, "cull_back_face1": GREEN,
-          "mask_rg": GREEN}
-DECODED = dict(BEFORE, depth=GREEN, cull_front=BLUE, cull_back_face1=BLUE, mask_rg=CYAN)
+          "mask_rg": GREEN, "guest_clear": GREEN, "guest_clear_stencil_only": GREEN}
+DECODED = dict(BEFORE, depth=GREEN, cull_front=BLUE, cull_back_face1=BLUE, mask_rg=CYAN, guest_clear_stencil_only=BLUE)
+EXPECTED = {"off": BEFORE, "on": DECODED, "on-noclear": dict(DECODED, guest_clear=BLUE), "master-off": BEFORE}
 
 
 def left(pixels, name):
@@ -76,14 +82,22 @@ def check(directory, program, backend):
         run = subprocess.run(args + [str(out)], env=dict(base, **switches), capture_output=True, text=True)
         if run.returncode or "-> drawn;" not in run.stderr:
             raise RuntimeError(f"{mode}: draw failed on {backend}: {run.returncode}\n{run.stderr[-3000:]}")
-        errors = [line for line in run.stderr.splitlines() if re.search(r"x2w-d3d12-debug.*sev=[012]\b", line)]
+        # The cases clear depth to 0 and to 1, so the debug layer's clear-value performance warnings (820 mismatching
+        # clear value, 821 no clear value at creation) are expected; every other warning or error fails.
+        errors = [line for line in run.stderr.splitlines()
+                  if re.search(r"x2w-d3d12-debug.*sev=[012]\b", line) and not re.search(r"sev=2 id=82[01] ", line)]
         assert not errors, f"{mode}: debug layer: {errors[:4]}"
-        on = mode == "on"
-        expected = DECODED if on else BEFORE
+        on = mode.startswith("on")
+        expected = EXPECTED[mode]
         decoded_psos = run.stderr.count(", decoded state")
         switch_line = [line for line in run.stderr.splitlines() if "x2w-draw-state switches:" in line]
         assert switch_line, f"{mode}: no switch line"
         assert ("depth 1 cull 1" in switch_line[0]) == on, f"{mode}: {switch_line[0]}"
+        clears = [line for line in run.stderr.splitlines() if "x2w-render ClearDepthStencilView" in line]
+        if mode == "on":
+            assert len(clears) == 2 and "flags 0x1 depth 1 " in clears[0] and "flags 0x2 depth 1 " in clears[1], clears
+        else:
+            assert not clears, f"{mode}: slot 51 forwarded: {clears}"
         assert (decoded_psos > 0) == on, f"{mode}: {decoded_psos} pipelines with decoded state"
         assert "decoded state refused" not in run.stderr, f"{mode}: a decoded PSO failed creation"
         got = {name: left((out / name).read_bytes(), f"{mode} {name}") for name in expected}
@@ -92,7 +106,8 @@ def check(directory, program, backend):
         assert not wrong, f"{mode}: drew / expected {wrong}"
     print(f"startup_draw_state: PASS on {backend} (off and X2W_DRAW_STATE=0 draw as before; on: depth LESS keeps near green, "
           f"CULL_FRONT and FACE 1 + CULL_BACK cull the counter-clockwise triangle, CULL_BACK keeps it, target mask 0x3 keeps "
-          f"blue; refused depth word draws as before)")
+          f"blue; refused depth word draws as before; slot 51 depth clear forwarded only with X2W_DRAW_STATE_DEPTH_CLEAR=1, "
+          f"stencil-only clear on D32 clears nothing)")
     return 0
 
 

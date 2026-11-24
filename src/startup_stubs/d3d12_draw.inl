@@ -72,8 +72,8 @@ const x2w_pipeline_state::Switches& switches()
 {
     static const x2w_pipeline_state::Switches s = [] {
         const auto v = x2w_pipeline_state::switches_from_env();
-        log("x2w-draw-state switches: depth %d cull %d (flip %d) blend masks %d (X2W_DRAW_STATE_DEPTH / _CULL / _CULL_FLIP / _BLEND, "
-            "X2W_DRAW_STATE=0 all off)", v.depth, v.cull, v.flip, v.blend);
+        log("x2w-draw-state switches: depth %d cull %d (flip %d) blend masks %d depth clears %d (X2W_DRAW_STATE_DEPTH / _CULL / "
+            "_CULL_FLIP / _BLEND / _DEPTH_CLEAR, X2W_DRAW_STATE=0 all off)", v.depth, v.cull, v.flip, v.blend, v.depth_clear);
         return v;
     }();
     return s;
@@ -98,6 +98,10 @@ void report_draw_state()
         v[refused_blend], v[derived_ds], v[derived_rs], v[derived_invalid], v[depth_bounds_ignored], v[stencil_masks_differ],
         v[clip_split], v[bias_rounded], v[conservative_dropped], v[pso_new], v[pso_failed_fallback], v[pso_failed_both],
         v[draws_depth_no_target], v[draws_stencil_no_plane], v[draws_read_only], v[draws_rect_cull_off], v[dual_multi_target]);
+    if (s.depth_clear)
+        log("x2w-draw-state 300 frames: depth clears (slot 51) forwarded %ld; dropped: list not open %ld, not a depth view %ld, depth "
+            "outside [0, 1] %ld, nothing to clear %ld", InterlockedExchange(&depth_clears[0], 0), InterlockedExchange(&depth_clears[1], 0),
+            InterlockedExchange(&depth_clears[2], 0), InterlockedExchange(&depth_clears[3], 0), InterlockedExchange(&depth_clears[4], 0));
 }
 // LOCAL meshrt (d3d12_mesh.inl): mesh pipelines through draw_translated.
 int load_mesh_stages(Translation& tr, const std::string& manifest);

@@ -2886,6 +2886,45 @@ void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
 {
     if (auto* list = recording(self)) list->OMSetStencilRef(reference & 0xFF);
 }
+// LOCAL (renderstate): list slot 51, ClearDepthStencilView(view, flags, depth, stencil, rect count, rects).
+// Installed straight into the list table with X2W_DRAW_STATE_DEPTH_CLEAR=1 (render mode): the depth value
+// is a float, the 4th argument, so it arrives in xmm3 (Win64 ABI; assumed to be the title's convention
+// as well, the run 78 trace fits: rdx a handle, r8 flags 2, r9 unrelated). noop_slot forwards integer
+// registers only, so this entry bypasses it and keeps its slot counters itself. Desktop resources rest in
+// COMMON here: the target goes to DEPTH_WRITE for the clear and back to the state this list had it in.
+LONG depth_clears[5];  // [0] forwarded, [1] list not open, [2] view not a known depth view, [3] depth value outside [0, 1], [4] nothing left to clear
+void __stdcall list_clear_depth(Wrapper* self, u64 handle, UINT flags, float depth, UINT stencil, UINT rect_count, const D3D12_RECT* rects)
+{
+    InterlockedIncrement64(&list_slot_calls[51]);
+    InterlockedIncrement64(&list_slot_census[51]);
+    InterlockedIncrement(&draw_calls_seen);
+    static LONG logged;
+    const bool log_this = first_calls(logged, 8);
+    auto* list = recording(self);
+    if (!list) return (void)InterlockedIncrement(&depth_clears[1]);
+    const u64 resolved = desktop_cpu_handle(handle);
+    const ResolvedView view = resolved ? resolve_view(resolved, 21) : ResolvedView{};
+    ID3D12Resource* target = view.resource;
+    const DXGI_FORMAT format = target ? view_format_of(resolved, target) : DXGI_FORMAT_UNKNOWN;
+    UINT clear = flags & (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL);
+    if (!format_has_stencil(format)) clear &= ~D3D12_CLEAR_FLAG_STENCIL;
+    if (log_this)
+        log("x2w-render ClearDepthStencilView view=0x%llx target=%p format %d flags 0x%x depth %g stencil %u rects %u", handle,
+            static_cast<void*>(target), static_cast<int>(format), flags, depth, stencil & 0xFF, rect_count);
+    if (!target) return (void)InterlockedIncrement(&depth_clears[2]);
+    if ((clear & D3D12_CLEAR_FLAG_DEPTH) && !(depth >= 0.0f && depth <= 1.0f)) return (void)InterlockedIncrement(&depth_clears[3]);
+    if (!clear) return (void)InterlockedIncrement(&depth_clears[4]);
+    if (rect_count && !x2w_local::readable(rects, rect_count * sizeof(*rects))) return (void)InterlockedIncrement(&depth_clears[2]);
+    D3D12_RESOURCE_STATES before = D3D12_RESOURCE_STATE_COMMON;
+    bool known = false;
+    for (const auto& s : pass_of(self).states)
+        if (s.first == target) before = s.second, known = true;
+    require_state(self, target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(resolved)}, static_cast<D3D12_CLEAR_FLAGS>(clear), depth,
+                                static_cast<UINT8>(stencil & 0xFF), rect_count, rect_count ? rects : nullptr);
+    if (known && before != D3D12_RESOURCE_STATE_DEPTH_WRITE) require_state(self, target, before);  // a read-only bind stays valid
+    InterlockedIncrement(&depth_clears[0]);
+}
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
@@ -5297,6 +5336,8 @@ void build_tables()
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
         list_typed[23] = reinterpret_cast<ListTyped>(&list_blend_factor);
         if (x2w_pipeline_state::switches_from_env().depth) list_typed[24] = reinterpret_cast<ListTyped>(&list_stencil_ref);  // LOCAL (renderstate)
+        if (x2w_pipeline_state::switches_from_env().depth_clear)  // LOCAL (renderstate): not through noop_slot (float argument)
+            tables[list_kind][51] = reinterpret_cast<void*>(&list_clear_depth);
         list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
