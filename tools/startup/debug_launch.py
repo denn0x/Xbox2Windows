@@ -669,12 +669,67 @@ def main():
                 watch_values[rva] = blob
                 log(f"{time.time() - start:7.3f} watch +{rva:#x} = {blob.hex(' ')}")
 
+    # Host safety (runtime_work/NOTES.md): the job memory limit counts private commit only, so the
+    # title's page slabs (pagefile-backed sections) and driver allocations are not limited by it.
+    # Every second the system commit headroom is read; below X2W_HEADROOM_STOP_MIB (default 1536)
+    # the run ends as at a timeout. commit.txt gets a sample every 2 s: seconds, system committed,
+    # commit limit, the title's private commit, this debugger's private commit (MiB).
+    class PERF_INFO(ctypes.Structure):
+        _fields_ = [("cb", wt.DWORD)] + [(n, ctypes.c_size_t) for n in (
+            "CommitTotal", "CommitLimit", "CommitPeak", "PhysicalTotal", "PhysicalAvailable", "SystemCache",
+            "KernelTotal", "KernelPaged", "KernelNonpaged", "PageSize")] + [(n, wt.DWORD) for n in (
+            "HandleCount", "ProcessCount", "ThreadCount")]
+
+    class PROC_MEM(ctypes.Structure):
+        _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD)] + [(n, ctypes.c_size_t) for n in (
+            "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+            "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+    psapi = ctypes.WinDLL("psapi")
+    psapi.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD]
+    k32.GetCurrentProcess.restype = wt.HANDLE
+    headroom_stop_mib = int(os.environ.get("X2W_HEADROOM_STOP_MIB") or "1536")
+    headroom_stop = None
+    commit_log = open(os.path.join(logdir, "commit.txt"), "w", encoding="utf-8")
+    commit_log.write("# seconds system_committed_MiB commit_limit_MiB title_private_MiB debugger_private_MiB\n")
+    open_logs.append(commit_log)
+    commit_next = [0.0, 0.0]  # next check, next commit.txt line
+
+    def private_mib(handle):
+        counters = PROC_MEM()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return -1
+        return counters.PagefileUsage >> 20
+
+    def commit_check():
+        """Samples the commit; returns (committed, limit) MiB when the headroom is below the stop."""
+        now = time.time()
+        if now < commit_next[0]:
+            return None
+        commit_next[0] = now + 1.0
+        perf = PERF_INFO()
+        perf.cb = ctypes.sizeof(perf)
+        if not psapi.GetPerformanceInfo(ctypes.byref(perf), perf.cb):
+            return None
+        committed, limit = (perf.CommitTotal * perf.PageSize) >> 20, (perf.CommitLimit * perf.PageSize) >> 20
+        if now >= commit_next[1]:
+            commit_next[1] = now + 2.0
+            commit_log.write(f"{now - start:7.1f} {committed} {limit} {private_mib(wt.HANDLE(pi.hProcess))} "
+                             f"{private_mib(k32.GetCurrentProcess())}\n")
+        return (committed, limit) if limit - committed < headroom_stop_mib else None
+
     interrupted = False
     asserts_total = 0
     exception_repeats = {}  # (code, address) -> events not logged because of --log-repeats
     try:
         while time.time() - start < timeout:
             flush_logs()
+            low = commit_check()
+            if low:
+                headroom_stop = low
+                log(f"{time.time() - start:7.3f} host commit headroom {low[1] - low[0]} MiB < {headroom_stop_mib} MiB "
+                    f"(committed {low[0]} / limit {low[1]} MiB): ending the run (X2W_HEADROOM_STOP_MIB)")
+                break
             if dump_at and time.time() - start >= dump_at[0]:
                 dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
             if watches and time.time() >= watch_next:
@@ -917,7 +972,11 @@ def main():
     elif exit_code is not None:
         print(f"process exited with {exit_code:#010x} after {elapsed:.2f} s")
     else:
-        print(f"{'interrupted' if interrupted else 'timeout'} after {elapsed:.2f} s")
+        if headroom_stop:
+            print(f"stopped: host commit headroom {headroom_stop[1] - headroom_stop[0]} MiB below {headroom_stop_mib} MiB "
+                  f"(committed {headroom_stop[0]} / limit {headroom_stop[1]} MiB) after {elapsed:.2f} s")
+            fast_exit = True
+        print(f"{'interrupted' if interrupted else 'headroom stop' if headroom_stop else 'timeout'} after {elapsed:.2f} s")
         # --fast-exit: each thread's rip only (no stack walk); the full walk otherwise.
         dumped = timed("threads.txt", dump_threads, os.path.join(logdir, "threads.txt"), not fast_exit)
         for item in filter(None, os.environ.get("X2W_DUMP", "").split(",")):

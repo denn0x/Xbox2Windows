@@ -16,3 +16,5 @@ EXPORTS
     x2w_xmem_write_physical @14
     x2w_xmem_page_stats @15
     x2w_xmem_gpu_location @16
+    x2w_xmem_memory_stats @17
+    x2w_xmem_reserved_ranges @18

@@ -4,6 +4,7 @@
 
 #include "era_physical.h"
 #include "xmem_low.h"
+#include "xmem_census.h"
 
 #include <cstring>
 #include "startup_stubs/local_log.h"
@@ -63,6 +64,27 @@ struct PhysicalMemory {
 PhysicalMemory memory;
 constexpr SIZE_T page_bytes = era_physical::page_bytes;
 
+// LOCAL accounting (runtime_work/NOTES.md): what the memory stand-in commits on the title's behalf,
+// by path. The slabs are pagefile-backed sections: their commit is charged to the system at
+// creation, not to this process, so neither the process commit counter nor a job memory limit sees
+// them. Counters only grow except where a free is visible here.
+volatile LONG64 startup_block_bytes = 0, startup_block_calls = 0;   // commit_startup_block
+volatile LONG64 permissive_commit_bytes = 0, permissive_commit_calls = 0;  // local_virtual_alloc commits
+volatile LONG slab_refusals = 0;
+
+// X2W_XMEM_SLAB_BUDGET_MIB=<n>: no new slab once the slabs would pass n MiB; the page mapping or
+// page write that needed it fails (ERROR_COMMITMENT_LIMIT), as on a host without memory, but
+// inside the title instead of exhausting the host. 0 or unset: no budget.
+ULONG64 slab_budget_bytes() noexcept
+{
+    static const ULONG64 value = [] {
+        char text[24]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_XMEM_SLAB_BUDGET_MIB", text, sizeof(text));
+        return n && n < sizeof(text) ? std::strtoull(text, nullptr, 10) << 20 : 0ull;
+    }();
+    return value;
+}
+
 BOOL physical_result(era_physical::Status status) noexcept
 {
     switch (status) {
@@ -98,6 +120,14 @@ HANDLE section_for(ULONG_PTR page)
         return section;
     }
     if (memory.slabs.empty() || memory.slab_used == slab_bytes) {
+        const ULONG64 budget = slab_budget_bytes();
+        if (budget && (memory.slabs.size() + 1) * slab_bytes > budget) {
+            if (InterlockedIncrement(&slab_refusals) <= 4)
+                x2w_local::logf("x2w-xmem slab budget reached (X2W_XMEM_SLAB_BUDGET_MIB=%llu, %llu slabs of 256 MiB): page refused",
+                                static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(memory.slabs.size()));
+            SetLastError(ERROR_COMMITMENT_LIMIT);
+            return nullptr;
+        }
         const HANDLE slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
                                                static_cast<DWORD>(slab_bytes >> 32), static_cast<DWORD>(slab_bytes), nullptr);
         if (!slab) return nullptr;
@@ -530,6 +560,7 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
         if (!address) {
             result = x2w_low::alloc(bytes, MEM_COMMIT | MEM_RESERVE, protect);
             how = "commit";
+            if (result) InterlockedAdd64(&permissive_commit_bytes, static_cast<LONG64>(bytes)), InterlockedIncrement64(&permissive_commit_calls);
         } else {
             result = VirtualAlloc(address, bytes, MEM_COMMIT, protect);
             if (!result) {
@@ -538,6 +569,7 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
                                        MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0);
             }
             how = "commit at address";
+            if (result) InterlockedAdd64(&permissive_commit_bytes, static_cast<LONG64>(bytes)), InterlockedIncrement64(&permissive_commit_calls);
         }
     } else {
         result = address ? VirtualAlloc2(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
@@ -654,6 +686,7 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages);
 
 extern "C" BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR count, PULONG_PTR pages)
 {
+    x2w_census::start();
     static_assert(sizeof(ULONG_PTR) == sizeof(std::uint64_t));
     if (local_permissive()) {
         const ULONG_PTR requested = count ? *count : 0;
@@ -719,6 +752,39 @@ extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
     const std::lock_guard guard(memory.mutex);
     *live_sections = static_cast<ULONGLONG>(memory.backings.size());
     return TRUE;
+}
+
+// LOCAL accounting exports (xmem_census.h).
+extern "C" BOOL WINAPI x2w_xmem_memory_stats(X2wXmemStats* stats)
+{
+    if (!stats) return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    stats->slabs = memory.slabs.size();
+    stats->slab_bytes = memory.slabs.size() * (4096 * ULONG64{page_bytes});
+    stats->live_pages = memory.backings.size();
+    stats->free_slots = memory.free_slots.size();
+    stats->slab_budget_bytes = slab_budget_bytes();
+    stats->slab_refusals = static_cast<ULONGLONG>(slab_refusals);
+    stats->startup_block_bytes = static_cast<ULONGLONG>(startup_block_bytes);
+    stats->startup_block_calls = static_cast<ULONGLONG>(startup_block_calls);
+    stats->permissive_commit_bytes = static_cast<ULONGLONG>(permissive_commit_bytes);
+    stats->permissive_commit_calls = static_cast<ULONGLONG>(permissive_commit_calls);
+    stats->reservations = memory.reservations.size();
+    return TRUE;
+}
+
+extern "C" SIZE_T WINAPI x2w_xmem_reserved_ranges(ULONG_PTR* pairs, SIZE_T capacity)
+{
+    const std::lock_guard guard(memory.mutex);
+    SIZE_T i = 0;
+    for (const auto& [base, bytes] : memory.reservations) {
+        if (pairs && i < capacity) {
+            pairs[2 * i] = base;
+            pairs[2 * i + 1] = bytes;
+        }
+        ++i;
+    }
+    return i;
 }
 
 // Experimental export: writes bytes into physical pages named by the title's
@@ -804,8 +870,8 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
 // MEM_64K_PAGES type (MEM_LARGE_PAGES | MEM_PHYSICAL) keeps the 64 KiB allocation
 // granularity. Large pages themselves and the console protection bits above PAGE_READWRITE
 // are not reproduced. A host failure returns NULL with the host error.
-static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG attributes,
-                                  DWORD protection) noexcept
+static void* commit_startup_block_raw(SIZE_T bytes, DWORD allocation_type, ULONGLONG attributes,
+                                      DWORD protection) noexcept
 {
     constexpr SIZE_T granularity = SIZE_T{64} << 10;
     const bool large_pages = allocation_type == 0x20003000;
@@ -831,11 +897,33 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
                          &parameter, 1);
 }
 
+// LOCAL accounting: the startup blocks are counted and their first calls logged (the path was
+// silent before); the ranges go to the census (xmem_census.cpp).
+static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG attributes,
+                                  DWORD protection) noexcept
+{
+    void* block = commit_startup_block_raw(bytes, allocation_type, attributes, protection);
+    const DWORD error = GetLastError();
+    if (block) {
+        InterlockedAdd64(&startup_block_bytes, static_cast<LONG64>(bytes));
+        x2w_census::note_block(block, bytes);
+    }
+    const LONG64 n = InterlockedIncrement64(&startup_block_calls);
+    if (n <= 64 || !block)
+        x2w_local::logf("x2w-xmem startup block #%lld size=0x%llx type=0x%lx attr=0x%llx prot=0x%lx -> %p (err %lu), %lld MiB so far",
+                        static_cast<long long>(n), static_cast<unsigned long long>(bytes), static_cast<unsigned long>(allocation_type),
+                        attributes, static_cast<unsigned long>(protection), block, block ? 0ul : static_cast<unsigned long>(error),
+                        static_cast<long long>(startup_block_bytes >> 20));
+    SetLastError(error);
+    return block;
+}
+
 // The startup commit profile above, and the reserve-only desktop profile from the source-built
 // #888 comparison.
 extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_type,
                                         ULONGLONG attributes, DWORD protection)
 {
+    x2w_census::start();
     constexpr DWORD startup_reserve = 0x20402000;
     constexpr SIZE_T gib = SIZE_T{1} << 30;
     if (!address && (allocation_type == 0x20003000 || allocation_type == (startup_reserve | MEM_COMMIT)))
