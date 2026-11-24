@@ -799,9 +799,13 @@ static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    if (!large_pages) return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!large_pages) return x2w_low::alloc(bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     MEM_ADDRESS_REQUIREMENTS requirements{};
     requirements.Alignment = SIZE_T{2} << 20;
+    if (x2w_low::on()) {  // LOCAL: X2W_XMEM_LOW40 (xmem_low.h)
+        requirements.LowestStartingAddress = reinterpret_cast<void*>(ULONG_PTR{1} << 32);
+        requirements.HighestEndingAddress = reinterpret_cast<void*>((ULONG_PTR{1} << 40) - 1);
+    }
     MEM_EXTENDED_PARAMETER parameter{};
     parameter.Type = MemExtendedParameterAddressRequirements;
     parameter.Pointer = &requirements;
