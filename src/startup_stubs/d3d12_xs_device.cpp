@@ -143,10 +143,13 @@ std::vector<DescriptorRange> descriptor_ranges;
 
 // LOCAL (video): X2W_NOOP_CENSUS=1 counts the calls of every unimplemented (no-op) slot per object
 // kind, and logs the first calls whose register or stack arguments (or the first 64 bytes they point
-// to, for the first 64 calls of each slot) hold a descriptor handle inside a title heap. A console
-// "create view" or "write descriptors" entry point would show up here with handles into the main heap.
-// One census line per 4096 no-op calls (at most 60).
+// to, for the first 64 calls of each slot) hold a descriptor handle inside a title or desktop heap
+// range. A console "create view" or "write descriptors" entry point would show up here with handles
+// into the main heap. At most 6 hits per slot and 240 in all; stack words are marked "weak" (stale
+// caller stack often holds old pointers). Totals at 1024, 2048, 4096, ... no-op calls, one line per kind.
+// The same switch logs views that view_slot drops because their destination does not translate.
 LONG64 noop_census[16][512];
+LONG noop_census_hits[16][512];
 LONG64 noop_census_total;
 bool noop_census_on()
 {
@@ -166,20 +169,23 @@ bool noop_census_enabled()
     }();
     return on;
 }
-bool noop_census_heap_index(std::uint64_t value, std::uint64_t* index, bool* desktop)
+struct CensusHeap {
+    std::uint64_t base, index, count;
+    bool desktop;
+};
+bool noop_census_heap_index(std::uint64_t value, CensusHeap* out)
 {
+    if (value < 0x10000) return false;
     bool found = false;
     AcquireSRWLockShared(&descriptor_lock);
     for (const auto& r : descriptor_ranges) {
-        if (value >= r.title && value < r.title + r.bytes && r.title_stride) {
-            *index = (value - r.title) / r.title_stride;
-            *desktop = false;
+        if (r.title >= 0x10000 && r.title_stride && value >= r.title && value < r.title + r.bytes) {
+            *out = {r.title, (value - r.title) / r.title_stride, r.bytes / r.title_stride, false};
             found = true;
             break;
         }
-        if (r.desktop && r.desktop_stride && value >= r.desktop && value < r.desktop + r.desktop_descriptors * r.desktop_stride) {
-            *index = (value - r.desktop) / r.desktop_stride;
-            *desktop = true;
+        if (r.desktop >= 0x10000 && r.desktop_stride && value >= r.desktop && value < r.desktop + r.desktop_descriptors * r.desktop_stride) {
+            *out = {r.desktop, (value - r.desktop) / r.desktop_stride, r.desktop_descriptors, true};
             found = true;
             break;
         }
@@ -187,36 +193,53 @@ bool noop_census_heap_index(std::uint64_t value, std::uint64_t* index, bool* des
     ReleaseSRWLockShared(&descriptor_lock);
     return found;
 }
+bool noop_census_hit(int kind, int slot)
+{
+    static LONG hits;
+    return hits < 240 && InterlockedIncrement(&noop_census_hits[kind & 15][slot & 511]) <= 6 && first_calls(hits, 240);
+}
 void noop_census_note(int kind, int slot, const std::uint64_t* args, std::uint64_t ret)
 {
     const LONG64 calls = InterlockedIncrement64(&noop_census[kind & 15][slot & 511]);
     const LONG64 total = InterlockedIncrement64(&noop_census_total);
     static const char* const names[8] = {"rcx", "rdx", "r8", "r9", "s0", "s1", "s2", "s3"};
-    static LONG hits;
-    for (int i = 1; i < 8 && hits < 64; ++i) {
-        std::uint64_t index = 0;
-        bool desktop = false;
-        if (noop_census_heap_index(args[i], &index, &desktop) && first_calls(hits, 64))
-            log("x2w-noop-census %s::slot%d call %lld: %s=0x%llx is %s descriptor index 0x%llx; ret=+0x%llx", kind_names[kind], slot, calls,
-                names[i], args[i], desktop ? "a DESKTOP" : "a title", index, ret);
+    for (int i = 1; i < 8 && noop_census_hits[kind & 15][slot & 511] < 6; ++i) {
+        CensusHeap h{};
+        const char* weak = i >= 4 ? " (stack word: weak)" : "";
+        if (noop_census_heap_index(args[i], &h) && noop_census_hit(kind, slot))
+            log("x2w-noop-census %s::slot%d call %lld: %s=0x%llx is %s index 0x%llx of the heap at 0x%llx (%llu descriptors)%s; ret=+0x%llx",
+                kind_names[kind], slot, calls, names[i], args[i], h.desktop ? "DESKTOP" : "title", h.index, h.base, h.count, weak, ret);
         if (calls > 64 || args[i] < 0x10000) continue;
         std::uint64_t words[8]{};
         SIZE_T got = 0;
         if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(args[i]), words, sizeof(words), &got) || got != sizeof(words)) continue;
-        for (int w = 0; w < 8 && hits < 64; ++w)
-            if (noop_census_heap_index(words[w], &index, &desktop) && first_calls(hits, 64))
-                log("x2w-noop-census %s::slot%d call %lld: [%s+0x%x]=0x%llx is %s descriptor index 0x%llx; ret=+0x%llx", kind_names[kind], slot, calls,
-                    names[i], w * 8, words[w], desktop ? "a DESKTOP" : "a title", index, ret);
+        for (int w = 0; w < 8; ++w)
+            if (noop_census_heap_index(words[w], &h) && noop_census_hit(kind, slot))
+                log("x2w-noop-census %s::slot%d call %lld: [%s+0x%x]=0x%llx is %s index 0x%llx of the heap at 0x%llx (%llu descriptors)%s; ret=+0x%llx",
+                    kind_names[kind], slot, calls, names[i], w * 8, words[w], h.desktop ? "DESKTOP" : "title", h.index, h.base, h.count, weak, ret);
     }
-    static LONG reports;
-    if ((total & 4095) == 0 && first_calls(reports, 60)) {
-        char text[1024];
-        int at = std::snprintf(text, sizeof(text), "x2w-noop-census after %lld no-op calls:", total);
-        for (int k = 0; k < kind_count && at < 960; ++k)
-            for (int s = 0; s < 512 && at < 960; ++s)
-                if (noop_census[k][s]) at += std::snprintf(text + at, sizeof(text) - at, " %s::%d=%lld", kind_names[k], s, noop_census[k][s]);
-        log("%s", text);
+    if (total >= 1024 && (total & (total - 1)) == 0) {
+        for (int k = 0; k < kind_count; ++k) {
+            char text[1536];
+            int at = std::snprintf(text, sizeof(text), "x2w-noop-census after %lld no-op calls, %s:", total, kind_names[k]);
+            bool any = false;
+            for (int s = 0; s < 512 && at < static_cast<int>(sizeof(text)) - 32; ++s)
+                if (noop_census[k][s]) {
+                    at += std::snprintf(text + at, sizeof(text) - at, " %d=%lld", s, noop_census[k][s]);
+                    any = true;
+                }
+            if (any) log("%s", text);
+        }
     }
+}
+// Views view_slot drops because the destination is in no known heap (desktop_cpu_handle gives 0).
+void noop_census_dropped_view(int slot, std::uint64_t title_dest)
+{
+    static LONG64 dropped;
+    static LONG logged;
+    const LONG64 n = InterlockedIncrement64(&dropped);
+    if (first_calls(logged, 32) || (n & (n - 1)) == 0)
+        log("x2w-noop-census view slot %d dropped (destination 0x%llx is in no known heap); %lld dropped so far", slot, title_dest, n);
 }
 
 // Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: the
@@ -3540,7 +3563,10 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     u64 args[4] = {unwrap(a), unwrap(b), unwrap(c), unwrap(d)};
     const u64 title_dest = args[D];
     args[D] = desktop_cpu_handle(args[D]);
-    if (!args[D]) return 0;
+    if (!args[D]) {
+        if (noop_census_enabled()) noop_census_dropped_view(N, title_dest);
+        return 0;
+    }
     {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
@@ -4935,6 +4961,13 @@ void build_tables()
     tables[descriptor_heap_kind][9] = reinterpret_cast<void*>(&descriptor_heap_cpu_start);
     tables[descriptor_heap_kind][10] = reinterpret_cast<void*>(&descriptor_heap_gpu_start);
     if (device_noop()) fill_all_remaining_noops(std::make_index_sequence<kind_count>{});
+    // Runs 77-89 log Device::slot70 (memory SRV) and list slots such as 12/44/52 as "x2w-noop" first
+    // calls although this file installs handlers for them. Say what the tables hold after the fill.
+    if (noop_census_enabled())
+        log("x2w-noop-census tables: device slot 70 = %s, list slot 12 typed = %s, list slot 44 typed = %s, render mode %d, device noop %d, list noop %d",
+            tables[device_kind][70] == reinterpret_cast<void*>(&device_memory_srv) ? "memory SRV handler"
+                : tables[device_kind][70] == reinterpret_cast<void*>(&device_noop_slot<70>) ? "NO-OP" : "other",
+            list_typed[12] ? "yes" : "NO", list_typed[44] ? "yes" : "NO", render_mode() ? 1 : 0, device_noop() ? 1 : 0, list_noop() ? 1 : 0);
 }
 
 SRWLOCK written_lock = SRWLOCK_INIT;

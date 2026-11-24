@@ -209,6 +209,15 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                                  const MemoryShaderResourceView* input, u64 destination)
 {
     static LONG refused;
+    if (noop_census_enabled()) {  // LOCAL (video): is the handler reached at all, and where does it write?
+        static LONG64 calls;
+        const LONG64 n = InterlockedIncrement64(&calls);
+        CensusHeap h{};
+        const bool in_heap = noop_census_heap_index(destination, &h);
+        if (n <= 8 || (n & (n - 1)) == 0)
+            log("x2w-noop-census memory SRV call %lld: destination 0x%llx = %s index 0x%llx of the heap at 0x%llx", n, destination,
+                in_heap ? (h.desktop ? "DESKTOP" : "title") : "no heap", h.index, h.base);
+    }
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         if (first_calls(refused, 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
         return;
