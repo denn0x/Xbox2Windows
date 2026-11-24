@@ -199,10 +199,12 @@ inline uint32_t wrap(int32_t v, uint32_t bits) { return static_cast<uint32_t>(v)
 // UF16 half 0x2000 (2^-7) as a mode-13 base; the same bits read as SF16 give 2.0.
 inline constexpr uint16_t DEFAULT_FILL_BASE = 16913;
 
-// fill_base: mode-13 base value for streams without known endpoints (0 = zero block).
+// fill_base: mode-13 base value for the constant block (0 = zero block). copy_known = false sends every
+// unknown-endpoint block to the constant block instead of copying a known block's endpoints.
 // Returns false only on a malformed symbol stream (a mode code outside 0..13).
 inline bool decode_blocks(const std::vector<uint16_t>& symbols, size_t nb, uint8_t* out, size_t cap,
-                          Stats* stats, const Dictionary* dict = nullptr, uint16_t fill_base = DEFAULT_FILL_BASE) {
+                          Stats* stats, const Dictionary* dict = nullptr, uint16_t fill_base = DEFAULT_FILL_BASE,
+                          bool copy_known = true) {
     if (cap < nb * 16) return false;
     const size_t t = nb * 2;
     auto sym = [&](int lane, size_t i, int h) -> uint16_t { return symbols[lane * t + 2 * i + h]; };
@@ -304,7 +306,7 @@ inline bool decode_blocks(const std::vector<uint16_t>& symbols, size_t nb, uint8
         } else if (kep[i]) {
             flat(f);
             ++local.endpoints_only;
-        } else if (nearest[i] >= 0) {
+        } else if (copy_known && nearest[i] >= 0) {
             f = fl[static_cast<size_t>(nearest[i])];
             flat(f);
             ++local.copied;
@@ -323,13 +325,13 @@ inline bool decode_blocks(const std::vector<uint16_t>& symbols, size_t nb, uint8
 // The whole BCPack BC6H stream: lanes, then rebuild. False when the lanes do not decode.
 inline bool decode_stream(const unsigned char* input, size_t input_size, unsigned char* output, size_t output_size,
                           size_t* produced, Stats* stats, const Dictionary* dict = nullptr,
-                          uint16_t fill_base = DEFAULT_FILL_BASE) {
+                          uint16_t fill_base = DEFAULT_FILL_BASE, bool copy_known = true) {
     if (!input || !output || !produced || input_size == 0 || output_size == 0 || output_size % 16) return false;
     const size_t nb = output_size / 16;
     static constexpr uint8_t ab[16] = { 3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4 };
     std::vector<uint16_t> symbols;
     if (!decode_lanes(input, input_size, ab, 16, nb * 2, symbols)) return false;
-    if (!decode_blocks(symbols, nb, output, output_size, stats, dict, fill_base)) return false;
+    if (!decode_blocks(symbols, nb, output, output_size, stats, dict, fill_base, copy_known)) return false;
     *produced = output_size;
     return true;
 }

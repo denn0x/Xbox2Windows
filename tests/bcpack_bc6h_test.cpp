@@ -103,6 +103,15 @@ int main() {
               v.name[0] == 'm' ? "mixed fallback stream matches the model (bytes and counts)"
                                : "all-rooted stream gives the model's constant blocks");
     }
+    // copy_known = false: the copied blocks of the mixed stream become constant blocks.
+    {
+        std::vector<uint16_t> s(BC6H_MIX_SYMBOLS, BC6H_MIX_SYMBOLS + 16 * 2 * 40);
+        std::vector<uint8_t> o(16 * 40);
+        bc6h::Stats ns;
+        const bool d = bc6h::decode_blocks(s, 40, o.data(), o.size(), &ns, nullptr, bc6h::DEFAULT_FILL_BASE, false);
+        check(d && ns.copied == 0 && ns.constant == BC6H_MIX_COUNTS[2] && ns.exact == BC6H_MIX_COUNTS[0],
+              "copy_known = false turns copied blocks into constant blocks");
+    }
     // The constant block: mode 13 (5-bit code 0x0f), base 16913 in all channels, x = 0, indices 0.
     {
         const uint8_t* c = BC6H_ROOTED_OUT;

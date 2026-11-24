@@ -370,15 +370,18 @@ LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
 
 // LOCAL: BC6H (BCPack format 6) is zero-filled unless X2W_BC6H_FALLBACK=1. With it, streams go through
 // bcpack_bc6h.h: blocks free of the format's dictionary (unknown) are rebuilt, the rest get the
-// endpoints of a near block or a constant (approximate texels, never exact). X2W_BC6H_FILL_BASE (decimal,
+// endpoints of the nearest known block or a constant (approximate texels, never exact); =2 uses the
+// constant for every unknown-endpoint block (no copying). X2W_BC6H_FILL_BASE (decimal,
 // mode-13 base, default 16913 = UF16 2^-7) sets the constant; 0 gives zero blocks.
-bool bc6h_fallback_enabled() {
-    static const bool on = [] {
+char bc6h_fallback_mode() {
+    static const char mode = [] {
         char value[8] = {};
-        return GetEnvironmentVariableA("X2W_BC6H_FALLBACK", value, sizeof(value)) && value[0] == '1';
+        return GetEnvironmentVariableA("X2W_BC6H_FALLBACK", value, sizeof(value)) ? value[0] : '0';
     }();
-    return on;
+    return mode;
 }
+
+bool bc6h_fallback_enabled() { return bc6h_fallback_mode() == '1' || bc6h_fallback_mode() == '2'; }
 
 volatile LONG64 bc6h_blocks, bc6h_exact, bc6h_endpoints_only, bc6h_copied, bc6h_constant;
 LONG bc6h_streams;
@@ -391,7 +394,8 @@ bool decode_bc6h_fallback(const unsigned char* input, std::size_t size, unsigned
         return static_cast<uint16_t>(std::strtoul(value, nullptr, 10));
     }();
     x2w_bcpack::bc6h::Stats st;
-    if (!x2w_bcpack::bc6h::decode_stream(input, size, out, out_size, produced, &st, nullptr, fill)) return false;
+    if (!x2w_bcpack::bc6h::decode_stream(input, size, out, out_size, produced, &st, nullptr, fill,
+                                             bc6h_fallback_mode() != '2')) return false;
     InterlockedAdd64(&bc6h_blocks, static_cast<LONG64>(st.blocks));
     InterlockedAdd64(&bc6h_exact, static_cast<LONG64>(st.exact));
     InterlockedAdd64(&bc6h_endpoints_only, static_cast<LONG64>(st.endpoints_only));
