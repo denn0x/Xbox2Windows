@@ -5,8 +5,8 @@ G.Pipeline.__init__, which MeshPipeline does not call, so a mesh pair's pixel st
 Both pipelines now call the shared Pipeline.spi_inputs / spi_reads.
 
 Synthetic pixel stage `exp mrt0 vA, vB, vC, vD done vm` (entry reads only); the mesh stage is a stub (this checks
-the pixel stage). ENA 0x8c02 is the most common layout of the title's mesh pixel stages that read positions
-(meshps/spiscan_1500.txt): persp_center v0-v1, pos_z_float v2, pos_w_float v3, pos_fixed_pt v4.
+the pixel stage). ENA 0x8c02 is a layout that enables all three position forms: persp_center v0-v1,
+pos_z_float v2, pos_w_float v3, pos_fixed_pt v4.
 POS_W_FLOAT is SV_Position.w: Mesa ac_nir_lower_intrinsics_to_args.c loads frag_coord_w_rcp from it,
 nir_builder.c sets gl_FragCoord.w = frcp(frag_coord_w_rcp), and vkd3d-shader spirv.c (frag_coord_fixup) gives
 D3D SV_Position.w = 1 / gl_FragCoord.w.

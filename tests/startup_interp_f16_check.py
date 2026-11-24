@@ -122,6 +122,9 @@ def controls():
             self.exports, self.exported_prim = {'pos': ['0'] * 4, 'param0': ['0'] * 4}, True
             self.broadcasts, self.lds_used, self.wave_any, self.used_v = 0, False, [], set()
 
+        def __getattr__(self, name):  # other per-wave tables hlsl_ms reads (scc_any, ...): empty
+            return []
+
         def body(self):
             return ['    ' + line]
 
