@@ -234,7 +234,7 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
-LONG zero_tokens_at_enqueue, zero_tokens_at_run, requests_stream_pieces;
+LONG zero_tokens_at_enqueue, zero_tokens_at_run, requests_stream_pieces, tokens_replaced_after_enqueue;
 
 // Inflated multi-page streams, newest first (see execute_request).
 struct InflatedStream { u64 source, base; unsigned compressed; std::shared_ptr<const std::vector<unsigned char>> data; };
@@ -586,9 +586,15 @@ void run_entry(Object* self, Entry& entry)
         const u64 options = *reinterpret_cast<const u64*>(entry.bytes);
         if ((options & (1ull << 21)) && !entry.tokens.empty()) {
             const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(entry.bytes + 0x08);
+            // The title's page array as it is now (as at execution on the console): entries can be
+            // filled, and also replaced, between enqueue and run. X2W_DSTORAGE_ENQUEUE_TOKENS=1 keeps the
+            // old behaviour (only zero entries are re-read). Non-zero entries that changed are counted.
+            static const bool enqueue_tokens = x2w_local::env_on("X2W_DSTORAGE_ENQUEUE_TOKENS");
             for (std::size_t i = 0; i < entry.tokens.size(); ++i)
-                if (!entry.tokens[i] && title && x2w_local::readable(title + i, sizeof(ULONG_PTR))) {
-                    entry.tokens[i] = title[i];
+                if ((!entry.tokens[i] || !enqueue_tokens) && title && x2w_local::readable(title + i, sizeof(ULONG_PTR))) {
+                    const ULONG_PTR now = title[i];
+                    if (entry.tokens[i] && now != entry.tokens[i]) InterlockedIncrement(&tokens_replaced_after_enqueue);
+                    entry.tokens[i] = now;
                     if (!entry.tokens[i]) InterlockedIncrement(&zero_tokens_at_run), ++zero_at_run;
                 }
         }
@@ -812,8 +818,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
             const LONG total2 = total + requests_bcpack_blank;
             if (total2 != last)
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld (stream pieces %ld, starts found on disk %ld, shifted streams %ld, shifts other than 14 %ld) failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld", second, requests_done, requests_compressed, requests_stream_pieces, requests_pieces_found_on_disk, requests_shifted_streams, requests_shift_unconfirmed, requests_failed, requests_bcpack_blank,
-                    zero_tokens_at_enqueue, zero_tokens_at_run);
+                    "still 0 at run=%ld, replaced after enqueue=%ld", second, requests_done, requests_compressed, requests_stream_pieces, requests_pieces_found_on_disk, requests_shifted_streams, requests_shift_unconfirmed, requests_failed, requests_bcpack_blank,
+                    zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue);
             last = total2;
         }
     }, nullptr, 0, nullptr);

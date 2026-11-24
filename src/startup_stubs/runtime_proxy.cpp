@@ -373,6 +373,19 @@ unsigned env_number(const char* name, unsigned fallback, int base)
 bool area_call(unsigned long provider, int slot, u64* args, u64* result)
 {
     const auto out = [](u64 pointer, std::size_t bytes) { return pointer && x2w_local::writable(reinterpret_cast<void*>(pointer), bytes); };
+    if (provider == 0x8836fe87 && slot == 3) {
+        // IsFeatureAvailable(feature) -> bool. X2W_FEATURES_OFF="20,..." (decimal) reports those features
+        // as unavailable (20 = the game event / telemetry API, which an offline run has no use for).
+        char list[128];
+        const DWORD n = GetEnvironmentVariableA("X2W_FEATURES_OFF", list, sizeof list);
+        if (!n || n >= sizeof list) return false;
+        for (char* token = std::strtok(list, ","); token; token = std::strtok(nullptr, ","))
+            if (std::strtoull(token, nullptr, 10) == args[0]) {
+                *result = 0;
+                return true;
+            }
+        return false;
+    }
     if (provider == 0x973a344e && slot == 3) {  // title id (a 32-bit value from the title's manifest: X2W_TITLE_ID, hex)
         const unsigned id = env_number("X2W_TITLE_ID", 0, 16);
         if (!id) return false;
