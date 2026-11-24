@@ -22,12 +22,12 @@ std::uint32_t* private_pages()
 }
 
 // A one-entry shader-visible view heap whose descriptor memory is `backing` (0: the stand-in's own).
-void* view_heap(void* guest, void* backing)
+void* view_heap(void* guest, void* backing, UINT entries = 1)
 {
     struct Extended {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word address, bytes;
-    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, ptr(backing), backing ? 65536u : 0u};
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, entries, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, ptr(backing), backing ? 65536u : 0u};
     void* heap = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap))))) return nullptr;
     return heap;
@@ -83,6 +83,27 @@ int bind_heap_entry(void* guest, Word cpu)
     invoke(guest, 18, ptr(buffer), ptr(&srv), cpu);
     return 0;
 }
+
+// A 64 KiB placed buffer over `memory` (title memory of a resource for CopyBufferRegion).
+void* memory_buffer(void* guest, void* memory)
+{
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 65536;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return placed(guest, memory, desc);
+}
+void hardware_descriptor(Word cpu, Word base)
+{
+    // gfx10 buffer descriptor: base [47:0], stride 0, 256 records (bytes), word 3 a marker the shader checks.
+    const std::uint32_t words[8] = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32) & 0xffff, 256, 0x12345678u};
+    std::memcpy(reinterpret_cast<void*>(cpu), words, sizeof(words));
+}
+void* copy_dest;
+void* copy_source;
+Word copy_dest_offset, copy_source_offset;
+std::uint32_t* copy_memory;  // allocation of the copy destination
 }
 
 // X2W_TEST_DRAW_UAV=<mode>. aligned|misaligned|uavbase: entry 0 is a hardware buffer descriptor at title + 64
@@ -96,7 +117,8 @@ int draw_uav_stores(ID3D12Device* desktop, void* guest, void* list)
     // Heap draws need the console's 32-byte view slots (the title's own shader arithmetic).
     std::printf("view increment %u\n", desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
     std::fflush(stdout);
-    void* heap = view_heap(guest, heap_mode ? private_pages() : nullptr);
+    const bool copy_mode = std::wcsncmp(uav_mode, L"copy", 4) == 0;
+    void* heap = view_heap(guest, heap_mode ? private_pages() : nullptr, copy_mode ? 2 : 1);
     if (!heap) return 42;
     const Word cpu = invoke(heap, 9);
     if (!cpu) return 42;
@@ -104,13 +126,24 @@ int draw_uav_stores(ID3D12Device* desktop, void* guest, void* list)
         if (const int rc = bind_texture_entry(guest, cpu)) return rc;
     } else if (heap_mode) {
         if (const int rc = bind_heap_entry(guest, cpu)) return rc;
+    } else if (copy_mode) {
+        // copy-*: entry 0 (uav 0) = title + 64 of allocation A, entry 1 (srv 0) = title + 0x400 of A (copy-same) or
+        // of a second allocation B. Between the two draws the list copies A + 64 (128 bytes) to the srv range.
+        uav_memory = private_pages();
+        std::uint32_t* other = mode_is(L"copy-two") ? private_pages() : uav_memory;
+        if (!uav_memory || !other) return 45;
+        copy_memory = other;
+        copy_source = memory_buffer(guest, uav_memory);
+        copy_dest = other == uav_memory ? copy_source : memory_buffer(guest, other);
+        if (!copy_source || !copy_dest) return 47;
+        copy_source_offset = 64;
+        copy_dest_offset = 0x400;
+        hardware_descriptor(cpu, ptr(uav_memory) + 64);
+        hardware_descriptor(cpu + 32, ptr(other) + 0x400);
     } else {
         uav_memory = private_pages();
         if (!uav_memory) return 45;
-        const Word target = ptr(uav_memory) + (mode_is(L"aligned") ? 64 : 68);
-        // gfx10 buffer descriptor: base [47:0], stride 0, 256 records (bytes), word 3 a marker the shader checks.
-        const std::uint32_t words[8] = {static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(target >> 32) & 0xffff, 256, 0x12345678u};
-        std::memcpy(reinterpret_cast<void*>(cpu), words, sizeof(words));
+        hardware_descriptor(cpu, ptr(uav_memory) + (mode_is(L"aligned") ? 64 : 68));
     }
     invoke(list, 32, 1, ptr(&heap));
     invoke(list, 36, 0, invoke(heap, 10));
@@ -118,6 +151,9 @@ int draw_uav_stores(ID3D12Device* desktop, void* guest, void* list)
         const D3D12_RECT strip{x, 0, x + 1, 4};
         invoke(list, 22, 1, ptr(&strip));
         invoke(list, 12, 3, 1);
+        // CopyBufferRegion(dest, dest offset, source, source offset, bytes); copy-none: no copy (negative control)
+        if (!x && copy_dest && !mode_is(L"copy-none"))
+            invoke(list, 15, ptr(copy_dest), copy_dest_offset, ptr(copy_source), copy_source_offset, 128);
     }
     return 0;
 }
@@ -128,6 +164,11 @@ void report_uav_stores()
     if (!uav_memory) return;
     std::printf("uav memory:");
     for (int i = 0; i < 64; ++i) std::printf(" %u", uav_memory[i]);
+    if (copy_dest) {  // copy-*: the copied range as the CPU sees it (title + 0x400 of the destination allocation)
+        const auto* copied = copy_memory + 0x100;
+        std::printf("\ncopied:");
+        for (int i = 0; i < 32; ++i) std::printf(" %u", copied[i]);
+    }
     std::printf("\n");
     std::fflush(stdout);
 }

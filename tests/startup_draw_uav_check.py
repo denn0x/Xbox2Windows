@@ -10,6 +10,12 @@ one-column strips (columns 0 and 1).
 - tex / tex-noflag / tex-uint: `uav 0 tex2d table 0 0` on a UAV-capable RGBA8 texture (drawn), a texture
   without unordered access (skipped) and an R8G8B8A8_UINT view (skipped).
 - heap: `heap 1`; the pixel stage reads the view id from heapmem and the raw buffer of that view (dword 77).
+- copy-same / copy-two / copy-none / copy-cpu: CopyBufferRegion (list slot 15) between the two draws. uav 0 = title + 64
+  of allocation A (entry 0), srv 0 = title + 0x400 of A (copy-same) or of allocation B (copy-two) (entry 1). Draw 1
+  stores into A, the list copies A + 64 (128 bytes) to the srv range, draw 2 reads the copied values as its srv
+  (the constant-buffer path of translated draws: raw srvs). X2W_D3D12_COPY_BUFFER=gpu must order the copy after
+  draw 1 on the GPU and let draw 2 read it in place. Controls: copy-none (no copy) and copy-cpu (same list,
+  X2W_D3D12_COPY_BUFFER=1: the record-time copy runs before draw 1 has stored anything) must both read zeros.
 """
 import os
 from pathlib import Path
@@ -64,6 +70,9 @@ HEAP_HLSL = (
 )
 
 
+COPY_ENV = {"copy-same": "gpu", "copy-two": "gpu", "copy-none": "gpu", "copy-cpu": "1"}
+
+
 def run_mode(directory, consumer, backend, mode):
     cache = directory / mode / "cache"
     cache.mkdir(parents=True)
@@ -72,7 +81,9 @@ def run_mode(directory, consumer, backend, mode):
     ps.write_bytes(pixel(False))
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_D3D12_DEBUG="0", X2W_D3D12_DEVICE_NOOP="1", X2W_SHADER_CACHE=str(cache),
-               X2W_TEST_DRAW_UAV=mode, X2W_TRAP_LOG=str(directory / mode / "trap.log"))
+               X2W_TEST_DRAW_UAV="copy-same" if mode == "copy-cpu" else mode, X2W_TRAP_LOG=str(directory / mode / "trap.log"))
+    if mode in COPY_ENV:
+        env["X2W_D3D12_COPY_BUFFER"] = COPY_ENV[mode]
     args = [consumer, vs, ps, root]
     subprocess.run(args, env=env, check=True)
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
@@ -87,7 +98,7 @@ def run_mode(directory, consumer, backend, mode):
         lines, hlsl = ["heap 1"], HEAP_HLSL
     else:
         base = mode == "uavbase"
-        lines = ["uav 0 buf table 0 0", "srv 0 buf table 0 0", f"udsrc {count} uavword3 0", f"udsrc {count + 1} bufword3 0"]
+        lines = ["uav 0 buf table 0 0", "srv 0 buf table 0 32" if mode in COPY_ENV else "srv 0 buf table 0 0", f"udsrc {count} uavword3 0", f"udsrc {count + 1} bufword3 0"]
         if base:
             lines.append(f"udsrc {count + 2} uavbase 0")
         hlsl = buffer_hlsl(count, base)
@@ -104,6 +115,9 @@ def run_mode(directory, consumer, backend, mode):
         raise RuntimeError(f"{mode}: consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
     found = re.search(r"^uav memory:((?: \d+)+)$", result.stdout, re.M)
     memory = [int(v) for v in found.group(1).split()] if found else None
+    copied = re.search(r"^copied:((?: \d+)+)$", result.stdout, re.M)
+    if copied:
+        memory = (memory, [int(v) for v in copied.group(1).split()])
     return memory, output.read_bytes(), result.stderr + "\n" + result.stdout
 
 
@@ -115,7 +129,7 @@ def need(log, mode, *needles):
 
 def check(directory, consumer, backend):
     results = {}
-    for mode in ("aligned", "misaligned", "uavbase", "tex", "tex-noflag", "tex-uint", "heap"):
+    for mode in ("aligned", "misaligned", "uavbase", "tex", "tex-noflag", "tex-uint", "heap", "copy-same", "copy-two", "copy-none", "copy-cpu"):
         got = run_mode(directory, consumer, backend, mode)
         if got is None:
             print("no existing-heap support or no adapter: skip")
@@ -176,6 +190,34 @@ def check(directory, consumer, backend):
             raise AssertionError(f"heap: increment {increment} but drawn: {image[:16].hex()}")
         need(log, "heap", "heap draw skipped: descriptor increment is not 32")
         heap = f"heap draw NOT exercised (view increment {increment}; skipped as required)"
+    # copy-*: GPU order (copy after draw 1's stores, draw 2 reads the copy in place) against two controls.
+    stored = [0] * 64
+    for y in range(4):
+        stored[16 + y * 8] = 1000 + y * 8
+    copied_gpu = [0] * 32
+    for y in range(4):
+        copied_gpu[y * 8] = 1000 + y * 8
+    for mode in ("copy-same", "copy-two", "copy-none", "copy-cpu"):
+        (memory, copied), image, log = results[mode]
+        gpu = mode in ("copy-same", "copy-two")
+        expected = list(stored)
+        for y in range(4):
+            expected[16 + y * 8 + 1] = ((1000 + y * 8) if gpu else 0) + 1000 + y * 8 + 1
+        if memory != expected:
+            raise AssertionError(f"{mode}: memory {memory}\nexpected {expected}")
+        if copied != (copied_gpu if gpu else [0] * 32):
+            raise AssertionError(f"{mode}: copied range {copied}")
+        column1 = bytes((255 if gpu else 0, 255, 0, 255))
+        if image[:8] != bytes((0, 255, 0, 255)) + column1:
+            raise AssertionError(f"{mode}: pixels {image[:16].hex()}")
+        if gpu:
+            need(log, mode, "runs on the GPU in list order", "x2w-copy-gpu CopyBufferRegion", ": on the GPU, window")
+            if "record-time fallback" in log:
+                raise AssertionError(f"{mode}: copy fell back\n{log[-3000:]}")
+        elif mode == "copy-cpu":
+            need(log, mode, "copies title memory at record time")
+    print(f"{backend}: CopyBufferRegion on the GPU in list order (same window, two windows): draw 2 reads the bytes draw 1 "
+          f"stored; controls without the copy and with the record-time copy read zeros")
     print(f"{backend}: draw UAV buffer stores reach title memory (aligned, in-place re-read, uavbase; misaligned "
           f"control stores nothing); texture UAV bound, two refusals skip the draw; {heap}")
     return 0
