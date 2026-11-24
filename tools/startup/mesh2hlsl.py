@@ -434,6 +434,29 @@ class MeshStage(G.Stage):
         if self.is_tainted('v%d' % src[1]):
             self.au_scalars[dst[1]] = self.epoch
 
+    def op_s_buffer_load_dword(self, ops, mods, count=1):
+        """As the pipeline translator, plus: the offset is read once before the destination is written (the
+        title's `s_buffer_load_dwordx2 s[4:5], s[16:19], s4` overwrote s4 before the second word), the
+        instruction's offset:N is added, and the address is dword aligned (the hardware ignores bits 1:0)."""
+        extra = 0
+        for m in mods:
+            if m.startswith('offset:'):
+                extra += int(m[7:], 0)
+            else:
+                raise Unsupported('s_buffer_load with %s' % m)
+        dst = reg_range(ops[0])
+        buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
+        fixed = re.fullmatch(r'0x[0-9a-f]+|\d+', ops[2])
+        if fixed:
+            base = '%du' % ((int(ops[2], 0) + extra) & ~3)
+        else:
+            self.emit('a = (%s + %du) & ~3u;' % (self.u(ops[2]), extra))
+            base = 'a'
+        for i in range(count):
+            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, base, 4 * i))
+            if fixed:
+                self.sym[dst[1] + i] = ('fixed_buffer_word',)
+
     # Typed buffer formats the pipeline translator's table lacks. SNORM: max(x / (2^(n-1) - 1), -1) (RDNA 2 ISA
     # data-format conversion). 2_10_10_10 lists fields from the most significant: x is bits 9:0 and w bits 31:30
     # (Mesa gfx10_format_table.py maps R10G10B10A2 to 2_10_10_10).
