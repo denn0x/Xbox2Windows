@@ -35,6 +35,8 @@ inline void* alloc(SIZE_T bytes, ULONG type, ULONG protect) noexcept
     if (!fn) return VirtualAlloc(nullptr, bytes, type, protect);
     if (on()) {
         MEM_ADDRESS_REQUIREMENTS requirements{};
+        // Floor at 4 GiB: low 32-bit addresses can collide with values the title treats as non-pointers.
+        requirements.LowestStartingAddress = reinterpret_cast<void*>(ULONG_PTR{1} << 32);
         requirements.HighestEndingAddress = reinterpret_cast<void*>((ULONG_PTR{1} << 40) - 1);
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;

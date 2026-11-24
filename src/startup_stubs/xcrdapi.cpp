@@ -269,6 +269,38 @@ bool find_stream(u64 source, u64 offset, unsigned compressed, unsigned piece, st
 //   executable adds the shift is not known; LOCAL SHORTCUT until its offset arithmetic is understood.
 // A candidate needs a zlib header and must inflate in full from `compressed` bytes (Adler-32 checked).
 LONG requests_pieces_found_on_disk, requests_shifted_streams, requests_shift_unconfirmed;
+// RDS5 boundary table of an archive (cached per handle): stored offset, logical offset, codec.
+struct Rds5Boundary { u64 stored, logical; unsigned codec; };
+const std::vector<Rds5Boundary>* rds5_table(HANDLE handle)
+{
+    static std::mutex lock;
+    static std::map<HANDLE, std::unique_ptr<std::vector<Rds5Boundary>>> tables;
+    const std::lock_guard guard(lock);
+    auto& slot = tables[handle];
+    if (slot) return slot->empty() ? nullptr : slot.get();
+    slot = std::make_unique<std::vector<Rds5Boundary>>();
+    const auto read_at = [handle](u64 at, void* out, DWORD size) {
+        OVERLAPPED overlapped{};
+        overlapped.Offset = static_cast<DWORD>(at);
+        overlapped.OffsetHigh = static_cast<DWORD>(at >> 32);
+        DWORD read = 0;
+        return ReadFile(handle, out, size, &read, &overlapped) && read == size;
+    };
+    unsigned char header[16];
+    if (!read_at(0, header, 16) || std::memcmp(header, "RDS5", 4) != 0) return nullptr;
+    std::uint32_t count = 0;
+    std::memcpy(&count, header + 4, 4);
+    if (count < 2 || count > (1u << 20)) return nullptr;
+    std::vector<std::uint32_t> raw(std::size_t{count} * 2);
+    if (!read_at(16, raw.data(), count * 8)) return nullptr;
+    slot->reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t low = raw[2 * i], high = raw[2 * i + 1];
+        slot->push_back({u64{low & 0x03ffffffu} * 256, (u64{high & 0xfffffu} * 4 + (low >> 30)) * 4096, (low >> 26) & 15});
+    }
+    return slot.get();
+}
+
 std::shared_ptr<const std::vector<unsigned char>> stream_on_disk(HANDLE handle, u64 offset, unsigned compressed, unsigned piece,
                                                                  u64& base, bool& whole_shifted)
 {
@@ -300,48 +332,28 @@ std::shared_ptr<const std::vector<unsigned char>> stream_on_disk(HANDLE handle, 
             return data;
         }
     }
-    // A real shift is constant per archive (measured: 14 x 64 KiB on every request of one family). In
-    // other archives single requests also "matched" at a different k each (a stream that happens to
-    // inflate to the same size): those deliver wrong data. So a shift is used only once confirmed:
-    // the same k must match twice in one archive. Confirmed shifts are tried first; an unconfirmed
-    // match only adds a vote and the request fails.
-    static std::mutex shift_lock;
-    static std::map<HANDLE, std::map<u64, unsigned>> votes;
-    std::vector<u64> confirmed;
-    {
-        const std::lock_guard guard(shift_lock);
-        if (auto it = votes.find(handle); it != votes.end())
-            for (const auto& [k, n] : it->second)
-                if (n >= 2) confirmed.push_back(k);
-    }
-    const auto accept = [&](u64 k, std::shared_ptr<const std::vector<unsigned char>> data) {
-        base = offset;  // the request takes the stream from its start
-        whole_shifted = true;
-        return data;
+    // A real shift is one global constant (measured: 14 x 64 KiB in every archive family that shows
+    // it). Single "matches" at other k deliver wrong data, so a shift is accepted only when the
+    // archive's own RDS5 boundary table proves it: offset - k x 64 KiB is exactly a boundary, the
+    // interval is zlib (codec 8) and its logical size equals the destination size. 14 is tried first.
+    const auto* table = rds5_table(handle);
+    if (!table) return nullptr;
+    const auto proven = [&](u64 at) {
+        const auto it = std::lower_bound(table->begin(), table->end(), at,
+                                         [](const Rds5Boundary& b, u64 v) { return b.stored < v; });
+        return it != table->end() && it + 1 != table->end() && it->stored == at && it->codec == 8 &&
+               (it + 1)->logical - it->logical == piece;
     };
-    for (const u64 k : confirmed) {
-        if (k * 0x10000 > offset) continue;
+    for (u64 step = 0; step <= 256; ++step) {
+        const u64 k = step ? step : 14;
+        if ((step && k == 14) || k * 0x10000 > offset || !proven(offset - k * 0x10000)) continue;
         std::size_t produced = 0;
         auto data = try_at(offset - k * 0x10000, std::size_t{piece} + 1, produced);
         if (data && produced == piece) {
-            const std::lock_guard guard(shift_lock);
-            ++votes[handle][k];
-            return accept(k, data);
-        }
-    }
-    for (u64 k = 1; k <= 256 && k * 0x10000 <= offset; ++k) {
-        if (std::find(confirmed.begin(), confirmed.end(), k) != confirmed.end()) continue;
-        std::size_t produced = 0;
-        auto data = try_at(offset - k * 0x10000, std::size_t{piece} + 1, produced);
-        if (data && produced == piece) {
-            unsigned n;
-            {
-                const std::lock_guard guard(shift_lock);
-                n = ++votes[handle][k];
-            }
-            if (n >= 2) return accept(k, data);
-            InterlockedIncrement(&requests_shift_unconfirmed);
-            return nullptr;
+            base = offset;  // the request takes the stream from its start
+            whole_shifted = true;
+            if (k != 14) InterlockedIncrement(&requests_shift_unconfirmed);  // proven, but not the usual 14
+            return data;
         }
     }
     return nullptr;
@@ -799,7 +811,7 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
             const LONG total = requests_done + requests_compressed + requests_failed;
             const LONG total2 = total + requests_bcpack_blank;
             if (total2 != last)
-                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld (stream pieces %ld, starts found on disk %ld, shifted streams %ld, unconfirmed shifts %ld) failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
+                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld (stream pieces %ld, starts found on disk %ld, shifted streams %ld, shifts other than 14 %ld) failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
                     "still 0 at run=%ld", second, requests_done, requests_compressed, requests_stream_pieces, requests_pieces_found_on_disk, requests_shifted_streams, requests_shift_unconfirmed, requests_failed, requests_bcpack_blank,
                     zero_tokens_at_enqueue, zero_tokens_at_run);
             last = total2;
