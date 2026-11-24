@@ -748,6 +748,8 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     }
     std::uint32_t strides[64] = {}, word3[64] = {}, bases[64] = {};
     bool bound_res[64] = {};
+    u64 res_address[64] = {};      // title address of a bound buffer (X2W_CX_ENTRY_LOG)
+    std::size_t res_bytes[64] = {};
     const bool show = InterlockedIncrement(&tr.logged) <= 2;
     for (UINT i = 0; i < n; ++i) {
         const ComputeTranslation::Res& r = tr.res[i];
@@ -837,6 +839,8 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
                     device_of(the_device)->CreateShaderResourceView(window, &d, dest);
                 }
                 bound = true;
+                res_address[i] = address;
+                res_bytes[i] = bytes;
             }
         }
         if (!bound) null_view(r, dest, r.uav);
@@ -884,6 +888,17 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
                                   state[i] == 'u' ? " UNRESOLVED" : state[i] == 'n' ? " null-res" : "");
         }
         log("%s", text);
+        // The first words of each small bound buffer, as the CPU sees the title's memory now. The GPU reads the same
+        // pages in place (desktop_range) when the list executes, so a later title write can still change them.
+        for (UINT i = 0; i < n; ++i) {
+            if (!res_address[i] || !res_bytes[i] || res_bytes[i] > 256) continue;
+            std::uint32_t w[8] = {};
+            const std::size_t count = res_bytes[i] / 4 < 8 ? res_bytes[i] / 4 : 8;
+            if (!count || !x2w_local::readable(reinterpret_cast<const void*>(res_address[i]), count * 4)) continue;
+            std::memcpy(w, reinterpret_cast<const void*>(res_address[i]), count * 4);
+            log("x2w-cx entry %016llx   res %u at 0x%llx (%zu bytes): %08x %08x %08x %08x %08x %08x %08x %08x", key, i, res_address[i],
+                res_bytes[i], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        }
     }
     if (unresolved >= 0) {
         const ComputeTranslation::Ud& ud = tr.uds[unresolved];
