@@ -12,6 +12,7 @@
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_file_read.h"
 #include "startup_stubs/bcpack_decoder.h"
+#include "startup_stubs/bcpack_bc6h.h"
 #include <algorithm>
 #include <memory>
 #include <map>
@@ -366,6 +367,44 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
+
+// LOCAL: BC6H (BCPack format 6) is zero-filled unless X2W_BC6H_FALLBACK=1. With it, streams go through
+// bcpack_bc6h.h: blocks free of the format's dictionary (unknown) are rebuilt, the rest get the
+// endpoints of a near block or a constant (approximate texels, never exact). X2W_BC6H_FILL_BASE (decimal,
+// mode-13 base, default 16913 = UF16 2^-7) sets the constant; 0 gives zero blocks.
+bool bc6h_fallback_enabled() {
+    static const bool on = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("X2W_BC6H_FALLBACK", value, sizeof(value)) && value[0] == '1';
+    }();
+    return on;
+}
+
+volatile LONG64 bc6h_blocks, bc6h_exact, bc6h_endpoints_only, bc6h_copied, bc6h_constant;
+LONG bc6h_streams;
+
+bool decode_bc6h_fallback(const unsigned char* input, std::size_t size, unsigned char* out, std::size_t out_size,
+                          std::size_t* produced) {
+    static const uint16_t fill = [] {
+        char value[16] = {};
+        if (!GetEnvironmentVariableA("X2W_BC6H_FILL_BASE", value, sizeof(value))) return x2w_bcpack::bc6h::DEFAULT_FILL_BASE;
+        return static_cast<uint16_t>(std::strtoul(value, nullptr, 10));
+    }();
+    x2w_bcpack::bc6h::Stats st;
+    if (!x2w_bcpack::bc6h::decode_stream(input, size, out, out_size, produced, &st, nullptr, fill)) return false;
+    InterlockedAdd64(&bc6h_blocks, static_cast<LONG64>(st.blocks));
+    InterlockedAdd64(&bc6h_exact, static_cast<LONG64>(st.exact));
+    InterlockedAdd64(&bc6h_endpoints_only, static_cast<LONG64>(st.endpoints_only));
+    InterlockedAdd64(&bc6h_copied, static_cast<LONG64>(st.copied));
+    InterlockedAdd64(&bc6h_constant, static_cast<LONG64>(st.constant));
+    const LONG n = InterlockedIncrement(&bc6h_streams);
+    if (n <= 16 || (n & 63) == 0)
+        log("x2w-dstorage BC6H fallback: stream %ld blocks %zu exact %zu endpoints-only %zu copied %zu constant %zu "
+            "(totals: blocks %lld exact %lld endpoints-only %lld copied %lld constant %lld)",
+            n, st.blocks, st.exact, st.endpoints_only, st.copied, st.constant, bc6h_blocks, bc6h_exact,
+            bc6h_endpoints_only, bc6h_copied, bc6h_constant);
+    return true;
+}
 // LOCAL: failed requests by outcome text (outcomes are string literals), for the heartbeat.
 struct FailureTally { const char* outcome; LONG count; };
 FailureTally failure_tally[16];
@@ -613,7 +652,9 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
         // A zlib or a decoded BCPack format, not both (the table has one codec per interval).
-        const unsigned codec = zlib ? (bcpack ? 0u : 8u) : (bcpack == 7 || bcpack == 1 || (bcpack >= 3 && bcpack <= 5) ? bcpack : 0u);
+        const unsigned codec = zlib ? (bcpack ? 0u : 8u)
+                                    : (bcpack == 7 || bcpack == 1 || (bcpack >= 3 && bcpack <= 5) ||
+                                       (bcpack == 6 && bc6h_fallback_enabled()) ? bcpack : 0u);
         interval_request = codec && file_object && file_object->kind == file &&
                            rds5_slice(file_object->handle, offset, source_size, destination_size, codec, slice);
         if (file_object && file_object->kind == file &&
@@ -638,6 +679,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 auto decoded = std::make_shared<std::vector<unsigned char>>(slice.decoded_size);
                 std::size_t produced = 0;
                 const bool ok = zlib ? x2w_inflate::inflate_zlib(input, source_size, decoded->data(), decoded->size(), &produced)
+                                     : bcpack == 6 ? decode_bc6h_fallback(input, source_size, decoded->data(), decoded->size(), &produced)
                                      : x2w_bcpack::decode_bcpack(input, source_size, bcpack, decoded->data(), decoded->size(), &produced);
                 if (ok && produced == decoded->size()) {
                     whole = std::move(decoded);
@@ -796,12 +838,15 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         if (data && bcpack && !interval_request) {
             // BC3/BC4/BC5 (3-5) decode since 42cd462f; a failure there zero-fills as before (counted as
             // bcpack-blank), because a failed request has crashed the title and a blank texture has not.
-            const bool bcn_fallback = bcpack >= 3 && bcpack <= 5;
+            // BC6H (6) only with X2W_BC6H_FALLBACK=1; a failure zero-fills like BC3-5.
+            const bool bc6h = bcpack == 6 && bc6h_fallback_enabled();
+            const bool bcn_fallback = (bcpack >= 3 && bcpack <= 5) || bc6h;
             std::vector<unsigned char> decoded;
             std::size_t produced = 0;
             const bool tried = bcpack == 7 || bcpack == 1 || bcn_fallback;
             const bool ok = tried && (decoded.resize(destination_size),
-                x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced));
+                bc6h ? decode_bc6h_fallback(data, decode_length, decoded.data(), decoded.size(), &produced)
+                     : x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced));
             if (ok) {
                 output = std::move(decoded);
                 data = output.data();
