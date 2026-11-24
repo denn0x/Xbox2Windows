@@ -319,6 +319,22 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
+// LOCAL: failed requests by outcome text (outcomes are string literals), for the heartbeat.
+struct FailureTally { const char* outcome; LONG count; };
+FailureTally failure_tally[16];
+SRWLOCK failure_lock = SRWLOCK_INIT;
+void tally_failure(const char* outcome)
+{
+    AcquireSRWLockExclusive(&failure_lock);
+    for (auto& t : failure_tally) {
+        if (!t.outcome || t.outcome == outcome || std::strcmp(t.outcome, outcome) == 0) {
+            t.outcome = outcome;
+            ++t.count;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&failure_lock);
+}
 LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
 // Archives of one kind (an RDS5 boundary table at file offset 0) are addressed by the executable 14 x 64 KiB
 // after where their data sits on disk (measured on one executable: every shifted zlib stream starts exactly
@@ -706,11 +722,23 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     }
     const bool failed = (data == nullptr || !written) && std::strcmp(outcome, "empty") != 0;
     if (failed) InterlockedIncrement(&requests_failed);
+    if (failed) tally_failure(outcome);
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
-    static LONG summaries, failures;
-    if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
+    static LONG summaries;
+    if (InterlockedIncrement(&summaries) <= 12)
         log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
             static_cast<void*>(destination), destination_size, source, offset, source_size, outcome);
+    if (failed) {
+        // LOCAL: every failure, one line, with the source file's path, for offline analysis.
+        wchar_t path[300] = L"memory";
+        auto* file_object = reinterpret_cast<Object*>(source);
+        if (!(options & 0x400000) && file_object && x2w_local::readable(file_object, sizeof(Object)) && file_object->kind == file &&
+            file_object->handle != INVALID_HANDLE_VALUE) {
+            if (!GetFinalPathNameByHandleW(file_object->handle, path, 300, FILE_NAME_NORMALIZED)) std::wcscpy(path, L"?");
+        }
+        log("x2w-dstorage FAIL options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x outcome=\"%s\" file=\"%ls\"", options,
+            destination_size, offset, source_size, outcome, path);
+    }
 }
 
 void signal_fence(void* fence, u64 value);
@@ -729,6 +757,7 @@ void run_entry(Object* self, Entry& entry)
             const std::size_t bytes = entry.tokens.size() * sizeof(ULONG_PTR);
             if (!title || !x2w_local::readable(title, bytes)) {
                 InterlockedIncrement(&requests_failed);
+                tally_failure("page array unreadable");
                 if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                 static LONG unreadable;
                 if (InterlockedIncrement(&unreadable) <= 12)
@@ -774,6 +803,7 @@ QueueWork& work_of(Object* self)
                     run_entry(self, entry);
                 } catch (const std::exception& error) {
                     InterlockedIncrement(&requests_failed);
+                    tally_failure("exception");
                     InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                     static LONG reported;
                     if (InterlockedIncrement(&reported) <= 12)
@@ -1026,6 +1056,16 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                     "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
                     requests_failed, requests_bcpack_blank, requests_archive_shifted, requests_archive_past_end, requests_stream_pieces, requests_pieces_found_on_disk, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
                     section_text);
+                char tally[512];
+                int at = 0;
+                tally[0] = 0;
+                AcquireSRWLockShared(&failure_lock);
+                for (const auto& t : failure_tally) {
+                    if (!t.outcome || at >= static_cast<int>(sizeof(tally)) - 1) break;
+                    at += std::snprintf(tally + at, sizeof(tally) - at, " [%s]=%ld", t.outcome, t.count);
+                }
+                ReleaseSRWLockShared(&failure_lock);
+                if (tally[0]) log("x2w-dstorage failures by outcome:%s", tally);
                 last = total2;
                 last_memory = sample;
             }
