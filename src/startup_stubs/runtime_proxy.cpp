@@ -199,9 +199,96 @@ void fill_slots(std::index_sequence<I...>)
     ((slot_table[I] = reinterpret_cast<void*>(&forward<static_cast<int>(I)>)), ...);
 }
 
+// LOCAL (performance): repeated QueryApiImpl answers. The title's static runtime library calls
+// QueryApiImpl before every API call (query, call one method, Release), so a title that polls one
+// API (seen: the connectivity hint, about 120 times a second) also asks the runtime for the same
+// object each time. Once the runtime has returned the same object for one (provider, interface)
+// pair cache_after times in a row, that object is kept with a reference of the cache's own and later
+// queries for the pair get it (with AddRef, as the runtime gives it) without calling the runtime.
+// The extra reference keeps the object alive even if the runtime made a new one per call.
+// X2W_RUNTIME_QUERY_CACHE=0 turns this off.
+struct CachedQuery {
+    GUID provider, iid;
+    void* real;    // what the runtime returned
+    void* answer;  // what the title received (the proxy, or the object itself)
+    int same;
+    bool cached;
+};
+constexpr int max_cached_queries = 32, cache_after = 8;
+CachedQuery cached_queries[max_cached_queries];
+int cached_query_count;
+SRWLOCK cached_query_lock = SRWLOCK_INIT;
+volatile LONG cached_answers;  // queries answered from the cache (heartbeat)
+bool query_cache_on() noexcept
+{
+    static const bool on = [] {
+        char value[8];
+        const DWORD n = GetEnvironmentVariableA("X2W_RUNTIME_QUERY_CACHE", value, sizeof(value));
+        return !(n == 1 && value[0] == '0');
+    }();
+    return on;
+}
+using AddRefMethod = ULONG(__stdcall*)(void*);
+void add_ref(void* object) { reinterpret_cast<AddRefMethod>((*reinterpret_cast<void***>(object))[1])(object); }
+
+bool cached_answer(const GUID* provider, const GUID* iid, void** out)
+{
+    void* real = nullptr;
+    void* answer = nullptr;
+    AcquireSRWLockShared(&cached_query_lock);
+    for (int i = 0; i < cached_query_count; ++i) {
+        const CachedQuery& entry = cached_queries[i];
+        if (entry.cached && IsEqualGUID(entry.provider, *provider) && IsEqualGUID(entry.iid, *iid)) {
+            real = entry.real;
+            answer = entry.answer;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&cached_query_lock);
+    if (!answer) return false;
+    add_ref(real);  // the title releases the answer once per query; the proxy forwards Release to real
+    *out = answer;
+    InterlockedIncrement(&cached_answers);
+    return true;
+}
+
+void note_answer(const GUID& provider, const GUID& iid, void* real, void* answer)
+{
+    AcquireSRWLockExclusive(&cached_query_lock);
+    CachedQuery* entry = nullptr;
+    for (int i = 0; i < cached_query_count && !entry; ++i)
+        if (IsEqualGUID(cached_queries[i].provider, provider) && IsEqualGUID(cached_queries[i].iid, iid)) entry = &cached_queries[i];
+    if (!entry && cached_query_count < max_cached_queries) {
+        entry = &cached_queries[cached_query_count++];
+        *entry = CachedQuery{provider, iid, real, answer, 0, false};
+    }
+    bool now_cached = false;
+    if (entry && !entry->cached) {
+        if (entry->real == real && entry->answer == answer) {
+            ++entry->same;
+        } else {
+            entry->real = real;
+            entry->answer = answer;
+            entry->same = 1;
+        }
+        if (entry->same >= cache_after) {
+            add_ref(real);  // the cache's own reference, never released
+            entry->cached = now_cached = true;
+        }
+    }
+    ReleaseSRWLockExclusive(&cached_query_lock);
+    if (now_cached)
+        x2w_local::logf("x2w-runtime QueryApiImpl %08lx/%08lx: same object %d times, later queries answered from the cache "
+                        "(X2W_RUNTIME_QUERY_CACHE=0 turns this off)", provider.Data1, iid.Data1, cache_after);
+}
+
 HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
 {
+    if (provider && iid && out && query_cache_on() && cached_answer(provider, iid, out)) return S_OK;
     const HRESULT hr = real_query(provider, iid, out);
+    const bool cacheable = hr == S_OK && provider && iid && out && *out && query_cache_on();
+    void* const real_object = cacheable ? *out : nullptr;
+    const GUID asked_provider = provider ? *provider : GUID{};
     if (FAILED(hr) && out && provider && provider->Data1 == 0xf4faf4d4 && fake_user()) {
         // Persistent local storage: the system runtime has none for an unpackaged process.
         static LONG logged;
@@ -233,6 +320,7 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
     }
     ReleaseSRWLockExclusive(&proxy_lock);
     if (proxy) *out = proxy;
+    if (cacheable) note_answer(asked_provider, *iid, real_object, *out);
     return hr;
 }
 
@@ -1036,6 +1124,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void*)
         // logs have gone quiet.
         CreateThread(nullptr, 0, [](void*) -> DWORD {
             static LONG seen[max_providers][max_slots];
+            LONG cached_seen = 0;
             for (int second = 10;; second += 10) {
                 Sleep(10000);
                 char line[1024];
@@ -1050,6 +1139,12 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void*)
                             any = true;
                         }
                     }
+                const LONG cached_now = cached_answers, cached_delta = cached_now - cached_seen;
+                cached_seen = cached_now;
+                if (cached_delta > 0 && n < static_cast<int>(sizeof(line)) - 40) {
+                    n += std::snprintf(line + n, sizeof(line) - n, " (queries from cache x%ld)", cached_delta);
+                    any = true;
+                }
                 if (any) x2w_local::logf("%s", line);
             }
         }, nullptr, 0, nullptr);
