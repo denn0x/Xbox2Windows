@@ -1175,6 +1175,22 @@ class Stage:
             if not (m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:')):
                 raise Unsupported('%s modifier %s' % (name, m))
         key = self.descriptor(ops[2])
+        if key[0][0] == 'heapdyn' and {'heap', 'heapwords'} <= set(getattr(self.pipe, 'features', ())):
+            # A resource-heap buffer view: word 3 is the runtime's synthesized V# word of the view (manifest
+            # `heapwords 1`: vdesc, 32 bytes per view id, root SRV t2 space1; mesh_work/RUNTIME_NEEDS.md 6.3, the
+            # same contract and helper as mesh2hlsl's format_load). 0 for an unknown slot or id: every channel 0.
+            for m in mods:
+                if not (m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:')):
+                    raise Unsupported('%s modifier %s' % (name, m))
+            dst = reg_range(ops[0])
+            buf, address = self.buffer_address(ops, mods)
+            if buf.startswith('u'):
+                raise Unsupported('%s through a buffer the program stores to' % name)
+            self.pipe.draw_heapwords = True
+            self.emit('a = %s;' % address)
+            for i in range(count):
+                self.set_v(dst[1] + i, 'x2w_fmt_load(%s, a, x2w_hword(h%d, 3u), %du)' % (buf, key[0][1], i))
+            return
         if key[0][0] != 'table':
             # word 3 reaches the shader only for table entries (root and vertex sources give 0)
             raise Unsupported('%s through %s' % (name, key[0][0]))
@@ -2402,8 +2418,10 @@ SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
 
 # Draw lowerings that need the draw runtime to parse a manifest line, named in X2W_DRAW_FEATURES (comma list):
 # heap (`heap 1`), bufword3 (`udsrc <n> bufword3 <srv>` for buffer_load_format_*), uav (`uav <i> buf table ...`
-# with `udsrc <n> uavbase <i>` for buffer stores). Off by default until a build with the runtime side is announced.
-KNOWN_DRAW_FEATURES = frozenset(('heap', 'bufword3', 'uav'))
+# with `udsrc <n> uavbase <i>` for buffer stores), heapwords (`heapwords 1`: a resource-heap view's synthesized
+# descriptor words from vdesc, for buffer_load_format_* through a heap descriptor; needs heap and bufword3).
+# Off by default until a build with the runtime side is announced.
+KNOWN_DRAW_FEATURES = frozenset(('heap', 'bufword3', 'uav', 'heapwords'))
 
 
 def draw_features():
@@ -2478,6 +2496,7 @@ class Pipeline:
         # --requests pass never publishes a result the runtime cannot bind yet.
         self.features = draw_features() if features is None else frozenset(features)
         self.heapvars = []    # heap descriptor k -> resource kind it is used as (None until used)
+        self.draw_heapwords = False  # x2w_hword read (X2W_DRAW_FEATURES heapwords, manifest `heapwords 1`)
         self.spi_inputs(ps_hw_inputs)
         self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
@@ -2642,6 +2661,11 @@ class Pipeline:
             for kind in sorted(set(k for k in self.heapvars if k), key=lambda k: HEAP_KINDS[k][1]):
                 name, slot, hlsl_type = HEAP_KINDS[kind]
                 out.append('%s %s[%d] : register(t0, space%d);' % (hlsl_type, name, 8 + 8 * HEAP_IDS, 2 + slot))
+            if getattr(self, 'draw_heapwords', False):
+                # vdesc: the gfx10 descriptor words per view id (RUNTIME_NEEDS.md 6.3.1; text as mesh2hlsl's x2w_hword)
+                out += ['ByteAddressBuffer x2w_vdesc : register(t2, space1);',
+                        'uint x2w_hword(uint h, uint i) { uint id = x2w_vid(h); return id < %du ? '
+                        'x2w_vdesc.Load(id * 32u + 4u * i) : 0u; }' % HEAP_IDS]
         if self.uses_sampler_heap:
             out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
             out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
@@ -2735,6 +2759,8 @@ class Pipeline:
                 raise Unsupported('uav through %s at %s' % (source, off))
         if any(getattr(self, 'heapvars', ())):
             lines.append('heap 1')
+            if getattr(self, 'draw_heapwords', False):
+                lines.append('heapwords 1')
         for key, i in self.samplers.items():
             comparison = key[0] == 'cmp'
             lines.append('%s %d %s' % ('smpc' if comparison else 'smp', i, ' '.join('0x%x' % w for w in key[comparison:])))
