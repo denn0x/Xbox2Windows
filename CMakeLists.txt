@@ -693,6 +693,35 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_INDIRECT_READBACK=8")
 endforeach()
 
+# LOCAL meshrt: DispatchMesh ExecuteIndirect through a translated mesh pipeline (d3d12_mesh.inl, X2W_MESH=1).
+set(startup_mesh_headers)
+foreach(entry IN ITEMS "MeshMain;ms_6_5;ms" "PixelMain;ps_6_5;ps" "Writer;cs_6_0;writer")
+    list(GET entry 0 entry_name)
+    list(GET entry 1 entry_profile)
+    list(GET entry 2 entry_short)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/startup_mesh_${entry_short}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${entry_profile} -E ${entry_name} -Vn startup_mesh_${entry_short} -Fh "${header}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mesh_dispatch.hlsl"
+        DEPENDS tests/startup_mesh_dispatch.hlsl VERBATIM)
+    list(APPEND startup_mesh_headers "${header}")
+endforeach()
+add_executable(startup_mesh_dispatch tests/startup_mesh_dispatch.cpp ${startup_mesh_headers})
+target_include_directories(startup_mesh_dispatch PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_mesh_dispatch PRIVATE cxx_std_17)
+target_link_libraries(startup_mesh_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS gpu derived zero huge off missing depth)
+        add_test(NAME startup_mesh_dispatch_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set(mesh_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(NOT mode STREQUAL "off")
+            set(mesh_env "${mesh_env};X2W_MESH=1")
+        endif()
+        set_tests_properties(startup_mesh_dispatch_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${mesh_env}")
+    endforeach()
+endforeach()
+
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp
     tests/descriptor_heap_paging.cpp)
