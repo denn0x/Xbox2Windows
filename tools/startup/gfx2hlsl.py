@@ -1215,9 +1215,17 @@ class Stage:
         # (image_sample_l and image_load_mip check their own modifier lists below.)
         allowed = ('dlc', 'glc', 'slc', 'a16') + (('unorm',) if how == 'load' else ())
         for m in mods:
-            if how in ('sample', 'lz', 'load') and not (m.startswith(('dim:', 'dmask:')) or m in allowed):
+            if how in ('sample', 'lz', 'load', 'b') and not (m.startswith(('dim:', 'dmask:')) or m in allowed):
                 raise Unsupported('image_%s modifier %s' % (how, m))
         a16 = 'a16' in mods
+        bias = None
+        if how == 'b':
+            # image_sample_b: the LOD bias is the first address dword, before the coordinates (LLVM
+            # AMDGPUImageDimIntrinsics sample_b: ExtraAddrArgs [bias]). With a16 it would be a 16-bit value packed
+            # into its own dword, not modelled here.
+            if a16 or dmask == 0 or len(cs) != axes + 1:
+                raise Unsupported('image_sample_b form %s %s' % (', '.join(ops), ' '.join(mods)))
+            bias, cs = cs[0], cs[1:]
         if a16:
             if len(cs) < (axes + 1) // 2:
                 raise Unsupported('a16 image address with %d registers' % len(cs))
@@ -1264,6 +1272,12 @@ class Stage:
             uv = fs[0] if axes == 1 else 'float%d(%s)' % (axes, ', '.join(fs))
             if how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
+            elif how == 'b':
+                # SampleBias takes implicit derivatives like Sample, so it is lowered only where Sample is (below);
+                # the level-0 fallback Sample uses elsewhere would ignore the bias.
+                if not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
+                    raise Unsupported('image_sample_b outside straight-line code with every lane active')
+                call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(bias))
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
@@ -1389,6 +1403,9 @@ class Stage:
 
     def op_image_sample(self, ops, mods):
         self.image(ops, mods, 'sample')
+
+    def op_image_sample_b(self, ops, mods):
+        self.image(ops, mods, 'b')
 
     def op_image_sample_lz(self, ops, mods):
         self.image(ops, mods, 'lz')
