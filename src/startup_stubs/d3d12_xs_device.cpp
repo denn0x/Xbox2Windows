@@ -3507,7 +3507,8 @@ void report_dispatches()
     // LOCAL: every key is listed; a full line continues on another line with the same prefix, and a closing
     // line gives the key and line counts so a reader can tell the list is complete.
     static const char prefix[] = "x2w-render dispatches per compute key (300 frames):";
-    char line[2048];
+    // log() cuts a line at 1533 characters (its 1536-byte buffer): stay below it, or the tail keys are lost.
+    char line[1400];
     int n = std::snprintf(line, sizeof(line), "%s", prefix), lines = 0;
     for (const auto& entry : all) {
         if (n > static_cast<int>(sizeof(line)) - 80) {
