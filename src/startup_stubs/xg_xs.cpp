@@ -126,11 +126,18 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
         put32(mip + 0x3c, desc.SampleDesc.Count);
     }
     static LONG calls, failures;
-    if (x2w_local::first_calls(calls, 6) || (!valid && x2w_local::first_calls(failures, 8)))
+    static const bool verbose = [] { char v[8] = {}; return GetEnvironmentVariableA("X2W_XG_VERBOSE", v, sizeof v) > 0 && v[0] == '1'; }();
+    if (x2w_local::first_calls(calls, verbose ? 4000 : 6) || (!valid && x2w_local::first_calls(failures, 8))) {
+        char sizes[256] = {};
+        int used = 0;
+        for (unsigned i = 0; valid && i < mips && used < 200; ++i)
+            used += std::snprintf(sizes + used, sizeof sizes - used, " %llx@%llx",
+                                  u64{footprints[i].Footprint.RowPitch} * rows[i] * footprints[i].Footprint.Depth, footprints[i].Offset);
         x2w_local::logf("x2w-xg TextureComputer::slot2(layout) dim=%d %llux%ux%u mips=%u fmt=%d(->%d) layout=0x%x -> %s "
-                        "slice=0x%llx total=0x%llx mip0 pitch=%u", self->desc.Dimension, self->desc.Width, self->desc.Height,
+                        "slice=0x%llx total=0x%llx mip0 pitch=%u mips:%s", self->desc.Dimension, self->desc.Width, self->desc.Height,
                         self->desc.DepthOrArraySize, self->desc.MipLevels, self->desc.Format, desc.Format, self->desc.Layout,
-                        valid ? "ok" : "DESKTOP REJECTED THE DESC", stride, total, valid ? footprints[0].Footprint.RowPitch : 0);
+                        valid ? "ok" : "DESKTOP REJECTED THE DESC", stride, total, valid ? footprints[0].Footprint.RowPitch : 0, sizes);
+    }
     return 0;
 }
 

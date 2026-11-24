@@ -11,6 +11,10 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
 
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include <cstdarg>
@@ -42,6 +46,26 @@ struct Object {
     unsigned capacity;  // StatusArray, Queue
     LONG* results;      // StatusArray: one HRESULT per index, E_PENDING until a status is enqueued
     LONG pending;       // Queue: worst HRESULT of the requests since the last status
+    struct QueueWork* work = nullptr;  // Queue: entries waiting for Submit and the worker running them
+};
+
+// A queue entry as enqueued: a request (its 0x48 bytes copied, and a snapshot of its destination page
+// tokens), a status entry or a fence signal. Entries run in order on the queue's worker after Submit,
+// like DirectStorage; a destination page token that was 0 at enqueue is read again at the entry's turn
+// (titles fill those in after EnqueueRequest).
+struct Entry {
+    enum Type { request, status_entry, signal } type;
+    unsigned char bytes[0x48];
+    std::vector<ULONG_PTR> tokens;
+    Object* array;
+    unsigned index;
+    void* fence;
+    u64 value;
+};
+struct QueueWork {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<Entry> waiting, submitted;
 };
 
 void log(const char* format, ...)
@@ -202,8 +226,9 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // format, 1 seen), +0x08 destination pointer, +0x18 destination size (u32), +0x20 source (File object
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
-LONG requests_done, requests_compressed, requests_failed;
-void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
+LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
+LONG zero_tokens_at_enqueue, zero_tokens_at_run;
+void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens)
 {
     if (!request) return;
     const u64 options = *reinterpret_cast<const u64*>(request);
@@ -220,62 +245,91 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
         for (int i = 0; i < 0x40; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
         log("x2w-dstorage Queue::EnqueueRequest [%s]", bytes);
     }
+    // Option bits (from the reference projects' notes, matched against this title's requests): bit 0
+    // zlib, bits 1-4 a BCPack BC format number, bit 21 a destination given as 64 KiB physical page
+    // tokens (+0x10 low 16 bits: offset into the first page), bit 22 a memory source.
+    const bool zlib = (options & 1) != 0;
+    const unsigned bcpack = static_cast<unsigned>((options >> 1) & 0xF);
+    const bool page_destination = (options & (1ull << 21)) != 0;
+    const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
+    const u64 known = 1 | (0xFull << 1) | (1ull << 21) | 0x400000;
     const char* outcome = "done";
-    if (compression == 1 && destination && source_size) {
-        // Option bit 0: the source is one zlib stream that expands to the destination size.
-        std::vector<unsigned char> packed;
-        const unsigned char* input = nullptr;
-        if (memory_source) {
-            input = reinterpret_cast<const unsigned char*>(source);
-        } else {
-            auto* file_object = reinterpret_cast<Object*>(source);
-            packed.resize(source_size);
-            OVERLAPPED overlapped{};
-            overlapped.Offset = static_cast<DWORD>(offset);
-            overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
-            DWORD read = 0;
-            if (file_object && file_object->kind == file &&
-                ReadFile(file_object->handle, packed.data(), source_size, &read, &overlapped) && read == source_size)
-                input = packed.data();
-        }
-        std::size_t produced = 0;
-        if (!input) {
-            outcome = "read failed";
-            InterlockedIncrement(&requests_failed);
-        } else if (!x2w_inflate::inflate_zlib(input, source_size, destination, destination_size, &produced)) {
-            outcome = "zlib failed";
-            InterlockedIncrement(&requests_failed);
-        } else {
-            outcome = produced == destination_size ? "inflated" : "inflated (short)";
-            InterlockedIncrement(&requests_compressed);
-        }
-    } else if (compression) {
-        outcome = "unknown compression, not done";
-        InterlockedIncrement(&requests_failed);
-    } else if (!destination || source_size == 0) {
+    std::vector<unsigned char> packed, output;
+    const unsigned char* input = nullptr;
+    if (options & ~known) {
+        outcome = "unknown option bits, not done";
+    } else if (!destination || !source_size) {
         outcome = "empty";
-    } else if (source_size > destination_size) {
-        // The destination-size field is a guess from one code path; never copy past it.
-        outcome = "refused: source larger than destination";
-        InterlockedIncrement(&requests_failed);
     } else if (memory_source) {
-        std::memcpy(destination, reinterpret_cast<const void*>(source + 0), source_size);
-        InterlockedIncrement(&requests_done);
+        input = reinterpret_cast<const unsigned char*>(source);
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
+        packed.resize(source_size);
         OVERLAPPED overlapped{};
         overlapped.Offset = static_cast<DWORD>(offset);
         overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
         DWORD read = 0;
-        const bool ok = file_object && file_object->kind == file &&
-                        ReadFile(file_object->handle, destination, source_size, &read, &overlapped) && read == source_size;
-        if (ok) InterlockedIncrement(&requests_done);
-        else {
-            InterlockedIncrement(&requests_failed);
+        if (file_object && file_object->kind == file &&
+            ReadFile(file_object->handle, packed.data(), source_size, &read, &overlapped) && read == source_size)
+            input = packed.data();
+        else
             outcome = "read failed";
+    }
+    if (input) {
+        const unsigned char* data = input;
+        std::size_t size = source_size;
+        if (zlib) {
+            // With BCPack after it, the inflated size is not given; the destination size bounds it.
+            output.resize(bcpack ? std::size_t{destination_size} * 2 + 0x10000 : destination_size);
+            std::size_t produced = 0;
+            if (!x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced)) {
+                outcome = "zlib failed";
+                data = nullptr;
+                static LONG diagnosed;
+                if (InterlockedIncrement(&diagnosed) <= 12) {
+                    std::vector<unsigned char> big(std::size_t{destination_size} * 8 + 0x40000);
+                    std::size_t big_produced = 0;
+                    const bool big_ok = x2w_inflate::inflate_zlib(input, source_size, big.data(), big.size(), &big_produced);
+                    log("x2w-dstorage zlib failure: header %02x %02x %02x %02x, larger buffer -> %s produced=0x%zx (dest 0x%x, source 0x%x)",
+                        input[0], input[1], input[2], input[3], big_ok ? "ok" : "still failed", big_produced, destination_size, source_size);
+                }
+            } else {
+                output.resize(produced);
+                data = output.data();
+                size = produced;
+                outcome = produced == destination_size || bcpack ? "inflated" : "inflated (short)";
+                InterlockedIncrement(&requests_compressed);
+            }
+        }
+        if (data && bcpack) {
+            // shortcut: BCPack is not decoded yet; the texels are left zero (a blank texture) so the
+            // title's loading continues. Counted as bcpack_blank.
+            output.assign(destination_size, 0);
+            data = output.data();
+            size = destination_size;
+            outcome = "BCPack not decoded: zero-filled";
+            InterlockedIncrement(&requests_bcpack_blank);
+        }
+        if (data) {
+            if (size > destination_size) size = destination_size;
+            bool written = true;
+            if (page_destination) {
+                using WritePhysical = BOOL(WINAPI*)(const ULONG_PTR*, ULONG_PTR, SIZE_T, const void*, SIZE_T);
+                static const WritePhysical write_physical = [] {
+                    const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+                    return xmem ? reinterpret_cast<WritePhysical>(GetProcAddress(xmem, "x2w_xmem_write_physical")) : nullptr;
+                }();
+                const ULONG_PTR pages = (page_offset + size + 0xFFFF) / 0x10000;
+                written = write_physical && tokens && write_physical(tokens, pages, page_offset, data, size);
+                if (!written) outcome = "page destination write failed";
+            } else if (data != destination) {
+                std::memcpy(destination, data, size);
+            }
+            if (written && !zlib && !bcpack) InterlockedIncrement(&requests_done);
         }
     }
-    const bool failed = outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u';  // read/refused, zlib, unknown
+    if (outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u' || outcome[0] == 'p') InterlockedIncrement(&requests_failed);
+    const bool failed = outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u' || outcome[0] == 'p';  // read, zlib, unknown, page write
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries, failures;
     if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
@@ -283,26 +337,128 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
             static_cast<void*>(destination), destination_size, source, offset, source_size, outcome);
 }
 
-// Queue slot 4, EnqueueStatus(statusArray, index) by the PC numbering: the entry completes when the
-// requests enqueued before it have completed. Requests run synchronously here, so it completes now
-// with the worst result since the previous status.
+void signal_fence(void* fence, u64 value);
+
+void run_entry(Object* self, Entry& entry)
+{
+    if (entry.type == Entry::request) {
+        const u64 options = *reinterpret_cast<const u64*>(entry.bytes);
+        if ((options & (1ull << 21)) && !entry.tokens.empty()) {
+            const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(entry.bytes + 0x08);
+            for (std::size_t i = 0; i < entry.tokens.size(); ++i)
+                if (!entry.tokens[i] && title && x2w_local::readable(title + i, sizeof(ULONG_PTR))) {
+                    entry.tokens[i] = title[i];
+                    if (!entry.tokens[i]) InterlockedIncrement(&zero_tokens_at_run);
+                }
+        }
+        execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data());
+    } else if (entry.type == Entry::status_entry) {
+        const LONG result = InterlockedExchange(&self->pending, S_OK);
+        InterlockedExchange(&entry.array->results[entry.index], result);
+    } else {
+        signal_fence(entry.fence, entry.value);
+    }
+}
+
+QueueWork& work_of(Object* self)
+{
+    static std::mutex create;
+    const std::lock_guard guard(create);
+    if (!self->work) {
+        self->work = new QueueWork;
+        std::thread([self] {
+            QueueWork& work = *self->work;
+            for (;;) {
+                Entry entry;
+                {
+                    std::unique_lock lock(work.mutex);
+                    work.wake.wait(lock, [&] { return !work.submitted.empty(); });
+                    entry = std::move(work.submitted.front());
+                    work.submitted.pop_front();
+                }
+                run_entry(self, entry);
+            }
+        }).detach();
+    }
+    return *self->work;
+}
+
+void submit(Object* self)
+{
+    QueueWork& work = work_of(self);
+    {
+        const std::lock_guard guard(work.mutex);
+        for (auto& entry : work.waiting) work.submitted.push_back(std::move(entry));
+        work.waiting.clear();
+    }
+    work.wake.notify_one();
+}
+
+void push(Object* self, Entry&& entry)
+{
+    QueueWork& work = work_of(self);
+    bool full;
+    {
+        const std::lock_guard guard(work.mutex);
+        work.waiting.push_back(std::move(entry));
+        full = self->capacity && work.waiting.size() >= self->capacity;
+    }
+    if (full) submit(self);  // a full queue submits itself, as on PC
+}
+
+// Queue slot 3, EnqueueRequest(request*): copied now, run after Submit.
+void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
+{
+    if (!request) return;
+    Entry entry{};
+    entry.type = Entry::request;
+    std::memcpy(entry.bytes, request, sizeof entry.bytes);
+    const u64 options = *reinterpret_cast<const u64*>(request);
+    if (options & (1ull << 21)) {
+        const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(request + 0x08);
+        const unsigned size = *reinterpret_cast<const unsigned*>(request + 0x18);
+        const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
+        const std::size_t pages = (std::size_t{page_offset} + size + 0xFFFF) / 0x10000;
+        if (title && pages && x2w_local::readable(title, pages * sizeof(ULONG_PTR))) {
+            entry.tokens.assign(title, title + pages);
+            for (ULONG_PTR token : entry.tokens)
+                if (!token) InterlockedIncrement(&zero_tokens_at_enqueue);
+        }
+    }
+    push(self, std::move(entry));
+}
+
+// Queue slot 4, EnqueueStatus(statusArray, index): completes, in order, with the worst result of the
+// requests since the previous status.
 void __stdcall queue_enqueue_status(Object* self, Object* array, unsigned index)
 {
-    const LONG result = InterlockedExchange(&self->pending, S_OK);
     const bool valid = array && array->kind == status && index < array->capacity;
-    if (valid) InterlockedExchange(&array->results[index], result);
     static LONG calls;
     if (!valid || InterlockedIncrement(&calls) <= 8)
-        log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u -> 0x%08lx%s (requests done=%ld inflated=%ld failed=%ld)",
-            static_cast<void*>(array), index, static_cast<unsigned long>(result), valid ? "" : " INVALID ARRAY",
-            requests_done, requests_compressed, requests_failed);
+        log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests done=%ld inflated=%ld failed=%ld)",
+            static_cast<void*>(array), index, valid ? "" : " INVALID ARRAY", requests_done, requests_compressed, requests_failed);
+    if (!valid) return;
+    InterlockedExchange(&array->results[index], static_cast<LONG>(0x8000000A));  // E_PENDING until its turn
+    Entry entry{};
+    entry.type = Entry::status_entry;
+    entry.array = array;
+    entry.index = index;
+    push(self, std::move(entry));
 }
 
 // The remaining queue and status-array slots follow the public PC IDStorageQueue / IDStorageStatusArray
 // order, which slots 3, 4 and 6 matched; each logs its first calls with its arguments.
 // Queue slot 5, EnqueueSignal(fence, value): requests are already complete, so the fence is signaled
 // now through its own vtable (ID3D12Fence::Signal, slot 10).
-void __stdcall queue_enqueue_signal(Object*, void* fence, u64 value)
+void __stdcall queue_enqueue_signal(Object* self, void* fence, u64 value)
+{
+    Entry entry{};
+    entry.type = Entry::signal;
+    entry.fence = fence;
+    entry.value = value;
+    push(self, std::move(entry));
+}
+void signal_fence(void* fence, u64 value)
 {
     long hr = E_POINTER;
     if (fence) {
@@ -313,10 +469,11 @@ void __stdcall queue_enqueue_signal(Object*, void* fence, u64 value)
     if (InterlockedIncrement(&calls) <= 4)
         log("x2w-dstorage Queue::EnqueueSignal fence=%p value=0x%llx -> 0x%08lx", fence, value, static_cast<unsigned long>(hr));
 }
-void __stdcall queue_submit(Object*, u64 rdx, u64 r8)
+void __stdcall queue_submit(Object* self, u64 rdx, u64 r8)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx (requests ran at enqueue)", rdx, r8);
+    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
+    submit(self);
 }
 void __stdcall queue_cancel(Object*, u64 mask, u64 value)
 {
@@ -391,6 +548,22 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     guid_text(riid, id, sizeof(id));
     log("x2w-dstorage DStorageGetFactory riid=%s", id);
     if (!out) return E_POINTER;
+    // Heartbeat: the request counters every 10 s, so a run shows whether loading still progresses
+    // after the per-call logs have gone quiet.
+    static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
+        LONG last = -1;
+        for (int second = 10;; second += 10) {
+            Sleep(10000);
+            const LONG total = requests_done + requests_compressed + requests_failed;
+            const LONG total2 = total + requests_bcpack_blank;
+            if (total2 != last)
+                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
+                    "still 0 at run=%ld", second, requests_done, requests_compressed, requests_failed, requests_bcpack_blank,
+                    zero_tokens_at_enqueue, zero_tokens_at_run);
+            last = total2;
+        }
+    }, nullptr, 0, nullptr);
+    (void)heartbeat;
     static Object* instance = make(factory);
     InterlockedIncrement(&instance->refs);
     *out = instance;

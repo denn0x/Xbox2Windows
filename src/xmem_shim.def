@@ -13,3 +13,4 @@ EXPORTS
     XMemMapPhysicalPagesScatter @11
     XMemVirtualAlloc @12
     XMemTransferMemory @13
+    x2w_xmem_write_physical @14

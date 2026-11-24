@@ -10,7 +10,7 @@
 // upload ring / a private descriptor heap.
 
 struct Translation {
-    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
+    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 3 3D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     struct Ud { int kind, a, b; };           // 0 rect list, 1 base vertex, 2 start instance, 3 root constant(param a, word b), 4 stride of srv a
     int state = 0;                           // 1 ready, 2 unavailable
     std::vector<Srv> srvs;
@@ -21,7 +21,7 @@ struct Translation {
     ID3D12RootSignature* root = nullptr;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
     u64 key = 0;
-    LONG logged_draws = 0, logged_bindings = 0;  // diagnostics budget per translation
+    LONG logged_draws = 0, logged_bindings = 0, logged_large = 0;  // diagnostics budget per translation
 };
 
 // Per title pipeline: its translation and the blend state found in its state block (if any).
@@ -148,7 +148,7 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
             else if (!std::strcmp(source, "stride")) ud.kind = 4;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
-            Translation::Srv srv{!std::strcmp(kind, "tex2d") ? 1 : 0, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
+            Translation::Srv srv{!std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex3d") ? 3 : 0, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
         } else if (std::sscanf(line.c_str(), "smp %d %x %x %x %x", &i, &w[0], &w[1], &w[2], &w[3]) == 5) {
             tr.samplers.push_back({w[0], w[1], w[2], w[3]});
@@ -338,6 +338,190 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, bool have, u64 offset, std::s
     if (!have) InterlockedIncrement(&null_bindings);
 }
 
+// Texture contents. The XG stand-in reports the desktop copyable-footprint layout to the title
+// (mip footprints from GetCopyableFootprints, array slices every 64 KiB-aligned slice size), so a
+// texture's title memory is already in a layout CopyTextureRegion can read: each subresource is
+// copied through the upload ring as a placed footprint. A texture is uploaded on its first bind and
+// again when its memory changed: XG copies announce themselves (x2w_d3d12_texture_written), and
+// textures up to 32 MiB are also re-hashed every 15 frames for writes the title makes on its own.
+// Targets and UAVs are GPU-written and never uploaded.
+struct TextureUpload { u64 hash = 0; u64 generation = ~0ull; LONG checked_frame = -1000; bool done = false; };
+std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
+LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
+u64 hash_memory(const unsigned char* data, std::size_t bytes)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    const std::size_t words = bytes / 8;
+    const u64* w = reinterpret_cast<const u64*>(data);
+    for (std::size_t i = 0; i < words; ++i) h = (h ^ w[i]) * 0x100000001b3ull;
+    for (std::size_t i = words * 8; i < bytes; ++i) h = (h ^ data[i]) * 0x100000001b3ull;
+    return h;
+}
+void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
+{
+    auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
+    auto* list = recording(self);
+    const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    {
+        static LONG reasons;
+        if ((!memory || (desc.Flags & 0x7) || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) && !texture_uploads().count(texture) &&
+            first_calls(reasons, 12)) {
+            texture_uploads()[texture].done = true;
+            log("x2w-draw texture not uploaded %p: %llux%u format %d flags 0x%x dim %d title memory %p", static_cast<void*>(texture),
+                desc.Width, desc.Height, desc.Format, desc.Flags, desc.Dimension, static_cast<const void*>(memory));
+        }
+    }
+    if (!memory || !list) return;
+    if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+    const UINT mips = desc.MipLevels ? desc.MipLevels : 1;
+    const UINT slices = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
+    if (mips > 15) return;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[15];
+    UINT rows[15];
+    UINT64 row_bytes[15], slice_total = 0;
+    device_of(the_device)->GetCopyableFootprints(&desc, 0, mips, 0, footprints, rows, row_bytes, &slice_total);
+    if (slice_total == ~0ull || !slice_total) return;
+    const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
+    const u64 total = slices > 1 ? stride * (slices - 1) + slice_total : slice_total;
+    TextureUpload& state = texture_uploads()[texture];
+    u64 generation = 0;
+    AcquireSRWLockShared(&written_lock);
+    if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end()) generation = found->second;
+    ReleaseSRWLockShared(&written_lock);
+    const bool announced = state.generation != generation;
+    const bool recheck = state.done && !announced && total <= (u64{32} << 20) && frame_number - state.checked_frame >= 15;
+    if (state.done && !announced && !recheck) return;
+    if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
+        if (!state.done) InterlockedIncrement(&textures_unreadable);
+        state.done = true;
+        state.generation = generation;
+        return;
+    }
+    state.checked_frame = frame_number;
+    const u64 hash = hash_memory(memory, static_cast<std::size_t>(total));
+    if (state.done && hash == state.hash) {
+        state.generation = generation;
+        return;
+    }
+    state.hash = hash;
+    state.generation = generation;
+    state.done = true;
+    require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
+    for (UINT s = 0; s < slices; ++s)
+        for (UINT m = 0; m < mips; ++m) {
+            const auto& fp = footprints[m];
+            const u64 bytes = u64{fp.Footprint.RowPitch} * rows[m] * fp.Footprint.Depth;
+            u64 offset = 0;
+            if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) continue;
+            D3D12_TEXTURE_COPY_LOCATION source{upload_ring, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            source.PlacedFootprint = {offset, fp.Footprint};
+            D3D12_TEXTURE_COPY_LOCATION target{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            target.SubresourceIndex = m + s * mips;
+            list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+        }
+    InterlockedIncrement(&textures_uploaded);
+    InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
+    static LONG shown;
+    if (first_calls(shown, 12))
+        log("x2w-draw texture upload %p %llux%u x%u mips %u format %d from %p (%llu KiB)%s", static_cast<void*>(texture), desc.Width,
+            desc.Height, slices, mips, desc.Format, static_cast<const void*>(memory), total >> 10, announced ? " (announced write)" : "");
+}
+
+// Per-draw dumps (X2W_DRAW_DUMP_FRAME=<frame>, X2W_DRAW_DUMP_DIR=<folder>): during that frame, render
+// target 0 is copied to a readback buffer after every translated draw (at most 48); 30 frames later
+// the copies are written as BMPs reduced 4x (draw_<n>_<pipeline>.bmp), so one run shows what each
+// draw added. Only 4-byte target formats are written.
+struct DrawDump { ID3D12Resource* buffer; D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint; UINT rows; u64 key; UINT count; DXGI_FORMAT format; };
+std::vector<DrawDump>& draw_dumps() { static std::vector<DrawDump> v; return v; }
+LONG draw_dump_frame()
+{
+    static const LONG frame = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_DRAW_DUMP_FRAME", value, sizeof(value)) ? std::atol(value) : 0L;
+    }();
+    return frame;
+}
+void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT count)
+{
+    Pass& pass = pass_of(self);
+    const LONG wanted = draw_dump_frame();
+    if (!wanted || frame_number < wanted || frame_number > wanted + 1 || !pass.target0 || draw_dumps().size() >= 48) return;
+    const D3D12_RESOURCE_DESC desc = pass.target0->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT rows = 0;
+    UINT64 row_bytes = 0, total = 0;
+    device_of(the_device)->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total);
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = total;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* readback = nullptr;
+    if (FAILED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                              IID_PPV_ARGS(&readback)))) return;
+    require_state(self, pass.target0, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION target{readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    target.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION source{pass.target0, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    source.SubresourceIndex = 0;
+    list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+    require_state(self, pass.target0, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    draw_dumps().push_back({readback, footprint, rows, key, count, desc.Format});
+}
+void draw_dump_flush(LONG frame)
+{
+    const LONG wanted = draw_dump_frame();
+    if (!wanted || frame != wanted + 30) return;
+    char folder[MAX_PATH] = ".";
+    GetEnvironmentVariableA("X2W_DRAW_DUMP_DIR", folder, sizeof(folder));
+    AcquireSRWLockExclusive(&draw_lock);
+    int index = 0;
+    for (const DrawDump& dump : draw_dumps()) {
+        ++index;
+        const UINT bytes_per_pixel = dump.footprint.Footprint.RowPitch / (dump.footprint.Footprint.Width ? dump.footprint.Footprint.Width : 1);
+        void* mapped = nullptr;
+        if (bytes_per_pixel != 4 || FAILED(dump.buffer->Map(0, nullptr, &mapped))) continue;
+        const UINT w = dump.footprint.Footprint.Width / 4, h = dump.rows / 4;
+        std::vector<unsigned char> pixels(std::size_t{w} * h * 4);
+        const bool bgra = dump.format == DXGI_FORMAT_B8G8R8A8_UNORM || dump.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        for (UINT y = 0; y < h; ++y)
+            for (UINT x = 0; x < w; ++x) {
+                const unsigned char* p = static_cast<const unsigned char*>(mapped) + std::size_t{y * 4} * dump.footprint.Footprint.RowPitch + x * 16;
+                unsigned char* q = &pixels[(std::size_t{h - 1 - y} * w + x) * 4];
+                q[0] = bgra ? p[0] : p[2];
+                q[1] = p[1];
+                q[2] = bgra ? p[2] : p[0];
+                q[3] = 255;
+            }
+        dump.buffer->Unmap(0, nullptr);
+        char path[MAX_PATH + 64];
+        std::snprintf(path, sizeof(path), "%s\\draw_%02d_%016llx_%u.bmp", folder, index, dump.key, dump.count);
+        if (FILE* file = std::fopen(path, "wb")) {
+            const std::uint32_t data = static_cast<std::uint32_t>(pixels.size());
+            unsigned char header[54] = {'B', 'M'};
+            const std::uint32_t file_size = 54 + data, offset = 54, info = 40, planes_bits = 1u | (32u << 16);
+            const std::int32_t width = static_cast<std::int32_t>(w), height = static_cast<std::int32_t>(h);
+            std::memcpy(header + 2, &file_size, 4);
+            std::memcpy(header + 10, &offset, 4);
+            std::memcpy(header + 14, &info, 4);
+            std::memcpy(header + 18, &width, 4);
+            std::memcpy(header + 22, &height, 4);
+            std::memcpy(header + 26, &planes_bits, 4);
+            std::memcpy(header + 34, &data, 4);
+            std::fwrite(header, 1, 54, file);
+            std::fwrite(pixels.data(), 1, pixels.size(), file);
+            std::fclose(file);
+        }
+    }
+    log("x2w-draw per-draw dump: %d target copies written to %s", index, folder);
+    ReleaseSRWLockExclusive(&draw_lock);
+}
+
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
     auto* list = recording(self);
@@ -404,7 +588,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const u64 entry = srv.source == 0 && srv.a < 16 && pass.table_address[srv.a] ? pass.table_address[srv.a] + static_cast<u64>(srv.b) : 0;
         std::uint32_t words[8] = {};
         if (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
-        if (srv.kind == 1) {
+        if (srv.kind == 1 || srv.kind == 3) {
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;
@@ -417,20 +601,30 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             Wrapper* resource = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
             D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
             desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.ViewDimension = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            desc.Texture2D.MipLevels = 1;
+            desc.Texture2D.MipLevels = 1;  // same offset as Texture3D.MipLevels
             ID3D12Resource* texture = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
             }
+            if (texture) upload_texture(self, resource, texture);
             if (texture) require_state(self, texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             else InterlockedIncrement(&null_bindings);
             static LONG shown;
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
+            if (texture && desc.ViewDimension != (srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D) && record.desc_bytes >= 40) {
+                static LONG mismatch;
+                if (first_calls(mismatch, 6)) log("x2w-draw   %016llx srv %u: view dimension %d does not match the shader; binding null", tr->key, i, desc.ViewDimension);
+                texture = nullptr;
+                desc.ViewDimension = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
+                desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                desc.Texture2D = {};
+                desc.Texture2D.MipLevels = 1;
+            }
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
         }
@@ -520,8 +714,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         drawn = true;
     }
+    if (drawn) draw_dump_after(self, list, tr->key, count);
     ReleaseSRWLockExclusive(&draw_lock);
-    if (InterlockedIncrement(&tr->logged_draws) <= 10) {
+    if (InterlockedIncrement(&tr->logged_draws) <= 10 || (count > 100 && InterlockedIncrement(&tr->logged_large) <= 12)) {
         char indices[3 * 24 + 1] = "";
         if (indexed && pass.ib.BufferLocation) hex_text(reinterpret_cast<const void*>(pass.ib.BufferLocation + u64{start} * 2), 24, indices, sizeof(indices));
         log("x2w-draw %s(%u, %u, start %u, base %d) pipeline %016llx topology 0x%x -> %s; entry [%x %x %x %x %x %x]; ib 0x%llx+%u fmt %d [%s]; "

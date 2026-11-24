@@ -69,9 +69,26 @@ XInputGetStateFn xinput_get_state()
     return function;
 }
 
+// Controller window (input_pad.py): a named shared block "Local\x2w_input_pad" holding the buttons
+// clicked or typed there (OR-ed into every sample) and, written back here, the buttons the title last
+// read, so the window can show what reached the title. Absent when no window runs.
+struct PadShared { std::uint32_t magic, buttons, title_read, reads; };
+PadShared* pad_shared()
+{
+    static PadShared* const shared = [] {
+        HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(PadShared), L"Local\\x2w_input_pad");
+        if (!mapping) return static_cast<PadShared*>(nullptr);
+        auto* view = static_cast<PadShared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(PadShared)));
+        if (view) view->magic = 0x44415058;  // "XPAD"
+        return view;
+    }();
+    return shared;
+}
+
 GamepadState sample()
 {
     GamepadState s{};
+    if (PadShared* shared = pad_shared()) s.buttons |= shared->buttons;
     if (process_has_focus()) {
         const auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
         s.left_x = (down('D') ? 1.0f : 0.0f) - (down('A') ? 1.0f : 0.0f);
@@ -126,6 +143,28 @@ GamepadState sample()
     if (automatic.mask && automatic.period > 0) {
         const double t = (GetTickCount64() - automatic.zero) / 1000.0 - automatic.start;
         if (t >= 0 && std::fmod(t, automatic.period) < 0.2) s.buttons |= automatic.mask;
+    }
+    // X2W_INPUT_SCRIPT=<mask hex>@<second>[,...]: one press of 0.3 s per entry (e.g. 4@60,1@70,20@80
+    // presses A, then Menu, then Y), so one run can try several buttons at known times.
+    static const struct Script { std::uint32_t mask[32]; double at[32]; int count; ULONGLONG zero; } script = [] {
+        Script sc{{}, {}, 0, GetTickCount64()};
+        char text[512]{};
+        if (GetEnvironmentVariableA("X2W_INPUT_SCRIPT", text, sizeof(text))) {
+            for (char* item = std::strtok(text, ","); item && sc.count < 32; item = std::strtok(nullptr, ",")) {
+                unsigned mask = 0;
+                double at = 0;
+                if (std::sscanf(item, "%x@%lf", &mask, &at) == 2) {
+                    sc.mask[sc.count] = mask;
+                    sc.at[sc.count++] = at;
+                }
+            }
+        }
+        return sc;
+    }();
+    if (script.count) {
+        const double t = (GetTickCount64() - script.zero) / 1000.0;
+        for (int i = 0; i < script.count; ++i)
+            if (t >= script.at[i] && t < script.at[i] + 0.3) s.buttons |= script.mask[i];
     }
     return s;
 }
@@ -202,13 +241,24 @@ void __stdcall reading_device(Reading*, Object** device)
         *device = &the_device;
     }
 }
+const ULONGLONG loaded_at = GetTickCount64();
 bool __stdcall reading_gamepad(Reading* self, GamepadState* out)
 {
     static LONG calls, presses;
     note("Reading::GetGamepadState", calls);
     if (!out) return false;
     *out = self->state;
-    if (self->state.buttons && x2w_local::first_calls(presses, 8)) x2w_local::logf("x2w-input gamepad buttons 0x%x read by the title", self->state.buttons);
+    // Each new button combination the title reads is logged once per change (at most 64 lines).
+    static volatile LONG last_logged;
+    const LONG buttons = static_cast<LONG>(self->state.buttons);
+    if (buttons && InterlockedExchange(&last_logged, buttons) != buttons && x2w_local::first_calls(presses, 64))
+        x2w_local::logf("x2w-input gamepad buttons 0x%x read by the title at %.1f s", self->state.buttons,
+                        (GetTickCount64() - loaded_at) / 1000.0);
+    if (!buttons) InterlockedExchange(&last_logged, 0);
+    if (PadShared* shared = pad_shared()) {
+        shared->title_read = self->state.buttons;
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&shared->reads));
+    }
     return true;
 }
 

@@ -117,6 +117,7 @@ const char* const time_names[time_count] = {"list", "device-noop", "forward", "c
                                             "pipeline", "heap", "copy"};
 volatile LONG64 time_ticks[time_count], time_calls[time_count];
 volatile LONG64 list_slot_ticks[256], list_slot_calls[256];  // per command-list slot
+volatile LONG64 list_slot_census[256];  // per command-list slot, reported with the render totals
 struct Timed {
     int category;
     LARGE_INTEGER start;
@@ -357,6 +358,7 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
             if (K == list_kind) {
                 InterlockedAdd64(&list_slot_ticks[N & 255], end.QuadPart - start.QuadPart);
                 InterlockedIncrement64(&list_slot_calls[N & 255]);
+                InterlockedIncrement64(&list_slot_census[N & 255]);
             }
         }
     } slot_timed;
@@ -571,6 +573,20 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
 // Methods returning a structure by value: accept the object in either of the first two registers.
 Wrapper* receiver(void* a, void* b, void** result, const char* method)
 {
+    // Struct-returning methods arrive as (return buffer, object) or (object, return buffer). A return
+    // buffer on the caller's stack can still hold a stale copy of an object's vtable pointer and then
+    // looks like a wrapper too: when both do, the one on this thread's stack is the buffer.
+    if (as_wrapper(a) && as_wrapper(b)) {
+        ULONG_PTR low = 0, high = 0;
+        GetCurrentThreadStackLimits(&low, &high);
+        const auto on_stack = [&](void* p) { return reinterpret_cast<ULONG_PTR>(p) >= low && reinterpret_cast<ULONG_PTR>(p) < high; };
+        static LONG noted;
+        if (first_calls(noted, 4)) log("x2w-d3d12 %s: both arguments look like objects (%p, %p); the stack one is the result", method, a, b);
+        if (on_stack(a) && !on_stack(b)) {
+            *result = a;
+            return as_wrapper(b);
+        }
+    }
     if (Wrapper* w = as_wrapper(a)) {
         *result = b;
         return w;
@@ -1281,7 +1297,7 @@ bool ring_copy(u64 title_address, std::size_t bytes, u64* offset)
         ReleaseSRWLockExclusive(&lock);
     }
     if (!ring || bytes == 0 || bytes > ring_bytes / 4) return false;
-    const u64 rounded = (bytes + 255) & ~u64{255};
+    const u64 rounded = (bytes + 511) & ~u64{511};  // 512: texture footprints are placed in the ring too
     u64 start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded))) % ring_bytes;
     if (start + rounded > ring_bytes) start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded) + (ring_bytes - start))) % ring_bytes, start = 0;
     std::memcpy(mapped + start, reinterpret_cast<const void*>(title_address), bytes);
@@ -1313,6 +1329,7 @@ struct Pass {
     D3D12_INDEX_BUFFER_VIEW ib = {};
     DXGI_FORMAT target_formats[8] = {};
     UINT target_count = 0;
+    ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     bool heap_set = false;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
@@ -1396,6 +1413,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             if (view_format != DXGI_FORMAT_UNKNOWN) format = desktop_format(view_format);
         }
         pass.target_formats[i] = format;
+        if (i == 0) pass.target0 = target;
     }
     pass.target_count = count;
     list->OMSetRenderTargets(count, desktop, FALSE, nullptr);
@@ -1460,6 +1478,8 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     }
 }
 
+extern SRWLOCK written_lock;
+std::unordered_map<u64, u64>& written_textures();
 #include "startup_stubs/d3d12_draw.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
@@ -2408,6 +2428,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
     frame_number = frame;
+    draw_dump_flush(frame);
     {
         static const LONG wanted = [] {
             char value[16]{};
@@ -2465,9 +2486,21 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld", render_resets,
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld, textures uploaded %ld "
+            "(%ld KiB, unreadable %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_executes, render_draws, render_draws_skipped,
-            translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings);
+            translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings, textures_uploaded,
+            texture_bytes_uploaded, textures_unreadable);
+    if (render_mode() && frame % 300 == 0) {
+        // Which command-list slots the title called in the last 300 frames, per frame.
+        char line[2048];
+        int n = std::snprintf(line, sizeof(line), "x2w-render list slots per frame:");
+        for (int i = 0; i < 256 && n < static_cast<int>(sizeof(line)) - 24; ++i) {
+            const LONG64 calls = InterlockedExchange64(&list_slot_census[i], 0);
+            if (calls) n += std::snprintf(line + n, sizeof(line) - n, " %d:%.1f", i, calls / 300.0);
+        }
+        log("%s", line);
+    }
     if (now - last_report >= 5000) {
         last_report = now;
         log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu", views_noted, views_distinct,
