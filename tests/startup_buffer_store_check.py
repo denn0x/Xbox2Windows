@@ -4,8 +4,8 @@ Synthetic register states (descriptor s[16:19] from table 0 at byte 0x20). Check
 1. feature off: refused with the old message (the op name);
 2. feature on: `a = ud<uavbase> + vaddr + soffset + offset`, Store3 of the three data VGPRs, the exec guard after a
    branch made exec unknown, a literal soffset folded into the constant;
-3. refusals: idxen (no UAV stride source), a descriptor also read as an SRV (either order), a vertex-buffer source,
-   an unknown modifier, a ninth UAV;
+3. refusals: idxen (no UAV stride source), a vertex-buffer source, an unknown modifier, a ninth UAV; a buffer both read and
+   stored is read through the UAV (StoredSrv retry signal, rw_keys); descriptor edits that keep the base are accepted;
 4. manifest `uav 0 buf table 0 32` after the srv lines, `udsrc <n> uavbase 0`, and the HLSL declaration
    RWByteAddressBuffer u0 : register(u0).
 Not checked: stores on a GPU (draw-rt's startup_draw_uav_check covers the runtime side with its own shaders).
@@ -75,17 +75,48 @@ def main():
     refused(stage(), 'op_buffer_store_dwordx3', STORE, ['idxen'], 'modifier idxen')
     refused(stage(), 'op_buffer_store_dwordx3', STORE, ['offen', 'tfe'], 'modifier tfe')
     refused(stage(source=('vbtab',)), 'op_buffer_store_dwordx3', STORE, ['offen'], 'through vbtab')
+    # A buffer read and stored: a load before the store raises StoredSrv (translate_to rebuilds with the key in
+    # rw_keys); with it there, or after a store, loads go through the UAV at the uavbase-shifted address.
     s = stage()
     s.op_buffer_load_dword(['v8', 'v1', 's[16:19]', '0'], ['offen'])
-    refused(s, 'op_buffer_store_dwordx3', STORE, ['offen'], 'read as an SRV and stored to as a UAV')
+    try:
+        s.op_buffer_store_dwordx3(STORE, ['offen'])
+    except G.StoredSrv as conflict:
+        assert conflict.key == (('table', 0), 0x20), conflict.key
+    else:
+        raise AssertionError('store after an SRV read accepted without rw_keys')
+    s = stage()
+    s.pipe.rw_keys = {(('table', 0), 0x20)}
+    s.op_buffer_load_dword(['v8', 'v1', 's[16:19]', '0'], ['offen'])
+    s.op_buffer_store_dwordx3(STORE, ['offen'])
+    assert s.lines == ['a = ud0 + v1 + 0;', 'v8 = u0.Load(a + 0);', 'a = ud0 + v1 + 0;', 'u0.Store3(a, uint3(v4, v5, v6));'], s.lines
+    refused(s, 'op_buffer_load_dword', ['v8', 'v1', 's[16:19]', '0'], ['idxen'], 'indexed load through a buffer')
+    refused(s, 'op_tbuffer_load_format_x', ['v8', 'v1', 's[16:19]', '0'], ['offen', 'format:[BUF_FMT_8_UNORM]'],
+            'typed load through a buffer the program stores to')
+    refused(s, 'op_s_buffer_load_dword', ['s0', 's[16:19]', '0x0'], [], 'read as an SRV and stored to as a UAV')
     s = stage()
     s.op_buffer_store_dwordx3(STORE, ['offen'])
-    refused(s, 'op_buffer_load_dword', ['v8', 'v1', 's[16:19]', '0'], ['offen'], 'read as an SRV and stored to as a UAV')
+    s.op_buffer_load_dword(['v8', 'v1', 's[16:19]', '0'], ['offen'])
+    assert s.lines[-1] == 'v8 = u0.Load(a + 0);', s.lines
+
+    # Descriptor edits: stride cleared (AND keeping [15:0] of word 1), records and word 3 changed -> accepted;
+    # word 0 or a word-1 edit touching the base -> refused.
+    for edits, ok in (([(1, 's_and_b32', ('0xc000ffff',)), (2, 's_mul_i32', ('s10',)), (3, 's_or_b32', ('0x30000000',))], True),
+                      ([(0, 's_add_u32', ('0x10',))], False), ([(1, 's_and_b32', ('0xc0000fff',))], False),
+                      ([(1, 's_or_b32', ('0x10000',))], False)):
+        s = stage()
+        s.pipe.modified.add((('table', 0), 0x20))
+        s.pipe.modified_words = {(('table', 0), 0x20): edits}
+        if ok:
+            s.op_buffer_store_dwordx3(['v[1:3]', 'off', 's[16:19]', 's13'], [])
+            assert s.lines[-1] == 'u0.Store3(a, uint3(v1, v2, v3));', s.lines
+        else:
+            refused(s, 'op_buffer_store_dwordx3', ['v[1:3]', 'off', 's[16:19]', 's13'], [], 'modified descriptor')
     pipe = Pipe(('uav',))
     for n in range(8):
         pipe.uav((('table', 0), 0x100 * (n + 1)))
     refused(stage(pipe=pipe), 'op_buffer_store_dwordx3', ['v[4:6]', 'v1', 's[16:19]', '0'], ['offen'], 'more than 8 UAVs')
-    print('store refusals: idxen, tfe, vertex buffer, SRV+UAV both orders, ninth UAV')
+    print('store: idxen, tfe, vertex buffer, ninth UAV refused; read+store through the UAV (retry signal, rw loads); base-keeping descriptor edits accepted, others refused')
 
     s = stage()
     s.op_buffer_store_dwordx3(STORE, ['offen'])

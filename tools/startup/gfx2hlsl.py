@@ -18,6 +18,14 @@ class Unsupported(Exception):
     pass
 
 
+class StoredSrv(Unsupported):
+    """A descriptor first read as an SRV and later stored to; translate_to retries with it in rw_keys."""
+
+    def __init__(self, key, message):
+        super().__init__(message)
+        self.key = key
+
+
 PREFETCH = bytes.fromhex('0300a0bf')
 
 # SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
@@ -649,6 +657,10 @@ class Stage:
             elif own and own[0] in ('desc', 'ptr', 'ptrhi') and any(s == own for s in syms):
                 if own[0] == 'desc':
                     self.pipe.modified.add((own[1], own[2]))
+                    # which word changed and how (buffer_store accepts edits that keep the base address)
+                    other = [t for t, s in zip(srcs, syms) if s != own]
+                    self.pipe.__dict__.setdefault('modified_words', {}).setdefault((own[1], own[2]), []).append(
+                        (own[3], base, tuple(other)))
             else:
                 self.sym[d] = ('descnum',)
             return None
@@ -913,11 +925,25 @@ class Stage:
 
     def buffer_address(self, ops, mods):
         key = self.descriptor(ops[2])
-        buf = self.pipe.resource(key, 'buf')
-        offset = int(ops[3], 0)
+        rw = key in getattr(self.pipe, 'rw_keys', ()) or key in getattr(self.pipe, 'uavs', {})
+        if rw:
+            # A buffer this program also stores to: read through its UAV (in place, so the program sees its own
+            # stores), at the same uavbase-shifted address the stores use. No stride source for a UAV.
+            if 'idxen' in mods:
+                raise Unsupported('indexed load through a buffer the program stores to')
+            buf = self.pipe.uav(key)
+        else:
+            buf = self.pipe.resource(key, 'buf')
+        soff = ops[3]
+        if re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', soff):
+            offset, extra = int(soff, 0), ''
+        else:
+            offset, extra = 0, '%s + ' % self.u(soff)  # an SGPR soffset adds its value
         for m in mods:
             if m.startswith('offset:'):
                 offset += int(m[7:], 0)
+        if rw:
+            extra = 'ud%d + %s' % (self.pipe.ud(('uavbase', int(buf[1:]))), extra)
         if 'idxen' in mods:
             if key in self.pipe.modified:
                 raise Unsupported('indexed load through a modified descriptor')
@@ -930,7 +956,7 @@ class Stage:
             address = '%s + %d' % (self.u(ops[1]), offset)
         else:
             address = '%d' % offset
-        return buf, address
+        return buf, extra + address
 
     def op_buffer_load_dword(self, ops, mods, count=1):
         dst = reg_range(ops[0])
@@ -953,6 +979,8 @@ class Stage:
         formats = [m for m in mods if m.startswith('format:')]
         fmt = formats[0][8:-1] if formats else 'BUF_FMT_8_UNORM'  # the disassembler omits the default format
         buf, address = self.buffer_address(ops, [m for m in mods if not m.startswith('format:')])
+        if buf.startswith('u'):
+            raise Unsupported('typed load through a buffer the program stores to')  # ldu() takes a ByteAddressBuffer
         self.emit('a = %s;' % address)
         table = {'BUF_FMT_8_8_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)', 'U((w >> 24) / 255.0)']),
                  'BUF_FMT_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', '0u', 'U(1.0)']),
@@ -1005,6 +1033,8 @@ class Stage:
             raise Unsupported('%s through %s' % (name, key[0][0]))
         dst = reg_range(ops[0])
         buf, address = self.buffer_address(ops, mods)
+        if buf.startswith('u'):
+            raise Unsupported('%s through a buffer the program stores to' % name)  # bufword3 names an srv
         w3 = self.pipe.ud(('bufword3', self.pipe.resources[key]['index']))
         self.emit('a = %s;' % address)
         for i in range(count):
@@ -1028,7 +1058,14 @@ class Stage:
         if key[0][0] not in ('table', 'root'):
             raise Unsupported('%s through %s' % (name, key[0][0]))
         if key in self.pipe.modified:
-            raise Unsupported('%s through a modified descriptor' % name)
+            # A raw store uses only the base address (word 0, word 1 [15:0]); the runtime binds the entry's bytes in
+            # place. Accepted edits: words 2 and 3 (record count, format, OOB select: bounds and typing a raw
+            # store ignores; assumed in range) and an AND of word 1 that keeps [15:0] (clearing the stride).
+            for word, op, other in getattr(self.pipe, 'modified_words', {}).get(key, [('?', '?', ())]):
+                keeps_base = word == 1 and op == 's_and_b32' and len(other) == 1 and \
+                    re.fullmatch(r'0x[0-9a-f]+', other[0]) and int(other[0], 16) & 0xffff == 0xffff
+                if word not in (2, 3) and not keeps_base:
+                    raise Unsupported('%s through a modified descriptor' % name)
         u = self.pipe.uav(key)
         base = self.pipe.ud(('uavbase', int(u[1:])))
         offset = sum(int(m[7:], 0) for m in mods if m.startswith('offset:'))
@@ -2129,8 +2166,9 @@ def ps_input_layout(ena, addr):
 
 class Pipeline:
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None,
-                 features=None, vs_out_cntl=None):
+                 features=None, vs_out_cntl=None, rw_keys=()):
         self.root = parse_root(root_blob)
+        self.rw_keys = frozenset(rw_keys)  # buffers the program stores to and reads: every access through the UAV
         # PA_CL_VS_OUT_CNTL of the vertex stage (request .vsout), or None: says what a pos1 export carries.
         self.vs_out_cntl = vs_out_cntl
         # Lowerings whose manifest lines need draw-runtime support (DRAW_FEATURES); off unless named, so a
@@ -2224,7 +2262,7 @@ class Pipeline:
                 raise Unsupported('heap %s' % kind)
             self.heapvars[k] = kind
             return '%s[NonUniformResourceIndex(x2w_hix(h%d, %du))]' % (HEAP_KINDS[kind][0], k, HEAP_KINDS[kind][1])
-        if key in getattr(self, 'uavs', {}):
+        if key in getattr(self, 'uavs', {}) or key in getattr(self, 'rw_keys', ()):
             raise Unsupported('descriptor %s read as an SRV and stored to as a UAV' % (key,))
         r = self.resources.setdefault(key, dict(index=len(self.resources), kind=kind))
         if r['kind'] != kind:
@@ -2234,7 +2272,8 @@ class Pipeline:
     def uav(self, key):
         """u<i> for a raw buffer UAV (manifest `uav <i> buf ...`); indices count from 0 apart from the SRVs."""
         if key in self.resources:
-            raise Unsupported('descriptor %s read as an SRV and stored to as a UAV' % (key,))
+            # translate_to builds the pipeline again with the key in rw_keys, so its vector loads go through the UAV
+            raise StoredSrv(key, 'descriptor %s read as an SRV and stored to as a UAV' % (key,))
         uavs = self.__dict__.setdefault('uavs', {})
         if key not in uavs:
             if len(uavs) == 8:
@@ -2416,8 +2455,17 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, ps_hw_inputs=ps_hw_inputs,
-                        vs_out_cntl=vs_out_cntl)
+        rw_keys = set()
+        while True:
+            try:
+                pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, ps_hw_inputs=ps_hw_inputs,
+                                vs_out_cntl=vs_out_cntl, rw_keys=rw_keys)
+                break
+            except StoredSrv as conflict:
+                # read before the first store: build again with every access to that buffer through its UAV
+                if conflict.key in rw_keys or len(rw_keys) == 8:
+                    raise
+                rw_keys.add(conflict.key)
         if pipe.ps_entry_reads:
             # A request does not carry the SPI input layout, so the HLSL would read that input as 0 (for example
             # the packed pixel position a dither or a full-screen copy addresses with). Not written as a result.
