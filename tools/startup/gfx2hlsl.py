@@ -1692,6 +1692,13 @@ VEC_U = {
     'v_not_b32': (1, '~{0}'), 'v_lshlrev_b32': (2, '{1} << ({0} & 31)'), 'v_lshrrev_b32': (2, '{1} >> ({0} & 31)'),
     'v_ashrrev_i32': (2, 'uint(int({1}) >> ({0} & 31))'), 'v_min_u32': (2, 'min({0}, {1})'), 'v_max_u32': (2, 'max({0}, {1})'),
     'v_min_i32': (2, 'uint(min(int({0}), int({1})))'), 'v_max_i32': (2, 'uint(max(int({0}), int({1})))'),
+    # Three-operand integer forms (RDNA2 ISA: V_MIN3/V_MAX3/V_MED3 _I32/_U32; median = max(min(a, b), min(max(a, b), c)),
+    # the identity the f32 med3 helper uses).
+    'v_min3_u32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_u32': (3, 'max({0}, max({1}, {2}))'),
+    'v_min3_i32': (3, 'uint(min(int({0}), min(int({1}), int({2}))))'),
+    'v_max3_i32': (3, 'uint(max(int({0}), max(int({1}), int({2}))))'),
+    'v_med3_u32': (3, 'max(min({0}, {1}), min(max({0}, {1}), {2}))'),
+    'v_med3_i32': (3, 'uint(max(min(int({0}), int({1})), min(max(int({0}), int({1})), int({2}))))'),
     'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'),
     'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
