@@ -460,8 +460,10 @@ void report_cx_views()
         InterlockedExchange(&compute_root_same, 0), InterlockedExchange(&compute_root_changed, 0),
         x2w_local::env_on("X2W_CX_ROOT_RESET") ? " (X2W_CX_ROOT_RESET: both clear)" : "");
 }
+void vdesc_fill(const ViewRecord& record);  // LOCAL meshrt: d3d12_vdesc.inl (`heapwords 1`; inert until a manifest asks)
 void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
 {
+    if (record) vdesc_fill(*record);  // LOCAL meshrt
     const SIZE_T inc = draw_heap_increment;
     auto at = [&](UINT k) { return D3D12_CPU_DESCRIPTOR_HANDLE{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{base + k} * inc}; };
     static const ComputeTranslation::Res kinds[8] = {{false, 1, 0, 0, 0}, {false, 2, 0, 0, 0}, {false, 3, 0, 0, 0}, {false, 4, 0, 0, 0},
@@ -588,6 +590,41 @@ bool title_view_heap(const Pass& pass, u64* address, u64* bytes)
     return best != nullptr;
 }
 
+// The 8 gfx10 descriptor words the console would hold for a view the title created (gfx10_view_words.h): a CBV
+// or buffer view gives the V# (raw for a CBV), a texture view the T# from the view and its resource. False: no
+// words (unknown slot, unreadable desc, texture view of an unknown resource). Used by descword and vdesc
+// (meshrt, `heapwords 1`); no counters here.
+bool view_record_words(const ViewRecord& record, std::uint32_t out[8], bool* image, bool* unmapped)
+{
+    std::memset(out, 0, 32);
+    *image = *unmapped = false;
+    Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
+    ID3D12Resource* real = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
+    x2w_startup::BufferViewLayout l;
+    if (record.slot == 17 && record.desc_bytes >= 12) {
+        std::uint32_t size = 0;
+        std::memcpy(&size, record.desc + 8, 4);
+        l = x2w_startup::buffer_view_layout(DXGI_FORMAT_R32_TYPELESS, 0, size / 4, 0, 1);  // a CBV reads as a raw buffer
+    } else if ((record.slot == 18 || record.slot == 19) &&
+               x2w_startup::buffer_view_layout_from_desc(record.slot == 19, record.desc, record.desc_bytes, l, typed_views_off())) {
+    } else if (real && (record.slot == 18 || record.slot == 19)) {
+        x2w_startup::ImageViewFacts v;
+        if (!x2w_startup::image_view_from_desc(record.slot == 19, record.desc, record.desc_bytes, v)) return false;
+        const D3D12_RESOURCE_DESC rd = real->GetDesc();
+        v.dimension = rd.Dimension;
+        v.width = rd.Width;
+        v.height = rd.Height;
+        v.depth_or_array = rd.DepthOrArraySize;
+        v.mip_levels = rd.MipLevels;
+        v.format = typeless_to_float(desktop_format(v.format ? v.format : rd.Format));
+        return *image = x2w_startup::gfx10_image_words(v, out, unmapped);
+    } else {
+        return false;
+    }
+    x2w_startup::gfx10_buffer_words(l, out);
+    return true;
+}
+
 // LOCAL: `udsrc <i> descword <param> <byte offset>`: the dword at <byte offset> of the descriptor table bound at root
 // parameter <param>, as the console would hold it. Entries are 32 bytes: entry = offset & ~31, word = (offset & 31) / 4.
 // A view token becomes the synthesized gfx10 T# (texture view) or V# (buffer view, CBV) word (gfx10_view_words.h);
@@ -622,40 +659,14 @@ std::uint32_t descword_value(const Pass& pass, int param, int offset, u64 key, b
     const bool known = words[1] < view_records().size();
     if (known) record = view_records()[words[1]];
     ReleaseSRWLockShared(&note_lock);
-    Wrapper* resource = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
-    ID3D12Resource* real = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
     std::uint32_t out[8] = {};
-    bool made = false, image = false;
-    x2w_startup::BufferViewLayout l;
-    if (known && record.slot == 17 && record.desc_bytes >= 12) {
-        std::uint32_t size = 0;
-        std::memcpy(&size, record.desc + 8, 4);
-        l = x2w_startup::buffer_view_layout(DXGI_FORMAT_R32_TYPELESS, 0, size / 4, 0, 1);  // a CBV reads as a raw buffer
-        made = true;
-    } else if (known && (record.slot == 18 || record.slot == 19) &&
-               x2w_startup::buffer_view_layout_from_desc(record.slot == 19, record.desc, record.desc_bytes, l, typed_views_off())) {
-        made = true;
-    } else if (known && real && (record.slot == 18 || record.slot == 19)) {
-        x2w_startup::ImageViewFacts v;
-        if (x2w_startup::image_view_from_desc(record.slot == 19, record.desc, record.desc_bytes, v)) {
-            const D3D12_RESOURCE_DESC rd = real->GetDesc();
-            v.dimension = rd.Dimension;
-            v.width = rd.Width;
-            v.height = rd.Height;
-            v.depth_or_array = rd.DepthOrArraySize;
-            v.mip_levels = rd.MipLevels;
-            v.format = typeless_to_float(desktop_format(v.format ? v.format : rd.Format));
-            bool unmapped = false;
-            image = made = x2w_startup::gfx10_image_words(v, out, &unmapped);
-            if (made && unmapped) {
-                InterlockedIncrement(&cxd_unmapped);
-                static LONG logged;
-                if (first_calls(logged, 8))
-                    log("x2w-cx descword: view format %u has no gfx10 format here: FORMAT 0 (word 1 may then read as a null view)", v.format);
-            }
-        }
+    bool image = false, unmapped = false;
+    const bool made = known && view_record_words(record, out, &image, &unmapped);
+    if (made && unmapped) {
+        InterlockedIncrement(&cxd_unmapped);
+        static LONG logged;
+        if (first_calls(logged, 8)) log("x2w-cx descword: view %u has no gfx10 format here: FORMAT 0 (word 1 may then read as a null view)", record.id);
     }
-    if (made && !image) x2w_startup::gfx10_buffer_words(l, out);
     if (!made) {
         InterlockedIncrement(&cxd_null);
         return 0;

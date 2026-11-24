@@ -4916,6 +4916,7 @@ void draw_overlay(LONG frame, double seconds)
 }
 
 #include "startup_stubs/d3d12_compute.inl"
+#include "startup_stubs/d3d12_vdesc.inl"  // LOCAL meshrt: `heapwords 1`
 #include "startup_stubs/d3d12_gpu_time.inl"
 #include "startup_stubs/d3d12_indirect.inl"
 #include "startup_stubs/d3d12_mesh.inl"  // LOCAL meshrt

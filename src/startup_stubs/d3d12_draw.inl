@@ -24,6 +24,8 @@ struct Translation {
     UINT uav_parameter = 0;
     bool heap = false;                       // `heap 1`: heapmem, vinfo and the view-id region (root parameters heap_parameter..+2)
     UINT heap_parameter = 0;
+    bool heapwords = false;                  // LOCAL meshrt `heapwords 1` (needs `heap 1`): vdesc, root SRV t2 space1 (d3d12_vdesc.inl)
+    UINT vdesc_parameter = 0;
     x2w_startup::TranslatedSamplers samplers;
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
@@ -492,6 +494,11 @@ HRESULT create_draw_root(Translation& tr)
         parameters[count + 2].DescriptorTable = {5, heap_ranges};
         count += 3;
     }
+    if (tr.heap && tr.heapwords) {  // LOCAL meshrt: vdesc, root SRV t2 space1 (d3d12_vdesc.inl)
+        tr.vdesc_parameter = count;
+        parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        parameters[count++].Descriptor = {2, 1};
+    }
     const auto statics = x2w_startup::decode_statics(tr.samplers);
     const D3D12_ROOT_SIGNATURE_DESC desc{count, parameters, static_cast<UINT>(statics.size()), statics.data(), D3D12_ROOT_SIGNATURE_FLAG_NONE};
     x2w_startup::ComPtr<ID3DBlob> blob, errors;
@@ -697,6 +704,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
         } else if (line == "heap 1") {
             tr.heap = true;  // LOCAL draw-rt: resource-heap (bindless) descriptors
+        } else if (line == "heapwords 1") {
+            tr.heapwords = true;  // LOCAL meshrt: the heap descriptors' gfx10 words (vdesc, d3d12_vdesc.inl)
         } else if (!tr.samplers.read_manifest_line(line.c_str())) {
             log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
             return;
@@ -707,6 +716,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32) return;
+    if (tr.heapwords && !tr.heap) return log("x2w-vdesc %016llx: `heapwords 1` without `heap 1`: translation refused", tr.key);  // LOCAL meshrt
     // LOCAL draw-rt off switch (X2W_DRAW_RT_OFF=1): translations that use these features stay unavailable.
     static const bool rt_off = x2w_local::env_on("X2W_DRAW_RT_OFF");
     if (rt_off && (!tr.uavs.empty() || tr.heap || std::any_of(tr.uds.begin(), tr.uds.end(), [](const Translation::Ud& ud) {
@@ -732,6 +742,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     if (tr.heap) {
         InterlockedIncrement(&rt_loaded_heap);
         log("x2w-draw-rt pipeline %016llx: heap 1 in root parameters %u..%u", tr.key, tr.heap_parameter, tr.heap_parameter + 2);
+        if (tr.heapwords) log("x2w-vdesc pipeline %016llx: heapwords 1, vdesc in root parameter %u", tr.key, tr.vdesc_parameter);  // LOCAL meshrt
     }
     if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
@@ -1492,6 +1503,8 @@ void fill_views(Wrapper* self);
 bool title_view_heap(const Pass& pass, u64* address, u64* bytes);
 extern ID3D12Resource* vinfo_buffer;
 extern UINT views_filled;
+extern ID3D12Resource* vdesc_buffer;  // LOCAL meshrt: d3d12_vdesc.inl
+bool ensure_vdesc();
 
 // LOCAL draw-rt (`heap 1`): the desktop address of the title view heap a draw indexes: the shader-visible view
 // heap the list set (SetDescriptorHeaps), else compute's choice. The address is resolved once per frame.
@@ -1800,6 +1813,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (!reason) {
             fill_views(self);
             if (!vinfo_buffer) reason = "no per-view info buffer";
+            else if (tr->heapwords && !ensure_vdesc()) reason = "no view descriptor (vdesc) buffer";  // LOCAL meshrt
         }
         if (reason) {
             InterlockedIncrement(&rt_heap_skipped);
@@ -2145,6 +2159,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (tr->heap) {
         list->SetGraphicsRootShaderResourceView(tr->heap_parameter, heap_va);
         list->SetGraphicsRootShaderResourceView(tr->heap_parameter + 1, vinfo_buffer->GetGPUVirtualAddress());
+        if (tr->heapwords) list->SetGraphicsRootShaderResourceView(tr->vdesc_parameter, vdesc_buffer->GetGPUVirtualAddress());  // LOCAL meshrt
         // The region starts at the 8 empty views before id 0 (d3d12_compute.inl fill_views).
         list->SetGraphicsRootDescriptorTable(tr->heap_parameter + 2,
             D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{draw_heap_size} * draw_heap_increment});
