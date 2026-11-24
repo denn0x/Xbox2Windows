@@ -14,6 +14,7 @@
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "xmem_low.h"
 
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
@@ -850,6 +851,36 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12
     barrier.Transition.StateBefore = from;
     barrier.Transition.StateAfter = to;
     list->ResourceBarrier(1, &barrier);
+}
+
+// List slot 148 (Xbox order): AllocateUploadMemory(size, alignment) -> a pointer the CPU writes and
+// the GPU reads at the same address (console unified memory), released when the list's allocator is
+// reset. Used by the ray-tracing builder, which fails ("Failed to allocate upload buffer") on null.
+// LOCAL SHORTCUT: a bump arena of 64 MiB blocks below 1 TiB (x2w_low); blocks are never released.
+LONG upload_allocations;
+u64 __stdcall list_allocate_upload(Wrapper*, u64 size, u64 alignment)
+{
+    static std::mutex arena_lock;
+    static unsigned char *cursor = nullptr, *limit = nullptr;
+    constexpr std::size_t block = std::size_t{64} << 20;
+    if (!size) size = 16;
+    if (alignment < 16) alignment = 16;
+    if ((alignment & (alignment - 1)) || size > block / 2) return 0;
+    const std::lock_guard guard(arena_lock);
+    auto aligned = [&] { return reinterpret_cast<unsigned char*>((reinterpret_cast<u64>(cursor) + alignment - 1) & ~(alignment - 1)); };
+    if (!cursor || aligned() + size > limit) {
+        auto* fresh = static_cast<unsigned char*>(x2w_low::alloc(block, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!fresh) return 0;
+        cursor = fresh;
+        limit = fresh + block;
+        log("x2w-d3d12 upload arena block %p (64 MiB)", static_cast<void*>(fresh));
+    }
+    unsigned char* result = aligned();
+    cursor = result + size;
+    if (InterlockedIncrement(&upload_allocations) <= 4)
+        log("x2w-d3d12 CommandList::slot148(AllocateUploadMemory) size=0x%llx align=0x%llx -> %p", size, alignment,
+            static_cast<void*>(result));
+    return reinterpret_cast<u64>(result);
 }
 
 LONG render_resets, render_closes, render_clears, render_executes, render_reset_failures;
@@ -2638,6 +2669,7 @@ void build_tables()
         fill_noops<list_kind>(tables[list_kind], std::make_index_sequence<slot_count>{});
         tables[list_kind][7] = reinterpret_cast<void*>(&child_get_device);
     }
+    list_typed[148] = reinterpret_cast<ListTyped>(&list_allocate_upload);
     if (render_mode()) {
         list_typed[9] = reinterpret_cast<ListTyped>(&list_close);
         list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
