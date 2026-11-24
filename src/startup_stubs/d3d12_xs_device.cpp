@@ -3697,14 +3697,22 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
     // that lies inside that one allocation. Attempts that cannot succeed are skipped: each failure
     // throws inside D3D12Core.
+    // LOCAL (perf_work/STARTUP.md): the allocation walk below queries every region from the allocation
+    // base; one query on a large touched region costs about 1.8 ms per GiB (scratch bench), and the
+    // start-up loop places ~2,800 small buffers at unaligned offsets in a 2.2 GiB block, where the walk
+    // result is never used. The checks that need no walk come first; the result is the same.
+    // X2W_D3D12_PLACED_WALK=1 walks for every call, as before.
+    static const bool always_walk = x2w_local::env_on("X2W_D3D12_PLACED_WALK");
+    const bool rejected = (offset & 0xFFFF) || info.Type != MEM_PRIVATE ||
+                          initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
     MEMORY_BASIC_INFORMATION region{};
     SIZE_T allocation_bytes = 0;
-    for (auto* cursor = static_cast<char*>(base);
-         VirtualQuery(cursor, &region, sizeof(region)) && region.AllocationBase == base && region.State == MEM_COMMIT;
-         cursor += region.RegionSize)
-        allocation_bytes += region.RegionSize;
-    if ((offset & 0xFFFF) || offset > allocation_bytes || desc->Width > allocation_bytes - offset || info.Type != MEM_PRIVATE ||
-        initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) hr = E_INVALIDARG;
+    if (!rejected || always_walk)
+        for (auto* cursor = static_cast<char*>(base);
+             VirtualQuery(cursor, &region, sizeof(region)) && region.AllocationBase == base && region.State == MEM_COMMIT;
+             cursor += region.RegionSize)
+            allocation_bytes += region.RegionSize;
+    if (rejected || offset > allocation_bytes || desc->Width > allocation_bytes - offset) hr = E_INVALIDARG;
     query_time.stop();
     TimedPart create_time(time_placed_create);
     if (SUCCEEDED(hr)) {
