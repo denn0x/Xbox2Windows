@@ -672,7 +672,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     // LOCAL: X2W_CX_COMPILE_LOCKED=1 restores the old order (compile while holding draw_lock), for comparison.
     static const bool compile_locked = x2w_local::env_on("X2W_CX_COMPILE_LOCKED");
     ComputeTranslation* ready = compile_locked ? nullptr : &loaded_compute(key);
-    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(200000 + __LINE__);
+    lock_draw(200000 + __LINE__);
     if (!ready) {
         ready = &compute_translations()[key];
         if (!ready->state) load_compute(key, *ready);

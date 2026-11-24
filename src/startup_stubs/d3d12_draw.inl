@@ -158,6 +158,16 @@ void draw_lock_taken(int line)
     }, nullptr, 0, nullptr);
     (void)monitor;
 }
+// LOCAL: takes draw_lock; time spent blocked behind another holder is reported as "draw-lock-wait"
+// in the time-inside line (calls = acquisitions that had to wait), which the 10 s monitor cannot show.
+void lock_draw(int line)
+{
+    if (!TryAcquireSRWLockExclusive(&draw_lock)) {
+        Timed waited(time_draw_lock_wait);
+        AcquireSRWLockExclusive(&draw_lock);
+    }
+    draw_lock_taken(line);
+}
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
@@ -1428,7 +1438,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     const bool rect = pass.topology == 0x11;
     if (list && pass.pipeline && !pass.targets_bound) InterlockedIncrement(&draws_without_targets);
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
-    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
+    lock_draw(100000 + __LINE__);
     report_draw_rt();
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;

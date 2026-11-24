@@ -252,7 +252,7 @@ Wrapper* the_device;
 enum { time_list, time_device_noop, time_forward, time_create, time_view, time_queue, time_present, time_wait,
        time_pipeline, time_heap, time_copy, time_cx_fill_views, time_cx_desktop_range, time_cx_readable, time_cx_texture,
        time_cx_execute, time_vquery, time_placed, time_placed_query, time_placed_create, time_placed_log, time_placed_gap,
-       time_count };
+       time_draw_lock_wait, time_count };
 // LOCAL (perf_work/STARTUP.md): "placed" is all of Device slot 133 (CreatePlacedResourceX); its parts are
 // the memory queries, the desktop heap/resource creation and the log line; "placed-gap" is the time on
 // the same thread from the end of one slot 133 call to the start of the next (the title's own work
@@ -260,7 +260,7 @@ enum { time_list, time_device_noop, time_forward, time_create, time_view, time_q
 const char* const time_names[time_count] = {"list", "device-noop", "forward", "create", "view", "queue", "present", "wait",
                                             "pipeline", "heap", "copy", "cx-fill-views", "cx-desktop-range", "cx-readable",
                                             "cx-texture-view", "cx-execute", "vquery", "placed", "placed-query",
-                                            "placed-create", "placed-log", "placed-gap"};
+                                            "placed-create", "placed-log", "placed-gap", "draw-lock-wait"};
 volatile LONG64 time_ticks[time_count], time_calls[time_count];
 struct Timed;
 SIZE_T timed_query(const void* address, MEMORY_BASIC_INFORMATION* info);  // VirtualQuery, timed as "vquery"
@@ -2957,7 +2957,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         if (!ready.empty()) {
             auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
             const UINT ready_count = static_cast<UINT>(ready.size());
-            AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(0 + __LINE__);
+            lock_draw(0 + __LINE__);
             if (draw_dump_frame()) {
                 const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
                 if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
