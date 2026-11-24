@@ -88,23 +88,15 @@ int heap_text(char* out, int at, int capacity) noexcept
 // LOCAL memcut: resident (working-set) MiB of each startup block of 16 MiB or more, a lower bound of
 // the pages the title has touched (untouched committed pages are never resident; touched ones can be
 // trimmed). Ranks the "commit startup blocks on first touch" cut (memcut_work/PLAN.md).
-// The walk (~1.2 M pages in run 82) runs at most every 9 s; the lines in between repeat its text.
+// Part of the census line only (X2W_MEM_CENSUS_AT seconds): the walk covers ~1.2 M pages (run 82).
 int block_resident_walk(char* out, int at, int capacity);
 int block_resident_text(char* out, int at, int capacity) noexcept
 {
-    static char cached[384];
-    static ULONGLONG last;
-    const ULONGLONG now = GetTickCount64();
-    if (!cached[0] || now - last >= 9000) {
-        last = now;
-        cached[0] = 0;
-        try {
-            block_resident_walk(cached, 0, sizeof(cached));
-        } catch (...) {
-            cached[0] = 0;  // out of memory: no residency text this time
-        }
+    try {
+        return block_resident_walk(out, at, capacity);
+    } catch (...) {
+        return at;  // out of memory: no residency text this time
     }
-    return cached[0] ? append(out, at, capacity, "%s", cached) : at;
 }
 int block_resident_walk(char* out, int at, int capacity)
 {
@@ -178,7 +170,6 @@ void report(ULONGLONG second) noexcept
     if (at < 0) return;
     at = heap_text(line, at, sizeof(line));
     at = gpu_text(line, at, sizeof(line));
-    at = block_resident_text(line, at, sizeof(line));  // LOCAL memcut
     at = stand_in_text(line, at, sizeof(line));
     x2w_local::logf("%s", line);
 }
@@ -280,6 +271,9 @@ void census(ULONGLONG second) noexcept
     for (const Allocation& a : top)
         n = append(line, n, sizeof(line), " %p:%llu/%lluMiB p%lx", reinterpret_cast<void*>(a.base), a.committed / mib,
                    a.reserved / mib, a.protect);
+    const ULONGLONG walk = GetTickCount64();
+    n = block_resident_text(line, n, sizeof(line));  // LOCAL memcut
+    n = append(line, n, sizeof(line), " (%llu ms)", GetTickCount64() - walk);
     x2w_local::logf("%s", line);
 }
 

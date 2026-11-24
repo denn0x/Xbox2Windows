@@ -330,6 +330,7 @@ bool texture_view(Wrapper* self, const ComputeTranslation::Res& r, const ViewRec
     Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
     ID3D12Resource* texture = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
     if (!texture || record.desc_bytes < 24) return false;
+    if (resource->own().refs <= 0) x2w_memcut::note_after_release(true);  // LOCAL memcut
     const D3D12_RESOURCE_DESC rd = texture->GetDesc();
     const int dim = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 3 : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 4
         : rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ? (rd.DepthOrArraySize > 1 ? 2 : 1) : 0;
