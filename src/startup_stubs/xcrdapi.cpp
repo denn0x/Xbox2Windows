@@ -114,8 +114,9 @@ struct QueueWork {
     u64 next_submission_id = 0;
     static constexpr std::size_t max_cached_streams = 16;
     std::deque<CachedStream> cached_streams;
-    unsigned char last_served[0x48] = {};  // LOCAL: the latest request this queue served (worker only), for FAIL lines
-    bool served_any = false;
+    // LOCAL: the latest request this queue served per options value (8 values, worker only), for FAIL lines.
+    struct Served { bool used; unsigned char bytes[0x48]; } served[8] = {};
+    unsigned served_next = 0;
 
     void put_stream(u64 source, u64 base_offset, unsigned compressed_size, unsigned chunk_size,
                     std::vector<u64> continuation_ids, std::vector<unsigned char> data)
@@ -983,14 +984,21 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         for (int i = 0; i < 0x48; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
         log("x2w-dstorage FAIL options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x outcome=\"%s\" file=\"%ls\" file_size=0x%llx +10=0x%llx +38=0x%llx +40=0x%llx bytes=[%s]", options,
             destination_size, offset, source_size, outcome, path, static_cast<unsigned long long>(file_size.QuadPart), words[2], words[7], words[8], bytes);
-        if (self && self->work && self->work->served_any &&
-            *reinterpret_cast<const u64*>(self->work->last_served) == options) {
-            for (int i = 0; i < 0x48; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", self->work->last_served[i]);
-            log("x2w-dstorage   the queue's latest served request with the same options: [%s]", bytes);
+        if (self && self->work) {
+            for (const auto& served : self->work->served) {
+                if (!served.used || std::memcmp(served.bytes, request, 8) != 0) continue;
+                for (int i = 0; i < 0x48; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", served.bytes[i]);
+                log("x2w-dstorage   the queue's latest served request with the same options: [%s]", bytes);
+            }
         }
     } else if (self && self->work && std::strcmp(outcome, "empty") != 0) {
-        std::memcpy(self->work->last_served, request, sizeof self->work->last_served);
-        self->work->served_any = true;
+        QueueWork& work = *self->work;
+        QueueWork::Served* slot = nullptr;
+        for (auto& served : work.served)
+            if (served.used && std::memcmp(served.bytes, request, 8) == 0) slot = &served;
+        if (!slot) slot = &work.served[work.served_next++ % 8];
+        std::memcpy(slot->bytes, request, sizeof slot->bytes);
+        slot->used = true;
     }
     static LONG slices_logged;
     if (interval_request && slice.at && x2w_local::first_calls(slices_logged, 32))
