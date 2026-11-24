@@ -189,7 +189,7 @@ bool rawaddr_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UI
     for (UINT i = 0; i < 16; ++i) {
         const int kind = pass.compute_kind[i];
         if (kind == 5 || (kind >= 2 && kind <= 4 && pass.compute_address[i] && !(addresses[i] = desktop_va(pass.compute_address[i])))) {
-            if (InterlockedIncrement(&key.skipped) <= 4) log("x2w-rawaddr %016llx: title parameter %u (kind %d) not bindable: dispatch skipped", key.key, i, kind);
+            if (x2w_local::first_of(InterlockedIncrement(&key.skipped), 4)) log("x2w-rawaddr %016llx: title parameter %u (kind %d) not bindable: dispatch skipped", key.key, i, kind);
             return false;
         }
     }
@@ -214,7 +214,7 @@ bool rawaddr_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UI
     ID3D12Resource* windows[ra::kRegions] = {};
     UINT count = 0, resolved = 0, unresolved = 0, overflow = 0;
     std::vector<u64> forget;  // learned addresses that do not resolve: dropped so they free their place
-    const bool show = InterlockedIncrement(&key.shown) <= 2;
+    const bool show = x2w_local::first_calls(key.shown, 2);
     auto add = [&](u64 address, const char* what) {
         if (!address) return;
         for (UINT k = 0; k < count; ++k)

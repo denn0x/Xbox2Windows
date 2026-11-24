@@ -707,7 +707,7 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
     // costs over a millisecond per call in this process (memory queries), so only the first calls
     // of each slot are checked.
     static LONG shape_checks;
-    if (shape_checks < 32 && InterlockedIncrement(&shape_checks) <= 32 && create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
+    if (shape_checks < 32 && x2w_local::first_calls(shape_checks, 32) && create_shaped(rdx, r8, r9, 0, 0, 0, 0)) {
         char name[64];
         std::snprintf(name, sizeof(name), "%s::slot%d(passes an IID)", kind_names[K], N);
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, rcx, rdx, r8, r9, _ReturnAddress());
@@ -739,7 +739,7 @@ __declspec(noinline) u64 device_noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 
         noop_census_note(device_kind, N, args, reinterpret_cast<u64>(_ReturnAddress()) - reinterpret_cast<u64>(GetModuleHandleW(nullptr)));
     }
     static LONG shape_checks;
-    if (shape_checks < 32 && InterlockedIncrement(&shape_checks) <= 32 && create_shaped(rdx, r8, r9, s0, s1, s2, s3)) {
+    if (shape_checks < 32 && x2w_local::first_calls(shape_checks, 32) && create_shaped(rdx, r8, r9, s0, s1, s2, s3)) {
         char name[64];
         std::snprintf(name, sizeof(name), "Device::slot%d(passes an IID)", N);
         char first[3 * 64 + 1];
@@ -1435,7 +1435,7 @@ u64 __stdcall list_allocate_upload(Wrapper*, u64 size, u64 alignment)
     }
     unsigned char* result = aligned();
     cursor = result + size;
-    if (InterlockedIncrement(&upload_allocations) <= 4)
+    if (x2w_local::first_calls(upload_allocations, 4))
         log("x2w-d3d12 CommandList::slot148(AllocateUploadMemory) size=0x%llx align=0x%llx -> %p", size, alignment,
             static_cast<void*>(result));
     return reinterpret_cast<u64>(result);
@@ -3949,11 +3949,11 @@ D3D12_GPU_VIRTUAL_ADDRESS desktop_va(u64 address)
         ULONG64 at = 0;
         if (location && location(reinterpret_cast<const void*>(address), &section, &at))
             return section_va(section, at);
-        if (InterlockedIncrement(&va_failed) <= 8) log("x2w-va 0x%llx: mapped page without a chunk location", address);
+        if (x2w_local::first_of(InterlockedIncrement(&va_failed), 8)) log("x2w-va 0x%llx: mapped page without a chunk location", address);
         return 0;
     }
     if (info.Type != MEM_PRIVATE || info.State != MEM_COMMIT) {
-        if (InterlockedIncrement(&va_failed) <= 8)
+        if (x2w_local::first_of(InterlockedIncrement(&va_failed), 8))
             log("x2w-va 0x%llx: not a committed private allocation (type 0x%lx state 0x%lx)", address, info.Type, info.State);
         return 0;
     }
@@ -4220,7 +4220,7 @@ void dump_pipeline(const char* what, int slot, const void* desc, std::size_t byt
         return GetEnvironmentVariableA("X2W_D3D12_DUMP_PSO", value, sizeof(value)) && value[0] == '1';
     }();
     static LONG dumped[512];
-    if (!enabled || !desc || InterlockedIncrement(&dumped[slot & 511]) > 4) return;
+    if (!enabled || !desc || !x2w_local::first_calls(dumped[slot & 511], 4)) return;
     if (!x2w_local::readable(desc, bytes)) return;
     const auto* words = static_cast<const u64*>(desc);
     log("x2w-pso %s slot %d desc %p, %llu bytes", what, slot, desc, static_cast<unsigned long long>(bytes));

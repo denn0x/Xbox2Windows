@@ -139,7 +139,7 @@ HANDLE pagefile_slab() noexcept
 {
     const ULONG64 budget = slab_budget_bytes();
     if (budget && (pagefile_slabs() + 1) * slab_bytes > budget) {
-        if (InterlockedIncrement(&slab_refusals) <= 4)
+        if (x2w_local::first_of(InterlockedIncrement(&slab_refusals), 4))
             x2w_local::logf("x2w-xmem slab budget reached (X2W_XMEM_SLAB_BUDGET_MIB=%llu, %llu pagefile slabs of 256 MiB): refused",
                             static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(pagefile_slabs()));
         SetLastError(ERROR_COMMITMENT_LIMIT);
@@ -171,11 +171,11 @@ HANDLE new_slab(bool* file) noexcept
                 return slab;
             }
             static LONG failed;
-            if (InterlockedIncrement(&failed) <= 4)
+            if (x2w_local::first_calls(failed, 4))
                 x2w_local::logf("x2w-xmem file-backed slab %ls failed (error %lu): pagefile slab instead", path, error);
         } else {
             static LONG failed;
-            if (InterlockedIncrement(&failed) <= 4)
+            if (x2w_local::first_calls(failed, 4))
                 x2w_local::logf("x2w-xmem slab file %ls could not be created (error %lu): pagefile slab instead", path, GetLastError());
         }
     }

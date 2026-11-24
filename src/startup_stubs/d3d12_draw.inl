@@ -1930,7 +1930,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         buffer_view(dest, have ? upload_ring : nullptr, offset, bytes);
         count_buffer(have);
         // LOCAL (video): a traced frame (X2W_D3D12_TRACE_FRAME/BUSY/QUIET) logs every draw's bindings.
-        if (InterlockedIncrement(&tr->logged_bindings) <= 8 || trace_frame_active) {
+        if (x2w_local::first_calls(tr->logged_bindings, 8) || trace_frame_active) {
             char head[3 * 48 + 1] = "";
             if (have) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
             log("x2w-draw   %016llx srv %u buffer source %d(%d,%d): entry 0x%llx words %08x %08x %08x %08x -> address 0x%llx, %zu bytes, stride %u: %s [%s]",
@@ -2033,7 +2033,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         log("x2w-frame translated draw %016llx count %u: target0 %p %llux%u format %d, %u targets", tr->key, count,
             static_cast<void*>(pass.target0), target.Width, target.Height, target.Format, pass.target_count);
     }
-    if (InterlockedIncrement(&tr->logged_draws) <= 10 || trace_frame_active || (count > 100 && InterlockedIncrement(&tr->logged_large) <= 12)) {
+    if (x2w_local::first_calls(tr->logged_draws, 10) || trace_frame_active || (count > 100 && x2w_local::first_calls(tr->logged_large, 12))) {
         char indices[3 * 24 + 1] = "";
         if (indexed && pass.ib.BufferLocation) hex_text(reinterpret_cast<const void*>(pass.ib.BufferLocation + u64{start} * 2), 24, indices, sizeof(indices));
         log("x2w-draw %s(%u, %u, start %u, base %d) pipeline %016llx topology 0x%x -> %s; entry [%x %x %x %x %x %x]; ib 0x%llx+%u fmt %d [%s]; "

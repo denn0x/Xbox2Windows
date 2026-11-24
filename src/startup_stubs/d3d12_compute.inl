@@ -806,7 +806,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     bool bound_res[64] = {};
     u64 res_address[64] = {};      // title address of a bound buffer (X2W_CX_ENTRY_LOG)
     std::size_t res_bytes[64] = {};
-    const bool show = InterlockedIncrement(&tr.logged) <= 2;
+    const bool show = x2w_local::first_calls(tr.logged, 2);
     for (UINT i = 0; i < n; ++i) {
         const ComputeTranslation::Res& r = tr.res[i];
         const SIZE_T inc = draw_heap_increment;
