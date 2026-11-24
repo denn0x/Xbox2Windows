@@ -2613,8 +2613,9 @@ std::unordered_map<Wrapper*, ID3D12PipelineState*>& compute_psos()
 LONG compute_executed, compute_skipped_args;
 // LOCAL: dispatch outcomes since the last 300-frame report, by path and reason (report_dispatches).
 enum ComputeOutcome { co_c62_run, co_c62_table_arg, co_c62_unmapped, co_c67_run, co_c67_off, co_c67_other_key, co_c67_untranslated,
-                      co_c67_heap, co_not_run, co_cx_skip, co_count };
-LONG compute_outcomes[co_count];
+                      co_c67_heap, co_not_run, co_cx_skip, co_rawaddr_run, co_count };
+LONG compute_outcomes[co_count];    // compute_lock; counted with the per-key count by execute_dispatch
+thread_local int dispatch_outcome;  // set on this thread by the path that handled the dispatch
 
 // LOCAL: the dispatches issued on each desktop list (Dispatch or ExecuteIndirect, through indirect_dispatch), in
 // order, since its last Reset, plus the recording before that one (a list can be reset while its previous
@@ -2766,11 +2767,11 @@ void __stdcall list_compute_srv(Wrapper* self, UINT parameter, u64 address) { co
 void __stdcall list_compute_uav(Wrapper* self, UINT parameter, u64 address) { compute_root_descriptor(self, parameter, address, 4); }
 
 // Runs a dispatch through a desktop compute pipeline when one exists for the bound pipeline.
-bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
+bool execute_dispatch_inner(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
 {
     static const bool enabled = !x2w_local::env_on("X2W_COMPUTE_OFF");
     if (cx_skip_key(key)) {
-        InterlockedIncrement(&compute_outcomes[co_cx_skip]);
+        dispatch_outcome = co_cx_skip;
         static LONG logged;
         if (first_calls(logged, 8)) log("x2w-cx dispatch of key %016llx skipped (X2W_CX_SKIP)", key);
         return false;
@@ -2778,12 +2779,15 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     if (!enabled || !list || !pass.pipeline) {
-        InterlockedIncrement(&compute_outcomes[co_not_run]);
+        dispatch_outcome = co_not_run;
         return false;
     }
     cx_issue_key = key;
     cx_issue_path = 'r';
-    if (rawaddr_dispatch(self, list, x, y, z)) return true;  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
+    if (rawaddr_dispatch(self, list, x, y, z)) {  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
+        dispatch_outcome = co_rawaddr_run;
+        return true;
+    }
     cx_issue_path = 't';
     if (!pass.compute_root || !pass.compute_root->own().real) return execute_translated(self, list, key, x, y, z);
     AcquireSRWLockShared(&compute_pso_lock);
@@ -2797,14 +2801,14 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
         const int kind = pass.compute_kind[i];
         if (kind == 5) {
             InterlockedIncrement(&compute_skipped_args);
-            InterlockedIncrement(&compute_outcomes[co_c62_table_arg]);
+            dispatch_outcome = co_c62_table_arg;
             return false;
         }
         if (kind >= 2 && kind <= 4) {
             addresses[i] = desktop_va(pass.compute_address[i]);
             if (!addresses[i] && pass.compute_address[i]) {
                 InterlockedIncrement(&compute_skipped_args);
-                InterlockedIncrement(&compute_outcomes[co_c62_unmapped]);
+                dispatch_outcome = co_c62_unmapped;
                 return false;
             }
         }
@@ -2825,12 +2829,29 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
     const LONG n = InterlockedIncrement(&compute_executed);
-    InterlockedIncrement(&compute_outcomes[co_c62_run]);
+    dispatch_outcome = co_c62_run;
     if (n <= 4 || n % 5000 == 0) log("x2w-compute dispatch %ld executed (%u, %u, %u)", n, x, y, z);
     return true;
 }
 struct DispatchCount { LONG64 calls = 0; LONG64 groups = 0; UINT x = 0, y = 0, z = 0; };
 std::unordered_map<u64, DispatchCount>& dispatch_counts() { static std::unordered_map<u64, DispatchCount> m; return m; }
+// LOCAL: every dispatch (list slot 14 and an ExecuteIndirect dispatch) is counted per key and by outcome in one
+// compute_lock hold, so the per-key list and the outcome line of one 300-frame report cover the same dispatches.
+// An indirect dispatch passes (0, 0, 0): it adds a call but keeps the key's last direct group counts.
+bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
+{
+    dispatch_outcome = co_not_run;
+    const bool executed = execute_dispatch_inner(self, x, y, z, key);
+    const int outcome = dispatch_outcome >= 0 && dispatch_outcome < co_count ? dispatch_outcome : co_not_run;
+    AcquireSRWLockExclusive(&compute_lock);
+    DispatchCount& count = dispatch_counts()[key];
+    ++count.calls;
+    count.groups += LONG64{x} * y * z;
+    if (x | y | z) count.x = x, count.y = y, count.z = z;
+    ++compute_outcomes[outcome];
+    ReleaseSRWLockExclusive(&compute_lock);
+    return executed;
+}
 // The compute key of the pipeline bound on list self (also used by indirect dispatches).
 u64 compute_key_of(Wrapper* self)
 {
@@ -2891,12 +2912,6 @@ u64 compute_key_of(Wrapper* self)
 void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
 {
     const u64 key = compute_key_of(self);
-    AcquireSRWLockExclusive(&compute_lock);
-    DispatchCount& count = dispatch_counts()[key];
-    ++count.calls;
-    count.groups += LONG64{x} * y * z;
-    count.x = x, count.y = y, count.z = z;
-    ReleaseSRWLockExclusive(&compute_lock);
     InterlockedIncrement(&frame_dispatches);
     const bool executed = execute_dispatch(self, x, y, z, key);
     if (trace_frame_active) log("x2w-frame dispatch %016llx (%u, %u, %u)%s", key, x, y, z, executed ? " executed" : "");
@@ -2905,8 +2920,10 @@ void report_dispatches()
 {
     std::vector<std::pair<u64, DispatchCount>> all;
     AcquireSRWLockExclusive(&compute_lock);
+    LONG o[co_count];
     for (const auto& entry : dispatch_counts()) all.push_back(entry);
     dispatch_counts().clear();
+    for (int i = 0; i < co_count; ++i) o[i] = compute_outcomes[i], compute_outcomes[i] = 0;  // the keys' window
     ReleaseSRWLockExclusive(&compute_lock);
     std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.second.calls > b.second.calls; });
     // LOCAL: every key is listed; a full line continues on another line with the same prefix, and a closing
@@ -2928,15 +2945,13 @@ void report_dispatches()
     log("%s", line);
     ++lines;
     log("x2w-render dispatch keys (300 frames): %zu keys in %d lines", all.size(), lines);
-    LONG o[co_count];
-    for (int i = 0; i < co_count; ++i) o[i] = InterlockedExchange(&compute_outcomes[i], 0);
     log("x2w-compute dispatches (300 frames): executed %ld skipped %ld; slot-62 desktop pipeline executed %ld skipped %ld "
         "(table argument %ld, unmapped root address %ld); translated executed %ld skipped %ld (X2W_CX_OFF %ld, not a slot-67 key %ld, "
-        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF); X2W_CX_SKIP skipped %ld",
-        o[co_c62_run] + o[co_c67_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap] + o[co_cx_skip],
+        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF); X2W_CX_SKIP skipped %ld; raw-address executed %ld",
+        o[co_c62_run] + o[co_c67_run] + o[co_rawaddr_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap] + o[co_cx_skip],
         o[co_c62_run], o[co_c62_table_arg] + o[co_c62_unmapped], o[co_c62_table_arg], o[co_c62_unmapped], o[co_c67_run],
         o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap], o[co_c67_off], o[co_c67_other_key], o[co_c67_untranslated],
-        o[co_c67_heap], o[co_not_run], o[co_cx_skip]);
+        o[co_c67_heap], o[co_not_run], o[co_cx_skip], o[co_rawaddr_run]);
 }
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
