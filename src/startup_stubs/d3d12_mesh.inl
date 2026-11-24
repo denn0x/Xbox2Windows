@@ -23,8 +23,8 @@
 // Per 300 frames: "x2w-mesh N frames: calls X issued Y; skipped: ..." (report_mesh), then the bound keys with their
 // call counts (report_mesh_keys, top 64). Per key: "x2w-mesh key K first bound frame F (cache: ok|fail|missing)"
 // (first 4096 keys), "no translation" / "translation failed" once, "first call issued" once.
-// Fixed-function state: today the same rule as pipeline_for (blend found in the state block, else opaque;
-// depth-stencil only from a stream pipeline, else off; cull none). Renderstate's decode replaces mesh_state_desc.
+// Fixed-function state: the default state (opaque blend; depth-stencil only from a stream pipeline, else off; cull
+// none). The decoded mesh state (+0x54 from the vertex-record offsets) replaces mesh_state_desc's body.
 
 bool mesh_enabled()
 {
@@ -236,8 +236,11 @@ void report_mesh_keys(LONG frames)
 
 // ---- Desktop pipeline ---------------------------------------------------------------------------------------
 
-// The fixed-function state of the mesh PSO: today exactly pipeline_for's rule (d3d12_draw.inl). renderstate:
-// replace the body with desktop_pso_desc's state part (decoded + fallback) when it lands; the key covers all of it.
+// The fixed-function state of the mesh PSO: the default state (lead, 2026-11-24). Opaque blend, all channels
+// written: translation_for's blend decode (bound.blend) reads slot-57 state at the vertex-record offsets, and mesh
+// records keep their state 0x54 bytes later, so it is NOT used here. Depth-stencil only from a stream pipeline
+// (never a slot-57 record), else off; cull none. The decoded mesh state replaces this body when it lands; the key
+// covers all of it.
 void mesh_state_desc(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, u64& key)
 {
     const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
@@ -245,9 +248,8 @@ void mesh_state_desc(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHIC
     for (auto& target : desc.BlendState.RenderTarget)
         target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
                   D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
-    if (bound.has_blend) desc.BlendState = bound.blend;
     static const bool default_blend = x2w_local::env_on("X2W_DRAW_DEFAULT_BLEND");
-    if (!bound.has_blend && default_blend)
+    if (default_blend)
         for (auto& target : desc.BlendState.RenderTarget)
             target = {TRUE, FALSE, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE,
                       D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
@@ -391,10 +393,6 @@ bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
     if (!list || !mesh_tier_ok()) return mesh_skip(mesh_tier), false;
     Pass& pass = pass_of(self);
     if (!pass.pipeline) return mesh_skip(mesh_no_record), false;
-    if (!pass.targets_bound) return mesh_skip(mesh_no_targets), false;
-    // Integer / 32-bit float targets need an RTV variant of the pixel stage (translation_for_targets); none exists
-    // for mesh translations yet.
-    if (std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) return mesh_skip(mesh_rtv_variant), false;
     AcquireSRWLockShared(&mesh_key_lock);
     const auto found = mesh_bindings().find(pass.pipeline);
     MeshBinding binding = found != mesh_bindings().end() ? found->second : MeshBinding{};
@@ -411,7 +409,11 @@ bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
     }
     if (!binding.mesh || !binding.key.keyed || !binding.bound) return mesh_skip(mesh_no_record), false;
     MeshEntry& e = loaded_mesh(binding.key.key);
-    mesh_note_use(binding.key.key, e.state);
+    mesh_note_use(binding.key.key, e.state);  // every keyed call, whatever is refused below (coverage)
+    if (!pass.targets_bound) return mesh_skip(mesh_no_targets), false;
+    // Integer / 32-bit float targets need an RTV variant of the pixel stage (translation_for_targets); none exists
+    // for mesh translations yet.
+    if (std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) return mesh_skip(mesh_rtv_variant), false;
     if (e.state == 4) return mesh_skip(mesh_no_translation), false;
     if (e.state != 1) return mesh_skip(mesh_failed), false;
     if (binding.attached != e.tr) {
