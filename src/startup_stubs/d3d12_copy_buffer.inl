@@ -62,6 +62,8 @@ void __stdcall list_copy_buffer(Wrapper* self, Wrapper* dest, u64 dest_offset, W
         done = true;
     }
     InterlockedIncrement(done ? &buffer_copies_done : &buffer_copies_skipped);
+    copy_watch_note("record-time", to ? reinterpret_cast<u64>(to) + dest_offset : 0, from ? reinterpret_cast<u64>(from) + source_offset : 0,
+                    bytes, outcome);
     // The first copy to each destination title address; copies of up to 0x100 bytes (constant
     // blocks) show the whole source, longer ones its first 16 bytes. Small and long copies have
     // separate budgets of 256 lines each: in run 84, world-streaming copies of 0x404 and 0x1000 bytes

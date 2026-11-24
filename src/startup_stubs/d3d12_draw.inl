@@ -2282,6 +2282,42 @@ void __stdcall list_draw_indexed(Wrapper* self, UINT count, UINT instances, UINT
 // The destination range is registered as GPU-written: translated draws read it in place from then on, not from
 // a record-time snapshot (which is stale by construction).
 void __stdcall list_copy_buffer(Wrapper* self, Wrapper* dest, u64 dest_offset, Wrapper* source, u64 source_offset, u64 bytes);
+
+// LOCAL (video): X2W_D3D12_COPY_WATCH=<hex title address>[,<hex>...] (up to 4): every CopyBufferRegion
+// whose destination range overlaps [address, address + 0x100) is logged with its outcome (at most 64
+// lines per address), whatever the copy-log budget says. For the 208-byte constant block of the final
+// upscale (342e9584749d47da), which holds CPU data when it is drawn: is it ever the target of a copy?
+void copy_watch_note(const char* path, u64 to, u64 from, u64 bytes, const char* outcome)
+{
+    static u64 watched[4];
+    static int count = [] {
+        char text[128]{};
+        int n = 0;
+        if (GetEnvironmentVariableA("X2W_D3D12_COPY_WATCH", text, sizeof(text))) {
+            for (char* at = text; *at && n < 4;) {
+                char* end = nullptr;
+                const u64 value = std::strtoull(at, &end, 16);
+                if (end == at) break;
+                if (value) watched[n++] = value;
+                at = *end == ',' ? end + 1 : end;
+            }
+            log("x2w-copy X2W_D3D12_COPY_WATCH: %d address(es) watched (%s)", n, text);
+        }
+        return n;
+    }();
+    static LONG lines[4];
+    for (int i = 0; i < count; ++i)
+        if (to && bytes && to < watched[i] + 0x100 && watched[i] < to + bytes && first_calls(lines[i], 64)) {
+            unsigned char head[32]{};
+            char text[3 * 32 + 1] = "";
+            if (from && x2w_local::readable(reinterpret_cast<const void*>(from), bytes < 32 ? bytes : 32)) {
+                std::memcpy(head, reinterpret_cast<const void*>(from), bytes < 32 ? bytes : 32);
+                hex_text(head, bytes < 32 ? bytes : 32, text, sizeof(text));
+            }
+            log("x2w-copy watch 0x%llx: %s copy to 0x%llx from 0x%llx bytes 0x%llx frame %ld: %s; source [%s]", watched[i], path, to, from,
+                bytes, frame_number, outcome, text);
+        }
+}
 bool copy_title_bytes(unsigned char* dest, const unsigned char* source, std::size_t bytes) noexcept;  // d3d12_copy_buffer.inl
 void note_issued_dispatch(ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z, bool indirect);  // d3d12_xs_device.cpp (DRED report)
 extern thread_local u64 cx_issue_key;
@@ -2379,6 +2415,7 @@ void __stdcall list_copy_buffer_gpu(Wrapper* self, Wrapper* dest, u64 dest_offse
     AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
     const bool source_gpu_written = gpu_written_overlaps(from_address, bytes);
     ReleaseSRWLockExclusive(&draw_lock);
+    copy_watch_note("gpu", to_address, from_address, bytes, source_gpu_written ? "GPU copy (source GPU-written)" : "GPU copy + record-time copy");
     if (!source_gpu_written && x2w_local::readable(from + source_offset, static_cast<std::size_t>(bytes)) &&
         copy_title_bytes(to + dest_offset, from + source_offset, static_cast<std::size_t>(bytes)))
         InterlockedIncrement(&cg_record_too);
