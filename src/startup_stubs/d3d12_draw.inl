@@ -955,8 +955,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             facts.resource_wrapper = had_texture;
             facts.dimension_matches = !mismatched;
             count_null_binding(x2w_local::classify_null_binding(facts));
-            if (texture) fix_srv_plane(desc);
-            device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
+            D3D12_SHADER_RESOURCE_VIEW_DESC depth_default{};
+            const bool no_desc = texture && record.desc_bytes < 40;
+            const bool depth_desc = no_desc && default_depth_srv(texture, depth_default);
+            if (texture && !no_desc) fix_srv(desc, texture);
+            device_of(the_device)->CreateShaderResourceView(texture, depth_desc ? &depth_default : no_desc ? nullptr : &desc, dest);
             continue;
         }
         if (srv.source == 0 && words[0] == view_token_magic && entry) {
@@ -1060,13 +1063,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a] : 0;
     }
     list->SetPipelineState(pipeline);
-    list->SetGraphicsRootSignature(tr->root);
+    // Heaps before the root signature: a directly-indexed root signature set with no heap bound is an
+    // error on the desktop (#1419).
     ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;
     if (!pass.heap_set || pass.bound_sampler_heap != samplers) {
         x2w_startup::bind_translated_heaps(list, draw_heap, samplers);
         pass.heap_set = true;
         pass.bound_sampler_heap = samplers;
     }
+    list->SetGraphicsRootSignature(tr->root);
     list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (n) list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(n), samplers->GetGPUDescriptorHandleForHeapStart());

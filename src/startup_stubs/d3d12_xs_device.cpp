@@ -697,6 +697,134 @@ void fix_srv_plane(D3D12_SHADER_RESOURCE_VIEW_DESC& d)
     else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) d.Texture2DArray.PlaneSlice = plane;
 }
 
+// LOCAL: a view of a multisampled resource must use a multisample dimension; the desktop removes the
+// device (DXGI_ERROR_INVALID_CALL) for a TEXTURE2D/ARRAY view of one. The title's descriptions name
+// the plain dimensions.
+void fix_srv_samples(D3D12_SHADER_RESOURCE_VIEW_DESC& d, ID3D12Resource* resource)
+{
+    if (!resource) return;
+    const D3D12_RESOURCE_DESC rd = resource->GetDesc();
+    if (rd.SampleDesc.Count <= 1) return;
+    if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        d.Texture2DMS = {};
+    } else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+        const UINT first = d.Texture2DArray.FirstArraySlice, size = d.Texture2DArray.ArraySize;
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+        d.Texture2DMSArray = {};
+        d.Texture2DMSArray.FirstArraySlice = first;
+        d.Texture2DMSArray.ArraySize = size ? size : rd.DepthOrArraySize;
+    }
+}
+
+// LOCAL: depth textures are created typeless on the desktop (typeless_depth_family), so a view has to
+// name a format of that family. The console views its 16-bit depth with stencil (created here as
+// R24G8) as R16_UNORM / R8_UINT and a 32-bit depth with stencil as R32_FLOAT; the desktop removes
+// the device (DXGI_ERROR_INVALID_CALL) for those. Depth-named views read the depth plane, stencil-
+// named views the stencil plane. Only the format changes; the bit layout of a 16-bit console depth
+// view is not reproduced (it reads 24-bit depth as UNORM).
+DXGI_FORMAT depth_view_format(DXGI_FORMAT resource, DXGI_FORMAT view)
+{
+    const bool stencil = view == DXGI_FORMAT_R8_UINT || view == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
+                         view == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    switch (resource) {
+    case DXGI_FORMAT_R24G8_TYPELESS:
+        return stencil ? DXGI_FORMAT_X24_TYPELESS_G8_UINT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+        return stencil ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT : DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R32_TYPELESS:
+        return view == DXGI_FORMAT_D32_FLOAT || view == DXGI_FORMAT_UNKNOWN ? DXGI_FORMAT_R32_FLOAT : view;
+    case DXGI_FORMAT_R16_TYPELESS:
+        return view == DXGI_FORMAT_D16_UNORM || view == DXGI_FORMAT_UNKNOWN ? DXGI_FORMAT_R16_UNORM : view;
+    default:
+        return view;
+    }
+}
+
+// The depth-stencil view format of a typeless depth family (DSVs need the D format).
+DXGI_FORMAT depth_target_format(DXGI_FORMAT resource)
+{
+    switch (resource) {
+    case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_D32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_D16_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+// A typed depth format of a texture that may be sampled -> its typeless family, so that shader
+// resource views of it can exist on the desktop. Typed D formats allow no SRV at all.
+DXGI_FORMAT typeless_depth_family(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32G8X24_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_TYPELESS;
+    case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_TYPELESS;
+    default: return format;
+    }
+}
+
+// All shader-resource-view repairs for a view of `resource`: depth family format, plane, samples.
+void fix_srv(D3D12_SHADER_RESOURCE_VIEW_DESC& d, ID3D12Resource* resource)
+{
+    if (!resource) return;
+    const D3D12_RESOURCE_DESC rd = resource->GetDesc();
+    if (depth_target_format(rd.Format) != DXGI_FORMAT_UNKNOWN) {
+        const DXGI_FORMAT before = d.Format;
+        d.Format = depth_view_format(rd.Format, d.Format);
+        if (d.Format != before) {
+            static LONG calls;
+            if (first_calls(calls, 6)) log("x2w-d3d12 SRV of depth format %d: view format %d -> %d", rd.Format, before, d.Format);
+        }
+        fix_srv_plane(d);
+    }
+    fix_srv_samples(d, resource);
+}
+
+// A default shader resource view description for a typeless depth resource (a null description is
+// refused for typeless resources).
+bool default_depth_srv(ID3D12Resource* resource, D3D12_SHADER_RESOURCE_VIEW_DESC& d)
+{
+    if (!resource) return false;
+    const D3D12_RESOURCE_DESC rd = resource->GetDesc();
+    if (depth_target_format(rd.Format) == DXGI_FORMAT_UNKNOWN || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return false;
+    d = {};
+    d.Format = depth_view_format(rd.Format, DXGI_FORMAT_UNKNOWN);
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (rd.DepthOrArraySize > 1) {
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray.MipLevels = UINT(-1);
+        d.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+    } else {
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        d.Texture2D.MipLevels = UINT(-1);
+    }
+    fix_srv_samples(d, resource);
+    return true;
+}
+
+// A default depth-stencil view description for a typeless depth resource.
+bool default_depth_dsv(ID3D12Resource* resource, D3D12_DEPTH_STENCIL_VIEW_DESC& d)
+{
+    if (!resource) return false;
+    const D3D12_RESOURCE_DESC rd = resource->GetDesc();
+    const DXGI_FORMAT format = depth_target_format(rd.Format);
+    if (format == DXGI_FORMAT_UNKNOWN || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return false;
+    d = {};
+    d.Format = format;
+    const bool ms = rd.SampleDesc.Count > 1;
+    if (rd.DepthOrArraySize > 1) {
+        d.ViewDimension = ms ? D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY : D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        if (ms) d.Texture2DMSArray.ArraySize = rd.DepthOrArraySize;
+        else d.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+    } else {
+        d.ViewDimension = ms ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+    }
+    return true;
+}
+
 constexpr UINT desktop_resource_flags = 0x3f;
 D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
 {
@@ -725,6 +853,12 @@ D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
     }
     if (desc.Alignment != 0 && desc.Alignment != 0x10000 && desc.Alignment != 0x400000) copy.Alignment = 0;
     copy.Format = desktop_format(desc.Format);
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && (copy.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+        !(copy.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && typeless_depth_family(copy.Format) != copy.Format) {
+        static LONG depths;
+        if (first_calls(depths, 4)) log("x2w-d3d12 depth texture format %d created typeless (%d) so it can be sampled", copy.Format, typeless_depth_family(copy.Format));
+        copy.Format = typeless_depth_family(copy.Format);
+    }
     // A 16-bit packed target the adapter cannot render to or write as a UAV: packed_target_format.h.
     if (the_device && x2w_startup::packed_target_format(copy.Format)) {
         ID3D12Device* const device = static_cast<ID3D12Device*>(the_device->own().real);
@@ -957,7 +1091,13 @@ std::unordered_map<const void*, SignatureInfo>& signature_infos()
 u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND_SIGNATURE_DESC* desc, u64 root,
                                               u64 iid, u64 out)
 {
-    const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
+    // Argument types outside the desktop enumeration (0x69 seen, stride 12) cannot be created on
+    // desktop and are not passed to it (the debug layer reports CREATECOMMANDSIGNATURE_INVALID).
+    bool console_type = false;
+    for (UINT i = 0; desc && i < desc->NumArgumentDescs; ++i)
+        console_type |= static_cast<UINT>(desc->pArgumentDescs[i].Type) > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    const u64 result = console_type ? static_cast<u64>(static_cast<UINT>(E_INVALIDARG))
+                                    : create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
     static LONG failures;
     if (FAILED(static_cast<HRESULT>(result)) && desc && first_calls(failures, 8)) {
         log("x2w-d3d12   CreateCommandSignature failed: stride=%u args=%u node=0x%x root=0x%llx", desc->ByteStride,
@@ -968,11 +1108,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
             log("x2w-d3d12     arg[%u]=[%s]", i, bytes);
         }
     }
-    // Argument types outside the desktop enumeration (0x69 seen, stride 12) cannot be created on
-    // desktop; the title gets a placeholder CommandSignature (command lists are not executed).
-    bool console_type = false;
-    for (UINT i = 0; desc && i < desc->NumArgumentDescs; ++i)
-        console_type |= static_cast<UINT>(desc->pArgumentDescs[i].Type) > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    // The title gets a placeholder CommandSignature for those (command lists are not executed).
     if (FAILED(static_cast<HRESULT>(result)) && console_type && out) {
         log("x2w-d3d12   CreateCommandSignature: console argument type -> placeholder");
         *reinterpret_cast<void**>(out) = wrap(nullptr, command_signature_kind);
@@ -1701,8 +1837,35 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
     ID3D12RootSignature* root = nullptr;
+    // LOCAL: the title's root signatures carry CBV_SRV_UAV/SAMPLER_HEAP_DIRECTLY_INDEXED. The title's
+    // SetDescriptorHeaps is not forwarded (translated draws bind their own heaps), so setting such a
+    // root on a desktop list is an error (#1419). No title shader runs against these roots on the
+    // desktop, so the two flags are cleared there; the title's blob is kept for translation keys.
+    ID3DBlob* stripped = nullptr;
+    {
+        ID3D12VersionedRootSignatureDeserializer* reader = nullptr;
+        if (blob && SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&reader)))) {
+            const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
+            constexpr UINT indexed = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                     D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+            if (SUCCEEDED(reader->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc &&
+                (static_cast<UINT>(desc->Desc_1_1.Flags) & indexed)) {
+                D3D12_VERSIONED_ROOT_SIGNATURE_DESC copy = *desc;
+                copy.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(static_cast<UINT>(copy.Desc_1_1.Flags) & ~indexed);
+                if (FAILED(D3D12SerializeVersionedRootSignature(&copy, &stripped, nullptr))) stripped = nullptr;
+                static LONG strips;
+                if (first_calls(strips, 4))
+                    log("x2w-d3d12 Device::CreateRootSignature flags 0x%x: heap-directly-indexed bits cleared for the desktop (%s)",
+                        static_cast<UINT>(desc->Desc_1_1.Flags), stripped ? "ok" : "serialize failed, kept");
+            }
+            reader->Release();
+        }
+    }
     const HRESULT hr = kind_for(*iid) == root_signature_kind
-        ? device_of(self)->CreateRootSignature(node, blob, size, IID_PPV_ARGS(&root)) : E_NOINTERFACE;
+        ? device_of(self)->CreateRootSignature(node, stripped ? stripped->GetBufferPointer() : blob,
+                                               stripped ? stripped->GetBufferSize() : size, IID_PPV_ARGS(&root))
+        : E_NOINTERFACE;
+    if (stripped) stripped->Release();
     static LONG calls;
     const bool log_it = first_calls(calls, 6);
     if (FAILED(hr)) {
@@ -2869,7 +3032,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             D3D12_SHADER_RESOURCE_VIEW_DESC view;
             std::memcpy(&view, desc_copy, sizeof(view));
             const D3D12_SHADER_RESOURCE_VIEW_DESC before = view;
-            fix_srv_plane(view);
+            fix_srv(view, reinterpret_cast<ID3D12Resource*>(args[0]));
             if (std::memcmp(&view, &before, sizeof(view)) != 0) {
                 std::memcpy(desc_copy, &view, sizeof(view));
                 args[desc_index] = reinterpret_cast<u64>(desc_copy);
@@ -2878,6 +3041,13 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             }
         }
     }
+    // A typeless depth texture (typeless_depth_family) needs a description; the title passed none.
+    D3D12_SHADER_RESOURCE_VIEW_DESC default_srv{};
+    D3D12_DEPTH_STENCIL_VIEW_DESC default_dsv{};
+    if (N == 18 && args[0] && !args[1] && default_depth_srv(reinterpret_cast<ID3D12Resource*>(args[0]), default_srv))
+        args[1] = reinterpret_cast<u64>(&default_srv);
+    if (N == 21 && args[0] && !args[1] && default_depth_dsv(reinterpret_cast<ID3D12Resource*>(args[0]), default_dsv))
+        args[1] = reinterpret_cast<u64>(&default_dsv);
     D3D12_UNORDERED_ACCESS_VIEW_DESC null_uav{};
     D3D12_RENDER_TARGET_VIEW_DESC null_rtv{};
     if constexpr (N == 19) {

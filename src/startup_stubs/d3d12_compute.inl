@@ -314,8 +314,7 @@ bool texture_view(Wrapper* self, const ComputeTranslation::Res& r, const ViewRec
         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
         upload_texture(self, resource, texture);
     if (prepare) require_state(self, texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && (rd.Format == DXGI_FORMAT_R32G8X24_TYPELESS || rd.Format == DXGI_FORMAT_R24G8_TYPELESS || rd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || rd.Format == DXGI_FORMAT_D24_UNORM_S8_UINT))
-        fix_srv_plane(d);
+    fix_srv(d, texture);
     device_of(the_device)->CreateShaderResourceView(texture, &d, dest);
     return true;
 }
@@ -586,11 +585,12 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
             : ud.kind == 4 ? (in ? strides[ud.a] : 0) : ud.kind == 5 ? (in ? word3[ud.a] : 0) : (in ? bases[ud.a] : 0);
     }
     list->SetPipelineState(tr.pso);
-    list->SetComputeRootSignature(tr.root);
     if (!pass.heap_set) {
         list->SetDescriptorHeaps(1, &draw_heap);
         pass.heap_set = true;
+        pass.bound_sampler_heap = nullptr;  // this call unbinds any sampler heap a draw bound
     }
+    list->SetComputeRootSignature(tr.root);
     list->SetComputeRoot32BitConstants(0, tr.uds.empty() ? 1u : static_cast<UINT>(tr.uds.size()), values, 0);
     if (tr.heap) {
         list->SetComputeRootShaderResourceView(1, heap_va);
