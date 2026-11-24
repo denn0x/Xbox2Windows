@@ -1800,25 +1800,151 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     InterlockedIncrement(&render_clears);
 }
 
+// LOCAL stall (X2W_FENCE_TIMES=1, off by default): for every queue Signal that completes through
+// complete_when_reached, the time from our Signal to the desktop fence reaching the value (t1: a
+// time-critical probe thread waits on the same value with its own event, in signal order) and from
+// there to our store of the completed value that the title mwaits on (t2: the threadpool callback).
+// Reported with the present split. The probe works through the signals in order, so a later value of a
+// faster queue can be timed late ("probe behind": store before probe; counted, not in the means).
+namespace fence_times {
+struct Entry {
+    ID3D12Fence* fence;
+    Wrapper* wrapper;
+    UINT64 value;
+    LONG64 t0, t1, t2;
+    volatile LONG stage;
+};
+bool timing()
+{
+    static const bool value = x2w_local::env_on("X2W_FENCE_TIMES");
+    return value;
+}
+bool on() { return timing(); }
+SRWLOCK lock = SRWLOCK_INIT;
+std::deque<Entry*> entries;
+HANDLE wake;
+volatile LONG64 count, gpu_sum, gpu_max, store_sum, store_max, total_max, behind, timeouts;
+LONG64 now()
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+void raise(volatile LONG64& slot, LONG64 value)
+{
+    for (LONG64 seen = slot; value > seen;) {
+        const LONG64 previous = InterlockedCompareExchange64(&slot, value, seen);
+        if (previous == seen) break;
+        seen = previous;
+    }
+}
+void finish(Entry* e)
+{
+    if (InterlockedIncrement(&e->stage) != 2) return;
+    if (e->t1 <= e->t2) {
+        InterlockedIncrement64(&count);
+        InterlockedAdd64(&gpu_sum, e->t1 - e->t0);
+        InterlockedAdd64(&store_sum, e->t2 - e->t1);
+        raise(gpu_max, e->t1 - e->t0);
+        raise(store_max, e->t2 - e->t1);
+    } else {
+        InterlockedIncrement64(&behind);
+    }
+    raise(total_max, e->t2 - e->t0);
+    e->fence->Release();
+    delete e;
+}
+DWORD WINAPI probe(void*)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadDescription(GetCurrentThread(), L"x2w fence probe");
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    for (;;) {
+        Entry* e = nullptr;
+        AcquireSRWLockExclusive(&lock);
+        if (!entries.empty()) {
+            e = entries.front();
+            entries.pop_front();
+        }
+        ReleaseSRWLockExclusive(&lock);
+        if (!e) {
+            WaitForSingleObject(wake, 100);
+            continue;
+        }
+        if (e->fence->GetCompletedValue() < e->value && SUCCEEDED(e->fence->SetEventOnCompletion(e->value, event)) &&
+            WaitForSingleObject(event, 5000) != WAIT_OBJECT_0)
+            InterlockedIncrement64(&timeouts);
+        e->t1 = now();
+        finish(e);
+    }
+}
+Entry* start(Wrapper* wrapper, UINT64 value)
+{
+    if (!on()) return nullptr;
+    auto* fence = static_cast<ID3D12Fence*>(wrapper->own().real);
+    static const bool started = [] {
+        wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        CloseHandle(CreateThread(nullptr, 0, probe, nullptr, 0, nullptr));
+        return true;
+    }();
+    (void)started;
+    fence->AddRef();
+    auto* e = new Entry{fence, wrapper, value, now(), 0, 0, 0};
+    AcquireSRWLockExclusive(&lock);
+    entries.push_back(e);
+    ReleaseSRWLockExclusive(&lock);
+    SetEvent(wake);
+    return e;
+}
+void stored(Entry* e)
+{
+    if (!e) return;
+    e->t2 = now();
+    finish(e);
+}
+// One line per present split window; the counters restart.
+void report()
+{
+    if (!timing()) return;
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    const auto ms = [&](LONG64 t) { return static_cast<double>(t) * 1000.0 / static_cast<double>(f.QuadPart); };
+    const LONG64 n = InterlockedExchange64(&count, 0), gs = InterlockedExchange64(&gpu_sum, 0), ss = InterlockedExchange64(&store_sum, 0);
+    const LONG64 gm = InterlockedExchange64(&gpu_max, 0), sm = InterlockedExchange64(&store_max, 0), tm = InterlockedExchange64(&total_max, 0);
+    const LONG64 late = InterlockedExchange64(&behind, 0), lost = InterlockedExchange64(&timeouts, 0);
+    AcquireSRWLockShared(&lock);
+    const std::size_t queued = entries.size();
+    ReleaseSRWLockShared(&lock);
+    log("x2w-fence times: %lld signals; our Signal -> desktop fence reached mean %.2f ms max %.2f; reached -> completed "
+        "value stored (what the title mwaits on) mean %.3f ms max %.2f; Signal -> stored max %.2f ms; probe behind %lld, "
+        "probe timeouts %lld, queued %zu", static_cast<long long>(n), n ? ms(gs) / n : 0.0, ms(gm), n ? ms(ss) / n : 0.0, ms(sm),
+        ms(tm), static_cast<long long>(late), static_cast<long long>(lost), queued);
+}
+}  // namespace fence_times
+
 // A fence signalled on a queue completes when the desktop GPU reaches it.
 struct PendingSignal {
     Wrapper* fence;
     UINT64 value;
     HANDLE event;
+    fence_times::Entry* timing;
 };
 void CALLBACK signal_reached(PTP_CALLBACK_INSTANCE, void* context, PTP_WAIT wait, TP_WAIT_RESULT)
 {
     auto* pending = static_cast<PendingSignal*>(context);
     fence_reached(pending->fence, pending->value);
+    fence_times::stored(pending->timing);
     CloseHandle(pending->event);
     delete pending;
     CloseThreadpoolWait(wait);
 }
 void complete_when_reached(Wrapper* fence, UINT64 value)
 {
-    auto* pending = new PendingSignal{fence, value, CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+    auto* pending = new PendingSignal{fence, value, CreateEventW(nullptr, FALSE, FALSE, nullptr),
+                                      fence_times::start(fence, value)};
     if (FAILED(static_cast<ID3D12Fence*>(fence->own().real)->SetEventOnCompletion(value, pending->event))) {
         fence_reached(fence, value);
+        fence_times::stored(pending->timing);
         CloseHandle(pending->event);
         delete pending;
         return;
@@ -4841,6 +4967,7 @@ void present_split(LONG frame)
             "blocked or not running; timed d3d12_xs ms by thread (tid:ms over the window):%s; %ld threads seen",
             frames, wall / frames, tid, in / frames, (wall - in) / frames,
             cpu_ms / frames, (wall - cpu_ms) / frames, text, count);
+        fence_times::report();  // X2W_FENCE_TIMES=1, same window
     }
     last = now;
     last_frame = frame;
