@@ -232,6 +232,41 @@ void record_reservation(void* base, SIZE_T bytes)
     memory.reservations.insert_or_assign(reinterpret_cast<ULONG_PTR>(base), bytes);
 }
 
+// LOCAL EXPERIMENT (X2W_XMEM_LAZY_POOLS=1): the title commits a few pools of 0.5-2.2 GiB up front
+// (measured: 4.5 GiB at startup, most never touched before loading runs out of system commit).
+// Pools of 256 MiB or more are reserved instead; the first touch of a 64 KiB chunk faults and the
+// handler commits it with the pool's protection. None of these pools is aliased by a D3D12 heap
+// (every placed resource on them falls back to its own buffer), so no driver needs them committed.
+// Kernel-mode writes (ReadFile straight into a pool) would fail instead of faulting.
+struct LazyPool { ULONG_PTR base; SIZE_T bytes; DWORD protect; };
+SRWLOCK lazy_pools_lock = SRWLOCK_INIT;
+std::vector<LazyPool> lazy_pools;
+LONG lazy_pool_commits;
+bool lazy_pools_on()
+{
+    static const bool on = x2w_local::env_on("X2W_XMEM_LAZY_POOLS");
+    return on;
+}
+LONG CALLBACK lazy_pool_handler(EXCEPTION_POINTERS* info)
+{
+    const EXCEPTION_RECORD* record = info->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const ULONG_PTR address = record->ExceptionInformation[1];
+    DWORD protect = 0;
+    AcquireSRWLockShared(&lazy_pools_lock);
+    for (const LazyPool& pool : lazy_pools)
+        if (address >= pool.base && address - pool.base < pool.bytes) protect = pool.protect;
+    ReleaseSRWLockShared(&lazy_pools_lock);
+    if (!protect) return EXCEPTION_CONTINUE_SEARCH;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof mbi) || mbi.State != MEM_RESERVE) return EXCEPTION_CONTINUE_SEARCH;
+    const ULONG_PTR chunk = address & ~ULONG_PTR{0xFFFF};
+    if (!VirtualAlloc(reinterpret_cast<void*>(chunk), 0x10000, MEM_COMMIT, protect)) return EXCEPTION_CONTINUE_SEARCH;
+    const LONG n = InterlockedIncrement(&lazy_pool_commits);
+    if ((n & (n - 1)) == 0) x2w_local::logf("x2w-xmem lazy pool commit #%ld (%ld MiB committed on touch)", n, n / 16);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG attributes, DWORD protection)
 {
     const DWORD low = protection & 0xFF;
@@ -248,7 +283,16 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
         }
         how = "placeholder kept for page mapping";
     } else if (type & MEM_COMMIT) {
-        if (!address) {
+        if (!address && lazy_pools_on() && bytes >= (SIZE_T{256} << 20)) {
+            static const bool installed = AddVectoredExceptionHandler(1, lazy_pool_handler) != nullptr;
+            result = installed ? VirtualAlloc(nullptr, bytes, MEM_RESERVE, protect) : nullptr;
+            if (result) {
+                AcquireSRWLockExclusive(&lazy_pools_lock);
+                lazy_pools.push_back({reinterpret_cast<ULONG_PTR>(result), bytes, protect});
+                ReleaseSRWLockExclusive(&lazy_pools_lock);
+            }
+            how = "reserve, committed on touch";
+        } else if (!address) {
             result = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, protect);
             how = "commit";
         } else {

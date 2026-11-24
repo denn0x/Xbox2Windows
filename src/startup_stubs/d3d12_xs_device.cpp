@@ -1960,6 +1960,12 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         return S_OK;
     }
     MEMORY_BASIC_INFORMATION info{};
+    // A private range still in MEM_RESERVE inside a lazily committed pool (X2W_XMEM_LAZY_POOLS): commit the
+    // buffer's span now, as a first touch would. Outside such pools a reserved address stays invalid.
+    static const bool lazy_pools = x2w_local::env_on("X2W_XMEM_LAZY_POOLS");
+    if (lazy_pools && address && desc && desc->Width && VirtualQuery(address, &info, sizeof(info)) == sizeof(info) &&
+        info.State == MEM_RESERVE && info.Type == MEM_PRIVATE && info.AllocationProtect != PAGE_NOACCESS)
+        VirtualAlloc(address, static_cast<SIZE_T>(desc->Width), MEM_COMMIT, PAGE_READWRITE);
     // A mapped view still in MEM_RESERVE is a lazily committed physical page (X2W_XMEM_LAZY): valid memory.
     if (!address || VirtualQuery(address, &info, sizeof(info)) != sizeof(info) ||
         !(info.State == MEM_COMMIT || (info.State == MEM_RESERVE && info.Type == MEM_MAPPED))) {
