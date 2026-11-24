@@ -493,6 +493,12 @@ def main():
         text = ""
         if name == "BinkOpenWithOptions":
             text = repr((read(regs["Rcx"], 200) or b"").split(bytes(1))[0].decode("latin-1", "replace"))
+            # LOCAL (scene): post-setup movies pass a stack structure in rcx, not a name. With
+            # X2W_BINK_PER_HANDLE=1 also log its first 32 bytes and the string its first word points at.
+            head = read(regs["Rcx"], 32) if bink_per_handle else None
+            if head and len(head) == 32:
+                inner = read(struct.unpack_from("<Q", head, 0)[0], 160) or b""
+                text += f" [rcx]={head.hex(' ', 8)} [[rcx]]={inner.split(bytes(1))[0].decode('latin-1', 'replace')!r}"
         return f"{name} rcx={regs['Rcx']:#x} rdx={regs['Rdx']:#x} r8={regs['R8']:#x} {text} from {where(ret)}"
 
     def bink_report(luma=True):
