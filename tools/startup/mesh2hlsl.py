@@ -1826,10 +1826,12 @@ class MeshPipeline(G.Pipeline):
     def hlsl_ms(self, dump=False):
         """The mesh shader. dump=True (tests only): also store each thread's outputs and the group's allocation
         word in RWByteAddressBuffer u0 (per group: 16 bytes header [alloc], then per thread pos, param0..N-1,
-        primitive word) and give each primitive SV_PrimitiveID = group * 128 + index."""
+        primitive word, then the clip distances when pos1 is exported) and give each primitive SV_PrimitiveID =
+        group * 128 + index."""
         s = self.vs
         nparams = max(self.params) + 1 if self.params else 0
-        stride = 4 * (4 + 4 * nparams + 1)
+        nclip = s.exports.get('clip') or 0
+        stride = 4 * (4 + 4 * nparams + 1 + nclip)
         out = self.common()
         body_text = self.helper_text
         if self.heapwords and not any(self.heapvars):
@@ -1898,6 +1900,8 @@ class MeshPipeline(G.Pipeline):
                     '    x2w_dump.Store4(tb, asuint(o.pos));']
             out += ['    x2w_dump.Store4(tb + %du, asuint(o.param%d));' % (16 + 16 * p, p) for p in range(nparams)]
             out += ['    x2w_dump.Store(tb + %du, x2w_prim);' % (16 + 16 * nparams)]
+            if nclip:
+                out += ['    x2w_dump.Store%s(tb + %du, asuint(o.clip0));' % (nclip if nclip > 1 else '', 20 + 16 * nparams)]
         out += ['}']
         return '\n'.join(out) + '\n'
 
