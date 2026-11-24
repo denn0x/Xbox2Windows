@@ -460,10 +460,14 @@ const std::vector<Rds5Boundary>* rds5_table(HANDLE handle)
     return slot.get();
 }
 LONG requests_archive_shifted, requests_archive_past_end;
+// Off unless X2W_DSTORAGE_ARCHIVE_SHIFT=1: it served no request in runs 85-87 (heartbeat archive-shifted=0
+// past-end=0; the RDS5 interval slices took over), and it serves a request past the end of the file that
+// must fail (startup_storage_directory_batch, 'rejected at EOF').
 u64 archive_read_offset(HANDLE handle, u64 offset, unsigned size)
 {
+    static const bool enabled = x2w_local::env_on("X2W_DSTORAGE_ARCHIVE_SHIFT");
     constexpr u64 shift = 14 * 0x10000;
-    if (offset < shift) return offset;
+    if (!enabled || offset < shift) return offset;
     LARGE_INTEGER file_size{};
     if (!GetFileSizeEx(handle, &file_size)) return offset;
     const u64 end = static_cast<u64>(file_size.QuadPart);
