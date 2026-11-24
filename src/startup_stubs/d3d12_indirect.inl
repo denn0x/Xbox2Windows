@@ -351,6 +351,14 @@ void indirect_guard(ID3D12GraphicsCommandList* list, int type, u64 slot, UINT st
     list->SetComputeRootUnorderedAccessView(0, indirect_ring->GetGPUVirtualAddress() + slot);
     list->SetComputeRootUnorderedAccessView(1, indirect_guard_counter->GetGPUVirtualAddress());
     list->SetComputeRoot32BitConstants(2, 8, constants, 0);
+    // LOCAL: the guard pass is a Dispatch op in DRED too; record it so the report's Dispatch op count matches.
+    const u64 issue_key = cx_issue_key;
+    const char issue_path = cx_issue_path;
+    cx_issue_key = 0;
+    cx_issue_path = 'g';
+    note_issued_dispatch(list, (records + 63) / 64, 1, 1, false);
+    cx_issue_key = issue_key;
+    cx_issue_path = issue_path;
     list->Dispatch((records + 63) / 64, 1, 1);
 }
 

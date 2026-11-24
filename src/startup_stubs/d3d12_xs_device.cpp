@@ -2644,7 +2644,10 @@ void forget_list_dispatches(ID3D12GraphicsCommandList* list)
     }
     ReleaseSRWLockExclusive(&issued_lock);
 }
-const char* issued_path_name(char path) { return path == 'c' ? "slot-62" : path == 't' ? "translated" : path == 'r' ? "raw-address" : "?"; }
+const char* issued_path_name(char path)
+{
+    return path == 'c' ? "slot-62" : path == 't' ? "translated" : path == 'r' ? "raw-address" : path == 'g' ? "indirect guard pass" : "?";
+}
 // For one incomplete DRED list: the dispatch at op `done` (the Dispatch ops before it are counted from the op
 // types, so the barriers between dispatches need no fixed stride) and the five before and after it.
 void report_dred_dispatches(const D3D12_AUTO_BREADCRUMB_NODE* node, UINT done)
