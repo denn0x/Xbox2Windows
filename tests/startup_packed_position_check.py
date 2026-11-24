@@ -35,7 +35,15 @@ def main(dxc, renderer, adapter, fxc=None):
                 ('wrong register', 1, (0x8002, 0x8002), False),
                 ('packed position disabled', 1, (0x0100, 0x0100), False),
             ):
-                ps = compile_hlsl(compiler, kind, pixel_shader(reg, masks), 'ps', 'ps_' + profile, folder)
+                try:
+                    text = pixel_shader(reg, masks)
+                except G.Unsupported as err:
+                    # The translator maps every entry VGPR to its SPI input and refuses a read of one it does not
+                    # lower (persp_center, an unallocated register): a stronger outcome than a wrong image.
+                    assert not good and ('not lowered' in str(err) or 'past the SPI inputs' in str(err)), str(err)
+                    print(f'{kind} {adapter} {label}: refused at translation ({err})')
+                    continue
+                ps = compile_hlsl(compiler, kind, text, 'ps', 'ps_' + profile, folder)
                 run = subprocess.run([renderer, adapter, '--startup-packed-position', vs, ps],
                                      capture_output=True, text=True)
                 if run.returncode == 77:

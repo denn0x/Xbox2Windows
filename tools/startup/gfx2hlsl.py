@@ -1993,19 +1993,24 @@ class Pipeline:
         # SPI_PS_INPUT_ENA/ADDR state, which a request does not carry, so this is reported, not refused (existing
         # fixtures read entry VGPRs as zero): VGPR -> offset of the first read.
         self.ps_entry_reads = dict(self.ps.entry_reads)
+        # A read of an SPI input that is not lowered: kept here and raised by hlsl_ps(), so a pipeline can still be
+        # built to ask for its layout (packed_position_vgpr), but no pixel HLSL is ever written for it.
+        self.ps_input_refusal = None
         if self.ps_input_layout is not None:
             for reg, off in sorted(self.ps_entry_reads.items(), key=lambda item: item[1]):
                 bit = self.ps_input_layout.get(reg)
                 if bit is None:
-                    raise Unsupported('pixel stage reads entry VGPR v%d at %#x, past the SPI inputs (ADDR allocates %d)'
-                                      % (reg, off, len(self.ps_input_layout)))
-                if not self.ps_input_ena >> bit & 1:
-                    raise Unsupported('pixel stage reads SPI input %s (v%d) at %#x, allocated but not enabled'
-                                      % (PS_INPUTS[bit][0], reg, off))
-                if bit != POS_FIXED_PT:
-                    raise Unsupported('pixel stage reads SPI input %s (v%d) at %#x: not lowered'
-                                      % (PS_INPUTS[bit][0], reg, off))
-            self.ps_entry_reads = {}  # every entry read is the lowered packed position
+                    self.ps_input_refusal = ('pixel stage reads entry VGPR v%d at %#x, past the SPI inputs (ADDR allocates %d)'
+                                             % (reg, off, len(self.ps_input_layout)))
+                elif not self.ps_input_ena >> bit & 1:
+                    self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x, allocated but not enabled'
+                                             % (PS_INPUTS[bit][0], reg, off))
+                elif bit != POS_FIXED_PT:
+                    self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x: not lowered'
+                                             % (PS_INPUTS[bit][0], reg, off))
+                if self.ps_input_refusal:
+                    break
+            self.ps_entry_reads = {}  # every entry read is the lowered packed position (or refused above)
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         missing = [a for a in self.ps.attrs if a not in self.params]
@@ -2122,6 +2127,9 @@ class Pipeline:
         return '\n'.join(out) + '\n'
 
     def hlsl_ps(self):
+        refusal = getattr(self, 'ps_input_refusal', None)  # the tests' bare pipelines have none
+        if refusal:
+            raise Unsupported(refusal)
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
         out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};']
