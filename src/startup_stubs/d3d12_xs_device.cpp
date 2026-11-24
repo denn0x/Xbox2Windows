@@ -254,7 +254,7 @@ Wrapper* the_device;
 enum { time_list, time_device_noop, time_forward, time_create, time_view, time_queue, time_present, time_wait,
        time_pipeline, time_heap, time_copy, time_cx_fill_views, time_cx_desktop_range, time_cx_readable, time_cx_texture,
        time_cx_execute, time_vquery, time_placed, time_placed_query, time_placed_create, time_placed_log, time_placed_gap,
-       time_draw_lock_wait, time_count };
+       time_draw_lock_wait, time_log, time_log_in_draw_lock, time_count };
 // LOCAL (perf_work/STARTUP.md): "placed" is all of Device slot 133 (CreatePlacedResourceX); its parts are
 // the memory queries, the desktop heap/resource creation and the log line; "placed-gap" is the time on
 // the same thread from the end of one slot 133 call to the start of the next (the title's own work
@@ -262,7 +262,8 @@ enum { time_list, time_device_noop, time_forward, time_create, time_view, time_q
 const char* const time_names[time_count] = {"list", "device-noop", "forward", "create", "view", "queue", "present", "wait",
                                             "pipeline", "heap", "copy", "cx-fill-views", "cx-desktop-range", "cx-readable",
                                             "cx-texture-view", "cx-execute", "vquery", "placed", "placed-query",
-                                            "placed-create", "placed-log", "placed-gap", "draw-lock-wait"};
+                                            "placed-create", "placed-log", "placed-gap", "draw-lock-wait", "log",
+                                            "log-in-draw-lock"};
 volatile LONG64 time_ticks[time_count], time_calls[time_count];
 struct Timed;
 SIZE_T timed_query(const void* address, MEMORY_BASIC_INFORMATION* info);  // VirtualQuery, timed as "vquery"
@@ -306,8 +307,20 @@ SIZE_T timed_query(const void* address, MEMORY_BASIC_INFORMATION* info)
     return VirtualQuery(address, info, sizeof(*info));
 }
 
+extern SRWLOCK draw_lock;              // d3d12_draw.inl
+extern volatile LONG draw_lock_thread;  // the thread that took draw_lock last
+// LOCAL stall: all of log() is timed as "log"; lines written while this thread holds draw_lock also
+// as "log-in-draw-lock" (owner check: the last taker is this thread and the lock is not free).
 void log(const char* format, ...)
 {
+    Timed timed(time_log);
+    TimedPart locked(time_log_in_draw_lock);
+    if (draw_lock_thread != static_cast<LONG>(GetCurrentThreadId()))
+        locked.category = -1;
+    else if (TryAcquireSRWLockShared(&draw_lock)) {
+        ReleaseSRWLockShared(&draw_lock);
+        locked.category = -1;
+    }
     char line[1536];
     va_list args;
     va_start(args, format);
