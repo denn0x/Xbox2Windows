@@ -20,7 +20,9 @@
 // published last), <key>.ms.cso (DXIL ms_6_5, required), <key>.ps.cso (optional: none = depth-only pipeline).
 // Requests req_<key>.{b,root,a} are written by regblob at creation (not here).
 //
-// Per 300 frames: "x2w-mesh N frames: calls X issued Y; skipped: ..." (report_mesh). One line per new key.
+// Per 300 frames: "x2w-mesh N frames: calls X issued Y; skipped: ..." (report_mesh), then the bound keys with their
+// call counts (report_mesh_keys, top 64). Per key: "x2w-mesh key K first bound frame F (cache: ok|fail|missing)"
+// (first 4096 keys), "no translation" / "translation failed" once, "first call issued" once.
 // Fixed-function state: today the same rule as pipeline_for (blend found in the state block, else opaque;
 // depth-stencil only from a stream pipeline, else off; cull none). Renderstate's decode replaces mesh_state_desc.
 
@@ -182,6 +184,54 @@ MeshEntry& loaded_mesh(u64 key)
     ReleaseSRWLockExclusive(&mesh_lock);
     WakeAllConditionVariable(&mesh_loaded);
     return e;  // a failed Translation is kept (leaked) like draw translations: never retried
+}
+
+// ---- Coverage: which mesh keys are bound (board/msgs/210900_mesh) ----------------------------------------------
+
+SRWLOCK mesh_use_lock = SRWLOCK_INIT;
+std::unordered_map<u64, LONG>& mesh_key_uses() { static std::unordered_map<u64, LONG> m; return m; }  // since the last line
+std::unordered_map<u64, bool>& mesh_keys_seen() { static std::unordered_map<u64, bool> m; return m; }
+
+// Every mesh call with a keyed record, after its translation lookup (state: 1 ok, 2 fail, 4 missing).
+void mesh_note_use(u64 key, int state)
+{
+    AcquireSRWLockExclusive(&mesh_use_lock);
+    ++mesh_key_uses()[key];
+    const bool first = mesh_keys_seen().emplace(key, true).second;
+    ReleaseSRWLockExclusive(&mesh_use_lock);
+    static LONG shown;
+    if (first && first_calls(shown, 4096))
+        log("x2w-mesh key %016llx first bound frame %ld (cache: %s)", key, frame_number, state == 1 ? "ok" : state == 2 ? "fail" : "missing");
+}
+
+// "x2w-mesh N frames: keys n distinct, calls c; top: key:calls ..." (up to 64 keys, 32 per line; log lines are 1536 bytes).
+void report_mesh_keys(LONG frames)
+{
+    std::vector<std::pair<u64, LONG>> uses;
+    AcquireSRWLockExclusive(&mesh_use_lock);
+    uses.assign(mesh_key_uses().begin(), mesh_key_uses().end());
+    mesh_key_uses().clear();
+    const std::size_t seen = mesh_keys_seen().size();
+    ReleaseSRWLockExclusive(&mesh_use_lock);
+    LONG calls = 0;
+    for (const auto& u : uses) calls += u.second;
+    std::sort(uses.begin(), uses.end(), [](const auto& x, const auto& y) { return x.second != y.second ? x.second > y.second : x.first < y.first; });
+    const std::size_t top = uses.size() < 64 ? uses.size() : 64;
+    if (top <= 32) {
+        char line[1100];
+        int n = 0;
+        for (std::size_t i = 0; i < top; ++i) n += std::snprintf(line + n, sizeof(line) - n, " %016llx:%ld", uses[i].first, uses[i].second);
+        log("x2w-mesh %ld frames: keys %zu distinct, calls %ld; top:%s (keys seen since start %zu)", frames, uses.size(), calls, top ? line : " none", seen);
+        return;
+    }
+    log("x2w-mesh %ld frames: keys %zu distinct, calls %ld; top: 64 keys on the next 2 lines (keys seen since start %zu)", frames, uses.size(), calls, seen);
+    for (std::size_t from = 0; from < top; from += 32) {
+        const std::size_t to = top < from + 32 ? top : from + 32;
+        char line[1100];
+        int n = 0;
+        for (std::size_t i = from; i < to; ++i) n += std::snprintf(line + n, sizeof(line) - n, " %016llx:%ld", uses[i].first, uses[i].second);
+        log("x2w-mesh %ld frames top %zu-%zu:%s", frames, from + 1, to, line);
+    }
 }
 
 // ---- Desktop pipeline ---------------------------------------------------------------------------------------
@@ -361,6 +411,7 @@ bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
     }
     if (!binding.mesh || !binding.key.keyed || !binding.bound) return mesh_skip(mesh_no_record), false;
     MeshEntry& e = loaded_mesh(binding.key.key);
+    mesh_note_use(binding.key.key, e.state);
     if (e.state == 4) return mesh_skip(mesh_no_translation), false;
     if (e.state != 1) return mesh_skip(mesh_failed), false;
     if (binding.attached != e.tr) {
@@ -426,4 +477,5 @@ void report_mesh(LONG frames)
         "records keyed %ld unkeyed %ld (total)",
         frames, calls, issued, s[mesh_no_translation], s[mesh_failed], s[mesh_no_pso], s[mesh_no_targets], s[mesh_tier], s[mesh_no_record],
         s[mesh_rtv_variant], s[mesh_bind], calls - accounted, mesh_records_keyed, mesh_records_unkeyed);
+    report_mesh_keys(frames);
 }
