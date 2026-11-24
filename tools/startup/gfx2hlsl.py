@@ -2067,6 +2067,9 @@ SCA = {
     # s_pack_ll_b32_b16 selects build_vector(src0, src1): S0[15:0] in the low half, S1[15:0] in the high half.
     # It does not define SCC.
     's_pack_ll_b32_b16': ('({0} & 0xffffu) | ({1} << 16)', None),
+    # s_pack_hh_b32_b16 selects build_vector(trunc(src0 >> 16), trunc(src1 >> 16)) (LLVM SIInstructions.td):
+    # S0[31:16] in the low half, S1[31:16] in the high half. No SCC (SOP2_32 outside the Defs = [SCC] block).
+    's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
 }
 # Scalar ops whose SCC result the translation does not compute (LLVM SOPInstructions.td lists SCC in their Defs).
 # Stage.check_scc refuses a program only when that SCC can reach a reader.
