@@ -1474,7 +1474,8 @@ class Stage:
 
     def compare(self, base, ops, mods=()):
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|f16)(_sdwa)?', base)
-        if not m or (m.group(4) and m.group(3) not in ('i32', 'u32')) or (m.group(3) == 'f16' and m.group(2) != 'class'):
+        if not m or (m.group(4) and m.group(3) not in ('i32', 'u32') and (m.group(3), m.group(2)) != ('f32', 'class')) \
+                or (m.group(3) == 'f16' and m.group(2) != 'class'):
             raise Unsupported(base)
         writes_exec, cond, typ = m.group(1) == 'x', m.group(2), m.group(3)
         if len(ops) == 3:
@@ -1489,6 +1490,20 @@ class Stage:
             fields = dict(mod.partition(':')[::2] for mod in mods)
             if set(fields) != {'src0_sel', 'src1_sel'} or any(v not in SDWA_SEL for v in fields.values()):
                 raise Unsupported('%s with %s' % (base, mods))
+            if cond == 'class':
+                # v_cmp_class_f32 SDWA: S0 is the f32 value (whole dword only; neg()/abs() act on its sign bit as
+                # for the e64 form), S1 the integer class mask read through its selection (a compiler uses
+                # src1_sel:BYTE_n to test bits of one byte against constant classes such as -0.0).
+                if fields['src0_sel'] != 'DWORD':
+                    raise Unsupported('%s with a sub-dword f32 value' % base)
+                mm = re.fullmatch(r'(neg|abs)\((.*)\)', a)
+                value = self.u(mm.group(2) if mm else a)
+                if mm:
+                    value = '(%s %s)' % (value, '^ 0x80000000u' if mm.group(1) == 'neg' else '& 0x7fffffffu')
+                if b.startswith(('sext(', 'neg(', 'abs(')):
+                    raise Unsupported('%s with a modified class mask %s' % (base, b))
+                expr = 'x2w_class_f32(%s, %s)' % (value, sdwa_source(self.u(b), fields['src1_sel'], False))
+                return self.write_compare(writes_exec, dst, expr)
             words = []
             for token, key in ((a, 'src0_sel'), (b, 'src1_sel')):
                 sext = token.startswith('sext(') and token.endswith(')')
