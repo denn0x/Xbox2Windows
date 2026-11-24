@@ -102,8 +102,9 @@ void max_count_seen(UINT max_count)
 //   ExecuteIndirect; [read-back copy]; ring -> COMMON.
 // A window rests in COMMON or UAV-promoted (compute binds it as UAV); UAV is a valid BeforeState for both.
 
-// X2W_INDIRECT_OFF=1: nothing executed. X2W_INDIRECT_DISPATCH=0 / X2W_INDIRECT_DRAW=0 / X2W_INDIRECT_MESH=0:
-// per type (default on). X2W_INDIRECT_READBACK=<n>: read back the first n executed records per report.
+// X2W_INDIRECT_OFF=1: nothing executed. X2W_INDIRECT_DISPATCH=0 / X2W_INDIRECT_MESH=0: per type (default on).
+// Draw/DrawIndexed: default OFF until a test or run has exercised it; X2W_INDIRECT_DRAW=1 turns it on.
+// X2W_INDIRECT_READBACK=<n>: read back the first n executed records per report.
 bool indirect_env_zero(const char* name)
 {
     char value[8]{};
@@ -113,7 +114,7 @@ bool indirect_type_enabled(int type)
 {
     static const bool off = x2w_local::env_on("X2W_INDIRECT_OFF");
     static const bool dispatch = !indirect_env_zero("X2W_INDIRECT_DISPATCH");
-    static const bool draw = !indirect_env_zero("X2W_INDIRECT_DRAW");
+    static const bool draw = x2w_local::env_on("X2W_INDIRECT_DRAW");
     static const bool mesh = !indirect_env_zero("X2W_INDIRECT_MESH");
     if (off) return false;
     return type == itype_dispatch ? dispatch : type == itype_draw || type == itype_indexed ? draw : type == itype_mesh ? mesh : false;
