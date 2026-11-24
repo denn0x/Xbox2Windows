@@ -189,7 +189,7 @@ def main():
     # (gpu_slab_pool.py) so that every run reuses the same sections. Already-charged pool bytes are taken off the
     # slab budget in the guard below. X2W_XMEM_GPU_POOL=0: off.
     # X2W_XMEM_GPU_POOL=all: EVERY slab comes from the pool from the start (no file-backed slabs, no live moves);
-    # X2W_XMEM_GPU_POOL_SLABS sections (default 28 = 7 GiB), charged once per boot. The slab budget then only
+    # X2W_XMEM_GPU_POOL_SLABS sections (default 32 = 8 GiB; runs 89-91 used 28), charged once per boot. The slab budget then only
     # covers fresh sections beyond the pool.
     pool_mode = os.environ.get("X2W_XMEM_GPU_POOL", "")
     pool_all = pool_mode == "all"
@@ -197,12 +197,18 @@ def main():
     if pool_all or (os.environ.get("X2W_XMEM_SLAB_DIR") and pool_mode != "0"):
         try:  # a pool failure must never cost a run: xmem then falls back to fresh sections
             import gpu_slab_pool
-            count = (int(os.environ.get("X2W_XMEM_GPU_POOL_SLABS") or "28") if pool_all
+            count = (int(os.environ.get("X2W_XMEM_GPU_POOL_SLABS") or "32") if pool_all
                      else max(1, int(os.environ.get("X2W_XMEM_SLAB_BUDGET_MIB") or "3072") // 256))
             pooled_bytes = gpu_slab_pool.ensure(count) << 28
         except Exception as error:
+            count = 0
             print(f"GPU slab pool not started: {error}")
         print(f"GPU slab pool: {pooled_bytes >> 20} MiB reachable (X2W_XMEM_GPU_POOL={pool_mode or 'on'})")
+        if pool_all and pooled_bytes < count << 28:
+            # =all is an explicit opt-in: a short pool would push the title onto the (small) beyond-pool budget and
+            # make its page maps fail (err 1455) mid-run. Refuse instead.
+            print(f"refused to launch: X2W_XMEM_GPU_POOL=all needs {count} pool sections, {pooled_bytes >> 28} reachable")
+            return 3
     # Host safety (runtime_work/NOTES.md): the job limit covers private commit only. Pagefile page
     # slabs are capped by X2W_XMEM_SLAB_BUDGET_MIB; a launch whose job limit plus slab budget does not
     # fit in the host's commit headroom minus 2 GiB is refused. X2W_ALLOW_UNBUDGETED=1 skips this.

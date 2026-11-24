@@ -12,17 +12,19 @@ namespace {
 LONG next_index = 0;
 LONG misses = 0;
 
-// The pool is this process's alone: a named mutex, owned until the process ends (abandoned on a kill, which the
-// next owner sees as WAIT_ABANDONED and accepts).
+// The pool is this process's alone: the process that creates the named event Local\x2w-gpu-slab-pool-owner owns it.
+// The handle stays open until the process ends (also on a kill: the kernel closes it and the name goes away), so
+// the claim does not depend on the thread that made it, unlike a mutex.
 bool owner() noexcept
 {
     static const bool owned = [] {
-        const HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\x2w-gpu-slab-pool-owner");
-        const DWORD wait = mutex ? WaitForSingleObject(mutex, 0) : WAIT_FAILED;
-        const bool ok = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
-        if (!ok)
-            x2w_local::logf("x2w-xmem GPU slab pool: in use by another process (wait %lu, error %lu): fresh sections instead",
-                            wait, GetLastError());
+        const HANDLE claim = CreateEventW(nullptr, TRUE, FALSE, L"Local\\x2w-gpu-slab-pool-owner");
+        const DWORD error = GetLastError();
+        const bool ok = claim && error != ERROR_ALREADY_EXISTS;
+        if (!ok) {
+            if (claim) CloseHandle(claim);
+            x2w_local::logf("x2w-xmem GPU slab pool: in use by another process (error %lu): fresh sections instead", error);
+        }
         return ok;  // the handle is kept open on purpose
     }();
     return owned;

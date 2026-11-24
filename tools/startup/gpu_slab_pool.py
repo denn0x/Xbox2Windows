@@ -14,9 +14,9 @@ growing by every moved slab of every run.
 
 Names: Local\\x2w-gpu-slab-<i> (i = 0..N-1), events Local\\x2w-gpu-slab-pool-ready / -quit. Each section is
 SEC_COMMIT, M MiB (xmem's slab size is 256 MiB). xmem opens them in order (X2W_XMEM_GPU_POOL, default on: only slabs
-moved for the GPU; =all: every slab from the start, X2W_XMEM_GPU_POOL_SLABS sections, default 28); a run that needs
-more falls back to fresh sections (logged). xmem claims the pool with the mutex Local\\x2w-gpu-slab-pool-owner, so a
-second process never shares it. ensure with a larger count than the running holder has starts a second holder that
+moved for the GPU; =all: every slab from the start, X2W_XMEM_GPU_POOL_SLABS sections, default 32); a run that needs
+more falls back to fresh sections (logged). xmem claims the pool with the named event Local\\x2w-gpu-slab-pool-owner,
+so a second process never shares it. ensure with a larger count than the running holder has starts a second holder that
 holds the existing sections too and creates the missing ones (quit ends both).
 """
 import ctypes

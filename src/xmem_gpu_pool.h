@@ -13,8 +13,9 @@
 //   all             every slab comes from the pool from the start: no file-backed slabs, no live moves; a pool
 //                   section's slots are zeroed when first handed out (section_for). Pool exhausted: fresh sections.
 //   0               off: fresh sections as before.
-// Only one process uses the pool at a time: the first take() claims Local\x2w-gpu-slab-pool-owner (a mutex held until
-// the process ends); a second process gets no pool sections (logged) instead of sharing them.
+// Only one process uses the pool at a time: the first take() creates the named event Local\x2w-gpu-slab-pool-owner
+// (kept open until the process ends); a process that finds it existing gets no pool sections (logged) instead of
+// sharing them.
 #include <windows.h>
 
 namespace x2w_gpu_pool {
