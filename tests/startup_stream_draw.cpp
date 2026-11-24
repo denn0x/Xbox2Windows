@@ -279,6 +279,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_DRAW_UAV", nullptr, 0)) {
+        extern int draw_uav_stores(ID3D12Device*, void*, void*);
+        if (const int result = draw_uav_stores(desktop.Get(), guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0)) {
         extern int draw_address_buffer_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_buffer_srvs(desktop.Get(), guest, list)) return result;
@@ -350,6 +353,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         last = 2;
     }
     if (const int rc = submit(last)) return rc;
+    if (GetEnvironmentVariableW(L"X2W_TEST_DRAW_UAV", nullptr, 0)) {
+        extern void report_uav_stores();
+        report_uav_stores();
+    }
 
     return read_stream_target(desktop.Get(), frame, pixels);
 }
