@@ -20,6 +20,7 @@
 //   req_<key>.desc    0x300 bytes from the record (what note_pipeline copies; may run past the record)
 //   req_<key>.rec     the 0x160-byte record (pointers as the title passed them); last of the blob files
 //   req_<key>.b, .root, .a   the pipeline request, as cached_translation writes it (kept if present)
+//   req_<key>.d55_<8 hex>    slot 55 derived from this key: its patch records, once per distinct set
 // <key> is the request key (pipeline_key over [5]/[6], [9]/[10] and the root blob), unchanged, so these
 // pipelines get requests also when they are only ever bound at ExecuteIndirect (list slot 61).
 // Every distinct content of the blobs [1], [3], [7], [11] of a key (the first one too) is also written
@@ -58,7 +59,7 @@ SRWLOCK queue_lock = SRWLOCK_INIT;
 CONDITION_VARIABLE queue_ready = CONDITION_VARIABLE_INIT;
 std::vector<Job>& queue() { static std::vector<Job> q; return q; }
 LONG64 bytes_queued, bytes_pending;  // queued this run (capped), and not yet written (capped at 64 MiB)
-LONG sets_written, variants_written, generic_written, requests_written, failures, dropped, queued_jobs;
+LONG sets_written, variants_written, derived_written, generic_written, requests_written, failures, dropped, queued_jobs;
 
 // A pointer/length pair at odd word i: pointer 4-aligned in the user range, length 4..cap, readable.
 bool pair_at(const u64* w, int i, Pair& out)
@@ -94,15 +95,18 @@ void run_job(const Job& job)
         if (!f.keep_existing && !blobs) continue;
         if (!cache_path(path, job.prefix, job.key, f.ext.c_str())) { ok = false; break; }
         if (f.keep_existing && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) continue;
+        if (!ok && (f.ext == job.marker || f.keep_existing)) break;  // keep the order: no marker or .a after a failed write
         const bool done = write_whole(path, f.bytes.data(), f.bytes.size());
         ok = ok && done;
         if (f.keep_existing && done && f.ext == L".a") request = true;
-        if (!done && (f.ext == job.marker || f.keep_existing)) break;  // keep the order: no marker or .a after a failed write
     }
     if (!ok) InterlockedIncrement(&failures);
     if (request) InterlockedIncrement(&requests_written);
-    if (blobs && ok) {
-        const bool variant = job.marker.size() > 5;  // ".<8 hex>.rec"
+    const std::size_t m = job.marker.size();
+    const bool set = m >= 4 && job.marker.compare(m - 4, 4, L".rec") == 0;
+    if (blobs && ok && !set) InterlockedIncrement(&derived_written);
+    if (blobs && ok && set) {
+        const bool variant = m > 4;  // ".<8 hex>.rec"
         InterlockedIncrement(variant ? &variants_written : job.prefix[4] == L'g' ? &generic_written : &sets_written);
         static LONG logged;
         if (!variant && first_calls(logged, 8))
@@ -206,8 +210,12 @@ void add_blobs(std::vector<File>& files, const std::wstring& infix, const u64* w
     files.push_back({infix + L".rec", bytes_of(record, record_bytes)});
 }
 
+SRWLOCK key_lock = SRWLOCK_INIT;
+// Slot-57 pipeline wrapper -> its key and prefix, for the derived pipelines built on it.
+std::unordered_map<const Wrapper*, std::pair<u64, const wchar_t*>>& keys_of() { static std::unordered_map<const Wrapper*, std::pair<u64, const wchar_t*>> m; return m; }
+
 // Device slot 57, after note_pipeline. Returns the key (request key, or the req_g57_ content key).
-u64 dump57(const void* desc)
+u64 dump57(const void* desc, const Wrapper* self)
 {
     static const bool on = !x2w_local::env_on("X2W_REGBLOB_OFF");
     static SRWLOCK lock = SRWLOCK_INIT;
@@ -258,6 +266,9 @@ u64 dump57(const void* desc)
     const bool variant = keyed && states.size() < 16384 && states.insert(state_id).second;
     ReleaseSRWLockExclusive(&lock);
     const wchar_t* prefix = keyed ? L"req_" : L"req_g57_";
+    AcquireSRWLockExclusive(&key_lock);
+    keys_of()[self] = {key, prefix};
+    ReleaseSRWLockExclusive(&key_lock);
     if (plain) {
         Job job{prefix, key, L".rec", {}};
         add_blobs(job.files, L"", w, desc, true, true);
@@ -279,6 +290,41 @@ u64 dump57(const void* desc)
     return key;
 }
 
+// Device slot 55 (CreateDerivedPipelineStateX), after note_pipeline: the patch records ({u32 kind;
+// desktop desc}, x2w_derived_blend::record_size each; 1 rasterizer, 2 blend) as
+// <prefix><base key>.d55_<8 hex hash of the patch bytes>, once per distinct patch set and base key.
+// The base is found through the slot-55 base chain (depth 8), as translation_for does.
+void dump55(const void* base, const void* patches, std::size_t bytes)
+{
+    static const bool on = !x2w_local::env_on("X2W_REGBLOB_OFF");
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::unordered_set<u64> seen;
+    wchar_t probe[MAX_PATH];
+    if (!on || !patches || !bytes || bytes > 0x10000 || !cache_path(probe, L"req_", 0, L"")) return;
+    const Wrapper* w = as_wrapper(base);
+    std::pair<u64, const wchar_t*> found{0, nullptr};
+    for (int depth = 0; w && depth < 8; ++depth) {
+        AcquireSRWLockShared(&key_lock);
+        const auto it = keys_of().find(w);
+        if (it != keys_of().end()) found = it->second;
+        ReleaseSRWLockShared(&key_lock);
+        if (found.second) break;
+        const PipelineInfo* info = pipeline_info(w);
+        w = info && info->path == 55 ? info->base : nullptr;
+    }
+    if (!found.second) return;
+    const u64 hash = fnv_bytes(patches, bytes);
+    AcquireSRWLockExclusive(&lock);
+    const bool fresh = seen.size() < 16384 && seen.insert(fnv_bytes(&hash, sizeof(hash), found.first)).second;
+    ReleaseSRWLockExclusive(&lock);
+    if (!fresh) return;
+    wchar_t ext[32];
+    swprintf(ext, std::size(ext), L".d55_%08x", static_cast<unsigned>(hash ^ (hash >> 32)));
+    Job job{found.second, found.first, ext, {}};
+    job.files.push_back({ext, bytes_of(patches, bytes)});
+    push(std::move(job));
+}
+
 // Every 300 frames in render mode (frame heartbeat).
 void report()
 {
@@ -288,7 +334,7 @@ void report()
     const std::size_t pending = queue().size();
     ReleaseSRWLockShared(&queue_lock);
     log("x2w-regblob totals: queued %ld (%lld KiB), pending %zu, sets %ld, variants %ld, without key %ld, requests %ld, "
-        "failed %ld, dropped over cap %ld", queued_jobs, bytes_queued >> 10, pending, sets_written, variants_written,
-        generic_written, requests_written, failures, dropped);
+        "derived patch sets %ld, failed %ld, dropped over cap %ld", queued_jobs, bytes_queued >> 10, pending, sets_written,
+        variants_written, generic_written, requests_written, derived_written, failures, dropped);
 }
 }  // namespace regblob

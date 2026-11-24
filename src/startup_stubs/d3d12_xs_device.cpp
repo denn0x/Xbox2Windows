@@ -3836,7 +3836,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
-    if (N == 57) regblob::dump57(desc);
+    if (N == 57) regblob::dump57(desc, static_cast<Wrapper*>(*out));
     if (N == 67 &&x2w_local::readable(desc, 0x28)) {
         u64 words[5];
         std::memcpy(words, desc, sizeof(words));
@@ -3878,6 +3878,7 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
     }
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), 55, base, desc, bytes_in_patches);
+    regblob::dump55(base, desc, bytes_in_patches);
     return S_OK;
 }
 
