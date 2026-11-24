@@ -3328,6 +3328,10 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, name, N & 0xFF, reinterpret_cast<u64>(self), rdx, r8, r9,
                        _ReturnAddress());
     }
+    if (noop_census_enabled()) {
+        const u64 args[8] = {reinterpret_cast<u64>(self), rdx, r8, r9, 0, 0, 0, 0};
+        noop_census_note(queue_kind, N, args, reinterpret_cast<u64>(_ReturnAddress()) - reinterpret_cast<u64>(GetModuleHandleW(nullptr)));
+    }
     if (log_it) {
         char name[64];
         std::snprintf(name, sizeof(name), "CommandQueue::slot%d", N);
