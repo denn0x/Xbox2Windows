@@ -16,6 +16,7 @@
 
 #include <vector>
 
+#include <algorithm>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -559,8 +560,25 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
 // left alone; one that shows another page is unmapped first.
 BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages, const char* what)
 {
-    std::map<ULONG_PTR, ULONG_PTR> want;
-    for (ULONG_PTR i = 0; i < count; ++i) want[addresses[i]] = pages[i];
+    // The pairs in ascending address order, the last pair for a repeated address winning, as an
+    // ordered map assigned in call order would give; but one allocation instead of a tree node per
+    // page (a single call can carry ~100,000 pages).
+    std::vector<std::pair<ULONG_PTR, ULONG_PTR>> want;
+    want.reserve(count);
+    bool ascending = true;
+    for (ULONG_PTR i = 0; i < count; ++i) {
+        ascending = ascending && (!i || addresses[i] > addresses[i - 1]);
+        want.emplace_back(addresses[i], pages[i]);
+    }
+    if (!ascending) {
+        std::stable_sort(want.begin(), want.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            if (i + 1 < want.size() && want[i + 1].first == want[i].first) continue;  // a later pair names it again
+            want[kept++] = want[i];
+        }
+        want.resize(kept);
+    }
     std::vector<ULONG_PTR> unmap, map_at, map_page;
     {
         const std::lock_guard guard(memory.mutex);
