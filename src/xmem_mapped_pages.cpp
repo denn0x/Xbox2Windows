@@ -507,6 +507,70 @@ LONG CALLBACK lazy_commit_handler(EXCEPTION_POINTERS* info)
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 const bool lazy_handler_installed = lazy_commit() && AddVectoredExceptionHandler(1, lazy_commit_handler) != nullptr;
+
+// LOCAL (X2W_XMEM_LAZY=1): the kernel writes ReadFile's buffer without faulting, so a read into a
+// still-reserved section page fails (ERROR_NOACCESS) instead of committing it. The title's ReadFile
+// import is wrapped: reserved mapped pages in the buffer are committed first, then the call goes on.
+LONG read_commits;
+void commit_reserved_views(void* buffer, DWORD bytes)
+{
+    auto address = reinterpret_cast<ULONG_PTR>(buffer);
+    const ULONG_PTR end = address + bytes;
+    while (address < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof mbi)) return;
+        const ULONG_PTR region_end = reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) + mbi.RegionSize;
+        if (mbi.Type == MEM_MAPPED && mbi.State == MEM_RESERVE) {
+            const ULONG_PTR first = address & ~(ULONG_PTR{page_bytes} - 1);
+            const ULONG_PTR last = (end < region_end ? end : region_end);
+            for (ULONG_PTR page = first; page < last; page += page_bytes)
+                if (VirtualAlloc(reinterpret_cast<void*>(page), page_bytes, MEM_COMMIT, PAGE_READWRITE)) {
+                    const LONG n = InterlockedIncrement(&read_commits);
+                    if ((n & (n - 1)) == 0) x2w_local::logf("x2w-xmem lazy commit before ReadFile #%ld", n);
+                }
+        }
+        address = region_end;
+    }
+}
+BOOL WINAPI lazy_read_file(HANDLE file, void* buffer, DWORD bytes, DWORD* read, OVERLAPPED* overlapped)
+{
+    if (buffer && bytes) commit_reserved_views(buffer, bytes);
+    return ReadFile(file, buffer, bytes, read, overlapped);
+}
+int patch_read_file()
+{
+    auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const auto& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!directory.VirtualAddress) return 0;
+    int patched = 0;
+    for (auto* import = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + directory.VirtualAddress); import->Name; ++import) {
+        if (!import->OriginalFirstThunk) continue;
+        auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + import->OriginalFirstThunk);
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + import->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+            const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+            if (std::strcmp(by_name->Name, "ReadFile") != 0) continue;
+            DWORD old = 0;
+            if (VirtualProtect(&slots->u1.Function, 8, PAGE_READWRITE, &old)) {
+                slots->u1.Function = reinterpret_cast<ULONGLONG>(&lazy_read_file);
+                VirtualProtect(&slots->u1.Function, 8, old, &old);
+                ++patched;
+            }
+        }
+    }
+    return patched;
+}
+}  // namespace
+
+namespace {
+// Runs during this DLL's initialisation; the loader has bound the main module's imports by then.
+const bool read_file_patched = [] {
+    if (!lazy_commit()) return false;
+    x2w_local::logf("x2w-xmem lazy: %d ReadFile import(s) of the main module wrapped", patch_read_file());
+    return true;
+}();
 }  // namespace
 
 extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const ULONG_PTR* tokens)
