@@ -44,6 +44,7 @@
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
 #include "gfx10_view_words.h"
+#include "startup_stubs/rawaddr_table.h"  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
@@ -2576,6 +2577,8 @@ std::unordered_map<Wrapper*, u64>& compute_keys() { static std::unordered_map<Wr
 D3D12_GPU_VIRTUAL_ADDRESS desktop_va(u64 address);
 void note_window(ID3D12Resource* buffer);
 bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT x, UINT y, UINT z);
+bool rawaddr_pipeline(u64 key, Wrapper* root, Wrapper* pipeline);                              // d3d12_rawaddr.inl
+bool rawaddr_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z);  // d3d12_rawaddr.inl
 SRWLOCK compute_pso_lock = SRWLOCK_INIT;
 std::unordered_map<Wrapper*, ID3D12PipelineState*>& compute_psos()
 {
@@ -2647,6 +2650,7 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
         InterlockedIncrement(&compute_outcomes[co_not_run]);
         return false;
     }
+    if (rawaddr_dispatch(self, list, x, y, z)) return true;  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
     if (!pass.compute_root || !pass.compute_root->own().real) return execute_translated(self, list, key, x, y, z);
     AcquireSRWLockShared(&compute_pso_lock);
     const auto found = compute_psos().find(pass.pipeline);
@@ -3878,7 +3882,8 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
         wchar_t path[MAX_PATH];
         ID3DBlob* code = nullptr;
         Wrapper* root = as_wrapper(desc->pRootSignature);
-        if (root && root->own().real && cache_path(path, L"", compute_key, L".cs.dxbc") && SUCCEEDED(D3DReadFileToBlob(path, &code))) {
+        if (!rawaddr_pipeline(compute_key, root, static_cast<Wrapper*>(*out)) &&  // LOCAL: a sidecar key skips the plain path
+            root && root->own().real && cache_path(path, L"", compute_key, L".cs.dxbc") && SUCCEEDED(D3DReadFileToBlob(path, &code))) {
             D3D12_COMPUTE_PIPELINE_STATE_DESC real{};
             real.pRootSignature = static_cast<ID3D12RootSignature*>(root->own().real);
             real.CS = {code->GetBufferPointer(), code->GetBufferSize()};
@@ -4164,6 +4169,7 @@ void draw_overlay(LONG frame, double seconds)
 
 #include "startup_stubs/d3d12_compute.inl"
 #include "startup_stubs/d3d12_indirect.inl"
+#include "startup_stubs/d3d12_rawaddr.inl"
 #include "startup_stubs/d3d12_present.inl"
 #include "startup_stubs/d3d12_copy_buffer.inl"
 
@@ -4312,6 +4318,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             }
             if (used) log("x2w-d3d12 command-list slots over 20 ms:%s", text);
         }
+        rawaddr_report();  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
