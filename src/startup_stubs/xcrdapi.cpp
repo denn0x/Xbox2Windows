@@ -13,11 +13,14 @@
 
 #include <condition_variable>
 #include <deque>
+#include <exception>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include <cstdarg>
+#include <algorithm>
 #include <cstring>
 #include <utility>
 
@@ -57,6 +60,8 @@ struct Entry {
     enum Type { request, status_entry, signal } type;
     unsigned char bytes[0x48];
     std::vector<ULONG_PTR> tokens;
+    const unsigned char* origin;  // the title's request, to see whether it changed after enqueue
+    unsigned zero_at_enqueue;
     Object* array;
     unsigned index;
     void* fence;
@@ -160,6 +165,7 @@ long __stdcall factory_open_file(Object*, const wchar_t* path, const GUID* riid,
     if (handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(error);
     Object* object = make(file);
     object->handle = handle;
+    log("x2w-dstorage   file object %p = \"%ls\"", static_cast<void*>(object), path);
     *out = object;
     return S_OK;
 }
@@ -227,10 +233,76 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
-LONG zero_tokens_at_enqueue, zero_tokens_at_run;
-void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens)
+LONG zero_tokens_at_enqueue, zero_tokens_at_run, requests_stream_pieces;
+
+// Inflated multi-page streams, newest first (see execute_request).
+struct InflatedStream { u64 source, base; unsigned compressed; std::shared_ptr<const std::vector<unsigned char>> data; };
+std::mutex streams_lock;
+std::deque<InflatedStream> streams;
+void remember_stream(u64 source, u64 base, unsigned compressed, std::shared_ptr<const std::vector<unsigned char>> data)
 {
-    if (!request) return;
+    const std::lock_guard guard(streams_lock);
+    streams.push_front({source, base, compressed, std::move(data)});
+    if (streams.size() > 16) streams.pop_back();
+}
+bool find_stream(u64 source, u64 offset, unsigned compressed, unsigned piece, std::shared_ptr<const std::vector<unsigned char>>& data, u64& base)
+{
+    const std::lock_guard guard(streams_lock);
+    for (const InflatedStream& s : streams) {
+        if (s.source != source || s.compressed != compressed || offset <= s.base || !piece) continue;
+        const u64 at = offset - s.base;
+        if (at % piece || at >= s.data->size()) continue;
+        data = s.data;
+        base = s.base;
+        return true;
+    }
+    return false;
+}
+
+bool is_failure(const char* outcome) { return outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u' || outcome[0] == 'p'; }
+
+void log_request(Object* self, u64 options, unsigned char* destination, unsigned destination_size, u64 source,
+                 u64 offset, unsigned source_size, const char* outcome)
+{
+    const bool failed = is_failure(outcome);  // read, zlib, unknown, page write
+    if (failed) InterlockedIncrement(&requests_failed);
+    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+    static LONG summaries, failures;
+    if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
+        log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
+            static_cast<void*>(destination), destination_size, source, offset, source_size, outcome);
+}
+
+// LOCAL DIAGNOSTIC: X2W_DSTORAGE_TRACE names a text file that gets one line per request (queue, page
+// tokens 0 at enqueue and at run, whether the title's copy changed since enqueue, the 0x48 bytes, outcome).
+void trace_request(Object* self, const Entry& entry, unsigned zero_at_run, const char* outcome)
+{
+    static HANDLE out = [] {
+        wchar_t path[MAX_PATH];
+        const DWORD n = GetEnvironmentVariableW(L"X2W_DSTORAGE_TRACE", path, MAX_PATH);
+        return n && n < MAX_PATH ? CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                                               FILE_ATTRIBUTE_NORMAL, nullptr)
+                                 : INVALID_HANDLE_VALUE;
+    }();
+    if (out == INVALID_HANDLE_VALUE) return;
+    const char* changed = "?";
+    if (entry.origin && x2w_local::readable(entry.origin, sizeof entry.bytes))
+        changed = std::memcmp(entry.origin, entry.bytes, sizeof entry.bytes) ? "changed" : "same";
+    static std::mutex lock;
+    static unsigned long long sequence;
+    const std::lock_guard guard(lock);
+    char line[512];
+    int n = std::snprintf(line, sizeof line, "%llu %lu q=%p z0=%u zr=%u %s [", sequence++, GetTickCount(),
+                          static_cast<void*>(self), entry.zero_at_enqueue, zero_at_run, changed);
+    for (int i = 0; i < 0x48; ++i) n += std::snprintf(line + n, sizeof line - n, "%02x", entry.bytes[i]);
+    n += std::snprintf(line + n, sizeof line - n, "] %s\r\n", outcome);
+    DWORD written;
+    WriteFile(out, line, static_cast<DWORD>(n), &written, nullptr);
+}
+
+const char* execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens)
+{
+    if (!request) return "null";
     const u64 options = *reinterpret_cast<const u64*>(request);
     auto* const destination = *reinterpret_cast<unsigned char* const*>(request + 0x08);
     const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
@@ -245,7 +317,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         for (int i = 0; i < 0x40; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
         log("x2w-dstorage Queue::EnqueueRequest [%s]", bytes);
     }
-    // Option bits (from the reference projects' notes, matched against this title's requests): bit 0
+    // Option bits (matched against the requests one executable makes): bit 0
     // zlib, bits 1-4 a BCPack BC format number, bit 21 a destination given as 64 KiB physical page
     // tokens (+0x10 low 16 bits: offset into the first page), bit 22 a memory source.
     const bool zlib = (options & 1) != 0;
@@ -264,6 +336,14 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         input = reinterpret_cast<const unsigned char*>(source);
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
+        LARGE_INTEGER file_size{};
+        if (!file_object || !x2w_local::readable(file_object, sizeof(Object)) || file_object->kind != file ||
+            !GetFileSizeEx(file_object->handle, &file_size) || offset + source_size > static_cast<u64>(file_size.QuadPart)) {
+            // Checked before the buffer is sized from the request (one request named 0xd508a3ec bytes).
+            outcome = "read failed (no file, or past its end)";
+            log_request(self, options, destination, destination_size, source, offset, source_size, outcome);
+            return outcome;
+        }
         packed.resize(source_size);
         OVERLAPPED overlapped{};
         overlapped.Offset = static_cast<DWORD>(offset);
@@ -285,13 +365,42 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             if (!x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced)) {
                 outcome = "zlib failed";
                 data = nullptr;
-                static LONG diagnosed;
-                if (InterlockedIncrement(&diagnosed) <= 12) {
-                    std::vector<unsigned char> big(std::size_t{destination_size} * 8 + 0x40000);
+                // Multi-page streams (hypothesis, measured on one executable): one zlib stream that
+                // inflates to several destination-sized pieces is enqueued as one request per piece.
+                // Every piece names the same compressed size; piece k's source offset is the stream's
+                // offset plus k times the destination size. The first piece is inflated in full and
+                // cached; each piece gets its slice.
+                std::shared_ptr<const std::vector<unsigned char>> whole;
+                u64 base = 0;
+                if (!bcpack && find_stream(source, offset, source_size, destination_size, whole, base)) {
+                    outcome = "inflated (stream piece)";
+                } else if (!bcpack && destination_size <= (16u << 20)) {
+                    auto big = std::make_shared<std::vector<unsigned char>>(
+                        std::min<std::size_t>(std::size_t{32} << 20, std::max<std::size_t>(std::size_t{4} << 20, std::size_t{destination_size} * 64)));
                     std::size_t big_produced = 0;
-                    const bool big_ok = x2w_inflate::inflate_zlib(input, source_size, big.data(), big.size(), &big_produced);
-                    log("x2w-dstorage zlib failure: header %02x %02x %02x %02x, larger buffer -> %s produced=0x%zx (dest 0x%x, source 0x%x)",
-                        input[0], input[1], input[2], input[3], big_ok ? "ok" : "still failed", big_produced, destination_size, source_size);
+                    if (x2w_inflate::inflate_zlib(input, source_size, big->data(), big->size(), &big_produced) && big_produced > destination_size) {
+                        // An exact-size copy: resize would keep the large buffer's capacity in the cache.
+                        auto exact = std::make_shared<const std::vector<unsigned char>>(big->begin(), big->begin() + big_produced);
+                        big.reset();
+                        remember_stream(source, offset, source_size, exact);
+                        whole = exact;
+                        base = offset;
+                        outcome = "inflated (stream piece)";
+                    }
+                }
+                if (whole) {
+                    const std::size_t at = static_cast<std::size_t>(offset - base);
+                    const std::size_t take = std::min<std::size_t>(destination_size, whole->size() - at);
+                    output.assign(whole->begin() + at, whole->begin() + at + take);
+                    data = output.data();
+                    size = take;
+                    InterlockedIncrement(&requests_compressed);
+                    InterlockedIncrement(&requests_stream_pieces);
+                } else {
+                    static LONG diagnosed;
+                    if (InterlockedIncrement(&diagnosed) <= 12)
+                        log("x2w-dstorage zlib failure: header %02x %02x %02x %02x (dest 0x%x, source 0x%x, offset 0x%llx)",
+                            input[0], input[1], input[2], input[3], destination_size, source_size, offset);
                 }
             } else {
                 output.resize(produced);
@@ -328,13 +437,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             if (written && !zlib && !bcpack) InterlockedIncrement(&requests_done);
         }
     }
-    if (outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u' || outcome[0] == 'p') InterlockedIncrement(&requests_failed);
-    const bool failed = outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u' || outcome[0] == 'p';  // read, zlib, unknown, page write
-    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
-    static LONG summaries, failures;
-    if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
-        log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
-            static_cast<void*>(destination), destination_size, source, offset, source_size, outcome);
+    log_request(self, options, destination, destination_size, source, offset, source_size, outcome);
+    return outcome;
 }
 
 void signal_fence(void* fence, u64 value);
@@ -342,16 +446,18 @@ void signal_fence(void* fence, u64 value);
 void run_entry(Object* self, Entry& entry)
 {
     if (entry.type == Entry::request) {
+        unsigned zero_at_run = 0;
         const u64 options = *reinterpret_cast<const u64*>(entry.bytes);
         if ((options & (1ull << 21)) && !entry.tokens.empty()) {
             const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(entry.bytes + 0x08);
             for (std::size_t i = 0; i < entry.tokens.size(); ++i)
                 if (!entry.tokens[i] && title && x2w_local::readable(title + i, sizeof(ULONG_PTR))) {
                     entry.tokens[i] = title[i];
-                    if (!entry.tokens[i]) InterlockedIncrement(&zero_tokens_at_run);
+                    if (!entry.tokens[i]) InterlockedIncrement(&zero_tokens_at_run), ++zero_at_run;
                 }
         }
-        execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data());
+        const char* outcome = execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data());
+        trace_request(self, entry, zero_at_run, outcome);
     } else if (entry.type == Entry::status_entry) {
         const LONG result = InterlockedExchange(&self->pending, S_OK);
         InterlockedExchange(&entry.array->results[entry.index], result);
@@ -376,7 +482,18 @@ QueueWork& work_of(Object* self)
                     entry = std::move(work.submitted.front());
                     work.submitted.pop_front();
                 }
-                run_entry(self, entry);
+                // Buffers are sized from request fields; a failed allocation fails that request
+                // instead of ending the process (an exception leaving a thread calls terminate).
+                try {
+                    run_entry(self, entry);
+                } catch (const std::exception& error) {
+                    InterlockedIncrement(&requests_failed);
+                    InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+                    static LONG reported;
+                    if (InterlockedIncrement(&reported) <= 12)
+                        log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), error.what(),
+                            entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
+                }
             }
         }).detach();
     }
@@ -413,6 +530,7 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
     Entry entry{};
     entry.type = Entry::request;
     std::memcpy(entry.bytes, request, sizeof entry.bytes);
+    entry.origin = request;
     const u64 options = *reinterpret_cast<const u64*>(request);
     if (options & (1ull << 21)) {
         const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(request + 0x08);
@@ -422,7 +540,7 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
         if (title && pages && x2w_local::readable(title, pages * sizeof(ULONG_PTR))) {
             entry.tokens.assign(title, title + pages);
             for (ULONG_PTR token : entry.tokens)
-                if (!token) InterlockedIncrement(&zero_tokens_at_enqueue);
+                if (!token) InterlockedIncrement(&zero_tokens_at_enqueue), ++entry.zero_at_enqueue;
         }
     }
     push(self, std::move(entry));
@@ -557,8 +675,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
             const LONG total = requests_done + requests_compressed + requests_failed;
             const LONG total2 = total + requests_bcpack_blank;
             if (total2 != last)
-                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld", second, requests_done, requests_compressed, requests_failed, requests_bcpack_blank,
+                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld (stream pieces %ld) failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
+                    "still 0 at run=%ld", second, requests_done, requests_compressed, requests_stream_pieces, requests_failed, requests_bcpack_blank,
                     zero_tokens_at_enqueue, zero_tokens_at_run);
             last = total2;
         }
