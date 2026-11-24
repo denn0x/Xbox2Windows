@@ -198,6 +198,38 @@ void count_null_binding(x2w_local::NullCause cause)
     InterlockedIncrement(&null_bindings);
     InterlockedIncrement(&null_by_cause[static_cast<int>(cause)]);
 }
+// LOCAL (video): descriptor slots a null texture was copied from while free (X2W_DRAW_NULL_TEXTURE_LOG=1).
+// note_descriptor_watch (each present) logs the first change of each: "written later" or "never".
+struct WatchedSlot { u64 at, key, slot; UINT srv; std::uint32_t words[8]; LONG since; bool reported; };
+SRWLOCK watch_lock = SRWLOCK_INIT;
+std::vector<WatchedSlot>& watched_slots() { static std::vector<WatchedSlot> v; return v; }
+extern LONG frame_number;
+void watch_descriptor(u64 at, const std::uint32_t* words, u64 key, UINT srv, u64 slot)
+{
+    AcquireSRWLockExclusive(&watch_lock);
+    if (watched_slots().size() < 64) {
+        WatchedSlot w{at, key, slot, srv, {}, frame_number, false};
+        std::memcpy(w.words, words, sizeof(w.words));
+        watched_slots().push_back(w);
+    }
+    ReleaseSRWLockExclusive(&watch_lock);
+}
+void note_descriptor_watch(LONG frame)
+{
+    AcquireSRWLockExclusive(&watch_lock);
+    for (WatchedSlot& w : watched_slots()) {
+        if (w.reported) continue;
+        std::uint32_t now[8]{};
+        if (!x2w_local::readable(reinterpret_cast<const void*>(w.at), sizeof(now))) continue;
+        std::memcpy(now, reinterpret_cast<const void*>(w.at), sizeof(now));
+        if (!std::memcmp(now, w.words, sizeof(now))) continue;
+        w.reported = true;
+        log("x2w-draw watched slot 0x%llx (for %016llx srv %u, watched since frame %ld) changed at frame %ld: %08x %08x %08x %08x %08x %08x %08x %08x",
+            w.slot, w.key, w.srv, w.since, frame, now[0], now[1], now[2], now[3], now[4], now[5], now[6], now[7]);
+    }
+    ReleaseSRWLockExclusive(&watch_lock);
+}
+
 // LOCAL (video): X2W_DRAW_NULL_TEXTURE_LOG=1 logs the first null texture binding of each pipeline key
 // and srv (at most 96 lines) with the 8 descriptor words, to find which draws lose their texture
 // and whether the title wrote a hardware descriptor there instead of a view the wrapper made.
@@ -219,96 +251,130 @@ void note_null_texture(u64 key, UINT srv, u64 entry, const std::uint32_t* words,
     log("x2w-draw null texture %016llx srv %u cause %s frame %ld: entry 0x%llx words %08x %08x %08x %08x %08x %08x %08x %08x", key, srv,
         x2w_local::null_cause_names[static_cast<int>(cause)], frame_number, entry, words[0], words[1], words[2], words[3], words[4],
         words[5], words[6], words[7]);
-    // Run 84: every null texture of this kind held a small integer and seven zero words (0x25, 0x12e,
-    // 0x1d4, 0x212, 0x215, 0x2f16), neither a view token nor a hardware descriptor. Test whether that
-    // integer is an index into one of the title's descriptor heaps: show what each heap holds there.
+    // Runs 84/87: such entries hold a small integer N and seven zero words. Run 87 showed that the
+    // heap holding the entry has the value M+1 at every untouched index M: the title's free list. So
+    // the entry is a copy of slot N-1 while that slot was free. Show slots N-1 and N of that heap
+    // (contents, and the shadow id: the view the wrapper last created there, which the title's
+    // writes do not erase), and watch slot N-1 for a later write (note_descriptor_watch).
     bool rest_zero = true;
     for (int i = 1; i < 8; ++i) rest_zero = rest_zero && words[i] == 0;
-    if (!words[0] || words[0] == view_token_magic || !rest_zero) return;
+    const bool link = words[0] && words[0] != view_token_magic && rest_zero;
+    // A token whose first word the title replaced (a freed slot that still names a view).
+    const bool clobbered = words[0] != view_token_magic && words[2] >= 17 && words[2] <= 22 && (words[4] || words[5]);
+    if (!link && !clobbered) return;
     AcquireSRWLockShared(&note_lock);
     const std::vector<HeapInfo> heaps = heap_infos();
+    ViewRecord named{};
+    const bool named_known = clobbered && words[1] < view_records().size();
+    if (named_known) named = view_records()[words[1]];
     ReleaseSRWLockShared(&note_lock);
-    // Which heap holds the entry itself, and what the wrapper last noted there: a view id means a
-    // token was written and later overwritten; none means no view was ever created at that entry.
+    if (clobbered)
+        log("x2w-draw null texture %016llx srv %u: looks like a freed token: first word 0x%x, view id %u slot %u resource 0x%08x%08x; view %s%s",
+            key, srv, words[0], words[1], words[2], words[5], words[4], named_known ? "known" : "UNKNOWN",
+            named_known && named.resource == (u64{words[5]} << 32 | words[4]) ? ", resource matches" : named_known ? ", resource DIFFERS" : "");
     bool in_heap = false;
     for (std::size_t h = 0; h < heaps.size(); ++h) {
         const HeapInfo& heap = heaps[h];
         if (!heap.title_cpu) continue;
         const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
         if (entry < heap.title_cpu || entry >= heap.title_cpu + u64{heap.count} * stride) continue;
+        in_heap = true;
         const u64 index = (entry - heap.title_cpu) / stride;
         log("x2w-draw null texture %016llx srv %u: entry 0x%llx is index 0x%llx of heap %zu (type %u, count %u, title 0x%llx, stride %u); shadow id %u",
             key, srv, entry, index, h, heap.type, heap.count, heap.title_cpu, stride, heap.shadow ? heap.shadow[index] : 0u);
-        in_heap = true;
+        if (!link) break;
+        for (int d = -1; d <= 0; ++d) {
+            const u64 slot = u64{words[0]} + d;
+            if (slot >= heap.count) continue;
+            const u64 at = heap.title_cpu + slot * stride;
+            std::uint32_t there[8]{};
+            const bool readable = x2w_local::readable(reinterpret_cast<const void*>(at), sizeof(there));
+            if (readable) std::memcpy(there, reinterpret_cast<const void*>(at), sizeof(there));
+            const std::uint32_t shadow = heap.shadow ? heap.shadow[slot] : 0;
+            log("x2w-draw null texture %016llx srv %u: heap %zu slot 0x%llx (N%s): %s words %08x %08x %08x %08x %08x %08x; shadow id %u%s",
+                key, srv, h, slot, d ? "-1" : "", readable ? (there[0] == view_token_magic ? "token" : "no token") : "unreadable", there[0], there[1],
+                there[2], there[3], there[4], there[5], shadow, shadow ? "" : " (no view ever created there)");
+            if (d == -1 && readable) watch_descriptor(at, there, key, srv, slot);
+        }
+        break;
     }
     if (!in_heap) log("x2w-draw null texture %016llx srv %u: entry 0x%llx is in no title descriptor heap", key, srv, entry);
-    int shown = 0;
-    for (std::size_t h = 0; h < heaps.size() && shown < 6; ++h) {
-        const HeapInfo& heap = heaps[h];
-        if (!heap.title_cpu || words[0] >= heap.count) continue;
-        const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
-        const u64 at = heap.title_cpu + u64{words[0]} * stride;
-        std::uint32_t there[8]{};
-        const bool readable = x2w_local::readable(reinterpret_cast<const void*>(at), sizeof(there));
-        if (readable) std::memcpy(there, reinterpret_cast<const void*>(at), sizeof(there));
-        const std::uint32_t shadow = heap.shadow ? heap.shadow[words[0]] : 0;
-        ViewRecord record{};
-        const bool token = readable && there[0] == view_token_magic;
-        AcquireSRWLockShared(&note_lock);
-        const bool known = token && there[1] < view_records().size();
-        if (known) record = view_records()[there[1]];
-        ReleaseSRWLockShared(&note_lock);
-        log("x2w-draw null texture %016llx srv %u: index 0x%x in heap %zu (type %u, count %u, title 0x%llx, stride %u): %s words %08x %08x %08x "
-            "%08x; shadow id %u%s; view slot %u resource 0x%llx desc %u bytes",
-            key, srv, words[0], h, heap.type, heap.count, heap.title_cpu, stride, readable ? (token ? (known ? "token" : "unknown token") : "no token")
-            : "unreadable", there[0], there[1], there[2], there[3], shadow, shadow ? "" : " (none)", known ? record.slot : 0u,
-            known ? record.resource : 0ull, known ? record.desc_bytes : 0u);
-        ++shown;
-    }
-    if (!shown)
-        log("x2w-draw null texture %016llx srv %u: index 0x%x is beyond every title descriptor heap (%zu heaps)", key, srv, words[0], heaps.size());
 }
 LONG frame_number;
 
-// LOCAL (video), X2W_DRAW_TEXTURE_HEAP_INDEX=1 (default off): when a texture's table entry holds a
-// nonzero integer followed by seven zero words, and the heap that contains the entry holds a view token
-// at that index, use that token instead. Untested HYPOTHESIS. Run 84: loading-screen pipeline 961191d9
-// srv 2 held 0x2f16 at index 0xdcf0a of the count-1245184 heap and drew nothing (alpha 0). Only bindings
-// that are null today change. Each resolved key+srv logs once (at most 32 lines).
+// LOCAL (video), X2W_DRAW_TEXTURE_HEAP_INDEX=1 (default off). Run 87 REFUTED the first version, which
+// read the integer N as the slot to use. N is the free-list link the title keeps in word 0 of a free
+// slot (an untouched slot M holds M+1), so the entry is a copy of slot N-1 made while that slot was
+// free; slot N belongs to something else (run 87: 3c3d8abaf12f8a5c srv 0 got the wrong view and
+// failed on its dimension). This version uses, in order:
+//   a. a token whose word 0 was replaced (word 2 a view slot 17-22, words 4-5 the view's resource):
+//      restore it when that view id is known and names the same resource;
+//   b. for "N + seven zero words": slot N-1 of the heap holding the entry, if it holds a token now;
+//   c. else slot N-1's shadow id (the view the wrapper last created there), if any.
+// Otherwise nothing changes. Totals: "x2w-draw texture heap index totals" every 4096 checks (max 40).
+LONG heap_index_checks, heap_index_restored, heap_index_slot_token, heap_index_shadow, heap_index_unresolved;
 void resolve_heap_index(u64 key, UINT srv, u64 entry, std::uint32_t* words)
 {
     static const bool on = [] {
         const bool value = x2w_local::env_on("X2W_DRAW_TEXTURE_HEAP_INDEX");
-        if (value) log("x2w-draw X2W_DRAW_TEXTURE_HEAP_INDEX=1: integer texture descriptors are read as indices into their heap");
+        if (value) log("x2w-draw X2W_DRAW_TEXTURE_HEAP_INDEX=1: freed or free-slot texture descriptors are resolved (slot N-1 / view id)");
         return value;
     }();
-    if (!on || !words[0]) return;
-    for (int i = 1; i < 8; ++i)
-        if (words[i]) return;
-    u64 at = 0;
+    if (!on || words[0] == view_token_magic) return;
+    bool rest_zero = true;
+    for (int i = 1; i < 8; ++i) rest_zero = rest_zero && words[i] == 0;
+    const bool link = words[0] && rest_zero;
+    const bool clobbered = words[2] >= 17 && words[2] <= 22 && (words[4] || words[5]);
+    if (!link && !clobbered) return;
+    const LONG checks = InterlockedIncrement(&heap_index_checks);
+    std::uint32_t out[8]{};
+    const char* how = nullptr;
     AcquireSRWLockShared(&note_lock);
-    for (const HeapInfo& heap : heap_infos()) {
-        if (!heap.title_cpu || words[0] >= heap.count) continue;
-        const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
-        if (entry < heap.title_cpu || entry >= heap.title_cpu + u64{heap.count} * stride) continue;
-        at = heap.title_cpu + u64{words[0]} * stride;
-        break;
+    if (clobbered) {
+        if (words[1] < view_records().size() && view_records()[words[1]].resource == (u64{words[5]} << 32 | words[4])) {
+            std::memcpy(out, words, sizeof(out));
+            out[0] = view_token_magic;
+            how = "restored token";
+        }
+    } else {
+        for (const HeapInfo& heap : heap_infos()) {
+            if (!heap.title_cpu || words[0] > heap.count) continue;
+            const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
+            if (entry < heap.title_cpu || entry >= heap.title_cpu + u64{heap.count} * stride) continue;
+            const u64 slot = u64{words[0]} - 1;
+            const u64 at = heap.title_cpu + slot * stride;
+            if (x2w_local::readable(reinterpret_cast<const void*>(at), sizeof(out))) {
+                std::memcpy(out, reinterpret_cast<const void*>(at), sizeof(out));
+                if (out[0] == view_token_magic && out[1] < view_records().size()) how = "slot N-1 token";
+            }
+            const std::uint32_t shadow = heap.shadow ? heap.shadow[slot] : 0;
+            if (!how && shadow && shadow - 1 < view_records().size()) {
+                const ViewRecord& r = view_records()[shadow - 1];
+                const std::uint32_t token[8] = {view_token_magic, shadow - 1, r.slot, 0, static_cast<std::uint32_t>(r.resource),
+                                                static_cast<std::uint32_t>(r.resource >> 32), 0, 0};
+                std::memcpy(out, token, sizeof(out));
+                how = "slot N-1 shadow id";
+            }
+            break;
+        }
     }
     ReleaseSRWLockShared(&note_lock);
-    std::uint32_t there[8]{};
-    if (!at || !x2w_local::readable(reinterpret_cast<const void*>(at), sizeof(there))) return;
-    std::memcpy(there, reinterpret_cast<const void*>(at), sizeof(there));
-    if (there[0] != view_token_magic) return;
+    InterlockedIncrement(!how ? &heap_index_unresolved : how[0] == 'r' ? &heap_index_restored : how[9] == 't' ? &heap_index_slot_token
+                                                                                               : &heap_index_shadow);
+    static LONG reports;
+    if ((checks & 4095) == 0 && first_calls(reports, 40))
+        log("x2w-draw texture heap index totals: checks %ld, restored tokens %ld, slot N-1 tokens %ld, slot N-1 shadow ids %ld, unresolved %ld", checks,
+            heap_index_restored, heap_index_slot_token, heap_index_shadow, heap_index_unresolved);
     static SRWLOCK lock = SRWLOCK_INIT;
     static std::unordered_set<u64>* seen = new std::unordered_set<u64>;
     AcquireSRWLockExclusive(&lock);
     const bool fresh = seen->size() < 4096 && seen->insert(key * 31 + srv).second;
     ReleaseSRWLockExclusive(&lock);
     static LONG lines;
-    if (fresh && first_calls(lines, 32))
-        log("x2w-draw texture heap index %016llx srv %u frame %ld: entry 0x%llx index 0x%x -> 0x%llx token id %u slot %u", key, srv, frame_number,
-            entry, words[0], at, there[1], there[2]);
-    std::memcpy(words, there, sizeof(there));
+    if (fresh && first_calls(lines, 48))
+        log("x2w-draw texture heap index %016llx srv %u frame %ld: entry 0x%llx words %08x %08x %08x -> %s%s (view id %u slot %u)", key, srv,
+            frame_number, entry, words[0], words[1], words[2], how ? how : "unresolved", how ? "" : ", left null", how ? out[1] : 0u, how ? out[2] : 0u);
+    if (how) std::memcpy(words, out, sizeof(out));
 }
 
 u64 fnv_bytes(const void* data, std::size_t bytes, u64 hash = 1469598103934665603ull)
