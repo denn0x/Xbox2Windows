@@ -772,6 +772,11 @@ class Stage:
                 for t in srcs):
             # a lane mask is one bit per lane in the one-lane model: its high half has no per-lane value
             raise Unsupported('s_pack_hh_b32_b16 of a lane mask')
+        if base.startswith('s_bcnt') and any(t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or
+                                             (reg_range(t) and reg_range(t)[0] == 's' and reg_range(t)[1] in self.masks)
+                                             for t in srcs):
+            # a lane count: the one-lane model keeps only this lane's bit of a mask
+            raise Unsupported('%s of a lane mask' % base)
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
         if dname in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
@@ -853,6 +858,30 @@ class Stage:
         imm = (imm - 0x10000 if imm & 0x8000 else imm) & 0xffffffff
         self.masks.discard(d[1])
         self.set_s(d[1], '%s %s 0x%08xu' % (self.S(d[1]), op, imm))
+
+    # s_bitset0_b32 / s_bitset1_b32: D[S0[4:0]] = 0 / 1, the other bits of D kept (AMD RDNA 2 ISA SOP1; LLVM
+    # SOPInstructions.td defines them with D tied as an input and no SCC def). A lane mask or symbolic D is refused.
+    def bitset(self, ops, one):
+        d = reg_range(ops[0])
+        if not d or d[0] != 's' or d[1] != d[2] or d[1] in self.masks:
+            raise Unsupported('s_bitset%d_b32 destination %s' % (one, ops[0]))
+        bit = '(1u << (%s & 31))' % self.u(ops[1])
+        old = self.S(d[1])
+        expr = '%s | %s' % (old, bit) if one else '%s & ~%s' % (old, bit)
+        a, b = self.is_const(d[1]), self.is_const(reg_range(ops[1])[1]) if reg_range(ops[1]) else None
+        if b is None and re.fullmatch(r'(0x[0-9a-f]+|\d+)', ops[1]):
+            b = int(ops[1], 0)
+        if a is not None and b is not None:  # both known: keep the constant (descriptor words are built this way)
+            value = (a | 1 << (b & 31)) if one else (a & ~(1 << (b & 31)))
+            self.set_s(d[1], '0x%08xu' % (value & 0xffffffff), ('const', value & 0xffffffff))
+            return
+        self.set_s(d[1], expr)
+
+    def op_s_bitset0_b32(self, ops, mods):
+        self.bitset(ops, 0)
+
+    def op_s_bitset1_b32(self, ops, mods):
+        self.bitset(ops, 1)
 
     def op_s_addk_i32(self, ops, mods):
         self.sopk_arith(ops, '+')
@@ -2117,7 +2146,7 @@ VEC_U = {
     'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
     'v_lshl_add_u32': (3, '({0} << ({1} & 31)) + {2}'), 'v_add_lshl_u32': (3, '({0} + {1}) << ({2} & 31)'), 'v_add3_u32': (3, '{0} + {1} + {2}'),
-    'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),
+    'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_xor3_b32': (3, '{0} ^ {1} ^ {2}'),'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),
     'v_xad_u32': (3, '({0} ^ {1}) + {2}'), 'v_bfi_b32': (3, '({0} & {1}) | (~{0} & {2})'),
     'v_mul_u32_u24': (2, '({0} & 0xffffffu) * ({1} & 0xffffffu)'),
     # Per-lane bit operations (AMD RDNA 2 ISA reference). The bitscan results count from the most significant
@@ -2268,6 +2297,9 @@ SCA = {
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
     's_bfe_u32': ('({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 127)) - 1)', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
+    # s_bcnt0/1_i32_b32: the count of zero / one bits of S0; SCC = (D != 0) (AMD RDNA 2 ISA SOP1, LLVM
+    # SOPInstructions.td: Defs = [SCC]).
+    's_bcnt1_i32_b32': ('countbits({0})', '$ != 0'), 's_bcnt0_i32_b32': ('32u - countbits({0})', '$ != 0'),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
     's_mul_hi_u32': ('x2w_mul_hi_u32({0}, {1})', None),
