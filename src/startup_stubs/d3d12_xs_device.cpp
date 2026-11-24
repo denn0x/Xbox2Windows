@@ -2852,6 +2852,63 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
     ReleaseSRWLockExclusive(&compute_lock);
     return executed;
 }
+// LOCAL: slot-67 request files req_c67_<key>.{cs,meta,root,desc,regs}, then the marker .done. Once per key per run
+// (when the key is first computed for a pipeline, not per dispatch): a key with .done costs one GetFileAttributesW,
+// as the old .cs check did. Otherwise each part is checked; a part that is absent or has another size than its data
+// (a write cut off by an exit) is written through <name>.<pid>.<tid>.tmp and a rename (regblob::write_whole), and .done
+// is written last only when all five parts are on disk. A set started by an older build (no .regs) or cut off
+// mid-write (only .cs and .meta) is so completed by the next run that creates the key.
+LONG c67_checked, c67_sets_done, c67_parts_written, c67_incomplete, c67_failed;  // this run
+void complete_c67_request(u64 key, Wrapper* pipeline, const PipelineInfo* info, const void* code, u64 code_bytes, const void* meta,
+                          u64 meta_bytes, const std::vector<unsigned char>& root_blob)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::unordered_set<u64> keys;  // handled this run
+    wchar_t path[MAX_PATH];
+    if (!cache_path(path, L"req_c67_", key, L".done")) return;
+    AcquireSRWLockExclusive(&lock);
+    const bool fresh = keys.insert(key).second;
+    ReleaseSRWLockExclusive(&lock);
+    if (!fresh || GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;
+    InterlockedIncrement(&c67_checked);
+    std::vector<unsigned char> regs;
+    AcquireSRWLockShared(&compute_lock);
+    if (const auto found = compute_regs().find(pipeline); found != compute_regs().end()) regs = found->second;
+    ReleaseSRWLockShared(&compute_lock);
+    const bool have_meta = meta_bytes && meta_bytes <= 0x10000 && x2w_local::readable(meta, meta_bytes);
+    struct Part { const wchar_t* ext; const void* data; std::size_t bytes; bool available; };
+    const Part parts[] = {
+        {L".cs", code, static_cast<std::size_t>(code_bytes), true},
+        {L".meta", meta, have_meta ? static_cast<std::size_t>(meta_bytes) : 0, have_meta},
+        {L".root", root_blob.data(), root_blob.size(), true},
+        {L".desc", info->desc.data(), info->desc.size(), true},
+        {L".regs", regs.data(), regs.size(), !regs.empty()},
+    };
+    int present = 0, written = 0;
+    bool failed = false;
+    for (const Part& part : parts) {
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        if (!cache_path(path, L"req_c67_", key, part.ext)) return;
+        const bool on_disk = GetFileAttributesExW(path, GetFileExInfoStandard, &a);
+        const u64 size = (u64{a.nFileSizeHigh} << 32) | a.nFileSizeLow;
+        if (on_disk && (!part.available || size == part.bytes)) {
+            ++present;
+            continue;
+        }
+        if (!part.available) continue;
+        if (regblob::write_whole(path, part.data, part.bytes)) ++present, ++written;
+        else failed = true;
+    }
+    InterlockedAdd(&c67_parts_written, written);
+    const bool whole = present == static_cast<int>(std::size(parts));
+    static const char marker[] = "ok\n";
+    if (whole && cache_path(path, L"req_c67_", key, L".done") && regblob::write_whole(path, marker, 3)) InterlockedIncrement(&c67_sets_done);
+    else InterlockedIncrement(failed ? &c67_failed : &c67_incomplete);  // retried by the next run
+    static LONG logged;
+    if ((written || !whole) && first_calls(logged, 6))
+        log("x2w-cx request %016llx: %d of 5 parts on disk, %d written now%s", key, present, written,
+            whole ? ", .done written" : failed ? ", a write failed (no .done)" : ", no .regs or .meta yet (no .done)");
+}
 // The compute key of the pipeline bound on list self (also used by indirect dispatches).
 u64 compute_key_of(Wrapper* self)
 {
@@ -2867,7 +2924,8 @@ u64 compute_key_of(Wrapper* self)
         // Device slot 67: a console compute pipeline. Its description has the layout of slot 57:
         // [0] root signature, [5]/[6] machine code address and length, [7]/[8] the stage's metadata.
         // The key is fnv(root blob, fnv(code)), tagged with 0x67 in the top byte; the code, metadata
-        // and root blob are written to the shader cache as req_c67_<key>.{cs,meta,root}.
+        // and root blob are written to the shader cache as req_c67_<key>.{cs,meta,root,desc,regs}, then .done
+        // (complete_c67_request).
         const PipelineInfo* info = pipeline_info(pass.pipeline);
         if (info && info->path == 67 && info->desc.size() >= 0x48) {
             u64 words[9];
@@ -2883,19 +2941,7 @@ u64 compute_key_of(Wrapper* self)
             const auto* meta = reinterpret_cast<const void*>(words[7]);
             if (words[6] && words[6] <= (1u << 20) && x2w_local::readable(code, words[6])) {
                 key = (fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(code, words[6])) & 0x00ffffffffffffffull) | (0x67ull << 56);
-                wchar_t path[MAX_PATH];
-                if (cache_path(path, L"req_c67_", key, L".cs") && GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
-                    write_file(path, code, words[6]);
-                    if (words[8] && words[8] <= 0x10000 && x2w_local::readable(meta, words[8]) && cache_path(path, L"req_c67_", key, L".meta"))
-                        write_file(path, meta, words[8]);
-                    if (cache_path(path, L"req_c67_", key, L".root")) write_file(path, root_blob.data(), root_blob.size());
-                    if (cache_path(path, L"req_c67_", key, L".desc")) write_file(path, info->desc.data(), info->desc.size());
-                    std::vector<unsigned char> regs;
-                    AcquireSRWLockShared(&compute_lock);
-                    if (const auto found = compute_regs().find(pass.pipeline); found != compute_regs().end()) regs = found->second;
-                    ReleaseSRWLockShared(&compute_lock);
-                    if (!regs.empty() && cache_path(path, L"req_c67_", key, L".regs")) write_file(path, regs.data(), regs.size());
-                }
+                complete_c67_request(key, pass.pipeline, info, code, words[6], meta, words[8], root_blob);
             } else {
                 key = 0x67ull << 56;  // code unreadable
             }
@@ -2952,6 +2998,10 @@ void report_dispatches()
         o[co_c62_run], o[co_c62_table_arg] + o[co_c62_unmapped], o[co_c62_table_arg], o[co_c62_unmapped], o[co_c67_run],
         o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap], o[co_c67_off], o[co_c67_other_key], o[co_c67_untranslated],
         o[co_c67_heap], o[co_not_run], o[co_cx_skip], o[co_rawaddr_run]);
+    if (c67_checked)
+        log("x2w-cx requests (this run): %ld keys without .done checked, %ld sets completed (.done written), %ld parts written, "
+            "%ld incomplete (no .meta or .regs at creation), %ld with a failed write; incomplete ones are retried next run",
+            c67_checked, c67_sets_done, c67_parts_written, c67_incomplete, c67_failed);
 }
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
