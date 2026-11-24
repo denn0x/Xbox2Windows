@@ -2696,8 +2696,8 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
 }
 struct DispatchCount { LONG64 calls = 0; LONG64 groups = 0; UINT x = 0, y = 0, z = 0; };
 std::unordered_map<u64, DispatchCount>& dispatch_counts() { static std::unordered_map<u64, DispatchCount> m; return m; }
-// List slot 14, Dispatch(x, y, z). LOCAL instrumentation: counts dispatches per compute pipeline key.
-void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
+// The compute key of the pipeline bound on list self (also used by indirect dispatches).
+u64 compute_key_of(Wrapper* self)
 {
     Pass& pass = pass_of(self);
     u64 key = ~0ull;  // no compute pipeline bound
@@ -2750,6 +2750,12 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
         compute_keys()[pass.pipeline] = key;
         ReleaseSRWLockExclusive(&compute_lock);
     }
+    return key;
+}
+// List slot 14, Dispatch(x, y, z). LOCAL instrumentation: counts dispatches per compute pipeline key.
+void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
+{
+    const u64 key = compute_key_of(self);
     AcquireSRWLockExclusive(&compute_lock);
     DispatchCount& count = dispatch_counts()[key];
     ++count.calls;
