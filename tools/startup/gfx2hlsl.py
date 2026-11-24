@@ -2283,19 +2283,7 @@ class Pipeline:
         # --requests pass never publishes a result the runtime cannot bind yet.
         self.features = draw_features() if features is None else frozenset(features)
         self.heapvars = []    # heap descriptor k -> resource kind it is used as (None until used)
-        # With the pixel stage's SPI_PS_INPUT_ENA/ADDR (ps_hw_inputs), entry VGPRs map to SPI inputs. Only
-        # POS_FIXED_PT is lowered: the integer pixel X in [15:0] and Y in [31:16] (Mesa nir_intrinsics.py
-        # pixel_coord, "16-bit integer vec2 of the pixel X/Y in the framebuffer", which
-        # ac_nir_lower_intrinsics_to_args.c builds as unpack_32_2x16 of the pos_fixed_pt argument). D3D
-        # SV_Position.xy is the pixel centre, so its integer part is that pixel.
-        self.packed_position_vgpr = None
-        self.ps_input_layout = None
-        if ps_hw_inputs is not None:
-            ena, addr = ps_hw_inputs
-            self.ps_input_layout = layout = ps_input_layout(ena, addr)
-            self.ps_input_ena = ena
-            if ena >> POS_FIXED_PT & 1:
-                self.packed_position_vgpr = [v for v, bit in layout.items() if bit == POS_FIXED_PT][0]
+        self.spi_inputs(ps_hw_inputs)
         self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
@@ -2308,30 +2296,7 @@ class Pipeline:
         self.rect = self.ud(('rect',))
         self.vs = Stage(self, 'vs', vs_code)
         self.ps = Stage(self, 'ps', ps_code)
-        # A pixel stage starts with its SPI inputs in the VGPRs (barycentrics, position, face, ancillary data). The
-        # interpolation instructions name them without reading them (they take the attribute); any other read before
-        # a write sees 0 in the HLSL instead of the hardware input. Which input sits in which VGPR depends on the
-        # SPI_PS_INPUT_ENA/ADDR state, which a request does not carry, so this is reported, not refused (existing
-        # fixtures read entry VGPRs as zero): VGPR -> offset of the first read.
-        self.ps_entry_reads = dict(self.ps.entry_reads)
-        # A read of an SPI input that is not lowered: kept here and raised by hlsl_ps(), so a pipeline can still be
-        # built to ask for its layout (packed_position_vgpr), but no pixel HLSL is ever written for it.
-        self.ps_input_refusal = None
-        if self.ps_input_layout is not None:
-            for reg, off in sorted(self.ps_entry_reads.items(), key=lambda item: item[1]):
-                bit = self.ps_input_layout.get(reg)
-                if bit is None:
-                    self.ps_input_refusal = ('pixel stage reads entry VGPR v%d at %#x, past the SPI inputs (ADDR allocates %d)'
-                                             % (reg, off, len(self.ps_input_layout)))
-                elif not self.ps_input_ena >> bit & 1:
-                    self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x, allocated but not enabled'
-                                             % (PS_INPUTS[bit][0], reg, off))
-                elif bit != POS_FIXED_PT:
-                    self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x: not lowered'
-                                             % (PS_INPUTS[bit][0], reg, off))
-                if self.ps_input_refusal:
-                    break
-            self.ps_entry_reads = {}  # every entry read is the lowered packed position (or refused above)
+        self.spi_reads()
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         missing = [a for a in self.ps.attrs if a not in self.params]
@@ -2339,6 +2304,52 @@ class Pipeline:
             raise Unsupported('pixel stage reads attributes %s the vertex stage does not export' % missing)
         if 'pos' not in self.vs.exports:
             raise Unsupported('vertex stage exports no position')
+
+    def spi_inputs(self, ps_hw_inputs):
+        """Before the pixel stage is built: the SPI input layout from its SPI_PS_INPUT_ENA/ADDR, or none.
+
+        Shared by the draw and mesh pipelines. With (ENA, ADDR), entry VGPRs map to SPI inputs. Only POS_FIXED_PT
+        is lowered: the integer pixel X in [15:0] and Y in [31:16] (Mesa nir_intrinsics.py pixel_coord, "16-bit
+        integer vec2 of the pixel X/Y in the framebuffer", which ac_nir_lower_intrinsics_to_args.c builds as
+        unpack_32_2x16 of the pos_fixed_pt argument). D3D SV_Position.xy is the pixel centre, so its integer part
+        is that pixel."""
+        self.packed_position_vgpr = None
+        self.ps_input_layout = None
+        if ps_hw_inputs is not None:
+            ena, addr = ps_hw_inputs
+            self.ps_input_layout = layout = ps_input_layout(ena, addr)
+            self.ps_input_ena = ena
+            if ena >> POS_FIXED_PT & 1:
+                self.packed_position_vgpr = [v for v, bit in layout.items() if bit == POS_FIXED_PT][0]
+
+    def spi_reads(self):
+        """After the pixel stage is built: check its entry-VGPR reads against the SPI input layout.
+
+        A pixel stage starts with its SPI inputs in the VGPRs (barycentrics, position, face, ancillary data). The
+        interpolation instructions name them without reading them (they take the attribute); any other read before
+        a write sees 0 in the HLSL instead of the hardware input. Without the layout this is reported, not refused
+        (existing fixtures read entry VGPRs as zero): ps_entry_reads, VGPR -> offset of the first read; the
+        translate_to callers refuse a pipeline that has any. With the layout, a read of an input that is not
+        lowered is kept in ps_input_refusal and raised by hlsl_ps(), so a pipeline can still be built to ask for its
+        layout (packed_position_vgpr), but no pixel HLSL is ever written for it."""
+        self.ps_entry_reads = dict(self.ps.entry_reads)
+        self.ps_input_refusal = None
+        if self.ps_input_layout is None:
+            return
+        for reg, off in sorted(self.ps_entry_reads.items(), key=lambda item: item[1]):
+            bit = self.ps_input_layout.get(reg)
+            if bit is None:
+                self.ps_input_refusal = ('pixel stage reads entry VGPR v%d at %#x, past the SPI inputs (ADDR allocates %d)'
+                                         % (reg, off, len(self.ps_input_layout)))
+            elif not self.ps_input_ena >> bit & 1:
+                self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x, allocated but not enabled'
+                                         % (PS_INPUTS[bit][0], reg, off))
+            elif bit != POS_FIXED_PT:
+                self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x: not lowered'
+                                         % (PS_INPUTS[bit][0], reg, off))
+            if self.ps_input_refusal:
+                break
+        self.ps_entry_reads = {}  # every entry read is the lowered packed position (or refused above)
 
     def mrt_kind(self, slot):
         if slot >= len(self.rtv_formats):

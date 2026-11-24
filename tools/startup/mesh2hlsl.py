@@ -1454,7 +1454,8 @@ for _op in ('add', 'sub', 'subrev'):
 class MeshPipeline(G.Pipeline):
     """Mesh + pixel pipeline. ps_code None: the mesh stage alone (coverage runs; params = what it exports)."""
 
-    def __init__(self, ms_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), user_sgpr=MESH_USER_SGPR):
+    def __init__(self, ms_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), user_sgpr=MESH_USER_SGPR,
+                 ps_hw_inputs=None):
         self.root = G.parse_root(root_blob)
         # First user SGPR: s16 for the run programs (measured, real roots). Archive programs (offline, synthesized
         # root) may start at s8: callers pass entry_sgpr(code) together with synth_root(code).
@@ -1464,7 +1465,7 @@ class MeshPipeline(G.Pipeline):
         self.scc_publish = frozenset()
         for _ in range(8):
             try:
-                self.build(ms_code, ps_code, sampler_heap, rtv_formats)
+                self.build(ms_code, ps_code, sampler_heap, rtv_formats, ps_hw_inputs)
                 return
             except LaneScc as refusal:
                 if not LANE_SCC or not refusal.origins or refusal.origins <= self.scc_publish:
@@ -1472,7 +1473,7 @@ class MeshPipeline(G.Pipeline):
                 self.scc_publish |= refusal.origins
         raise Unsupported('lane-mask SCC: no fixed point after 8 translations')
 
-    def build(self, ms_code, ps_code, sampler_heap, rtv_formats):
+    def build(self, ms_code, ps_code, sampler_heap, rtv_formats, ps_hw_inputs=None):
         # Fields of G.Pipeline.__init__ (which this does not call: it builds a vertex stage) that newer base
         # translators read. The draw lowerings (manifest `heap 1`, `udsrc bufword3`, `uav`) are named in
         # X2W_DRAW_FEATURES as for draws (pstrans gfx2hlsl.draw_features); a base without them keeps refusing.
@@ -1481,8 +1482,8 @@ class MeshPipeline(G.Pipeline):
         self.heapwords = False   # x2w_hword used (manifest `heapwords 1`)
         self.rw_keys = frozenset()
         self.vs_out_cntl = None
-        self.packed_position_vgpr = None
-        self.ps_input_layout = None
+        # the pixel stage's SPI inputs (SPI_PS_INPUT_ENA/ADDR, request .psin), as for draws
+        self.spi_inputs(ps_hw_inputs)
         self.quad_ops = True  # the pixel stage compiles with dxc ps_6_0: DPP quad reads (gfx2hlsl Stage.quad_dpp)
         self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
@@ -1496,7 +1497,7 @@ class MeshPipeline(G.Pipeline):
         self.ps = G.Stage(self, 'ps', ps_code) if ps_code is not None else None
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         if self.ps is not None:
-            self.ps_entry_reads = dict(self.ps.entry_reads)
+            self.spi_reads()
             self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
             missing = [a for a in self.ps.attrs if a not in self.params]
             if missing:
@@ -1618,11 +1619,13 @@ def compile_hlsl(path, profile, out):
 
 
 def translate_to(out_dir, key, ms_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='',
-                 user_sgpr=MESH_USER_SGPR):
-    """Writes <key>.ms.hlsl, <key>.ps.hlsl, the .cso files and <key>.txt (last), or <key>.fail."""
+                 user_sgpr=MESH_USER_SGPR, ps_hw_inputs=None):
+    """Writes <key>.ms.hlsl, <key>.ps.hlsl, the .cso files and <key>.txt (last), or <key>.fail.
+    ps_hw_inputs: the pixel stage's (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR), or None (entry-VGPR reads refused)."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = MeshPipeline(ms_code, ps_code, root_blob, rtv_formats=rtv_formats, user_sgpr=user_sgpr)
+        pipe = MeshPipeline(ms_code, ps_code, root_blob, rtv_formats=rtv_formats, user_sgpr=user_sgpr,
+                            ps_hw_inputs=ps_hw_inputs if ps_code is not None else None)
         if pipe.ps_entry_reads:
             reg, off = min(pipe.ps_entry_reads.items(), key=lambda item: item[1])
             raise Unsupported('pixel stage reads entry VGPR v%d (an SPI input; layout not in the request) at %#x' % (reg, off))
@@ -1666,10 +1669,15 @@ def translate_request(out_dir, key):
         return 'unreadable: %s' % error
     if not a and b and is_mesh(b):
         return translate_to(out_dir, key, b, None, root)   # depth-only mesh pipeline (no pixel stage)
+    try:
+        # the pixel stage's SPI inputs: req_<key>.psin (gfx2hlsl.read_ps_inputs format), else none
+        ps_hw_inputs = G.read_ps_inputs(base + '.psin')
+    except Unsupported as reason:
+        return 'unsupported: %s' % reason
     if a and b and is_mesh(b) and not is_mesh(a):
-        return translate_to(out_dir, key, b, a, root)
+        return translate_to(out_dir, key, b, a, root, ps_hw_inputs=ps_hw_inputs)
     if a and b and is_mesh(a) and not is_mesh(b):
-        return translate_to(out_dir, key, a, b, root)
+        return translate_to(out_dir, key, a, b, root, ps_hw_inputs=ps_hw_inputs)
     return 'not a mesh pipeline'
 
 
