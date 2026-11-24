@@ -33,16 +33,7 @@ inline void logf(const char* format, ...) noexcept
     line[n++] = '\n';
     const DWORD error = GetLastError();
     x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(n));
-    wchar_t log_path[MAX_PATH];
-    const DWORD length = GetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path, MAX_PATH);
-    if (length && length < MAX_PATH) {
-        HANDLE out = CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (out != INVALID_HANDLE_VALUE) {
-            x2w_trap::write_all(out, line, static_cast<DWORD>(n));
-            CloseHandle(out);
-        }
-    }
+    x2w_trap::append_trap_log(line, static_cast<DWORD>(n));  // one open handle per module (trap.h)
     SetLastError(error);
 }
 

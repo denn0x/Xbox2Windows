@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 
 namespace x2w_trap {
 
@@ -33,6 +34,53 @@ inline void write_all(HANDLE handle, const char* text, DWORD length) noexcept
     if (!handle || handle == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(handle, text, length, &written, nullptr);
+}
+
+// LOCAL (perf_work/STARTUP.md): appends one line to %X2W_TRAP_LOG% through a handle that each module
+// keeps open, instead of opening and closing the file for every line. Under the startup debugger every
+// open is a traced NtCreateFile (two debug events that freeze the whole process); run 81 had 4,958 of
+// them, 64% of files.txt. The handle follows the variable: a changed, unset or overlong path closes it.
+// It is opened for appending only, sharing read and write as before, so each WriteFile lands at the
+// end of the file whichever module writes. X2W_TRAP_LOG_REOPEN=1 restores an open per line.
+// GetLastError is preserved.
+inline void append_trap_log(const char* text, DWORD length) noexcept
+{
+    const DWORD error = GetLastError();
+    wchar_t path[MAX_PATH];
+    const DWORD path_length = GetEnvironmentVariableW(L"X2W_TRAP_LOG", path, MAX_PATH);
+    const bool usable = path_length && path_length < MAX_PATH;
+    static const bool reopen = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_TRAP_LOG_REOPEN", value, sizeof(value)) && value[0] == '1';
+    }();
+    if (reopen) {
+        if (usable) {
+            HANDLE out = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (out != INVALID_HANDLE_VALUE) {
+                write_all(out, text, length);
+                CloseHandle(out);
+            }
+        }
+        SetLastError(error);
+        return;
+    }
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static HANDLE handle = INVALID_HANDLE_VALUE;
+    static wchar_t open_path[MAX_PATH];
+    AcquireSRWLockExclusive(&lock);
+    if (handle != INVALID_HANDLE_VALUE && (!usable || std::wcscmp(path, open_path) != 0)) {
+        CloseHandle(handle);
+        handle = INVALID_HANDLE_VALUE;
+    }
+    if (handle == INVALID_HANDLE_VALUE && usable) {
+        handle = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) std::wmemcpy(open_path, path, path_length + 1);
+    }
+    write_all(handle, text, length);
+    ReleaseSRWLockExclusive(&lock);
+    SetLastError(error);
 }
 
 // Switch: %X2W_TRAP_CONTINUE% lists export names (comma-separated, or *) whose
