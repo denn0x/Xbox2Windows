@@ -1247,7 +1247,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(n), samplers->GetGPUDescriptorHandleForHeapStart());
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
-    if (indexed) {
+    if (indirect_pending(self)) { drawn = indirect_draw_issue(self, list, indexed); } else if (indexed) {  // LOCAL: d3d12_indirect.inl
         u64 offset = 0;
         const u64 address = index_address;
         const std::size_t bytes = index_total;
