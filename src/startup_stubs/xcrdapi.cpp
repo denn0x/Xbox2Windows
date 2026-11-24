@@ -15,6 +15,7 @@
 #include <deque>
 #include <exception>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -259,6 +260,71 @@ bool find_stream(u64 source, u64 offset, unsigned compressed, unsigned piece, st
     return false;
 }
 
+// A zlib request whose offset holds no stream (measured on one executable, archive files of one kind):
+// a valid stream of exactly `compressed` bytes starts a multiple of 64 KiB earlier. Two cases:
+// - a piece whose stream is not cached (evicted, or its first piece ran on another queue): the stream
+//   starts at offset - k * piece and inflates past piece k; the request gets piece k's slice;
+// - a whole stream at offset - k * 64 KiB that inflates to exactly the destination size (one run: 19,393
+//   failing requests, all with k = 14, each matching the archive's own boundary table). Why the
+//   executable adds the shift is not known; LOCAL SHORTCUT until its offset arithmetic is understood.
+// A candidate needs a zlib header and must inflate in full from `compressed` bytes (Adler-32 checked).
+LONG requests_pieces_found_on_disk, requests_shifted_streams;
+std::shared_ptr<const std::vector<unsigned char>> stream_on_disk(HANDLE handle, u64 offset, unsigned compressed, unsigned piece,
+                                                                 u64& base, bool& whole_shifted)
+{
+    whole_shifted = false;
+    if (!piece || compressed > (64u << 20)) return nullptr;
+    const auto read_at = [handle](u64 at, unsigned char* out, unsigned size) {
+        OVERLAPPED overlapped{};
+        overlapped.Offset = static_cast<DWORD>(at);
+        overlapped.OffsetHigh = static_cast<DWORD>(at >> 32);
+        DWORD read = 0;
+        return ReadFile(handle, out, size, &read, &overlapped) && read == size;
+    };
+    std::vector<unsigned char> packed;
+    const auto try_at = [&](u64 at, std::size_t limit, std::size_t& produced) -> std::shared_ptr<const std::vector<unsigned char>> {
+        unsigned char head[2];
+        if (!read_at(at, head, 2) || head[0] != 0x78 || ((head[0] << 8) | head[1]) % 31) return nullptr;
+        packed.resize(compressed);
+        if (!read_at(at, packed.data(), compressed)) return nullptr;
+        std::vector<unsigned char> big(limit);
+        if (!x2w_inflate::inflate_zlib(packed.data(), compressed, big.data(), big.size(), &produced)) return nullptr;
+        return std::make_shared<const std::vector<unsigned char>>(big.begin(), big.begin() + produced);
+    };
+    for (u64 k = 1; k <= 64 && k * piece <= offset; ++k) {
+        std::size_t produced = 0;
+        const u64 at = offset - k * piece;
+        auto data = try_at(at, std::min<std::size_t>(std::size_t{32} << 20, std::max<std::size_t>(std::size_t{4} << 20, std::size_t{piece} * (k + 64))), produced);
+        if (data && produced > k * piece) {
+            base = at;
+            return data;
+        }
+    }
+    // The shift is constant per archive (measured: 14 x 64 KiB for one family, 58 x 64 KiB for another),
+    // so the archive's last shift is tried first.
+    static std::mutex shift_lock;
+    static std::map<HANDLE, u64> last_shift;
+    u64 known = 0;
+    {
+        const std::lock_guard guard(shift_lock);
+        if (auto it = last_shift.find(handle); it != last_shift.end()) known = it->second;
+    }
+    for (u64 step = 0; step <= 256; ++step) {
+        const u64 k = step ? step : known;
+        if (!k || (step && k == known) || k * 0x10000 > offset) continue;
+        std::size_t produced = 0;
+        auto data = try_at(offset - k * 0x10000, std::size_t{piece} + 1, produced);
+        if (data && produced == piece) {
+            base = offset;  // the request takes the stream from its start
+            whole_shifted = true;
+            const std::lock_guard guard(shift_lock);
+            last_shift[handle] = k;
+            return data;
+        }
+    }
+    return nullptr;
+}
+
 bool is_failure(const char* outcome) { return outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u' || outcome[0] == 'p'; }
 
 void log_request(Object* self, u64 options, unsigned char* destination, unsigned destination_size, u64 source,
@@ -328,6 +394,7 @@ const char* execute_request(Object* self, const unsigned char* request, const UL
     const char* outcome = "done";
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
+    HANDLE file_handle = nullptr;  // the source file, for pieces whose stream start must be found on disk
     if (options & ~known) {
         outcome = "unknown option bits, not done";
     } else if (!destination || !source_size) {
@@ -350,8 +417,10 @@ const char* execute_request(Object* self, const unsigned char* request, const UL
         overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
         DWORD read = 0;
         if (file_object && file_object->kind == file &&
-            ReadFile(file_object->handle, packed.data(), source_size, &read, &overlapped) && read == source_size)
+            ReadFile(file_object->handle, packed.data(), source_size, &read, &overlapped) && read == source_size) {
             input = packed.data();
+            file_handle = file_object->handle;
+        }
         else
             outcome = "read failed";
     }
@@ -374,6 +443,16 @@ const char* execute_request(Object* self, const unsigned char* request, const UL
                 u64 base = 0;
                 if (!bcpack && find_stream(source, offset, source_size, destination_size, whole, base)) {
                     outcome = "inflated (stream piece)";
+                } else if (bool shifted = false;
+                           !bcpack && file_handle && (whole = stream_on_disk(file_handle, offset, source_size, destination_size, base, shifted))) {
+                    if (shifted) {
+                        outcome = "inflated (shifted stream)";
+                        InterlockedIncrement(&requests_shifted_streams);
+                    } else {
+                        remember_stream(source, base, source_size, whole);
+                        outcome = "inflated (stream piece)";
+                        InterlockedIncrement(&requests_pieces_found_on_disk);
+                    }
                 } else if (!bcpack && destination_size <= (16u << 20)) {
                     auto big = std::make_shared<std::vector<unsigned char>>(
                         std::min<std::size_t>(std::size_t{32} << 20, std::max<std::size_t>(std::size_t{4} << 20, std::size_t{destination_size} * 64)));
@@ -675,8 +754,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
             const LONG total = requests_done + requests_compressed + requests_failed;
             const LONG total2 = total + requests_bcpack_blank;
             if (total2 != last)
-                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld (stream pieces %ld) failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld", second, requests_done, requests_compressed, requests_stream_pieces, requests_failed, requests_bcpack_blank,
+                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld (stream pieces %ld, starts found on disk %ld, shifted streams %ld) failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
+                    "still 0 at run=%ld", second, requests_done, requests_compressed, requests_stream_pieces, requests_pieces_found_on_disk, requests_shifted_streams, requests_failed, requests_bcpack_blank,
                     zero_tokens_at_enqueue, zero_tokens_at_run);
             last = total2;
         }
