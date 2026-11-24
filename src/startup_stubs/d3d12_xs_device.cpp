@@ -2125,6 +2125,7 @@ struct Pass {
     u64 compute_address[16] = {};
     std::uint32_t compute_constants[16][16] = {};
     UINT compute_count[16] = {};
+    std::uint16_t compute_set[16] = {};  // LOCAL: constant words set since the root signature changed (entry value checks)
     // Whether the title set a viewport / scissor on this list; without them a desktop list draws no pixel.
     bool viewport_set = false;
     bool scissor_set = false;
@@ -2613,7 +2614,7 @@ std::unordered_map<Wrapper*, ID3D12PipelineState*>& compute_psos()
 LONG compute_executed, compute_skipped_args;
 // LOCAL: dispatch outcomes since the last 300-frame report, by path and reason (report_dispatches).
 enum ComputeOutcome { co_c62_run, co_c62_table_arg, co_c62_unmapped, co_c67_run, co_c67_off, co_c67_other_key, co_c67_untranslated,
-                      co_c67_heap, co_not_run, co_cx_skip, co_rawaddr_run, co_count };
+                      co_c67_heap, co_not_run, co_cx_skip, co_rawaddr_run, co_c67_unresolved, co_count };
 LONG compute_outcomes[co_count];    // compute_lock; counted with the per-key count by execute_dispatch
 thread_local int dispatch_outcome;  // set on this thread by the path that handled the dispatch
 
@@ -2717,11 +2718,21 @@ bool cx_skip_key(u64 key)
     return std::find(keys.begin(), keys.end(), key) != keys.end();
 }
 // slot 33, SetComputeRootSignature(root)
+// LOCAL: as in D3D12, setting the root signature already bound keeps the root arguments; another one clears them
+// (X2W_CX_ROOT_RESET=1: every call clears them, as before).
+LONG compute_root_same, compute_root_changed;
 void __stdcall list_compute_root(Wrapper* self, Wrapper* root)
 {
+    static const bool always_reset = x2w_local::env_on("X2W_CX_ROOT_RESET");  // the old behaviour
     Pass& pass = pass_of(self);
+    if (root && root == pass.compute_root && !always_reset) {
+        InterlockedIncrement(&compute_root_same);
+        return;
+    }
+    InterlockedIncrement(&compute_root_changed);
     pass.compute_root = root;
     for (auto& k : pass.compute_kind) k = 0;
+    for (auto& s : pass.compute_set) s = 0;
 }
 // slot 35, SetComputeRootDescriptorTable(parameter, handle): not replayed (the executed shaders use none).
 void __stdcall list_compute_table(Wrapper* self, UINT parameter, u64 gpu_handle)
@@ -2735,14 +2746,17 @@ void __stdcall list_compute_table(Wrapper* self, UINT parameter, u64 gpu_handle)
     ReleaseSRWLockShared(&note_lock);
     pass_of(self).compute_kind[parameter] = 5;
     pass_of(self).compute_address[parameter] = address;
+    pass_of(self).compute_set[parameter] = 0;
 }
 // slot 37, SetComputeRoot32BitConstant(parameter, value, offset)
 void __stdcall list_compute_constant(Wrapper* self, UINT parameter, UINT value, UINT offset)
 {
     Pass& pass = pass_of(self);
     if (parameter >= 16 || offset >= 16) return;
+    if (pass.compute_kind[parameter] != 1) pass.compute_set[parameter] = 0;
     pass.compute_kind[parameter] = 1;
     pass.compute_constants[parameter][offset] = value;
+    pass.compute_set[parameter] |= static_cast<std::uint16_t>(1u << offset);
     if (offset + 1 > pass.compute_count[parameter]) pass.compute_count[parameter] = offset + 1;
 }
 // slot 39, SetComputeRoot32BitConstants(parameter, count, data, offset)
@@ -2751,8 +2765,10 @@ void __stdcall list_compute_constants(Wrapper* self, UINT parameter, UINT count,
     Pass& pass = pass_of(self);
     if (parameter >= 16 || offset >= 16 || !data || !x2w_local::readable(data, std::size_t{count} * 4)) return;
     if (offset + count > 16) count = 16 - offset;
+    if (pass.compute_kind[parameter] != 1) pass.compute_set[parameter] = 0;
     pass.compute_kind[parameter] = 1;
     std::memcpy(&pass.compute_constants[parameter][offset], data, std::size_t{count} * 4);
+    for (UINT i = 0; i < count; ++i) pass.compute_set[parameter] |= static_cast<std::uint16_t>(1u << (offset + i));
     if (offset + count > pass.compute_count[parameter]) pass.compute_count[parameter] = offset + count;
 }
 void compute_root_descriptor(Wrapper* self, UINT parameter, u64 address, int kind)
@@ -2761,6 +2777,7 @@ void compute_root_descriptor(Wrapper* self, UINT parameter, u64 address, int kin
     if (parameter >= 16) return;
     pass.compute_kind[parameter] = kind;
     pass.compute_address[parameter] = address;
+    pass.compute_set[parameter] = 0;
 }
 void __stdcall list_compute_cbv(Wrapper* self, UINT parameter, u64 address) { compute_root_descriptor(self, parameter, address, 2); }
 void __stdcall list_compute_srv(Wrapper* self, UINT parameter, u64 address) { compute_root_descriptor(self, parameter, address, 3); }
@@ -2993,11 +3010,11 @@ void report_dispatches()
     log("x2w-render dispatch keys (300 frames): %zu keys in %d lines", all.size(), lines);
     log("x2w-compute dispatches (300 frames): executed %ld skipped %ld; slot-62 desktop pipeline executed %ld skipped %ld "
         "(table argument %ld, unmapped root address %ld); translated executed %ld skipped %ld (X2W_CX_OFF %ld, not a slot-67 key %ld, "
-        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF); X2W_CX_SKIP skipped %ld; raw-address executed %ld",
-        o[co_c62_run] + o[co_c67_run] + o[co_rawaddr_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap] + o[co_cx_skip],
+        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF); X2W_CX_SKIP skipped %ld; raw-address executed %ld; translated skipped, entry value unresolved %ld",
+        o[co_c62_run] + o[co_c67_run] + o[co_rawaddr_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap] + o[co_cx_skip] + o[co_c67_unresolved],
         o[co_c62_run], o[co_c62_table_arg] + o[co_c62_unmapped], o[co_c62_table_arg], o[co_c62_unmapped], o[co_c67_run],
         o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap], o[co_c67_off], o[co_c67_other_key], o[co_c67_untranslated],
-        o[co_c67_heap], o[co_not_run], o[co_cx_skip], o[co_rawaddr_run]);
+        o[co_c67_heap], o[co_not_run], o[co_cx_skip], o[co_rawaddr_run], o[co_c67_unresolved]);
     if (c67_checked)
         log("x2w-cx requests (this run): %ld keys without .done checked, %ld sets completed (.done written), %ld parts written, "
             "%ld incomplete (no .meta or .regs at creation), %ld with a failed write; incomplete ones are retried next run",

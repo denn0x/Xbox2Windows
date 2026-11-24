@@ -127,6 +127,7 @@ struct ComputeTranslation {
     UINT threads[3] = {};
     bool heap = false;  // indexes the title's resource heap (SM 6.6 ResourceDescriptorHeap)
     LONG logged = 0;
+    LONG entry_logged = 0;  // X2W_CX_ENTRY_LOG lines written
 };
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG cx_ready, cx_missing, cx_dispatched, cx_null_res, cx_bad_uav;
@@ -399,6 +400,36 @@ bool typed_views_off()
 }
 LONG cxv_typed_heap, cxv_typed_table, cxv_misaligned, cxv_word3;  // heap: views filled; table: bindings
 LONG cxd_image, cxd_buffer, cxd_title, cxd_null, cxd_unmapped;  // descword values by source
+LONG cxe_rootconst, cxe_descword, cxe_null_res;  // entry values: unset root constant, unbound descword table, of a null resource
+// LOCAL: X2W_CX_ENTRY_LOG=1 (every key) or <key>[,<key>...] (hex): the entry values of the first 4 dispatches per key.
+bool cx_entry_log(u64 key)
+{
+    static bool all = false;
+    static const std::vector<u64> keys = [] {
+        std::vector<u64> out;
+        char value[2048]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_CX_ENTRY_LOG", value, sizeof(value));
+        if (!n || n >= sizeof(value)) return out;
+        if (!std::strcmp(value, "1")) {
+            all = true;
+            log("x2w-cx X2W_CX_ENTRY_LOG: every key, first 4 dispatches each");
+            return out;
+        }
+        for (const char* p = value; *p;) {
+            char* end = nullptr;
+            const u64 k = std::strtoull(p, &end, 16);
+            if (end == p) {
+                ++p;
+                continue;
+            }
+            out.push_back(k);
+            p = end;
+        }
+        log("x2w-cx X2W_CX_ENTRY_LOG: %zu keys, first 4 dispatches each", out.size());
+        return out;
+    }();
+    return all || (!keys.empty() && std::find(keys.begin(), keys.end(), key) != keys.end());
+}
 void note_typed_view(const x2w_startup::BufferViewLayout& l, const ViewRecord& record, bool heap)
 {
     if (l.kind != x2w_startup::BufferViewKind::typed) return;
@@ -421,6 +452,12 @@ void report_cx_views()
         InterlockedExchange(&cxv_word3, 0), typed_views_off() ? " (X2W_CX_TYPED_OFF)" : "", InterlockedExchange(&cxd_image, 0),
         InterlockedExchange(&cxd_buffer, 0), InterlockedExchange(&cxd_title, 0), InterlockedExchange(&cxd_null, 0), InterlockedExchange(&cxd_unmapped, 0),
         InterlockedExchange(&cxu_bound, 0), InterlockedExchange(&cxu_refused, 0));
+    log("x2w-cx entry values (300 frames): root constant not set %ld, descword table not bound %ld (these dispatches %s), "
+        "of a null resource %ld (run); SetComputeRootSignature same %ld changed %ld%s",
+        InterlockedExchange(&cxe_rootconst, 0), InterlockedExchange(&cxe_descword, 0),
+        x2w_local::env_on("X2W_CX_UNRESOLVED_RUN") ? "run, X2W_CX_UNRESOLVED_RUN" : "skipped", InterlockedExchange(&cxe_null_res, 0),
+        InterlockedExchange(&compute_root_same, 0), InterlockedExchange(&compute_root_changed, 0),
+        x2w_local::env_on("X2W_CX_ROOT_RESET") ? " (X2W_CX_ROOT_RESET: both clear)" : "");
 }
 void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
 {
@@ -554,8 +591,10 @@ bool title_view_heap(const Pass& pass, u64* address, u64* bytes)
 // parameter <param>, as the console would hold it. Entries are 32 bytes: entry = offset & ~31, word = (offset & 31) / 4.
 // A view token becomes the synthesized gfx10 T# (texture view) or V# (buffer view, CBV) word (gfx10_view_words.h);
 // any other readable entry gives the title's own dword; null, unreadable or unknown views give 0.
-std::uint32_t descword_value(const Pass& pass, int param, int offset, u64 key)
+// resolved: false when the table is not bound or its entry is not readable (the value 0 is then not the title's).
+std::uint32_t descword_value(const Pass& pass, int param, int offset, u64 key, bool* resolved = nullptr)
 {
+    if (resolved) *resolved = false;
     if (param < 0 || param >= 16 || offset < 0 || pass.compute_kind[param] != 5 || !pass.compute_address[param]) {
         static LONG logged;
         if (first_calls(logged, 4))
@@ -572,6 +611,7 @@ std::uint32_t descword_value(const Pass& pass, int param, int offset, u64 key)
         return 0;
     }
     std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+    if (resolved) *resolved = true;
     if (words[0] != view_token_magic) {
         InterlockedIncrement(words[word] ? &cxd_title : &cxd_null);
         return words[word];
@@ -707,6 +747,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(2 * n));
     }
     std::uint32_t strides[64] = {}, word3[64] = {}, bases[64] = {};
+    bool bound_res[64] = {};
     const bool show = InterlockedIncrement(&tr.logged) <= 2;
     for (UINT i = 0; i < n; ++i) {
         const ComputeTranslation::Res& r = tr.res[i];
@@ -799,18 +840,63 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
             }
         }
         if (!bound) null_view(r, dest, r.uav);
+        bound_res[i] = bound;
         if (show)
             log("x2w-cx   %016llx %s %u kind %d source %d(%d,%d): entry 0x%llx words %08x %08x %08x %08x -> address 0x%llx %zu bytes stride %u: %s",
                 key, r.uav ? "uav" : "srv", i, r.kind, r.source, r.a, r.b, entry, words[0], words[1], words[2], words[3], address, bytes,
                 strides[i], bound ? "bound" : "NULL");
     }
     std::uint32_t values[64] = {};
+    // LOCAL: whether each entry value is the title's. A root constant word the title has not set since the root
+    // signature changed (or set as another kind of root argument), or a descword whose table is not bound, would
+    // be a stale value or 0; such a dispatch is skipped ("entry value unresolved"; X2W_CX_UNRESOLVED_RUN=1 runs it).
+    // A stride / word 3 / base of a resource that is not bound only addresses that null resource: counted, run.
+    char state[64] = {};  // 0 resolved, 'u' unresolved (skips), 'n' of a null resource
+    int unresolved = -1;
     for (std::size_t i = 0; i < tr.uds.size(); ++i) {
         const ComputeTranslation::Ud& ud = tr.uds[i];
         const bool in = ud.a >= 0 && ud.a < 64;
         values[i] = ud.kind == 3 ? ((ud.a < 16 && ud.b < 16) ? pass.compute_constants[ud.a][ud.b] : 0)
             : ud.kind == 4 ? (in ? strides[ud.a] : 0) : ud.kind == 5 ? (in ? word3[ud.a] : 0) : (in ? bases[ud.a] : 0);
-        if (ud.kind == 7) values[i] = descword_value(pass, ud.a, ud.b, key);
+        if (ud.kind == 3) {
+            const bool set = ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 16 && pass.compute_kind[ud.a] == 1 &&
+                             ((pass.compute_set[ud.a] >> ud.b) & 1);
+            if (!set) state[i] = 'u';
+        } else if (ud.kind == 7) {
+            bool resolved = false;
+            values[i] = descword_value(pass, ud.a, ud.b, key, &resolved);
+            if (!resolved) state[i] = 'u';
+        } else if (!in || static_cast<std::size_t>(ud.a) >= n || !bound_res[ud.a]) {
+            state[i] = 'n';
+        }
+        if (state[i] == 'u' && unresolved < 0) unresolved = static_cast<int>(i);
+        if (state[i]) InterlockedIncrement(state[i] == 'u' ? (ud.kind == 3 ? &cxe_rootconst : &cxe_descword) : &cxe_null_res);
+    }
+    static const bool run_unresolved = x2w_local::env_on("X2W_CX_UNRESOLVED_RUN");
+    if (cx_entry_log(key) && InterlockedIncrement(&tr.entry_logged) <= 4) {
+        char text[1600];
+        int used = std::snprintf(text, sizeof(text), "x2w-cx entry %016llx dispatch (%u, %u, %u):", key, x, y, z);
+        for (std::size_t i = 0; i < tr.uds.size() && used < static_cast<int>(sizeof(text)) - 80; ++i) {
+            const ComputeTranslation::Ud& ud = tr.uds[i];
+            static const char* const names[] = {"?", "?", "?", "rootconst", "stride", "bufword3", "bufbase", "descword"};
+            const char* name = ud.kind >= 0 && ud.kind <= 7 ? names[ud.kind] : "?";
+            used += std::snprintf(text + used, sizeof(text) - used, " ud%zu=%08x %s(%d,%d)%s", i, values[i], name, ud.a, ud.b,
+                                  state[i] == 'u' ? " UNRESOLVED" : state[i] == 'n' ? " null-res" : "");
+        }
+        log("%s", text);
+    }
+    if (unresolved >= 0) {
+        const ComputeTranslation::Ud& ud = tr.uds[unresolved];
+        static LONG logged;
+        if (first_calls(logged, 12))
+            log("x2w-cx %016llx: entry value %d (%s %d %d) unresolved: kind %d, words set %04x%s", key, unresolved,
+                ud.kind == 3 ? "rootconst" : "descword", ud.a, ud.b, ud.a >= 0 && ud.a < 16 ? pass.compute_kind[ud.a] : -1,
+                ud.a >= 0 && ud.a < 16 ? pass.compute_set[ud.a] : 0, run_unresolved ? "; run anyway (X2W_CX_UNRESOLVED_RUN)" : "; dispatch skipped");
+        if (!run_unresolved) {
+            dispatch_outcome = co_c67_unresolved;
+            ReleaseSRWLockExclusive(&draw_lock);
+            return false;
+        }
     }
     list->SetPipelineState(tr.pso);
     if (!pass.heap_set) {
