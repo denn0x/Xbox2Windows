@@ -1308,6 +1308,8 @@ class Stage:
                 words.append(self.u(tok))
             elif re.fullmatch(r'0x[0-9a-f]+', tok) and not sel[index] and not sel_hi[index]:
                 words.append(self.u(tok))  # a literal read only through its low half
+            elif tok == '0':
+                words.append('0x00000000u')  # the inline integer 0: every bit is 0, so each half reads +0.0
             else:
                 raise Unsupported('packed f16 operand %s with selection %s/%s' % (tok, sel[index], sel_hi[index]))
         def half(word, high):
@@ -1399,9 +1401,15 @@ class Stage:
             if absolute:
                 body = body[1:-1]
             r = reg_range(body)
-            if not r or r[1] != r[2]:
+            if re.fullmatch(r'0x[0-9a-f]{1,8}', body):
+                # A 32-bit literal read as an f16 operand: op_sel picks its half as for a register (LLVM
+                # SIFoldOperands::tryFoldImmWithOpSel reads VOP3P literal halves as ImmVal >> (OP_SEL_0 ? 16 : 0)).
+                value = int(body, 16)
+                text = 'f16tof32(0x%04xu)' % ((value >> 16) if is_high else (value & 0xffff))
+            elif not r or r[1] != r[2]:
                 raise Unsupported('f16 fma_mix operand %s' % tok)
-            text = 'f16tof32(%s%s)' % (self.u(body), ' >> 16' if is_high else '')
+            else:
+                text = 'f16tof32(%s%s)' % (self.u(body), ' >> 16' if is_high else '')
             if absolute:
                 text = 'abs(%s)' % text
             return '(-%s)' % text if neg else text

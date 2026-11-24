@@ -578,8 +578,14 @@ def mixes():
           refused(None, words=mix_word(0x20, 1, (258, 259, 260), op_sel=1)))
     check('fma_mix: high half of an inline f16 constant refused',
           refused(None, words=mix_word(0x20, 1, (240, 259, 260), op_sel=1, op_sel_hi=1)))
-    check('fma_mix: literal f16 operand refused',
-          refused(None, words=mix_word(0x20, 1, (255, 259, 260), op_sel_hi=1) + [0x3c00]))
+    # A literal f16 operand reads the half op_sel selects (LLVM SIFoldOperands::tryFoldImmWithOpSel;
+    # tests/startup_literal_halves_check.py). Formerly refused here.
+    check('fma_mix: literal f16 operand reads its low half',
+          lines(mix_word(0x20, 1, (255, 259, 260), op_sel_hi=1) + [0x3c00])[1]
+          == 'v1 = U(f16tof32(0x3c00u) * F(v3) + F(v4));')
+    check('fma_mix: literal f16 operand with op_sel reads its high half',
+          lines(mix_word(0x20, 1, (255, 259, 260), op_sel=1, op_sel_hi=1) + [0x3c00])[1]
+          == 'v1 = U(f16tof32(0x0000u) * F(v3) + F(v4));')
     check('fma_mix: inline 1/(2*pi) refused', refused(None, words=mix_word(0x20, 1, (248, 259, 260))))
 
 
