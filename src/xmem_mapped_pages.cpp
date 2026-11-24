@@ -55,6 +55,11 @@ struct PhysicalMemory {
     std::set<std::pair<HANDLE, ULONG64>> free_slots;  // ordered, so that pages reused together are adjacent slots again
     std::set<HANDLE> file_slabs;  // LOCAL: slabs backed by a temporary file (X2W_XMEM_SLAB_DIR), not by the pagefile
     ULONG64 migrations = 0, migration_failures = 0;
+    // LOCAL (X2W_XMEM_GPU_POOL=all, xmem_gpu_pool.h): slabs taken from the long-lived pool, each with a writable view
+    // of this process that zeroes a slot when it is first handed out (the section holds an earlier run's bytes).
+    std::map<HANDLE, unsigned char*> pool_views;
+    unsigned char* newest_pool_view = nullptr;  // pool_views of slabs.back(), or nullptr when it is not a pool slab
+    ULONG64 pool_slabs = 0;  // not counted against the slab budget: already charged by the holder
 
     ~PhysicalMemory()
     {
@@ -134,7 +139,7 @@ const wchar_t* slab_dir() noexcept
     return usable ? dir : nullptr;
 }
 
-ULONG64 pagefile_slabs() noexcept { return memory.slabs.size() - memory.file_slabs.size(); }
+ULONG64 pagefile_slabs() noexcept { return memory.slabs.size() - memory.file_slabs.size() - memory.pool_slabs; }
 
 HANDLE pagefile_slab() noexcept
 {
@@ -163,10 +168,35 @@ HANDLE gpu_slab(bool* pooled) noexcept
     return pagefile_slab();
 }
 
-// A new slab: file-backed when X2W_XMEM_SLAB_DIR allows it, else from the pagefile. *file says which.
-HANDLE new_slab(bool* file) noexcept
+// LOCAL (X2W_XMEM_GPU_POOL=all): the next pool section with a writable view of it, or nullptr (pool exhausted,
+// not running or owned elsewhere: logged once, then fresh sections as without the pool).
+HANDLE pool_slab(unsigned char** view) noexcept
+{
+    static bool exhausted = false;
+    if (exhausted) return nullptr;
+    const HANDLE section = x2w_gpu_pool::take(slab_bytes);
+    void* mapped = section ? MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0) : nullptr;
+    if (!mapped) {
+        if (section) CloseHandle(section);
+        exhausted = true;
+        x2w_local::logf("x2w-xmem GPU slab pool (all): no further pool section after %llu (error %lu): fresh %s slabs from "
+                        "now on%s", static_cast<unsigned long long>(memory.pool_slabs), GetLastError(),
+                        slab_dir() ? "file-backed" : "pagefile",
+                        slab_dir() ? " (moved for the GPU as without the pool)" : " (under the slab budget)");
+        return nullptr;
+    }
+    *view = static_cast<unsigned char*>(mapped);
+    return section;
+}
+
+// A new slab: from the pool with X2W_XMEM_GPU_POOL=all, else file-backed when X2W_XMEM_SLAB_DIR allows it, else from
+// the pagefile. *file says whether it is file-backed, *pool_view is the pool section's view (or nullptr).
+HANDLE new_slab(bool* file, unsigned char** pool_view) noexcept
 {
     *file = false;
+    *pool_view = nullptr;
+    if (x2w_gpu_pool::mode() == x2w_gpu_pool::Mode::all)
+        if (const HANDLE slab = pool_slab(pool_view)) return slab;
     if (const wchar_t* dir = slab_dir()) {
         static LONG serial;
         wchar_t path[MAX_PATH];
@@ -206,28 +236,39 @@ HANDLE section_for(ULONG_PTR page)
         return existing->second.section;
     if (!memory.free_slots.empty()) {
         const auto [section, offset] = *memory.free_slots.begin();
-        void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(offset >> 32), static_cast<DWORD>(offset), page_bytes);
-        if (!view) return nullptr;
-        std::memset(view, 0, page_bytes);  // a reused slot starts zero-filled, as a fresh section did
-        UnmapViewOfFile(view);
+        if (const auto pool = memory.pool_views.find(section); pool != memory.pool_views.end()) {
+            std::memset(pool->second + offset, 0, page_bytes);  // through the pool slab's own view
+        } else {
+            void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(offset >> 32), static_cast<DWORD>(offset), page_bytes);
+            if (!view) return nullptr;
+            std::memset(view, 0, page_bytes);  // a reused slot starts zero-filled, as a fresh section did
+            UnmapViewOfFile(view);
+        }
         memory.backings.emplace(page, Backing{section, 0, offset});
         memory.free_slots.erase(memory.free_slots.begin());
         return section;
     }
     if (memory.slabs.empty() || memory.slab_used == slab_bytes) {
         bool file = false;
-        const HANDLE slab = new_slab(&file);
+        unsigned char* pool_view = nullptr;
+        const HANDLE slab = new_slab(&file, &pool_view);
         if (!slab) return nullptr;
         try {
             memory.slabs.push_back(slab);
             if (file) memory.file_slabs.insert(slab);
+            if (pool_view) memory.pool_views.emplace(slab, pool_view), ++memory.pool_slabs;
         } catch (const std::bad_alloc&) {
+            if (pool_view) UnmapViewOfFile(pool_view);
             CloseHandle(slab);
             throw;
         }
+        memory.newest_pool_view = pool_view;
         memory.slab_used = 0;
     }
     const HANDLE section = memory.slabs.back();
+    // LOCAL (X2W_XMEM_GPU_POOL=all): a pool slot holds an earlier run's bytes; zero it before anyone sees it, as the
+    // kernel's demand-zero fill does for a fresh section (cost: memleak_work/NOTES.md "zeroing").
+    if (memory.newest_pool_view) std::memset(memory.newest_pool_view + memory.slab_used, 0, page_bytes);
     memory.backings.emplace(page, Backing{section, 0, memory.slab_used});
     memory.slab_used += page_bytes;
     return section;

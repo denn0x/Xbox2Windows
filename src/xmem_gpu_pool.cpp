@@ -9,22 +9,41 @@
 
 namespace x2w_gpu_pool {
 namespace {
-bool enabled() noexcept
-{
-    static const bool on = [] {
-        char text[8]{};
-        const DWORD n = GetEnvironmentVariableA("X2W_XMEM_GPU_POOL", text, sizeof(text));
-        return !(n == 1 && text[0] == '0');
-    }();
-    return on;
-}
 LONG next_index = 0;
 LONG misses = 0;
+
+// The pool is this process's alone: a named mutex, owned until the process ends (abandoned on a kill, which the
+// next owner sees as WAIT_ABANDONED and accepts).
+bool owner() noexcept
+{
+    static const bool owned = [] {
+        const HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\x2w-gpu-slab-pool-owner");
+        const DWORD wait = mutex ? WaitForSingleObject(mutex, 0) : WAIT_FAILED;
+        const bool ok = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+        if (!ok)
+            x2w_local::logf("x2w-xmem GPU slab pool: in use by another process (wait %lu, error %lu): fresh sections instead",
+                            wait, GetLastError());
+        return ok;  // the handle is kept open on purpose
+    }();
+    return owned;
+}
 }  // namespace
+
+Mode mode() noexcept
+{
+    static const Mode value = [] {
+        char text[8]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_XMEM_GPU_POOL", text, sizeof(text));
+        if (n == 1 && text[0] == '0') return Mode::off;
+        if (n == 3 && (text[0] | 0x20) == 'a' && (text[1] | 0x20) == 'l' && (text[2] | 0x20) == 'l') return Mode::all;
+        return Mode::moves;
+    }();
+    return value;
+}
 
 HANDLE take(ULONG64 bytes) noexcept
 {
-    if (!enabled()) return nullptr;
+    if (mode() == Mode::off || !owner()) return nullptr;
     const LONG index = InterlockedIncrement(&next_index) - 1;
     wchar_t name[64];
     swprintf(name, 64, L"Local\\x2w-gpu-slab-%ld", index);
@@ -32,8 +51,9 @@ HANDLE take(ULONG64 bytes) noexcept
     if (!section) {
         const DWORD error = GetLastError();
         if (InterlockedIncrement(&misses) <= 2)
-            x2w_local::logf("x2w-xmem GPU slab pool: %ls not available (error %lu): a fresh pagefile section instead "
-                            "(its commit stays charged after this process; tools/startup/gpu_slab_pool.py ensure)",
+            x2w_local::logf("x2w-xmem GPU slab pool: %ls not available (error %lu): a fresh section instead "
+                            "(a pagefile one opened as a GPU heap stays charged after this process; "
+                            "tools/startup/gpu_slab_pool.py ensure)",
                             name, error);
         return nullptr;
     }
@@ -44,11 +64,13 @@ HANDLE take(ULONG64 bytes) noexcept
     if (view) UnmapViewOfFile(view);
     if (!big_enough) {
         CloseHandle(section);
-        x2w_local::logf("x2w-xmem GPU slab pool: %ls is smaller than 0x%llx bytes: a fresh pagefile section instead", name,
+        x2w_local::logf("x2w-xmem GPU slab pool: %ls is smaller than 0x%llx bytes: a fresh section instead", name,
                         static_cast<unsigned long long>(bytes));
         return nullptr;
     }
-    x2w_local::logf("x2w-xmem GPU slab pool: %ls taken for a GPU slab", name);
+    static LONG taken;
+    if (InterlockedIncrement(&taken) <= 64)
+        x2w_local::logf("x2w-xmem GPU slab pool: %ls taken for %s", name, mode() == Mode::all ? "a slab" : "a GPU slab");
     return section;
 }
 }  // namespace x2w_gpu_pool

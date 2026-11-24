@@ -8,11 +8,20 @@
 //
 // tools/startup/gpu_slab_pool.py holds named sections Local\x2w-gpu-slab-<i> across runs. take() opens the next
 // one, so later runs reuse the same section objects and the host's loss stays at the pool size.
-// X2W_XMEM_GPU_POOL=0 turns it off (fresh sections as before). Without the holder take() returns nullptr.
+// X2W_XMEM_GPU_POOL:
+//   unset / 1 / on  moves: a file-backed slab that the GPU needs is moved into the next pool section (migrate_slab).
+//   all             every slab comes from the pool from the start: no file-backed slabs, no live moves; a pool
+//                   section's slots are zeroed when first handed out (section_for). Pool exhausted: fresh sections.
+//   0               off: fresh sections as before.
+// Only one process uses the pool at a time: the first take() claims Local\x2w-gpu-slab-pool-owner (a mutex held until
+// the process ends); a second process gets no pool sections (logged) instead of sharing them.
 #include <windows.h>
 
 namespace x2w_gpu_pool {
+enum class Mode { off, moves, all };
+Mode mode() noexcept;
 // The next unused pool section of at least bytes, opened read-write, or nullptr (pool off, not running,
-// exhausted, or too small). The contents are whatever the previous user left: the caller overwrites them.
+// exhausted, owned by another process, or too small). The contents are whatever the previous user left: the caller
+// overwrites or zeroes them.
 HANDLE take(ULONG64 bytes) noexcept;
 }  // namespace x2w_gpu_pool
