@@ -113,7 +113,8 @@ bool desktop_range(u64 address, u64 bytes, ID3D12Resource** buffer, u64* offset)
 }
 
 struct ComputeTranslation {
-    struct Res { bool uav; int kind, source, a, b; };  // kind 0 buffer, 1 2D, 2 2D array, 3 3D, 4 1D; source 0 table(param a, byte b), 2 root a
+    struct Res { bool uav; int kind, source, a, b; bool integer = false; };  // kind 0 buffer, 1 2D, 2 2D array, 3 3D, 4 1D; source 0 table(param a, byte b), 2 root a
+                                                                             // integer: R32_UINT texture UAV (manifest kinds tex2du, tex3du)
     struct Ud { int kind, a, b; };                     // 3 root constant(param a, word b), 4 stride of res a, 5 word 3 of res a, 6 base of res a,
                                                        // 7 descriptor dword at byte b of table param a (descword)
     int state = 0;                                     // 1 ready, 2 unavailable
@@ -167,6 +168,14 @@ void load_compute(u64 key, ComputeTranslation& tr)
                    (!std::strcmp(view, "srv") || !std::strcmp(view, "uav"))) {
             ComputeTranslation::Res r{view[0] == 'u', !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 : !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0,
                                       !std::strcmp(source, "root") ? 2 : 0, x, y};
+            if (!std::strcmp(kind, "tex2du") || !std::strcmp(kind, "tex3du")) {
+                r.kind = kind[3] == '2' ? 1 : 3;
+                r.integer = true;
+                if (!r.uav) {
+                    log("x2w-cx %016llx: integer texture kind %s only as a uav", key, kind);
+                    return;
+                }
+            }
             if (static_cast<std::size_t>(i) != tr.res.size()) return;
             tr.res.push_back(r);
         } else if (std::sscanf(line.c_str(), "smp %d %x %x %x %x", &i, &w[0], &w[1], &w[2], &w[3]) == 5) {
@@ -267,7 +276,7 @@ void null_view(const ComputeTranslation::Res& r, D3D12_CPU_DESCRIPTOR_HANDLE des
     InterlockedIncrement(&cx_null_res);
     if (uav) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-        d.Format = r.kind ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_TYPELESS;
+        d.Format = r.integer ? DXGI_FORMAT_R32_UINT : r.kind ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_TYPELESS;
         d.ViewDimension = r.kind == 1 ? D3D12_UAV_DIMENSION_TEXTURE2D : r.kind == 2 ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY
             : r.kind == 3 ? D3D12_UAV_DIMENSION_TEXTURE3D : r.kind == 4 ? D3D12_UAV_DIMENSION_TEXTURE1D : D3D12_UAV_DIMENSION_BUFFER;
         if (!r.kind) {
@@ -292,6 +301,17 @@ void null_view(const ComputeTranslation::Res& r, D3D12_CPU_DESCRIPTOR_HANDLE des
         }
         device_of(the_device)->CreateShaderResourceView(nullptr, &d, dest);
     }
+}
+
+// LOCAL: integer texture UAVs (tex2du/tex3du) bound and refused, for the 300-frame report.
+LONG cxu_bound, cxu_refused;
+void note_integer_uav(bool bound, DXGI_FORMAT resource_format, UINT flags)
+{
+    InterlockedIncrement(bound ? &cxu_bound : &cxu_refused);
+    static LONG logged_bound, logged_refused;
+    if (bound ? first_calls(logged_bound, 1) : first_calls(logged_refused, 6))
+        log("x2w-cx integer texture uav %s: resource format %u flags 0x%x%s", bound ? "bound as R32_UINT" : "REFUSED (null R32_UINT view)",
+            resource_format, flags, bound ? "" : " (needs ALLOW_UNORDERED_ACCESS and an R32_TYPELESS or R32_UINT resource)");
 }
 
 // Binds a texture behind a view record as SRV or UAV (true when a real view was written).
@@ -319,10 +339,13 @@ bool texture_view(Wrapper* self, const ComputeTranslation::Res& r, const ViewRec
     }
     if (mip >= rd.MipLevels) mip = 0;
     if (r.uav) {
-        if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !float_format(format)) {
+        if (r.integer) format = x2w_startup::integer_uav_format(rd.Format);
+        if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || (r.integer ? format == DXGI_FORMAT_UNKNOWN : !float_format(format))) {
             InterlockedIncrement(&cx_bad_uav);
+            if (r.integer) note_integer_uav(false, rd.Format, rd.Flags);
             return false;
         }
+        if (r.integer) note_integer_uav(true, rd.Format, rd.Flags);
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
         d.Format = format;
         if (r.kind == 1) { d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; d.Texture2D.MipSlice = mip; }
@@ -386,10 +409,11 @@ void note_typed_view(const x2w_startup::BufferViewLayout& l, const ViewRecord& r
 void report_cx_views()
 {
     log("x2w-cx view facts (300 frames): typed buffer views heap %ld table %ld (heap misaligned %ld), bufword3 synthesized %ld%s; "
-        "descword values image %ld buffer %ld title %ld null %ld (unmapped format %ld)",
+        "descword values image %ld buffer %ld title %ld null %ld (unmapped format %ld); integer texture uavs bound %ld refused %ld",
         InterlockedExchange(&cxv_typed_heap, 0), InterlockedExchange(&cxv_typed_table, 0), InterlockedExchange(&cxv_misaligned, 0),
         InterlockedExchange(&cxv_word3, 0), typed_views_off() ? " (X2W_CX_TYPED_OFF)" : "", InterlockedExchange(&cxd_image, 0),
-        InterlockedExchange(&cxd_buffer, 0), InterlockedExchange(&cxd_title, 0), InterlockedExchange(&cxd_null, 0), InterlockedExchange(&cxd_unmapped, 0));
+        InterlockedExchange(&cxd_buffer, 0), InterlockedExchange(&cxd_title, 0), InterlockedExchange(&cxd_null, 0), InterlockedExchange(&cxd_unmapped, 0),
+        InterlockedExchange(&cxu_bound, 0), InterlockedExchange(&cxu_refused, 0));
 }
 void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
 {
