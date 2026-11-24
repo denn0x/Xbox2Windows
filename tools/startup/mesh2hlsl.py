@@ -72,6 +72,10 @@ MESH_HELPERS = {
     'x2w_fma':'float x2w_fma(float a, float b, float c) { return (float)fma((double)a, (double)b, (double)c); }',
     'x2w_mbcnt_lo':'uint x2w_mbcnt_lo(uint m, uint lane) { return countbits(m & (lane >= 32u ? 0xffffffffu : ((1u << lane) - 1u))); }',
     'x2w_mbcnt_hi': 'uint x2w_mbcnt_hi(uint m, uint lane) { return lane < 32u ? 0u : countbits(m & ((1u << (lane - 32u)) - 1u)); }',
+    # word 3 of a resource-heap buffer view: vinfo dword 2 of its view id (PROPOSED runtime field, RUNTIME_NEEDS.md
+    # section 8: the same synthesized SQ_BUF_RSRC_WORD3 that `udsrc bufword3` hands a table view; 0 = raw)
+    'x2w_vword3': 'uint x2w_vword3(uint h) { uint i = x2w_vid(h); return i < %du ? vinfo.Load(i * 16u + 8u) : 0u; }'
+                  % getattr(G, 'HEAP_IDS', 90000),
 }
 
 
@@ -495,9 +499,25 @@ class MeshStage(G.Stage):
 
     def merge(self, states):
         super().merge(states)
-        statics = [s[3] for s in states]
+        # the two mesh fields are the last two of the snapshot, whatever the base snapshot holds before them
+        statics = [s[-2] for s in states]
         self.exec_static = statics[0] if all(x == statics[0] for x in statics) else None
-        self.static_copies = {r: m for r, m in states[0][4].items() if all(s[4].get(r) == m for s in states)}
+        self.static_copies = {r: m for r, m in states[0][-1].items() if all(s[-1].get(r) == m for s in states)}
+
+    def format_load(self, ops, mods, count, name):
+        """buffer_load_format_* through a resource-heap descriptor (X2W_DRAW_FEATURES heap + bufword3): the format
+        and swizzle come from x2w_vword3 (vinfo dword 2 of the view id); table descriptors take the base path."""
+        key = self.descriptor(ops[2])
+        if key[0][0] != 'heapdyn' or not {'heap', 'bufword3'} <= set(getattr(self.pipe, 'features', ())):
+            return super().format_load(ops, mods, count, name)
+        for m in mods:
+            if not (m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:')):
+                raise Unsupported('%s modifier %s' % (name, m))
+        dst = reg_range(ops[0])
+        buf, address = self.buffer_address(ops, mods)
+        self.emit('a = %s;' % address)
+        for i in range(count):
+            self.set_v(dst[1] + i, 'x2w_fmt_load(%s, a, x2w_vword3(h%d), %du)' % (buf, key[0][1], i))
 
     def set_exec_static(self, mask):
         """exec = a constant lane mask (s_mov_b64 exec, <constant> or a copy of one)."""
@@ -803,6 +823,30 @@ class MeshStage(G.Stage):
         mask = self.sdwa_src(ops[2], f.get('src1_sel', 'DWORD'))
         return self.write_compare(False, ops[0], '((%s >> x2w_fclass(%s)) & 1u)' % (mask, x))
 
+    def op_v_cmp_class_f16_sdwa(self, ops, mods):
+        """V_CMP_CLASS_F16 (SDWA, VOPC into an SGPR mask): the selected 16-bit field of S0 with its abs/neg applied
+        to bit 15 (as the e64 form, base x2w_class_f16), S1 the class mask (DWORD)."""
+        f = dict(m.partition(':')[::2] for m in mods)
+        if set(f) - {'src0_sel', 'src1_sel'} or f.get('src1_sel', 'DWORD') != 'DWORD' or len(ops) != 3:
+            raise Unsupported('v_cmp_class_f16_sdwa with %s %s' % (ops, mods))
+        tok = ops[1]
+        neg, ab = tok.startswith('-'), '|' in tok
+        reg = tok.strip('-|')
+        if not reg_range(reg) or f.get('src0_sel', 'DWORD') not in ('WORD_0', 'WORD_1', 'DWORD'):
+            raise Unsupported('v_cmp_class_f16_sdwa source %s %s' % (tok, mods))
+        x = '(%s & 0xffffu)' % self.sdwa_src(reg, f.get('src0_sel', 'DWORD'))
+        if ab:
+            x = '(%s & 0x7fffu)' % x
+        if neg:
+            x = '(%s ^ 0x8000u)' % x
+        return self.write_compare(False, ops[0], 'x2w_class_f16(%s, %s)' % (x, self.u(ops[2])))
+
+    def op_v_bfm_b32(self, ops, mods):
+        """V_BFM_B32: D = ((1 << S0[4:0]) - 1) << S1[4:0] (RDNA 2 ISA)."""
+        if mods or len(ops) != 3:
+            raise Unsupported('v_bfm_b32 form %s %s' % (ops, mods))
+        self.set_v(reg_range(ops[0])[1], '(((1u << (%s & 31u)) - 1u) << (%s & 31u))' % (self.u(ops[1]), self.u(ops[2])))
+
     def carry_op(self, base, ops, mods):
         """v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 and the _ci forms: D, carry-out mask, S0, S1[, carry-in mask].
         Add: sum = S0 + S1 + cin (mod 2^32), carry = cin ? sum <= S0 : sum < S0. Sub: d = S0 - S1 - bin, borrow =
@@ -1006,6 +1050,15 @@ class MeshPipeline(G.Pipeline):
 
     def __init__(self, ms_code, ps_code, root_blob, sampler_heap=None, rtv_formats=()):
         self.root = G.parse_root(root_blob)
+        # Fields of G.Pipeline.__init__ (which this does not call: it builds a vertex stage) that newer base
+        # translators read. The draw lowerings (manifest `heap 1`, `udsrc bufword3`, `uav`) are named in
+        # X2W_DRAW_FEATURES as for draws (pstrans gfx2hlsl.draw_features); a base without them keeps refusing.
+        self.features = G.draw_features() if hasattr(G, 'draw_features') else frozenset()
+        self.heapvars = []
+        self.rw_keys = frozenset()
+        self.vs_out_cntl = None
+        self.packed_position_vgpr = None
+        self.ps_input_layout = None
         self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
