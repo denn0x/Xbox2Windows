@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "era_physical.h"
+#include "xmem_low.h"
 
 #include <cstring>
 #include "startup_stubs/local_log.h"
@@ -285,7 +286,7 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
     } else if (type & MEM_COMMIT) {
         if (!address && lazy_pools_on() && bytes >= (SIZE_T{256} << 20)) {
             static const bool installed = AddVectoredExceptionHandler(1, lazy_pool_handler) != nullptr;
-            result = installed ? VirtualAlloc(nullptr, bytes, MEM_RESERVE, protect) : nullptr;
+            result = installed ? x2w_low::alloc(bytes, MEM_RESERVE, protect) : nullptr;
             if (result) {
                 AcquireSRWLockExclusive(&lazy_pools_lock);
                 lazy_pools.push_back({reinterpret_cast<ULONG_PTR>(result), bytes, protect});
@@ -293,7 +294,7 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
             }
             how = "reserve, committed on touch";
         } else if (!address) {
-            result = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, protect);
+            result = x2w_low::alloc(bytes, MEM_COMMIT | MEM_RESERVE, protect);
             how = "commit";
         } else {
             result = VirtualAlloc(address, bytes, MEM_COMMIT, protect);
@@ -305,8 +306,9 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
             how = "commit at address";
         }
     } else {
-        result = VirtualAlloc2(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
-                               nullptr, 0);
+        result = address ? VirtualAlloc2(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                         PAGE_NOACCESS, nullptr, 0)
+                         : x2w_low::alloc(bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS);
         // A caller that asks for a placeholder splits it itself; other reservations are split here on mapping.
         if (result && !(type & MEM_RESERVE_PLACEHOLDER)) record_reservation(result, bytes);
         how = "placeholder reserve";
@@ -634,8 +636,7 @@ extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allo
         else
             ++it;
     }
-    auto* reservation = VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                      PAGE_NOACCESS, nullptr, 0);
+    auto* reservation = x2w_low::alloc(bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS);
     if (!reservation) return nullptr;
     try {
         memory.reservations.insert_or_assign(reinterpret_cast<ULONG_PTR>(reservation), bytes);

@@ -28,6 +28,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "xmem_low.h"
 
 namespace {
 // The BVH callers' query buffer. era_query writes at most its first 0x31 bytes.
@@ -57,7 +58,7 @@ std::unordered_set<void*>& local_blocks()
 
 void* local_alloc(SIZE_T bytes, ULONGLONG attributes)
 {
-    void* block = bytes ? VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : nullptr;
+    void* block = bytes ? x2w_low::alloc(bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) : nullptr;
     if (block) {
         AcquireSRWLockExclusive(&local_lock);
         local_blocks().insert(block);

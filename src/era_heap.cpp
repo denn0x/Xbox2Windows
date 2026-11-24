@@ -13,6 +13,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "xmem_low.h"
 
 namespace era_heap {
 namespace {
@@ -52,7 +53,7 @@ void* allocate_pages(std::size_t bytes, std::size_t alignment) noexcept
     const auto page = geometry().page;
     const auto committed = (bytes + page - 1) & ~(page - 1);
     for (int attempt = 0; attempt < 8; ++attempt) {
-        auto* probe = VirtualAlloc(nullptr, committed + alignment, MEM_RESERVE, PAGE_NOACCESS);
+        auto* probe = x2w_low::alloc(committed + alignment, MEM_RESERVE, PAGE_NOACCESS);
         if (!probe) {
             return nullptr;
         }
@@ -117,7 +118,7 @@ void* allocate(std::size_t bytes, std::uint64_t attributes) noexcept
             return nullptr;
         }
         // Committed pages are zero-filled by the system.
-        return VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        return x2w_low::alloc(bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     }
 
     // Physical memory types need title physical pages, which this experiment does not model.
