@@ -1005,6 +1005,57 @@ class Stage:
         for i in range(count):
             self.set_v(dst[1] + i, 'x2w_fmt_load(%s, a, ud%d, %du)' % (buf, w3, i))
 
+    def buffer_store(self, ops, mods, count, name):
+        """buffer_store_dword{,x2,x3,x4} to a raw buffer UAV, behind X2W_DRAW_FEATURES=uav.
+
+        The descriptor becomes `uav <i> buf table|root ...` (RWByteAddressBuffer u<i>, draw-rt RUNTIME_DONE.md) and the
+        address adds `udsrc <n> uavbase <i>` (the bytes between the 16-aligned view start the runtime binds and the
+        descriptor base; without it a misaligned buffer would get a null UAV). Refused: idxen (no stride line for a
+        UAV), a descriptor this program also reads as an SRV (D3D12 has no SRV + UAV on one buffer in a draw), and
+        any modifier other than offen, offset:N and the cache-policy bits. The lane's store runs only where exec holds.
+        """
+        if 'uav' not in getattr(self.pipe, 'features', ()):
+            raise Unsupported(name)
+        for m in mods:
+            if not (m in ('offen', 'glc', 'slc', 'dlc') or m.startswith('offset:')):
+                raise Unsupported('%s modifier %s' % (name, m))
+        key = self.descriptor(ops[2])
+        if key[0][0] not in ('table', 'root'):
+            raise Unsupported('%s through %s' % (name, key[0][0]))
+        if key in self.pipe.modified:
+            raise Unsupported('%s through a modified descriptor' % name)
+        u = self.pipe.uav(key)
+        base = self.pipe.ud(('uavbase', int(u[1:])))
+        offset = sum(int(m[7:], 0) for m in mods if m.startswith('offset:'))
+        soff = ops[3]
+        if re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', soff):
+            offset += int(soff, 0)
+            parts = []
+        else:
+            parts = [self.u(soff)]  # an SGPR soffset adds its value
+        if 'offen' in mods:
+            parts.insert(0, self.u(ops[1]))
+        address = ' + '.join(['ud%d' % base] + parts + ['%d' % offset])
+        data = reg_range(ops[0])
+        if data[2] - data[1] + 1 != count:
+            raise Unsupported('%s data %s' % (name, ops[0]))
+        values = ', '.join(self.u('v%d' % (data[1] + i)) for i in range(count))
+        call = '%s.Store%s(a, %s);' % (u, '' if count == 1 else count, values if count == 1 else 'uint%d(%s)' % (count, values))
+        self.emit('a = %s;' % address)
+        self.emit(call if self.exec_known else 'if (exec & 1) %s' % call)
+
+    def op_buffer_store_dword(self, ops, mods):
+        self.buffer_store(ops, mods, 1, 'buffer_store_dword')
+
+    def op_buffer_store_dwordx2(self, ops, mods):
+        self.buffer_store(ops, mods, 2, 'buffer_store_dwordx2')
+
+    def op_buffer_store_dwordx3(self, ops, mods):
+        self.buffer_store(ops, mods, 3, 'buffer_store_dwordx3')
+
+    def op_buffer_store_dwordx4(self, ops, mods):
+        self.buffer_store(ops, mods, 4, 'buffer_store_dwordx4')
+
     def op_buffer_load_format_x(self, ops, mods):
         self.format_load(ops, mods, 1, 'buffer_load_format_x')
 
@@ -2168,10 +2219,23 @@ class Pipeline:
                 raise Unsupported('heap %s' % kind)
             self.heapvars[k] = kind
             return '%s[NonUniformResourceIndex(x2w_hix(h%d, %du))]' % (HEAP_KINDS[kind][0], k, HEAP_KINDS[kind][1])
+        if key in getattr(self, 'uavs', {}):
+            raise Unsupported('descriptor %s read as an SRV and stored to as a UAV' % (key,))
         r = self.resources.setdefault(key, dict(index=len(self.resources), kind=kind))
         if r['kind'] != kind:
             raise Unsupported('resource %s used as %s and %s' % (key, r['kind'], kind))
         return 'r%d' % r['index']
+
+    def uav(self, key):
+        """u<i> for a raw buffer UAV (manifest `uav <i> buf ...`); indices count from 0 apart from the SRVs."""
+        if key in self.resources:
+            raise Unsupported('descriptor %s read as an SRV and stored to as a UAV' % (key,))
+        uavs = self.__dict__.setdefault('uavs', {})
+        if key not in uavs:
+            if len(uavs) == 8:
+                raise Unsupported('more than 8 UAVs')
+            uavs[key] = len(uavs)
+        return 'u%d' % uavs[key]
 
     def sampler(self, key, comparison=False):
         if not isinstance(key[0], int):
@@ -2192,6 +2256,8 @@ class Pipeline:
         out += ['cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
+        for key, i in getattr(self, 'uavs', {}).items():
+            out.append('RWByteAddressBuffer u%d : register(u%d);' % (i, i))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if any(getattr(self, 'heapvars', ())):  # tests build bare pipelines without __init__
@@ -2277,6 +2343,13 @@ class Pipeline:
             if where is None:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
+        for (source, off), i in sorted(getattr(self, 'uavs', {}).items(), key=lambda kv: kv[1]):
+            if source[0] == 'table':
+                lines.append('uav %d buf table %d %d' % (i, source[1] if len(source) > 1 else 0, off or 0))
+            elif source[0] == 'root' and not off:
+                lines.append('uav %d buf root %d 0' % (i, source[1] if len(source) > 1 else 0))
+            else:
+                raise Unsupported('uav through %s at %s' % (source, off))
         if any(getattr(self, 'heapvars', ())):
             lines.append('heap 1')
         for key, i in self.samplers.items():
