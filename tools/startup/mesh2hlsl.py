@@ -107,6 +107,10 @@ EXEC_COPIES = os.environ.get('X2W_MESH_EXEC_COPIES', '1') != '0'
 # X2W_MESH_BARRIER_RANGES=0: a group-uniform execz range is skipped when no lane of the group is active even when it
 # holds a phase barrier (the f37ad9f8 form; barrier_count then refuses "paths cross different numbers of barriers").
 BARRIER_RANGES = os.environ.get('X2W_MESH_BARRIER_RANGES', '1') != '0'
+# X2W_MESH_RESTORED_SCALARS=0: a scalar written in a per-lane skipped range counts as live after it even when every
+# exit of the range gives it back its value from before, and liveness reads VALU lane masks by their low SGPR only
+# (the f37ad9f8 rule).
+RESTORED_SCALARS = os.environ.get('X2W_MESH_RESTORED_SCALARS', '1') != '0'
 MESH_FEATURES = frozenset(f for f in os.environ.get('X2W_MESH_FEATURES', '').replace(' ', '').split(',') if f)
 if MESH_FEATURES - {'heapwords'}:
     raise SystemExit('X2W_MESH_FEATURES: unknown %s' % ', '.join(sorted(MESH_FEATURES - {'heapwords'})))
@@ -1009,6 +1013,14 @@ class MeshStage(G.Stage):
         for off in order:
             name, asm = info[off]
             r, w, wv, rv = reads_writes(name, asm)
+            if RESTORED_SCALARS:
+                # wave64 lane masks that a VALU op names by their low SGPR: a v_cmp SDST writes the pair; a
+                # v_cndmask / carry-in mask operand reads it (AMD RDNA 2 ISA, VOP3 SDST / SSRC2 in wave64)
+                w = self.pair_writes(name, asm)
+                base = re.sub(r'_e(32|64)$', '', name)
+                last = parse(asm)[1][-1:] if base.startswith('v_cndmask') or (CARRY.fullmatch(base) and '_ci' in base) else []
+                if last and re.fullmatch(r's\d+', last[0]):
+                    r = set(r) | {int(last[0][1:]) + 1}
             rw[off] = (frozenset(r | ({-1} if rv else set())), frozenset(w | ({-1} if wv else set())))
             nxt = [] if name in ('s_endpgm', 's_branch') else ([following[off]] if off in following else [])
             if name.startswith('s_cbranch') or name == 's_branch':
@@ -1034,6 +1046,76 @@ class MeshStage(G.Stage):
         if hit:
             raise Unsupported('scalar %s written in the per-lane skipped range %#x-%#x is live at its end'
                               % ('vcc' if min(hit) == -1 else 's%d' % min(hit), off, target))
+
+    def range_successors(self):
+        if getattr(self, '_succ', None) is None:
+            order = [x[0] for x in self.ins]
+            info = {x[0]: (x[2], x[3]) for x in self.ins}
+            following = dict(zip(order, order[1:]))
+            self._succ = {}
+            for o in order:
+                name, asm = info[o]
+                nxt = [] if name in ('s_endpgm', 's_branch') else ([following[o]] if o in following else [])
+                if name.startswith('s_cbranch') or name == 's_branch':
+                    nxt.append(int(parse(asm)[1][0].split('_')[1], 16))
+                self._succ[o] = [x for x in nxt if x in info]
+        return self._succ
+
+    def restored_scalars(self, off, target, hits):
+        """Of the SGPRs in `hits` (written in the range (off, target)), those that hold their value from before the
+        range again on every exit of the range: the register-allocator shuffle `s_mov_b32 sT, sR; ... sR = ...;
+        ... s_mov_b32 sR, sT`. Forward copy tracking over the range's own paths (state: register -> the register
+        whose entry value it holds, None = unknown; a register not in the state holds its own entry value),
+        intersected at joins; s_mov_b32 / s_mov_b64 copy, any other write ends what the destination held."""
+        if not RESTORED_SCALARS:
+            return set()
+        succ = self.range_successors()
+        info = {x[0]: (x[2], x[3]) for x in self.ins}
+        inside = [o for o, _, _, _ in self.ins if off < o < target]
+        if not inside:
+            return set()
+        state = {inside[0]: {}}
+        exits = []
+        work = [inside[0]]
+        seen_edges = 0
+        while work:
+            seen_edges += 1
+            if seen_edges > 100000:
+                return set()
+            o = work.pop()
+            st = dict(state[o])
+            name, asm = info[o]
+            ops = parse(asm)[1]
+            w = self.pair_writes(name, asm)
+            d = reg_range(ops[0]) if ops else None
+            s = reg_range(ops[1]) if len(ops) == 2 else None
+            if name in ('s_mov_b32', 's_mov_b64') and d and d[0] == 's' and s and s[0] == 's':
+                n = 2 if name == 's_mov_b64' else 1
+                vals = [st.get(s[1] + i, s[1] + i) for i in range(n)]
+                for i in range(n):
+                    st[d[1] + i] = vals[i]
+            else:
+                for r in w:
+                    if isinstance(r, int):
+                        st[r] = None
+            for nx in succ[o]:
+                if not off < nx < target:
+                    if nx <= off:
+                        return set()   # a loop back above the branch: not modelled
+                    exits.append(st)
+                    continue
+                if nx not in state:
+                    state[nx] = st
+                    work.append(nx)
+                else:
+                    merged = {r: v for r, v in state[nx].items()}
+                    for r in set(merged) | set(st):
+                        a, b = merged.get(r, r), st.get(r, r)
+                        merged[r] = a if a == b else None
+                    if merged != state[nx]:
+                        state[nx] = merged
+                        work.append(nx)
+        return {r for r in hits if isinstance(r, int) and r >= 0 and exits and all(e.get(r, r) == r for e in exits)}
 
     def group_branches(self):
         """execz branches (offsets) translated as group-uniform branches: those whose range writes a scalar that
@@ -1169,7 +1251,8 @@ class MeshStage(G.Stage):
                                           % (name, off, target))
                 pw = self.pair_writes(name, asm)
                 copies -= {t for t in copies if t in pw or (isinstance(t, int) and t + 1 in pw)}
-        return written & self.liveness().get(target, frozenset())
+        hits = written & self.liveness().get(target, frozenset())
+        return hits - self.restored_scalars(off, target, hits) if hits else hits
 
     def scalar(self, base, ops):
         """With X2W_MESH_FEATURES=heapwords, words of a resource-heap descriptor that a scalar op reads as numbers
