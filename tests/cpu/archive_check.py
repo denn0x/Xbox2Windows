@@ -1,5 +1,6 @@
 """Check the archive reader against independent byte, status and callback observations."""
 import ctypes
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -13,6 +14,55 @@ from native_map_check import Mapper, STATUS
 
 FIRST_RECORD = bytes.fromhex("08 00 04 82 24 25 8f 80 7f")
 SECOND_RECORD = bytes.fromhex("08 00 04 84 24 25 8f 80 7f")
+
+# Issue #1293: when Control Flow Guard is enforced for a process, ntdll accepts a longjmp target only inside an
+# image the Windows loader registered (or under a process-wide protected policy). pe_map maps blast_source
+# privately, so blast's out-of-input longjmp fails fast with FAST_FAIL_INVALID_LONGJUMP_TARGET. The pull that
+# returns no input ("input 0" in a trace) is the only path to that longjmp. The parent marks those mapped runs
+# with LONGJMP_ENV; the mapped child then reads its own effective CFG policy before it maps anything and, when
+# CFG is active, prints CFG_SKIP and exits with SKIP instead of failing fast. Every other run is unchanged.
+LONGJMP_EVENT = "input 0"
+LONGJMP_ENV = "X2W_MAPPED_LONGJMP_CASE"
+CFG_SKIP = "skip: CFG is active in the pe_map runner; blast's out-of-input longjmp would fail fast (#1293)"
+SKIP = 77
+PROCESS_CONTROL_FLOW_GUARD_POLICY = 7
+
+
+def cfg_active(kernel32=None):
+    """The EnableControlFlowGuard bit of this process's effective CFG policy; raises if it cannot be read."""
+    from ctypes import wintypes
+    k = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    k.GetCurrentProcess.restype = wintypes.HANDLE
+    k.GetProcessMitigationPolicy.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+    k.GetProcessMitigationPolicy.restype = wintypes.BOOL
+    flags = ctypes.c_uint32()
+    if not k.GetProcessMitigationPolicy(k.GetCurrentProcess(), PROCESS_CONTROL_FLOW_GUARD_POLICY,
+                                        ctypes.byref(flags), ctypes.sizeof(flags)):
+        raise OSError(f"cannot read the CFG policy of the pe_map runner: error {ctypes.get_last_error()}")
+    return bool(flags.value & 1)
+
+
+def run_mapped_case(command, data, events, timeout, env=None):
+    """Run the mapped runner for one case. Returns (child, skipped): skipped only for a case that reaches
+    blast's longjmp and whose runner reported CFG_SKIP with SKIP."""
+    import os
+    reaches_longjmp = LONGJMP_EVENT in events
+    env = dict(os.environ if env is None else env)
+    env.pop(LONGJMP_ENV, None)
+    if reaches_longjmp:
+        env[LONGJMP_ENV] = "1"
+    child = subprocess.run(command, input=data, capture_output=True, timeout=timeout, env=env)
+    skipped = reaches_longjmp and child.returncode == SKIP and CFG_SKIP.encode("ascii") in child.stderr
+    return child, skipped
+
+
+def report_cfg_skips(skipped):
+    """Print the skipped mapped cases and return the exit status for the test."""
+    if not skipped:
+        return 0
+    print(f"skip: CFG is active in the pe_map runner, so its blast longjmp cases did not run (#1293): "
+          f"{', '.join(skipped)}")
+    return SKIP
 
 
 def wider_exit_control(native):
@@ -55,6 +105,15 @@ def mapped_exports(mapper, image, providers):
 
 
 def mapped_archive(mapper_path, native, codec, source=None):
+    if source is not None and os.environ.get(LONGJMP_ENV) == "1":
+        try:
+            active = cfg_active()
+        except OSError as error:
+            sys.stderr.write(f"{error}\n")
+            sys.exit(1)
+        if active:
+            sys.stderr.write(CFG_SKIP + "\n")
+            sys.exit(SKIP)
     # DXGI loads d3d10warp.dll from the process's directory first. This host is python.exe, so load the
     # app-local WARP (OFFSCREEN_WARP_DIR) beside the native EXE explicitly, as the native run finds it.
     warp = native.with_name("d3d10warp.dll")
@@ -161,16 +220,24 @@ def compare(mapper, native, lifted, codec, *blast_images):
         for image in (lifted, adapter, translated):
             check("no native decoder fallback", module_names(image) & {source.name.lower(), codec.name.lower()}, set())
     commands = ([native], mapped, [lifted])
+    skipped = []
     for data, output, code, events in cases:
         trace = ("\n".join(events) + "\n").encode("ascii")
         for command in commands:
-            child = subprocess.run(command, input=data, capture_output=True, timeout=15)
+            if command is mapped:
+                child, skip = run_mapped_case(command, data, events, 15)
+                if skip:
+                    skipped.append(f"{len(data)} input bytes")
+                    continue
+            else:
+                child = subprocess.run(command, input=data, capture_output=True, timeout=15)
             check(str(command), Observation(child.stderr, child.stdout, child.returncode),
                   Observation(trace, output, code))
         print(f"{len(data)} input bytes: {len(output)} published bytes, exit {code}, {events}")
+    return report_cfg_skips(skipped)
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "--mapped":
         mapped_archive(*map(Path, sys.argv[2:]))
-    compare(*map(Path, sys.argv[1:]))
+    sys.exit(compare(*map(Path, sys.argv[1:])))

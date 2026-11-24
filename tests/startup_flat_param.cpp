@@ -32,7 +32,7 @@ std::vector<char> read_blob(const char* path)
 }  // namespace
 
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                              std::uint32_t words[4])
+                              std::uint32_t* words, UINT width, UINT height)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -70,8 +70,8 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
 
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = 1;
-    rd.Height = 1;
+    rd.Width = width;
+    rd.Height = height;
     rd.DepthOrArraySize = 1;
     rd.MipLevels = 1;
     rd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -96,8 +96,8 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     list->SetGraphicsRootSignature(root.Get());
     const std::uint32_t constants[entry_constants] = {0, 0, 0, 0};
     list->SetGraphicsRoot32BitConstants(0, entry_constants, constants, 0);
-    const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
-    const D3D12_RECT scissor{0, 0, 1, 1};
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -111,10 +111,14 @@ void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, con
     commands.submit_and_wait(device);
 
     void* mapped = nullptr;
-    const D3D12_RANGE read{0, 4 * sizeof(std::uint32_t)};
+    const D3D12_RANGE read{0, static_cast<SIZE_T>(readback_size)};
     const D3D12_RANGE none{0, 0};
     check(readback->Map(0, &read, &mapped), "Map flat parameter readback");
-    std::memcpy(words, static_cast<std::uint8_t*>(mapped) + footprint.Offset, 4 * sizeof(std::uint32_t));
+    const auto* first = static_cast<const std::uint8_t*>(mapped) + footprint.Offset;
+    for (UINT y = 0; y < height; ++y) {
+        std::memcpy(words + size_t(y) * width * 4, first + size_t(y) * footprint.Footprint.RowPitch,
+                    size_t(width) * 4 * sizeof(*words));
+    }
     readback->Unmap(0, &none);
     std::printf("startup_flat_param words=%08x,%08x,%08x,%08x\n", words[0], words[1], words[2], words[3]);
 }

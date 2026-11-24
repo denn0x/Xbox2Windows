@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import sys
 
+import pefile
+
 from pe_package_preflight import inspect
 from host_commit import read_host_commit, require_commit_budget
 
@@ -311,7 +313,7 @@ def main():
                      trap_callable=options.trap_callable)
         if commit_report is not None:
             result = {**result, "host_commit": commit_report}
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, pefile.PEFormatError) as exc:
         parser.exit(1, f"{exc}\n")
     print(json.dumps(result, indent=2))
 

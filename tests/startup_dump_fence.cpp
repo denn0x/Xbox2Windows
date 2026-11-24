@@ -93,11 +93,138 @@ void run()
     check(list->Close(), "Close empty list");
     std::printf("submitted=1 cancelled=2 published=1 readback=%08x\n", actual);
 }
+
+// Stands in for a queue so the test decides when, and with which value, the
+// tracker's fence completes. Lists are passed through without being executed.
+class ScriptedQueue final : public ID3D12CommandQueue {
+public:
+    explicit ScriptedQueue(ID3D12Device* device) : device_(device) {}
+    HRESULT signal_result = S_OK;
+    UINT executes = 0;
+    UINT signals = 0;
+    UINT64 signal_value = 0;
+    ComPtr<ID3D12Fence> fence;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override
+    {
+        if (!out) return E_POINTER;
+        *out = id == __uuidof(IUnknown) || id == __uuidof(ID3D12CommandQueue) ? this : nullptr;
+        return *out ? S_OK : E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID id, void** out) override { return device_->QueryInterface(id, out); }
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
+        const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT, const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
+        D3D12_TILE_MAPPING_FLAGS) override {}
+    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*, ID3D12Resource*,
+        const D3D12_TILED_RESOURCE_COORDINATE*, const D3D12_TILE_REGION_SIZE*, D3D12_TILE_MAPPING_FLAGS) override {}
+    void STDMETHODCALLTYPE ExecuteCommandLists(UINT, ID3D12CommandList* const*) override { ++executes; }
+    void STDMETHODCALLTYPE SetMarker(UINT, const void*, UINT) override {}
+    void STDMETHODCALLTYPE BeginEvent(UINT, const void*, UINT) override {}
+    void STDMETHODCALLTYPE EndEvent() override {}
+    HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* target, UINT64 value) override
+    {
+        ++signals;
+        fence = target;
+        signal_value = value;
+        return signal_result;
+    }
+    HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence*, UINT64) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64*, UINT64*) override { return E_NOTIMPL; }
+    D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override { return {D3D12_COMMAND_LIST_TYPE_DIRECT}; }
+
+private:
+    ID3D12Device* device_;
+};
+
+DrawDump keyed(std::uint64_t key)
+{
+    DrawDump dump{};
+    dump.key = key;
+    return dump;
+}
+
+unsigned fill(DrawReadbacks& tracker, ID3D12CommandList* list)
+{
+    unsigned recorded = 0;
+    while (tracker.record(list, keyed(0xd0))) ++recorded;
+    return recorded;
+}
+
+// The capture budget is 48 recorded or published copies. Lists are compared
+// by address only, so four bytes of storage stand in for four lists.
+void run_budget(bool mutate_removed)
+{
+    auto device = shim_create_device();
+    ScriptedQueue queue(device.Get());
+    char storage[4]{};
+    ID3D12CommandList* lists[4];
+    for (int i = 0; i < 4; ++i) lists[i] = reinterpret_cast<ID3D12CommandList*>(&storage[i]);
+    auto* a = lists[0];
+    auto* b = lists[1];
+    auto* c = lists[2];
+    auto* d = lists[3];
+
+    DrawReadbacks tracker;
+    require(tracker.record(a, keyed(0xa1)) && tracker.record(b, keyed(0xb1)), "Could not record a1 and b1");
+    require(tracker.record(c, keyed(0xc0)), "Could not record c0");
+    tracker.discard(c);
+    require(tracker.record(c, keyed(0xc1)), "Could not record c1");
+
+    ID3D12CommandList* both[] = {a, b};
+    check(tracker.execute(&queue, 2, both), "Execute a and b");
+    require(queue.executes == 1 && queue.signals == 1 && queue.signal_value == 1, "Expected one execute and one signal of 1");
+    require(tracker.take_completed().empty(), "Batch published before its fence completed");
+    check(queue.fence->Signal(1), "Complete the batch fence");
+    auto done = tracker.take_completed();
+    require(done.size() == 2, "Expected both lists of the batch to complete");
+    require(done[0].key == 0xa1 && done[0].index == 1, "Expected a1 as capture 1");
+    require(done[1].key == 0xb1 && done[1].index == 2, "Expected b1 as capture 2");
+
+    // c1 is pending and two captures are published: 45 of 48 slots remain.
+    for (int i = 0; i < 45; ++i)
+        require(!tracker.full() && tracker.record(d, keyed(0xd0)), "Budget closed before 48 captures");
+    require(tracker.full() && !tracker.record(d, keyed(0xd0)), "Budget open after 48 captures");
+    tracker.discard(d);
+
+    // D3D12 reports device removal as UINT64_MAX. c1 is then dropped without
+    // being published, and it no longer counts against the budget.
+    ID3D12CommandList* third[] = {c};
+    check(tracker.execute(&queue, 1, third), "Execute c");
+    require(queue.signals == 2, "Expected a second fence signal");
+    check(queue.fence->Signal(UINT64_MAX), "Report device removal");
+    const auto removed = tracker.take_completed();
+    require(removed.size() == (mutate_removed ? 1u : 0u), "Capture published after device removal");
+    const unsigned after_removal = fill(tracker, d);
+    require(after_removal == 46, "Expected 46 slots after device removal");
+    tracker.discard(d);
+
+    // A failed fence signal retains the copy within the budget: a later reset
+    // of the list does not release it and it is never published.
+    queue.signal_result = DXGI_ERROR_DEVICE_REMOVED;
+    require(tracker.record(a, keyed(0xa2)), "Could not record a2");
+    ID3D12CommandList* first[] = {a};
+    require(tracker.execute(&queue, 1, first) == DXGI_ERROR_DEVICE_REMOVED, "Signal failure was not returned");
+    tracker.discard(a);
+    require(tracker.take_completed().empty(), "Capture published without a signalled fence");
+    const unsigned after_failure = fill(tracker, d);
+    require(after_failure == 45, "Expected 45 slots with a retained copy");
+    std::printf("batch=2 budget=45 removed=%zu after_removal=%u after_failure=%u\n", removed.size(), after_removal, after_failure);
+}
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    try { run(); }
+    bool mutate_removed = false;
+    if (argc == 3 && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "removed") == 0) mutate_removed = true;
+    else if (argc != 1) { std::fputs("usage: startup_dump_fence_check [--mutate removed]\n", stderr); return 2; }
+    try { run(); run_budget(mutate_removed); }
     catch (const std::exception& err) { std::fprintf(stderr, "%s\n", err.what()); return 1; }
     catch (...) { return 1; }
     return 0;

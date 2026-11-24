@@ -198,13 +198,13 @@ def scene_records(data, validator=None, *, observe=None):
             "validator_samples": len(samples), "first_per_stage": samples}
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--shader-control", type=Path)
     parser.add_argument("--scene-records", action="store_true", help="Inspect compressed records in shaders.rpf")
     parser.add_argument("--scene-validator", type=Path, help="Use the built root_probe.exe on one container per stage")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     root = args.directory.resolve(strict=True)
     layouts = [path for path in root.glob("layout*.xml") if path.is_file()]
     if len(layouts) != 1:

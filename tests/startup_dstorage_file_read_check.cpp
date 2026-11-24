@@ -99,7 +99,7 @@ int main(int argc, char** argv)
     read("run above 2 GiB", file, 0x80000010, above_2g.bytes);
     read("run across 4 GiB", file, 0xFFFFFFFE, across_4g.bytes);
     // The last four bytes of the file, at the offset 4 GiB above the low run.
-    read("run above 4 GiB, ending at EOF", file, 0x100000010, alias ? low_alias.bytes : above_4g.bytes);
+    read("run above 4 GiB, ending at EOF", file, 0x100000010, *(alias ? &low_alias.bytes : &above_4g.bytes));
 
     // The range check compares 64-bit values.
     rejected("one byte past EOF above 4 GiB", file, 0x100000011, 4);

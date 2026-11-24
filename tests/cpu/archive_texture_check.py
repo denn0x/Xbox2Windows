@@ -3,7 +3,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from archive_check import FIRST_RECORD, SECOND_RECORD, check
+from archive_check import FIRST_RECORD, SECOND_RECORD, check, report_cfg_skips, run_mapped_case
 
 
 def expected_texture(red):
@@ -26,16 +26,24 @@ def compare(mapper, native, lifted, codec, blast):
         ("both", FIRST_RECORD + SECOND_RECORD, first + second, 0, complete * 2 + b"completed 2\n"),
         ("truncated", FIRST_RECORD + SECOND_RECORD[:5], first, 2, complete + truncated + b"completed 1\n"),
     ]
+    skipped = []
     for runner, command in (("native", [native]), ("pe_map", mapped), ("AOT", [lifted])):
         for label, data, expected, status, trace in cases:
-            child = subprocess.run(command, input=data, capture_output=True, timeout=15)
+            if runner == "pe_map":
+                child, skip = run_mapped_case(command, data, trace.decode("ascii"), 15)
+                if skip:
+                    skipped.append(label)
+                    continue
+            else:
+                child = subprocess.run(command, input=data, capture_output=True, timeout=15)
             check(f"{runner} {label} status/trace", (child.returncode, child.stderr), (status, trace))
             check(f"{runner} {label} RGBA8 bytes", child.stdout, expected)
             if label == "both":
                 stale = sum(x != y for x, y in zip(child.stdout[64:], first, strict=True))
                 check(f"{runner} stale texture differing bytes", stale, 9)
             print(f"{runner} {label}: {len(child.stdout)} RGBA8 bytes, exit {child.returncode}")
+    return report_cfg_skips(skipped)
 
 
 if __name__ == "__main__":
-    compare(*map(Path, sys.argv[1:]))
+    sys.exit(compare(*map(Path, sys.argv[1:])))

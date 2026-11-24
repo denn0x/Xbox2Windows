@@ -53,6 +53,24 @@ int rule(bool mutate)
     expect("keeps caller-provided CPU memory",
            x2w_startup::ensure_title_heap_memory(samplers, 0x74adb007, 64, memory, fail_allocation), true);
     expect("no alternate allocation after validation", memory == 0x10000 && allocations == 1, true);
+    // A successful allocation becomes the heap's memory, sized for the whole heap: 1024 view
+    // descriptors of 32 bytes are 0x8000 bytes, 128 samplers of 32 bytes are 0x1000.
+    std::uint64_t asked = 0;
+    const auto allocate = [&](std::uint64_t size) -> std::uint64_t {
+        ++allocations;
+        asked = size;
+        return 0x20000;
+    };
+    memory = 0;
+    expect("view heap without backing gets the allocation",
+           x2w_startup::ensure_title_heap_memory(views, 0x7c000000, 0x8000, memory, allocate), true);
+    expect("view heap backing is the allocated address and size",
+           memory == 0x20000 && asked == 0x8000 && allocations == 2, true);
+    memory = 0;
+    expect("tagged sampler without backing gets the allocation",
+           x2w_startup::ensure_title_heap_memory(samplers, 0x74adb007, 0x1000, memory, allocate), true);
+    expect("sampler backing is the allocated address and size",
+           memory == 0x20000 && asked == 0x1000 && allocations == 3, true);
     if (failures) {
         std::printf("startup_title_heap: %d FAILED\n", failures);
         return 1;

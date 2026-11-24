@@ -198,6 +198,9 @@ if __name__ == "__main__":
     if args.output.suffix.lower() != ".cpp":
         parser.error("choose a .cpp output")
     providers = [(Path(path), symbol) for path, symbol in args.provider]
-    source = translate(args.image, args.io_provider, args.mix_provider, providers, entry_export=args.entry_export,
-                       frame_selector=args.frame_selector)
-    args.output.write_text(source, encoding="ascii")
+    try:
+        source = translate(args.image, args.io_provider, args.mix_provider, providers, entry_export=args.entry_export,
+                           frame_selector=args.frame_selector)
+        args.output.write_text(source, encoding="ascii")
+    except (OSError, ValueError, pefile.PEFormatError) as error:
+        parser.exit(1, f"{error}\n")

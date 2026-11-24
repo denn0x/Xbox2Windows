@@ -131,6 +131,8 @@ def exports(pe):
     It also drops a name or forwarder it cannot read, or the whole table, with only a warning.
     Here a table, name or forwarder that does not lie in section file data is an error.
     """
+    if not pe.OPTIONAL_HEADER.DATA_DIRECTORY:
+        return []
     start, size = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0].VirtualAddress, pe.OPTIONAL_HEADER.DATA_DIRECTORY[0].Size
     if not start:
         return []

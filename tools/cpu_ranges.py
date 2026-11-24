@@ -15,7 +15,10 @@ def image_bytes(pe, rva, size, executable=False):
 
 
 def function_ranges(pe, entry):
-    table = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+    directories = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    if len(directories) < 4:
+        raise ValueError("image has no runtime-function directory")
+    table = directories[3]
     if table.Size % 12:
         raise ValueError("incomplete runtime-function record")
     records = list(struct.iter_unpack("<III", image_bytes(pe, table.VirtualAddress, table.Size)))

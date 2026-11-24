@@ -146,9 +146,12 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_image_load_mip_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
 ./out/pe-env/bin/python -B tests/startup_host_cpu_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_capture_check.py
 ./out/pe-env/bin/python -B tests/startup_translator_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_smem_offset_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
 ./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
+./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support

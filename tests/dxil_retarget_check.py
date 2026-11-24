@@ -1,6 +1,8 @@
 """Synthetic controls and DXC validator checks for tools/dxil_retarget.py."""
 
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+import io
 import json
 from pathlib import Path
 import struct
@@ -15,6 +17,27 @@ import dxil_retarget as rt
 from resource_inventory import dxil_program, parts
 
 SKIP = 77
+
+
+def _run_cli(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run rt.main(argv) in-process with CPython SystemExit semantics."""
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = 0
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            result = rt.main(argv)
+            rc = 0 if result is None else int(result)
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            rc = 0
+        elif isinstance(code, int):
+            rc = code
+        else:
+            stderr.write(f"{code}\n")
+            rc = 1
+    return subprocess.CompletedProcess(argv, rc, stdout.getvalue(), stderr.getvalue())
 
 
 def _encode_synthetic_bitcode(*, triple: str, abbreviated_triple: bool, abbreviated_md_name: bool,
@@ -316,9 +339,9 @@ def check_pure_python_controls() -> None:
         in_file.write_bytes(synth_dxbc)
         cli_out = json.loads(subprocess.check_output([sys.executable, "-B", str(tool), str(in_file), str(out_file)]))
         assert cli_out["kind"] == "dxbc" and cli_out["signed"] is False and out_file.read_bytes() == out_dxbc
-        cli_bc = json.loads(subprocess.check_output(
-            [sys.executable, "-B", str(tool), str(in_file), str(bc_file), "--extract-module"]
-        ))
+        cli_bc_run = _run_cli([str(in_file), str(bc_file), "--extract-module"])
+        assert cli_bc_run.returncode == 0, cli_bc_run.stderr
+        cli_bc = json.loads(cli_bc_run.stdout)
         assert cli_bc["kind"] == "bitcode" and bc_file.read_bytes() == new_bc
 
         for bad_args in (
@@ -328,7 +351,7 @@ def check_pure_python_controls() -> None:
             [str(in_file), str(out_file), "--warp-only"],
             [str(bc_file), str(out_file), "--sign", "--probe", str(fake_probe)],
         ):
-            bad_run = subprocess.run([sys.executable, "-B", str(tool), *bad_args], capture_output=True)
+            bad_run = _run_cli(bad_args)
             assert bad_run.returncode != 0, f"Accepted invalid CLI arguments {bad_args}"
 
         # A damaged or missing input is reported as an error message, not a traceback.
@@ -338,12 +361,10 @@ def check_pure_python_controls() -> None:
             bad_in = tmp_dir / f"damaged-{label}.bin"
             bad_in.write_bytes(payload)
             bad_out = tmp_dir / f"damaged-{label}.out"
-            bad_run = subprocess.run([sys.executable, "-B", str(tool), str(bad_in), str(bad_out)],
-                                     capture_output=True, text=True)
+            bad_run = _run_cli([str(bad_in), str(bad_out)])
             assert bad_run.returncode == 1, (label, bad_run.returncode, bad_run.stderr)
             assert "Traceback" not in bad_run.stderr and not bad_out.exists(), (label, bad_run.stderr)
-        missing_run = subprocess.run([sys.executable, "-B", str(tool), str(tmp_dir / "missing.bin"),
-                                      str(tmp_dir / "missing.out")], capture_output=True, text=True)
+        missing_run = _run_cli([str(tmp_dir / "missing.bin"), str(tmp_dir / "missing.out")])
         assert missing_run.returncode == 1 and "Traceback" not in missing_run.stderr, missing_run.stderr
 
     # 5. Pure-Python controls for sign_container and check_compute_pso
@@ -731,16 +752,13 @@ define void @main() {
     assert stub.batches == [], "an unexamined module reached the submission callable"
 
     # --pso-probe without --probe: no disassembly, so the CLI records NOT_CHECKED and submits nothing.
-    tool = Path(__file__).resolve().parents[1] / "tools" / "dxil_retarget.py"
     with TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         in_file = tmp_dir / "in.dxbc"
         out_file = tmp_dir / "out.dxbc"
         absent_probe = tmp_dir / "absent_probe.exe"
         in_file.write_bytes(synth_dxbc)
-        ungated = subprocess.run(
-            [sys.executable, "-B", str(tool), str(in_file), str(out_file), "--pso-probe", str(absent_probe)],
-            capture_output=True, text=True)
+        ungated = _run_cli([str(in_file), str(out_file), "--pso-probe", str(absent_probe)])
         assert ungated.returncode == 0, ungated.stderr
         pso = json.loads(ungated.stdout)["pso"]
         assert pso["gate"]["verdict"] == gate.NOT_CHECKED, pso
@@ -761,6 +779,41 @@ define void @main() {
           "executable uses only while the archive filter treats every reachable form as reaching an "
           "intrinsic; a metadata string that spells a call and a ';' inside a metadata string still "
           "pass; without --probe the CLI records NOT_CHECKED and submits nothing")
+    # Malformed streams end in ValueError, not in a hang or an interpreter error.
+    # An array count larger than the bits left in the stream is refused, even when its elements
+    # are zero bits wide.
+    huge = rt.BitWriter()
+    huge.write_vbr(1 << 22, 6)
+    huge.align32()
+    for element in ((rt.ENC_FIXED, 0), (rt.ENC_FIXED, 8), (rt.ENC_VBR, 6), (rt.ENC_CHAR6, None)):
+        try:
+            rt._read_abbrev_record(rt.BitReader(huge.finish()), [("LIT", 4), (rt.ENC_ARRAY, None), element])
+        except ValueError as exc:
+            assert "Array length" in str(exc), exc
+        else:
+            raise AssertionError(f"array of {element} accepted a count beyond the stream")
+    # A legitimate zero-width array that fits the stream still reads.
+    small = rt.BitWriter()
+    small.write_vbr(3, 6)
+    small.align32()
+    code, values, _ = rt._read_abbrev_record(rt.BitReader(small.finish()), [("LIT", 4), (rt.ENC_ARRAY, None), (rt.ENC_FIXED, 0)])
+    assert (code, values) == (4, [0, 0, 0]), (code, values)
+
+    # Blocks nested beyond the limit are refused; blocks at the limit still parse.
+    def nested(levels: int) -> bytes:
+        items: list = []
+        for _ in range(levels):
+            items = [("BLOCK", rt.MODULE_BLOCK_ID, 3, items)]
+        return rt.serialize_bitcode(items)
+
+    rt.parse_bitcode(nested(rt.MAX_BLOCK_DEPTH))
+    try:
+        rt.parse_bitcode(nested(rt.MAX_BLOCK_DEPTH + 1))
+    except ValueError as exc:
+        assert "nest deeper" in str(exc), exc
+    else:
+        raise AssertionError("bitcode nested beyond the limit was accepted")
+
     print("pure-python dxil_retarget controls: ok")
 
 

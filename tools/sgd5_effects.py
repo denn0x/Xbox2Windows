@@ -5,7 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 import struct
-from typing import BinaryIO
+import sys
+from typing import BinaryIO, Sequence
 import zlib
 
 from paged_resource import PagedResource, Segment
@@ -160,7 +161,7 @@ def offset(value: str) -> int:
     return int(value, 0)
 
 
-if __name__ == "__main__":
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("effect", help="Expected exact name of the supplied effect record")
@@ -169,10 +170,16 @@ if __name__ == "__main__":
     parser.add_argument("--arrays", required=True, type=offset, help="Physical start of the six program arrays")
     parser.add_argument("--record", nargs=2, required=True, type=offset, metavar=("START", "END"),
                         help="Physical bounds of the selected effect, including its final name block")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         with args.archive.open("rb") as stream:
             found = candidates(stream, args.effect, *args.group, args.arrays, *args.record)
         print(json.dumps({"effect": args.effect, "candidates": [asdict(item) for item in found]}, indent=2))
     except (OSError, ValueError) as exc:
-        parser.exit(1, f"{args.archive}: {exc}\n")
+        sys.stderr.write(f"{args.archive}: {exc}\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

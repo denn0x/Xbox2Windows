@@ -127,6 +127,7 @@ def exports():
     # A whole pixel stage that exports depth and colour declares SV_Depth next to SV_Target0.
     pipe = G.Pipeline.__new__(G.Pipeline)
     pipe.rtv_formats = ()
+    pipe.packed_position_vgpr = None  # set by Pipeline.__init__ since upstream #1634
     pipe.resources, pipe.samplers, pipe.uds, pipe.uses_sampler_heap, pipe.helper_text = {}, {}, [], False, None
     pipe.vs = pipe.ps = None
     pipe.root = FakePipe.root

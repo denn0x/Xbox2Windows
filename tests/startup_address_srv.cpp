@@ -99,6 +99,40 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     return 0;
 }
 
+// Exercise the same four columns twice. The fourth view deliberately names a 2D resource.
+int draw_1d_srvs(void* guest, void* list)
+{
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, 4, 1, 1, 1,
+        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    static std::array<std::array<unsigned char, 16>, 4> data;
+    void* resources[4]{};
+    for (unsigned i = 0; i < data.size(); ++i) {
+        auto shape = desc;
+        if (i == 3) shape.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        for (unsigned x = 0; x < 4; ++x) {
+            data[i][4*x] = static_cast<unsigned char>(7 + 3*x);
+            data[i][4*x+3] = static_cast<unsigned char>(24 + 48*i + 8*x);
+        }
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(data[i].data()), ptr(&shape),
+                    D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&resources[i]))))) return 41;
+    }
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    for (unsigned x = 0; x < 8; ++x) {
+        const unsigned i = x % 4;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = desc.Format;
+        view.ViewDimension = i == 3 ? D3D12_SRV_DIMENSION_TEXTURE2D : D3D12_SRV_DIMENSION_TEXTURE1D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture1D.MipLevels = 1;
+        invoke(guest, 18, ptr(resources[i]), i == 1 ? 0 : ptr(&view), cpu);
+        const D3D12_RECT strip{LONG(x), 0, LONG(x + 1), 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    }
+    return 0;
+}
+
 int draw_bc_address_srvs(void* guest, void* list)
 {
     wchar_t path[MAX_PATH]{};

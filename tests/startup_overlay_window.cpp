@@ -24,11 +24,21 @@ int main()
     if (!guest || x2w_startup::overlay_window() != guest) return 3;
     if (!SetWindowPos(output, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE) ||
         x2w_startup::overlay_window() != guest) return 4;
+    // With two guests the enumeration stops at the first match, so the upper one is selected
+    // in either order. Continuing to the end would select the lower one.
+    HWND second = make(L"STATIC", nullptr, true);
+    const auto raise = [](HWND hwnd) {
+        return SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+    };
+    if (!second || !raise(guest) || x2w_startup::overlay_window() != guest) return 6;
+    if (!raise(second) || x2w_startup::overlay_window() != second) return 7;
+    DestroyWindow(second);
     DestroyWindow(guest);
     if (x2w_startup::overlay_window()) return 5;
     DestroyWindow(owned);
     DestroyWindow(hidden);
     DestroyWindow(output);
-    std::puts("GDI overlay selected the guest below or above the presenter; no target after guest destruction");
+    std::puts("GDI overlay selected the guest below or above the presenter and the upper of two guests; "
+              "no target after guest destruction");
     return 0;
 }

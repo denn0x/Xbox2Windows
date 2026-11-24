@@ -198,6 +198,19 @@ class CommandLineTests(unittest.TestCase):
                         self.assertIn(archive.name, result.stderr)
                         self.assertNotIn("Traceback", result.stderr)
 
+    def test_replay_failure_is_reported_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "replay.bin"
+            archive.write_bytes(fixture(priorities=(9, 8)))
+            result = self.run_tool("script_path_replay.py", archive, "--host", root / "host.dll",
+                                   "--record-with", "synthetic_orbit", "a//b")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(archive.name, result.stderr)
+            self.assertIn("Expected one root states container", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(result.stdout, "")
+
     def test_non_ascii_state_label_is_reported_without_a_traceback(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "text.bin"

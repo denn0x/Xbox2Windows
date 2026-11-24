@@ -1,13 +1,15 @@
 // Checks src/startup_stubs/packed_target_format.h without a device, against adapters described
 // by their format-support bits.
-// --mutate stand-in | array | b565 | view: the helper's answer perturbed the way a wrong helper
+// --mutate stand-in | array | b565 | view | tag: the helper's answer perturbed the way a wrong helper
 // would answer (a stand-in in another format, arrays left alone as before, B5G6R5_UNORM left alone
-// as before, the view format of the stand-in kept packed); each must fail on the rows it concerns.
+// as before, the view format of the stand-in kept packed, the stand-in's tag read back as no tag);
+// each must fail on the rows it concerns.
 #include "startup_stubs/packed_target_format.h"
 
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <winerror.h>
 
 namespace {
 int failures, checks;
@@ -39,6 +41,89 @@ x2w_startup::PackedView packed_view(DXGI_FORMAT view_format, DXGI_FORMAT resourc
     if (!std::strcmp(mutation, "view") && got == x2w_startup::PackedView::stand_in) return x2w_startup::PackedView::unchanged;
     return got;
 }
+
+DXGI_FORMAT packed_stand_in_of(ID3D12Resource* resource)
+{
+    const DXGI_FORMAT got = x2w_startup::packed_stand_in_of(resource);
+    if (!std::strcmp(mutation, "tag")) return DXGI_FORMAT_UNKNOWN;
+    return got;
+}
+
+// A created texture as the tag helpers see it: its format and one private-data entry, which
+// GetPrivateData answers the way a D3D12 object does (the stored size, DXGI_ERROR_NOT_FOUND for
+// another GUID, DXGI_ERROR_MORE_DATA for a short buffer). Nothing else is called.
+class Texture final : public ID3D12Resource {
+public:
+    explicit Texture(DXGI_FORMAT format) : format_(format) {}
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override
+    {
+        if (!size) return E_INVALIDARG;
+        if (!stored_ || guid != guid_) {
+            *size = 0;
+            return DXGI_ERROR_NOT_FOUND;
+        }
+        if (!data) {
+            *size = bytes_;
+            return S_OK;
+        }
+        if (*size < bytes_) {
+            *size = bytes_;
+            return DXGI_ERROR_MORE_DATA;
+        }
+        std::memcpy(data, data_, bytes_);
+        *size = bytes_;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override
+    {
+        if (size > sizeof(data_) || (size && !data)) return E_INVALIDARG;
+        guid_ = guid;
+        bytes_ = size;
+        stored_ = true;
+        if (size) std::memcpy(data_, data, size);
+        return S_OK;
+    }
+    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override
+    {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = 64;
+        desc.Height = 64;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = format_;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        return desc;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override
+    {
+        if (out) *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void** out) override
+    {
+        if (out) *out = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE*, void**) override { return E_NOTIMPL; }
+    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return 0; }
+    HRESULT STDMETHODCALLTYPE WriteToSubresource(UINT, const D3D12_BOX*, const void*, UINT, UINT) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE ReadFromSubresource(void*, UINT, UINT, UINT, const D3D12_BOX*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS*) override { return E_NOTIMPL; }
+
+private:
+    DXGI_FORMAT format_;
+    GUID guid_{};
+    UINT bytes_ = 0;
+    bool stored_ = false;
+    unsigned char data_[16]{};
+};
 
 D3D12_RESOURCE_DESC texture(DXGI_FORMAT format, UINT flags, D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D)
 {
@@ -77,7 +162,7 @@ int main(int argc, char** argv)
 {
     if (argc == 3 && !std::strcmp(argv[1], "--mutate")) mutation = argv[2];
     else if (argc != 1) {
-        std::printf("usage: startup_packed_target_check [--mutate stand-in|array|b565|view]\n");
+        std::printf("usage: startup_packed_target_check [--mutate stand-in|array|b565|view|tag]\n");
         return 2;
     }
     const auto packed_target_stand_in = stand_in;
@@ -178,6 +263,34 @@ int main(int argc, char** argv)
     view("b5g6r5 view of the b5g5r5a1 stand-in", packed_view(b565, rgba, b5), PackedView::refused);
     view("b5g5r5a1 view of the b5g6r5 stand-in", packed_view(b5, rgba, b565), PackedView::refused);
     view("b5g6r5 view of a b5g5r5a1 texture", packed_view(b565, b5, plain), PackedView::refused);
+
+    // Provenance, as the view paths compose it: packed_view(view format, the texture's format,
+    // packed_stand_in_of(texture)). A texture created as R8G8B8A8_UNORM for a packed format reads
+    // back that packed format and its packed view becomes the stand-in; a texture created in the
+    // packed format itself carries no tag, so its own view is unchanged; an untagged R8G8B8A8_UNORM
+    // texture refuses the packed view.
+    for (const DXGI_FORMAT packed : {b5, b4, b565}) {
+        char name[64];
+        Texture stand_in_texture(rgba);
+        x2w_startup::mark_packed_stand_in(&stand_in_texture, packed);
+        std::snprintf(name, sizeof(name), "format %d stand-in tag", packed);
+        expect(name, packed_stand_in_of(&stand_in_texture), packed);
+        std::snprintf(name, sizeof(name), "format %d view of its tagged stand-in", packed);
+        view(name, packed_view(packed, stand_in_texture.GetDesc().Format, packed_stand_in_of(&stand_in_texture)), PackedView::stand_in);
+        Texture described(packed);
+        x2w_startup::mark_packed_stand_in(&described, packed);
+        std::snprintf(name, sizeof(name), "format %d texture created as described, tag", packed);
+        expect(name, packed_stand_in_of(&described), plain);
+        std::snprintf(name, sizeof(name), "format %d view of a texture created as described", packed);
+        view(name, packed_view(packed, described.GetDesc().Format, packed_stand_in_of(&described)), PackedView::unchanged);
+        Texture untagged(rgba);
+        std::snprintf(name, sizeof(name), "format %d view of an untagged rgba8 texture", packed);
+        view(name, packed_view(packed, untagged.GetDesc().Format, packed_stand_in_of(&untagged)), PackedView::refused);
+    }
+    Texture b4_stand_in(rgba);
+    x2w_startup::mark_packed_stand_in(&b4_stand_in, b4);
+    view("b5g5r5a1 view of the tagged b4g4r4a4 stand-in", packed_view(b5, b4_stand_in.GetDesc().Format, packed_stand_in_of(&b4_stand_in)),
+        PackedView::refused);
 
     if (failures) {
         std::printf("startup_packed_target: %d FAILED\n", failures);

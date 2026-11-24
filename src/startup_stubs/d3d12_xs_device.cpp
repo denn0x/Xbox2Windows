@@ -54,6 +54,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -1212,6 +1213,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // when the desktop GPU finishes, and the presented surface is read back and shown in the window.
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
+void reset_viewport_state(Wrapper* self);
 void discard_draw_sampler_heaps(Wrapper* self);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
@@ -1461,6 +1463,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     }
     if (SUCCEEDED(hr)) {
         self->own().list_ready = false;
+        reset_viewport_state(self);
         discard_draw_sampler_heaps(self);
         if (draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
     }
@@ -2098,6 +2101,13 @@ struct Pass {
     u64 compute_address[16] = {};
     std::uint32_t compute_constants[16][16] = {};
     UINT compute_count[16] = {};
+    // Whether the title set a viewport / scissor on this list; without them a desktop list draws no pixel.
+    bool viewport_set = false;
+    bool scissor_set = false;
+    // Size of the automatic full-target default already forwarded to the desktop list (0 = none yet). Kept apart from
+    // the title flags above so a later render target 0 of another size gets a fresh default.
+    UINT64 default_viewport_w = 0, default_scissor_w = 0;
+    UINT default_viewport_h = 0, default_scissor_h = 0;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 
@@ -2140,6 +2150,16 @@ void release_targets(Wrapper* self)
     pass = Pass{};
 }
 
+// A reset list starts without a viewport or scissor, whatever the previous recording set.
+void reset_viewport_state(Wrapper* self)
+{
+    if (!self->own().pass) return;
+    pass_of(self).viewport_set = false;
+    pass_of(self).scissor_set = false;
+    pass_of(self).default_viewport_w = pass_of(self).default_scissor_w = 0;
+    pass_of(self).default_viewport_h = pass_of(self).default_scissor_h = 0;
+}
+
 // List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list (no desktop draw yet).
 void __stdcall list_topology(Wrapper* self, UINT topology)
 {
@@ -2161,8 +2181,12 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
 void __stdcall list_graphics_root(Wrapper* self, void* root)
 {
     Wrapper* w = as_wrapper(root);
-    pass_of(self).root = w ? root_info(w) : nullptr;
-    pass_of(self).srv_bound = 0;
+    Pass& pass = pass_of(self);
+    const auto* params = w ? root_info(w) : nullptr;
+    if (pass.root != params)
+        std::fill_n(pass.root_address, 16, 0);
+    pass.root = params;
+    pass.srv_bound = 0;
     if (auto* list = recording(self); list && w && w->own().kind == root_signature_kind && w->own().real)
         list->SetGraphicsRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
 }
@@ -2283,13 +2307,18 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
 // List slots 21 / 22 / 23, RSSetViewports / RSSetScissorRects / OMSetBlendFactor.
 void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* viewports)
 {
-    if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports)))
+    // Only a viewport that is forwarded counts as set; a call with no viewports leaves the state as it was.
+    if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports))) {
         list->RSSetViewports(count, viewports);
+        pass_of(self).viewport_set = true;
+    }
 }
 void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
 {
-    if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects)))
+    if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects))) {
         list->RSSetScissorRects(count, rects);
+        pass_of(self).scissor_set = true;
+    }
 }
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 {
@@ -2404,6 +2433,24 @@ void summarise_indirect_calls()
         log("x2w-frame indirect group sig %p type %u stride %u path %d args %p: calls %d, unreadable %d, non-zero at record %d, at end %d, sample %08x %08x %08x %08x",
             std::get<0>(key), g.type, g.stride, std::get<1>(key), std::get<2>(key), g.calls, g.unreadable, g.nonzero_at_record,
             g.nonzero_at_end, g.sample[0], g.sample[1], g.sample[2], g.sample[3]);
+}
+// List slot 42 (desktop 38 + 4), SetGraphicsRootConstantBufferView(parameter, title GPU address).
+// A translated shader reads a root CBV through the same pointer source as a root SRV (root_address). Nothing
+// is forwarded to the desktop list and srv_bound is left alone: bit 0 means a vertex-fetch SRV is bound.
+void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
+{
+    auto* list = recording(self);
+    if (!list) return;
+    Pass& pass = pass_of(self);
+    if (!pass.root || parameter >= pass.root->size() || parameter >= 16) return;
+    const D3D12_ROOT_PARAMETER_TYPE type = (*pass.root)[parameter].type;
+    if (type != D3D12_ROOT_PARAMETER_TYPE_CBV) {
+        static LONG refused;
+        if (first_calls(refused, 1))
+            log("x2w-render root CBV %u ignored: the root signature declares parameter type %d", parameter, static_cast<int>(type));
+        return;
+    }
+    pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
 }
 extern LONG translated_draws, untranslated_draws, frame_number;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
@@ -4264,6 +4311,7 @@ void build_tables()
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
+        list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);

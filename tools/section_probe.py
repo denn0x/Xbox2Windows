@@ -77,10 +77,16 @@ def section_tag(value):
     return value
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    """Run the section probe CLI and return the process exit code."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archives", type=Path, nargs="+")
     parser.add_argument("--first", required=True, type=section_tag)
     parser.add_argument("--last", required=True, type=section_tag)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     print(json.dumps([inspect(p, args.first, args.last) for p in args.archives], indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

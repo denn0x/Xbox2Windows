@@ -34,7 +34,17 @@ DSTORAGE_OK_OUTCOMES = {
 }
 
 # Allowlists: the only values that may be copied from a log into the report.
-SLOT70_REASONS = {"unsupported_description", "destination_outside_view_heaps", "unreadable_resource"}
+# Every refusal reason src/startup_stubs/d3d12_memory_srv.inl can log, in the order of its checks.
+SLOT70_REASONS = {
+    "null_destination",
+    "unreadable_resource",
+    "unreadable_view",
+    "null_address",
+    "unsupported_description",
+    "destination_outside_view_heaps",
+    "buffer_unavailable",
+    "texture_unavailable",
+}
 DSTORAGE_FAIL_OUTCOMES = {
     "bcpack failed",
     "destination capacity exceeded",

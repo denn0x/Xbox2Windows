@@ -33,38 +33,82 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends llvm-15 spirv-tools spirv-cross
-          python3 -B tests/spirv_window/sampler.py spirv-as spirv-val spirv-cross
-          python3 -B tests/spirv_window/ballot.py spirv-as spirv-val spirv-cross
-          python3 -B tests/spirv_window/check.py
-          python3 -B tests/spirv_window/compare_sampler.py spirv-as spirv-val spirv-cross
-          python3 -B tests/sampled_coverage_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/pixel_sample_offset_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/pixel_compare_sample_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/pixel_compare_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/pixel_compare_gather_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/pixel_gather_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/compute_mimg_msaa_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/mesh_indexed_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/mesh_descriptor_swap_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/mesh_lit_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/pixel_get_lod_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/pixel_sample_gradient_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
-          python3 -B tests/mesh_shadow_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/ffx_dispatch_aot_check.py llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-          python3 -B tests/startup_sampler_heap_check.py binary llvm-mc-15
-          python3 -B tests/startup_image_sample_l_check.py binary llvm-mc-15
-          python3 -B tests/startup_image_sample_c_check.py binary llvm-mc-15
-          python3 -B tests/startup_image_3d_check.py binary llvm-mc-15
-          python3 -B tests/startup_image_load_mip_check.py --llvm-mc llvm-mc-15
-          python3 -B tests/startup_image_2d_array_check.py binary llvm-mc-15
-          python3 -B tests/startup_flat_param_check.py binary llvm-mc-15
-          python3 -B tests/startup_gfx2hlsl_bit_alu_check.py binary llvm-mc-15
-          python3 -B tests/startup_inline_sampler_check.py binary llvm-mc-15
-          LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 python3 -B tests/rdna2_tools_check.py
+          python3 -B - <<'PY'
+          import concurrent.futures
+          import os
+          import subprocess
+          import sys
+          import time
+
+          COMMON_LLVM = ["binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"]
+          SPIRV = ["spirv-as", "spirv-val", "spirv-cross"]
+          CHECKS = [
+              (["tests/compute_store_check.py", *COMMON_LLVM], {}),
+              (["tests/pixel_aot_check.py", *COMMON_LLVM], {}),
+              (["tests/sampled_coverage_check.py", *COMMON_LLVM], {}),
+              (["tests/pixel_compare_gather_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
+              (["tests/pixel_gather_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
+              (["tests/pixel_sample_gradient_check.py", *COMMON_LLVM, "llc-15"], {}),
+              (["tests/pixel_sample_gradient_check.py", "binary-coarse", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1", "llc-15"], {}),
+              (["tests/depth_mask_check.py", *COMMON_LLVM], {}),
+              (["tests/mesh_entry_check.py", *COMMON_LLVM], {}),
+              (["tests/rdna2_tools_check.py"], {"LLVM_LIB": "libLLVM-15.so.1", "LLVM_MC": "llvm-mc-15", "LLVM_OBJCOPY": "llvm-objcopy-15"}),
+              (["tests/ffx_dispatch_aot_check.py", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
+              (["tests/spirv_window/sampler.py", *SPIRV], {}),
+              (["tests/spirv_window/ballot.py", *SPIRV], {}),
+              (["tests/spirv_window/check.py"], {}),
+              (["tests/spirv_window/compare_sampler.py", *SPIRV], {}),
+              (["tests/pixel_sample_offset_check.py", *COMMON_LLVM], {}),
+              (["tests/pixel_compare_sample_check.py", *COMMON_LLVM], {}),
+              (["tests/pixel_compare_check.py", *COMMON_LLVM], {}),
+              (["tests/compute_mimg_msaa_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
+              (["tests/compute_mimg_float_store_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
+              (["tests/mesh_indexed_check.py", *COMMON_LLVM], {}),
+              (["tests/mesh_descriptor_swap_check.py", *COMMON_LLVM], {}),
+              (["tests/mesh_lit_check.py", *COMMON_LLVM], {}),
+              (["tests/pixel_get_lod_check.py", *COMMON_LLVM], {}),
+              (["tests/mesh_shadow_check.py", *COMMON_LLVM], {}),
+              (["tests/startup_sampler_heap_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_load_mip_check.py", "--llvm-mc", "llvm-mc-15"], {}),
+              (["tests/startup_image_2d_array_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_flat_param_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_bit_alu_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_inline_sampler_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
+          ]
+
+          def run_one(item):
+              cmd, extra_env = item
+              env = {**os.environ, **extra_env} if extra_env else None
+              start = time.monotonic()
+              proc = subprocess.run(
+                  [sys.executable, "-B", *cmd],
+                  env=env,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+                  errors="replace",
+              )
+              return cmd[0], proc.returncode, proc.stdout, time.monotonic() - start
+
+          failed = []
+          with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+              for script, code, output, secs in pool.map(run_one, CHECKS):
+                  print(f"::group::{script} ({'ok' if code == 0 else f'exit {code}'}, {secs:.1f}s)", flush=True)
+                  sys.stdout.write(output)
+                  if output and not output.endswith("\n"):
+                      sys.stdout.write("\n")
+                  print("::endgroup::", flush=True)
+                  if code != 0:
+                      failed.append(f"{script} (exit {code})")
+          if failed:
+              print("FAILED: " + ", ".join(failed), flush=True)
+              sys.exit(1)
+          print(f"all {len(CHECKS)} pixel-binary checks passed", flush=True)
+          PY
   python-linux:
     name: Run platform-independent Python checks on Linux
     runs-on: ubuntu-24.04
@@ -76,6 +120,8 @@ jobs:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'requirements-dev.txt'
       - name: Install fixture dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run Python checks
@@ -125,16 +171,22 @@ jobs:
             tests/startup_image_load_mip_check.py \
             tests/startup_image_2d_array_check.py \
             tests/startup_host_cpu_check.py \
+            tests/startup_gfx2hlsl_capture_check.py \
             tests/startup_translator_check.py \
+            tests/startup_gfx2hlsl_smem_offset_check.py \
             tests/startup_triage_run_check.py \
+            tests/startup_run_ps1_check.py \
             tests/startup_flat_param_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_inline_sampler_check.py \
+            tests/compute_entry_layout_check.py \
             tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
     timeout-minutes: 20
+    env:
+      SCCACHE_CACHE_SIZE: '2G'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -142,6 +194,8 @@ jobs:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'requirements-dev.txt'
           architecture: x64
       - name: Install fixture dependencies
         shell: pwsh
@@ -155,6 +209,7 @@ jobs:
         run: |
           .\tools\dev.ps1
           "msvc=$env:VCToolsVersion" >> $env:GITHUB_OUTPUT
+          "SCCACHE_DIR=$($env:RUNNER_TEMP)\sccache" >> $env:GITHUB_ENV
       - name: Restore the pinned SPIR-V tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -163,21 +218,34 @@ jobs:
       - name: Build the pinned SPIR-V tools
         shell: pwsh
         run: .\tools\setup-spirv-tools.ps1
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Restore compiler cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ github.event_name == 'pull_request' && 'pr' || 'dev' }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ github.event_name == 'pull_request' && 'pr' || 'dev' }}-
+            sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-dev-
       - name: Configure, build and run PC tests
         shell: pwsh
         env:
           X2W_REQUIRE_SPIRV_TOOLS: '1'
+          X2W_USE_SCCACHE: '1'
         run: |
           .\tools\dev.ps1
-          cmake --preset dev
+          cmake --preset dev @X2wSccacheCmakeArgs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
             cmake --build --preset pr
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
             ctest --preset pr --no-tests=error --output-junit "$PWD/out/test-results.xml"
           } else {
             cmake --build --preset dev
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
             ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
           }
           exit $LASTEXITCODE
@@ -219,6 +287,8 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: windows-2025
     timeout-minutes: 20
+    env:
+      SCCACHE_CACHE_SIZE: '2G'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -226,6 +296,8 @@ jobs:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'requirements-dev.txt'
           architecture: x64
       - name: Install fixture dependencies
         shell: pwsh
@@ -239,6 +311,7 @@ jobs:
         run: |
           .\tools\dev.ps1
           "msvc=$env:VCToolsVersion" >> $env:GITHUB_OUTPUT
+          "SCCACHE_DIR=$($env:RUNNER_TEMP)\sccache" >> $env:GITHUB_ENV
       - name: Restore the pinned SPIR-V tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -247,16 +320,27 @@ jobs:
       - name: Build the pinned SPIR-V tools
         shell: pwsh
         run: .\tools\setup-spirv-tools.ps1
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Restore compiler cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-release-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', 'cmake/**', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.inc', '**/*.inl', '**/*.asm') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-release-
       - name: Configure, build and run PC tests at /O2
         shell: pwsh
         env:
           X2W_REQUIRE_SPIRV_TOOLS: '1'
+          X2W_USE_SCCACHE: '1'
         run: |
           .\tools\dev.ps1
-          cmake --preset release
+          cmake --preset release @X2wSccacheCmakeArgs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build --preset release
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
           ctest --preset release --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results-release.xml"
       - name: Require the SPIR-V bridge WARP tests at /O2
         if: ${{ !cancelled() }}

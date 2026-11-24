@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 from compute_store_check import assemble
-from pixel_aot_check import envelope, pixel_aot, translate, write_record
+from pixel_aot_check import envelope, lower, pixel_aot, translate, write_record
 from pixel_sample_lod_check import base_prefix, compile_ps, export_tail
 from pixel_sample_offset_check import draw, ramp_case, reject
 
@@ -20,6 +20,7 @@ FORMS = {
     "image_sample_d_g16": (6, 9),
     "image_sample_d_o_g16": (5, 9),
 }
+COARSE_FORMS = {op.replace("sample_d", "sample_cd"): shape for op, shape in FORMS.items()}
 ZERO = ("0", "0", "0", "0")
 HORIZONTAL_V = ("0", "-0.25", "0", "0")
 VERTICAL_U = ("0", "0", "0.25", "0")
@@ -28,7 +29,7 @@ WAVE64 = "+wavefrontsize64,-wavefrontsize32"
 
 
 def program(op, gradients, *, offset="0x3e01", entry_uv=False):
-    first, last = FORMS[op]
+    first, last = (COARSE_FORMS if op in COARSE_FORMS else FORMS)[op]
     g16 = op.endswith("_g16")
     has_offset = "_o" in op
     body = [f"v_mov_b32_e32 v{first}, {offset}"] if has_offset else []
@@ -43,6 +44,32 @@ def program(op, gradients, *, offset="0x3e01", entry_uv=False):
     if entry_uv:
         prefix = [line for line in prefix if "exec" not in line]
     return prefix + body + export_tail()
+
+
+def translate_coarse(lines):
+    return lower(lines, 20, 24, [1, 2, 3, 4], constant_descriptor=64, cpu="gfx1030")
+
+
+def check_coarse_lowering():
+    distinct = ("0.125", "-0.25", "0.5", "1.0")
+    for op, (first, _) in COARSE_FORMS.items():
+        lines = program(op, distinct, entry_uv=True)
+        plain = [line.replace("image_sample_cd", "image_sample_d") for line in lines]
+        assert translate_coarse(lines) == translate(plain), op
+        first_gradient = first + ("_o" in op)
+        prefix = f"v_mov_b32_e32 v{first_gradient}, "
+        bad_word = "0x7c003000" if op.endswith("_g16") else "0x7f800000"
+        for replacement, reason in ((f"{prefix}s60", "statically known"), (prefix + bad_word, "finite slopes")):
+            loads = ["s_load_dwordx4 s[44:47], s[20:21], 0x40", "s_waitcnt lgkmcnt(0)",
+                     "s_buffer_load_dwordx4 s[60:63], s[44:47], null", "s_waitcnt lgkmcnt(0)"]
+            edited = [item for line in lines for item in
+                      (loads + [replacement] if line.startswith(prefix) else [line])]
+            try:
+                translate_coarse(edited)
+            except ValueError as error:
+                assert reason in str(error), (op, error)
+            else:
+                raise AssertionError((op, reason))
 
 
 def check_lowering():
@@ -74,7 +101,7 @@ def check_lowering():
         ("SQ_RSRC_IMG_2D", "SQ_RSRC_IMG_3D", "Unsupported instruction"),
         ("SQ_RSRC_IMG_2D", "SQ_RSRC_IMG_2D a16", "Unsupported instruction"),
         ("SQ_RSRC_IMG_2D", "SQ_RSRC_IMG_2D d16", "Unsupported instruction"),
-        ("image_sample_d ", "image_sample_cd ", "Unsupported instruction"),
+        ("image_sample_d ", "image_sample_cd ", "requires gfx1030"),
         ("image_sample_d ", "image_sample_d_cl ", "Unsupported instruction"),
         ("image_sample_d ", "image_sample_c_d ", "Unsupported instruction"),
     ):
@@ -115,15 +142,17 @@ define amdgpu_ps <4 x float> @gradient_order(<8 x i32> inreg %r, <4 x i32> inreg
     assert f"v_mov_b32_e32 v{first + 1}, 0x3c003800" in asm, asm
 
 
-def check_binary(directory, assembler, objcopy, library, llc):
+def check_binary(directory, assembler, objcopy, library, llc, *, coarse=False):
     check_g16_codegen(directory, llc)
-    for op in FORMS:
+    forms = COARSE_FORMS if coarse else FORMS
+    translate_program = translate_coarse if coarse else translate
+    for op in forms:
         lines = program(op, ("0", "-0.5", "0", "0"), entry_uv=True)
         assembly = lines
         if not op.endswith("_g16"):
             # The assembler takes the eight-VGPR tuple spelling. The decoded
             # instruction lists the six or seven active VGPRs from the same encoding.
-            first, last = FORMS[op]
+            first, last = forms[op]
             assembly = [line.replace(f"v[{first}:{last}]", f"v[{first}:{first + 7}]")
                         if line.startswith(f"{op} ") else line for line in lines]
         code = assemble(directory, assembler, objcopy, assembly, cpu="gfx1030", features=WAVE64)
@@ -131,8 +160,8 @@ def check_binary(directory, assembler, objcopy, library, llc):
         assert [line for _, line in decoded if line.startswith("image_")] == [
             line for line in lines if line.startswith("image_")
         ]
-        expected = translate(lines)
-        assert translate(decoded) == expected
+        expected = translate_program(lines)
+        assert translate_program(decoded) == expected
         archive = directory / "fixture.bin"
         archive.write_bytes(envelope(code))
         output = directory / "fixture.hlsl"
@@ -143,25 +172,27 @@ def check_binary(directory, assembler, objcopy, library, llc):
         assert output.read_text(encoding="utf-8") == expected
 
 
-def check_draw(directory, compiler, renderer=None, adapter=None):
+def check_draw(directory, compiler, renderer=None, adapter=None, *, coarse=False):
+    forms = COARSE_FORMS if coarse else FORMS
+    translate_program = translate_coarse if coarse else translate
     # On the 8x8 texture either nonzero slope gives a two-texel footprint
     # and selects the green mip. Implicit derivatives and zero slopes give mip zero.
-    for op in FORMS:
+    for op in forms:
         for label, gradients in (("horizontal_v", HORIZONTAL_V), ("vertical_u", VERTICAL_U), ("zero", ZERO)):
-            shader = compile_ps(compiler, translate(program(op, gradients, entry_uv=True)), directory, f"{op}_{label}")
+            shader = compile_ps(compiler, translate_program(program(op, gradients, entry_uv=True)), directory, f"{op}_{label}")
             if renderer is not None:
                 draw(renderer, adapter, "--check-pixel-quad-lod", shader, mismatch=label == "zero")
         # A four-texel footprint selects blue mip 2 of a four-mip texture
         # across the full viewport, including pixels outside the partial quad above.
-        shader = compile_ps(compiler, translate(program(op, MIP_TWO, entry_uv=True)), directory, f"{op}_mip_two")
+        shader = compile_ps(compiler, translate_program(program(op, MIP_TWO, entry_uv=True)), directory, f"{op}_mip_two")
         if renderer is not None:
             draw(renderer, adapter, "--check-pixel-mip-clamp", shader, "2")
     # Offsets must survive the SampleGrad lowering. Exercise both axes and clamp on a spatial ramp.
     case = directory / "gradient-offset.case"
     case.write_bytes(ramp_case(1, -2))
-    for op in ("image_sample_d_o", "image_sample_d_o_g16"):
+    for op in (op for op in forms if "_o" in op):
         for offset in ("0x3e01", "0"):
-            shader = compile_ps(compiler, translate(program(op, ZERO, offset=offset, entry_uv=True)),
+            shader = compile_ps(compiler, translate_program(program(op, ZERO, offset=offset, entry_uv=True)),
                                 directory, f"{op}_ramp_{offset}")
             if renderer is not None:
                 draw(renderer, adapter, "--check-pixel-case", shader, case, mismatch=offset == "0")
@@ -173,8 +204,13 @@ if __name__ == "__main__":
     check_lowering()
     if len(sys.argv) > 1:
         mode, *args = sys.argv[1:]
+        coarse = mode.endswith("-coarse")
+        mode = mode.removesuffix("-coarse")
+        if coarse:
+            check_coarse_lowering()
         out = Path(__file__).resolve().parents[1] / "out"
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="sample-grad-", dir=out) as tmp:
-            {"binary": check_binary, "compile": check_draw, "draw": check_draw}[mode](Path(tmp), *args)
-    print("Four 2D explicit-gradient sample forms checked")
+            {"binary": check_binary, "compile": check_draw, "draw": check_draw}[mode](Path(tmp), *args, coarse=coarse)
+    print("Four 2D coarse-gradient sample forms checked" if len(sys.argv) > 1 and coarse
+          else "Four 2D explicit-gradient sample forms checked")

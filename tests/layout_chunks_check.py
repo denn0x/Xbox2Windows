@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Check the per-chunk layout summary emitted by verify_build.compare_layout."""
 
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "tools"))
 
-from verify_build import compare_layout, decode_torrent
+from resource_inventory import main as resource_inventory_main
+from verify_build import compare_layout, decode_torrent, main as verify_build_main
 
 LAYOUT = r"""<?xml version="1.0" encoding="utf-8"?>
 <Package>
@@ -53,6 +57,30 @@ def main():
     print("layout chunk summary ok")
 
 
+def _run_cli(main_fn, argv, prog):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    saved_argv = sys.argv
+    sys.argv = [prog, *argv]
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = main_fn(argv)
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            returncode = 0
+        elif isinstance(code, int):
+            returncode = int(code)
+        else:
+            stderr.write(f"{code}\n")
+            returncode = 1
+    else:
+        returncode = 0 if result is None else int(result)
+    finally:
+        sys.argv = saved_argv
+    return SimpleNamespace(returncode=returncode, stdout=stdout.getvalue(), stderr=stderr.getvalue())
+
+
 def check_unreadable_torrent_is_a_usage_error() -> None:
     single_file = (b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:" + bytes(20) + b"ee")
     for label, torrent in (
@@ -71,9 +99,10 @@ def check_unreadable_torrent_is_a_usage_error() -> None:
             (package / "layout.xml").write_text("<Package/>", encoding="utf-8")
             (package / "payload.torrent").write_bytes(torrent)
             report = Path(directory) / "report.json"
-            run = subprocess.run(
-                [sys.executable, "-B", str(PROJECT / "tools/verify_build.py"), str(package), "--output", str(report)],
-                capture_output=True, text=True,
+            run = _run_cli(
+                verify_build_main,
+                [str(package), "--output", str(report)],
+                "verify_build.py",
             )
             assert run.returncode == 2, (label, run.returncode, run.stderr)
             assert "payload.torrent" in run.stderr and "Traceback" not in run.stderr, (label, run.stderr)
@@ -101,9 +130,10 @@ def check_manifest_selection() -> None:
             for name in files:
                 (package / name).touch()
             report = Path(directory) / "report.json"
-            run = subprocess.run(
-                [sys.executable, "-B", str(PROJECT / "tools/verify_build.py"), str(package), "--output", str(report)],
-                capture_output=True, text=True,
+            run = _run_cli(
+                verify_build_main,
+                [str(package), "--output", str(report)],
+                "verify_build.py",
             )
             assert run.returncode == 2, run.stderr
             assert pattern in run.stderr and f"found {count}" in run.stderr, run.stderr
@@ -111,19 +141,26 @@ def check_manifest_selection() -> None:
 
 
 def check_inventory_layout_selection() -> None:
-    for files, count in (
-        ([], 0),
-        (["layout_a.xml", "layout_b.xml"], 2),
+    for use_subprocess, files, count in (
+        (True, [], 0),
+        (False, ["layout_a.xml", "layout_b.xml"], 2),
     ):
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory)
             (package / "layout_directory.xml").mkdir()
             for name in files:
                 (package / name).touch()
-            run = subprocess.run(
-                [sys.executable, "-B", str(PROJECT / "tools/resource_inventory.py"), str(package)],
-                capture_output=True, text=True,
-            )
+            if use_subprocess:
+                run = subprocess.run(
+                    [sys.executable, "-B", str(PROJECT / "tools/resource_inventory.py"), str(package)],
+                    capture_output=True, text=True,
+                )
+            else:
+                run = _run_cli(
+                    resource_inventory_main,
+                    [str(package)],
+                    "resource_inventory.py",
+                )
             assert run.returncode == 2, run.stderr
             assert "layout*.xml" in run.stderr and f"found {count}" in run.stderr, run.stderr
             assert "Traceback" not in run.stderr, run.stderr

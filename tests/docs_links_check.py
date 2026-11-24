@@ -139,7 +139,8 @@ def link_error(root, source, target, headings, tracked=None):
             return "trailing slash on a file"
     elif not linked.is_file():
         return "file does not exist"
-    if fragment and (not path or linked.suffix.lower() == ".md"):
+    # An empty fragment points to the top of the document, not to a named heading.
+    if anchor and (not path or linked.suffix.lower() == ".md"):
         if linked not in headings:
             headings[linked] = heading_slugs(markdown_lines(linked.read_text(encoding="utf-8-sig")))
         if unquote(anchor) not in headings[linked]:
@@ -207,12 +208,16 @@ def self_test():
         (root / "docs").mkdir()
         (root / "docs" / "Guide.md").write_text("# Guide\n", encoding="utf-8")
         (root / "links.md").write_text(
-            "[case](docs/guide.md)\n[dir](docs/)\n[ok](docs/Guide.md#guide)\n[frag](docs/#guide)\n",
+            "[case](docs/guide.md)\n[dir](docs/)\n[ok](docs/Guide.md#guide)\n[frag](docs/#guide)\n"
+            "[guide top](docs/Guide.md#)\n[this top](#)\n"
+            "[bad heading](docs/Guide.md#absent)\n[untracked](sample.md#)\n",
             encoding="utf-8")
         tracked = {Path("links.md"), Path("docs/Guide.md")}
         assert check_links(root, [Path("links.md")], tracked) == (
-            4, ["links.md:1: docs/guide.md (file is not tracked (check the case of the path))",
-                "links.md:4: docs/#guide (fragment on a directory)"],
+            8, ["links.md:1: docs/guide.md (file is not tracked (check the case of the path))",
+                "links.md:4: docs/#guide (fragment on a directory)",
+                "links.md:7: docs/Guide.md#absent (heading does not exist)",
+                "links.md:8: sample.md# (file is not tracked (check the case of the path))"],
         )
         # A backslash is not a separator on GitHub or Linux, so it fails everywhere; a slash
         # after a file fails, while the same slash after a tracked directory is the control.

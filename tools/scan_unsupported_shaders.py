@@ -337,7 +337,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
     "s_getreg_b32", "s_setreg_b32", "s_setreg_imm32_b32", "s_version",
     # VOP1
-    "v_nop", "v_mov_b32", "v_swap_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
+    "v_nop", "v_mov_b32", "v_swap_b32", "v_swaprel_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",
     "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbl_b32", "v_ffbh_i32", "v_rcp_iflag_f32",
     "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",

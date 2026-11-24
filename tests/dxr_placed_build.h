@@ -15,9 +15,12 @@ class PlacedBuildScene {
         ~Buffer() { wrapper.Reset(); if (memory) VirtualFree(memory, 0, MEM_RELEASE); }
     };
     Microsoft::WRL::ComPtr<IUnknown> guest_;
-    std::array<Buffer, 5> buffers_;
+    std::array<Buffer, 7> buffers_;
 
 public:
+    // Wrong-routing control (issue #874): also build a decoy BLAS from another triangle into its own placed
+    // destination and scratch, and route the TLAS instance to the decoy instead of the BLAS under test.
+    bool misroute = false;
     void attach(ID3D12Device* device) {
         device->AddRef();
         x2w_startup::attach_device(device, reinterpret_cast<void**>(guest_.GetAddressOf()));
@@ -91,6 +94,17 @@ public:
         std::printf("Placed DXR bytes dest/scratch: BLAS=%llu/%llu TLAS=%llu/%llu; short scratch, missing dest and swapped states rejected before recording\n",
             bottom_size.ResultDataMaxSizeInBytes, bottom_size.ScratchDataSizeInBytes,
             top_size.ResultDataMaxSizeInBytes, top_size.ScratchDataSizeInBytes);
+    }
+
+    // The decoy BLAS for the wrong-routing control, placed and resolved through the same slot-133 path.
+    void prepare_decoy(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& bottom_size,
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& decoy) {
+        constexpr UINT64 dest_offset = 512, scratch_offset = 768;
+        const auto dest = place(5, dest_offset + bottom_size.ResultDataMaxSizeInBytes,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) + dest_offset;
+        const auto scratch = place(6, scratch_offset + bottom_size.ScratchDataSizeInBytes,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS) + scratch_offset;
+        check(x2w_startup::resolve_placed_build(guest_.Get(), dest, scratch, bottom_size, decoy), "Resolve decoy BLAS");
     }
 };
 

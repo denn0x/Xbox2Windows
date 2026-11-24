@@ -98,6 +98,28 @@ def format_fast_fail_diagnostic(exit_code, elapsed, trap_log, env):
             f"check trap log={trap_log}, X2W_STORAGE_PATH={storage}, X2W_SHADER_CACHE={shader_cache}")
 
 
+def quote_argument(argument):
+    """Quote one argument for CreateProcessW the way the C runtime and CommandLineToArgvW read it.
+
+    Backslashes only matter before a double quote: a run of them that ends the argument, or sits
+    before an embedded quote, is doubled (and the quote itself escaped), so a path such as
+    D:\\saves\\ does not swallow the closing quote.
+    """
+    pieces = ['"']
+    backslashes = 0
+    for char in argument:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == '"':
+            pieces.append("\\" * (2 * backslashes + 1) + '"')
+        else:
+            pieces.append("\\" * backslashes + char)
+        backslashes = 0
+    pieces.append("\\" * (2 * backslashes) + '"')
+    return "".join(pieces)
+
+
 def inheritable_file(path):
     sa = SECURITY_ATTRIBUTES(ctypes.sizeof(SECURITY_ATTRIBUTES), None, True)
     h = k32.CreateFileW(path, 0x40000000, 1 | 2, ctypes.byref(sa), 2, 0x80, None)  # GENERIC_WRITE, CREATE_ALWAYS
@@ -147,7 +169,7 @@ def main():
     if shader_warning:
         print(shader_warning)
     block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
-    cmdline = ctypes.create_unicode_buffer(" ".join(f'"{a}"' for a in [exe, *extra]))
+    cmdline = ctypes.create_unicode_buffer(" ".join(quote_argument(a) for a in [exe, *extra]))
     pi = PROCESS_INFORMATION()
     flags = 0x4 | 0x400  # CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
     if not k32.CreateProcessW(exe, cmdline, None, None, True, flags, ctypes.create_unicode_buffer(block),

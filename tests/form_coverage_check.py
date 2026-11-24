@@ -13,6 +13,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import form_coverage as fc
 import form_reference as fr
 
+_CONTROLS_ACCEPTED = None
+
+
+def _controls_accepted():
+    """Run pixel_aot_check.check_controls once per process and restore its ACCEPTED set."""
+    global _CONTROLS_ACCEPTED
+    import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
+    if _CONTROLS_ACCEPTED is None:
+        pixel.ACCEPTED.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            pixel.check_controls(Path(tmp))
+        _CONTROLS_ACCEPTED = frozenset(pixel.ACCEPTED)
+    else:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(_CONTROLS_ACCEPTED)
+    return pixel.ACCEPTED
+
 ENCODINGS = {"DPP16", "DPP8", "DS", "EXP", "FLAT", "MIMG", "MTBUF", "MUBUF", "SDWA", "SMEM", "SOP1", "SOP2",
              "SOPC", "SOPK", "SOPP", "VINTRP", "VOP1", "VOP2", "VOP3", "VOP3P", "VOPC"}
 
@@ -251,13 +268,12 @@ def check_shader_records():
         os.utime(record, (now - 3600, now - 3600))
         assert fc.read_records(record.parent, (now - 60, now + 60)) == {}
     # The same holds in the real controls. The scheduling-hint fixtures translate programs with s_nop
-    # and the hints, so those forms are recorded; s_branch reaches only must_reject and stays out.
+    # and the hints, so those forms are recorded; s_code_end reaches only rejections and stays out. Since
+    # issue #1413 stage 2, s_branch is recorded as the terminal branch of a uniform if/else diamond.
     assert ("SOPP", "s_branch") in gfx
-    pixel.ACCEPTED.clear()
-    with tempfile.TemporaryDirectory() as tmp:
-        pixel.check_controls(Path(tmp))
+    _controls_accepted()
     assert {"s_nop", "s_clause", "s_setprio", "s_sleep", "image_sample"} <= pixel.ACCEPTED
-    assert "s_branch" not in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
+    assert "s_branch" in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
     # The mode-register fixture records the immediate write; the register forms reach only rejections.
     assert ("SOPK", "s_setreg_imm32_b32") in gfx and "s_setreg_imm32_b32" in pixel.ACCEPTED
     assert not {"s_setreg_b32", "s_getreg_b32"} & pixel.ACCEPTED
@@ -278,8 +294,8 @@ def check_shader_records():
         assert shift64_forms <= fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name)), name
     masked_forms = {("SOP1", "s_and_saveexec_b64"), ("SOPP", "s_cbranch_execz")}
     assert masked_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
-    # Forward skips on a tracked scalar compare (issue #1413).
-    scc_skip_forms = {("SOPP", "s_cbranch_scc0"), ("SOPP", "s_cbranch_scc1")}
+    # Forward skips and if/else diamonds on a tracked scalar compare (issue #1413).
+    scc_skip_forms = {("SOPP", "s_cbranch_scc0"), ("SOPP", "s_cbranch_scc1"), ("SOPP", "s_branch")}
     assert scc_skip_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
     scalar64_forms = {
         ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),
@@ -330,6 +346,10 @@ def check_shader_records():
     # The binary32 to binary64 conversion of a statically known source: VOP1 in its plain and _e32 spellings, and the
     # VOP3 (_e64) spelling LLVM 15 prints for a source modifier.
     cvt_f64_f32_forms = {("VOP1", "v_cvt_f64_f32"), ("VOP3", "v_cvt_f64_f32_e64")}
+    # The conversions back from a binary64 pair of proven provenance: VOP1 in their plain and _e32 spellings only; the
+    # VOP3 (_e64) forms are refused.
+    cvt_int_f64_forms = {("VOP1", "v_cvt_i32_f64"), ("VOP1", "v_cvt_u32_f64")}
+    cvt_int_f64_rejected = {("VOP3", "v_cvt_i32_f64_e64"), ("VOP3", "v_cvt_u32_f64_e64")}
     mul24_forms = {
         ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
         ("VOP2", "v_mul_u32_u24"), ("VOP3", "v_mul_u32_u24_e64"),
@@ -375,6 +395,8 @@ def check_shader_records():
         assert mad64_forms <= covered, (name, mad64_forms - covered)
         assert cvt_f64_int_forms <= covered, (name, cvt_f64_int_forms - covered)
         assert cvt_f64_f32_forms <= covered, (name, cvt_f64_f32_forms - covered)
+        assert cvt_int_f64_forms <= covered, (name, cvt_int_f64_forms - covered)
+        assert not cvt_int_f64_rejected & covered, (name, cvt_int_f64_rejected & covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)
@@ -493,21 +515,25 @@ def check_plain_bitscan_forms():
     """The two plain bitscan fixtures cover VOP1 v_bfrev_b32, v_ffbh_u32, v_ffbh_i32, v_ffbl_b32 and VOP2
     v_xnor_b32 in both reference lists; a form neither fixture uses stays uncovered."""
     import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
     wanted = {("VOP1", "v_bfrev_b32"), ("VOP1", "v_ffbh_u32"), ("VOP1", "v_ffbh_i32"), ("VOP1", "v_ffbl_b32"),
               ("VOP2", "v_xnor_b32")}
     e64 = {("VOP3", "v_bfrev_b32_e64"), ("VOP3", "v_ffbh_u32_e64"), ("VOP3", "v_xnor_b32_e64")}
     untouched = {("VOP3", "v_ffbl_b32_e64"), ("VOP3", "v_ffbh_i32_e64")}
-    for name in ("gfx1013.tsv", "rdna2.tsv"):
-        reference = fc.load_reference(name)
-        assert wanted | e64 | untouched <= reference, name
+    try:
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert wanted | e64 | untouched <= reference, name
+            pixel.ACCEPTED.clear()
+            assert not wanted & fc.gfx_forms(pixel.ACCEPTED, reference)  # nothing lowered, nothing covered
+            for second in (False, True):
+                pixel.translate_int(pixel.plain_bitscan_ops(second))
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert wanted | e64 <= covered, (name, sorted((wanted | e64) - covered))
+            assert not untouched & covered, name
+    finally:
         pixel.ACCEPTED.clear()
-        assert not wanted & fc.gfx_forms(pixel.ACCEPTED, reference)  # nothing lowered, nothing covered
-        for second in (False, True):
-            pixel.translate_int(pixel.plain_bitscan_ops(second))
-        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
-        assert wanted | e64 <= covered, (name, sorted((wanted | e64) - covered))
-        assert not untouched & covered, name
-    pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
 
 
 
@@ -1246,9 +1272,7 @@ def check_swap_coverage():
     """v_swap_b32 is VOP1 in both references and counts as covered only through the accepted spelling.
     The _e64, DPP and SDWA spellings reach only rejections, and the neighbouring v_swaprel_b32 stays uncovered."""
     import pixel_aot_check as pixel
-    pixel.ACCEPTED.clear()
-    with tempfile.TemporaryDirectory() as tmp:
-        pixel.check_controls(Path(tmp))
+    _controls_accepted()
     assert "v_swap_b32" in pixel.ACCEPTED
     assert not {"v_swap_b32_e64", "v_swap_b32_dpp", "v_swap_b32_sdwa", "v_swaprel_b32"} & pixel.ACCEPTED
     for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -1265,9 +1289,7 @@ def check_pk_fmac_coverage():
     """v_pk_fmac_f16 is VOP2 in both references and counts as covered only through the accepted VOP2 spelling.
     The _e64, DPP and SDWA spellings reach only rejections."""
     import pixel_aot_check as pixel
-    pixel.ACCEPTED.clear()
-    with tempfile.TemporaryDirectory() as tmp:
-        pixel.check_controls(Path(tmp))
+    _controls_accepted()
     assert "v_pk_fmac_f16" in pixel.ACCEPTED
     assert not {"v_pk_fmac_f16_e64", "v_pk_fmac_f16_dpp", "v_pk_fmac_f16_sdwa"} & pixel.ACCEPTED
     for name in ("gfx1013.tsv", "rdna2.tsv"):

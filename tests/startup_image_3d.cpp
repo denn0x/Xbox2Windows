@@ -69,7 +69,7 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const char* sample
 // view of a two-slice texture is a Texture2DArray over both. levels (array only, 1 or 3): the array is
 // 4x4 with that many mip levels, and the default view spans all of them.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4], const char* sampler_line, bool array, UINT levels)
+                            float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional)
 {
     if (levels < 1 || levels > max_levels || (levels > 1 && !array))
         throw std::runtime_error("Unsupported image mip level count");
@@ -95,10 +95,10 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image 3D PSO");
 
     D3D12_RESOURCE_DESC td{};
-    td.Dimension = array ? D3D12_RESOURCE_DIMENSION_TEXTURE2D : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    td.Dimension = one_dimensional ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : array ? D3D12_RESOURCE_DIMENSION_TEXTURE2D : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     td.Width = base;
-    td.Height = base;
-    td.DepthOrArraySize = side;
+    td.Height = one_dimensional ? 1 : base;
+    td.DepthOrArraySize = one_dimensional ? 1 : side;
     td.MipLevels = levels;
     td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
@@ -116,14 +116,15 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     check(upload->Map(0, &none, &mapped), "Map image 3D texels");
     auto* const start = static_cast<std::uint8_t*>(mapped);
     const UINT slice_pitch = footprint.Footprint.RowPitch * footprint.Footprint.Height;
-    for (UINT tz = 0; tz < side; ++tz)
+    for (UINT tz = 0; tz < td.DepthOrArraySize; ++tz)
         for (UINT level = 0; level < levels; ++level) {
             const UINT extent = base >> level;
             const auto& place = array ? footprints[level + tz * levels] : footprint;
-            for (UINT ty = 0; ty < extent; ++ty)
+            for (UINT ty = 0; ty < (one_dimensional ? 1u : extent); ++ty)
                 for (UINT tx = 0; tx < extent; ++tx) {
                     float texel[4];
                     texel_value(tx, ty, tz, level, levels, texel);
+                    if (one_dimensional) texel[3] = tx ? 0.75f : 0.5f;
                     auto* const slice = array ? start + place.Offset : start + place.Offset + tz * slice_pitch;
                     std::memcpy(slice + ty * place.Footprint.RowPitch + tx * sizeof(texel), texel, sizeof(texel));
                 }

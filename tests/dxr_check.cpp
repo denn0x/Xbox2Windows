@@ -282,6 +282,14 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
             }
         }
     }
+    const bool decoy = placedScene && placedScene->misroute;
+    if (decoy) {
+        // A triangle 4 units right of the scene's, so the first ray misses whatever routes to it.
+        otherVertices = bvh_fixture::upload(device, std::vector<Vertex>{{3,-1,1}, {5,-1,1}, {4,1,1}});
+        otherGeometry.Triangles.VertexBuffer.StartAddress = otherVertices->GetGPUVirtualAddress();
+        otherBuild.Inputs.pGeometryDescs = &otherGeometry;
+        placedScene->prepare_decoy(bottom_size, otherBuild);
+    }
     if (addressScene && addressScene->route != AddressScene::Route::direct) {
         era_title_va::Table ranges;
         if (!ranges.add(lowTitle, blasBytes, blas->GetGPUVirtualAddress()) ||
@@ -302,7 +310,8 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
             if (!desc.AccelerationStructure) throw std::runtime_error("Unmapped fixture BLAS");
         }
     } else if (!addressScene) {
-        for (auto& desc : instances) desc.AccelerationStructure = bottom.DestAccelerationStructureData;
+        const UINT64 target = decoy ? otherBuild.DestAccelerationStructureData : bottom.DestAccelerationStructureData;
+        for (auto& desc : instances) desc.AccelerationStructure = target;
     }
     auto instanceBuffer = bvh_fixture::upload(device, instances);
     top.Inputs.InstanceDescs = instanceBuffer->GetGPUVirtualAddress();
@@ -343,7 +352,7 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     list->BuildRaytracingAccelerationStructure(&bottom, 0, nullptr);
     if (counts) ++counts->records;
     list->ResourceBarrier(1, &order);
-    if (addressScene) {
+    if (addressScene || decoy) {
         list->BuildRaytracingAccelerationStructure(&otherBuild, 0, nullptr);
         list->ResourceBarrier(1, &order);
     }
@@ -483,23 +492,40 @@ bool check_dxr_placed_build(ID3D12Device* device) {
     if (!supported(device, Backend::pipeline)) return false;
     PlacedBuildScene placement;
     const auto output = trace_placed_triangle(device, nullptr, &placement);
-    const std::vector<bvh_fixture::Word> expected{1,7,0,0x3f800000, 0,0,0,0, 0,0,0,0};
-    // Word 3 is the hit distance. As in check_dxr_rays, it must be within 1e-5 of 1, because hardware
-    // intersection may round it (the RX 6600 returns 0x3f7fffff). Every other word must match exactly.
-    float distance = 0;
-    if (output.size() == expected.size()) std::memcpy(&distance, &output[3], sizeof(distance));
-    const bool matches = output.size() == expected.size() &&
-                         std::equal(output.begin(), output.begin() + 3, expected.begin()) &&
-                         std::equal(output.begin() + 4, output.end(), expected.begin() + 4) &&
-                         std::abs(distance - 1.f) < 1e-5f;
-    if (!matches) {
-        std::fprintf(stderr, "placed ray words:");
-        for (const auto word : output) std::fprintf(stderr, " %08x", word);
-        std::fputc('\n', stderr);
-        throw std::runtime_error("Placed BLAS/TLAS ray output differs from hit7@1, miss, masked miss");
-    }
-    std::printf("Slot 133 placed BLAS/TLAS: hit7@1 (distance=0x%08x), miss, masked miss; 11/11 words and the "
-                "distance matched\n", output[3]);
+    // The reference (issue #874): the same geometry, build and instance inputs, rays and readback on the same
+    // adapter, with desktop GPU addresses given directly; only the placed-address resolver is bypassed.
+    const auto direct = trace_placed_triangle(device, nullptr, nullptr);
+    // Wrong-routing control: the instance routed to a decoy BLAS placed through the same resolver.
+    PlacedBuildScene misrouted_placement;
+    misrouted_placement.misroute = true;
+    const auto misrouted = trace_placed_triangle(device, nullptr, &misrouted_placement);
+    const auto print = [](const char* label, const std::vector<bvh_fixture::Word>& words) {
+        std::printf("placed_dxr_rows %s", label);
+        for (std::size_t i = 0; i + 3 < words.size(); i += 4)
+            std::printf(" [%u,%u,%u,0x%08x]", words[i], words[i + 1], words[i + 2], words[i + 3]);
+        std::puts("");
+    };
+    print("placed", output);
+    print("direct", direct);
+    print("misrouted", misrouted);
+    // Fixed expectations: hit7, miss, masked miss with zero miss rows. The hit distance is compared with the
+    // adapter's direct-address result instead of a constant and reported against the mathematical 1.0.
+    const std::vector<bvh_fixture::Word> expected{1,7,0,0, 0,0,0,0, 0,0,0,0};
+    const auto fixed = [&](const std::vector<bvh_fixture::Word>& words) {
+        if (words.size() != expected.size()) return false;
+        for (std::size_t i = 0; i < words.size(); ++i)
+            if (i != 3 && words[i] != expected[i]) return false;
+        return true;
+    };
+    if (!fixed(output) || !fixed(direct))
+        throw std::runtime_error("Placed BLAS/TLAS ray output differs from hit7, miss, masked miss");
+    std::printf("placed_dxr_distance placed=0x%08x direct=0x%08x (1.0=0x3f800000)\n", output[3], direct[3]);
+    if (output != direct)
+        throw std::runtime_error("Placed BLAS/TLAS rays differ from the direct-address reference");
+    if (misrouted == direct)
+        throw std::runtime_error("Routing the instance to the decoy BLAS still matched the direct reference");
+    std::printf("Slot 133 placed BLAS/TLAS: hit7 (distance=0x%08x), miss, masked miss; all 12 words equal the "
+                "direct-address reference, decoy routing differs\n", output[3]);
     return true;
 }
 

@@ -90,6 +90,19 @@ int check_shader()
                    packed[1].end_high == 2 && packed[1].slot == 1,
                "high range split into low and high words");
     }
+    // Adjacent ranges, which Table::add accepts, pack too; here the first one ends on a 4 GiB line.
+    era_title_va::Table adjacent;
+    expect(adjacent.add(0xffff'f000, 0x1000, 0x7000'0000), "add range ending on a 4 GiB line");
+    expect(adjacent.add(0x1'0000'0000, 0x1000, 0x9000'0000), "add adjacent range starting on it");
+    expect(era_title_va::shader_ranges(adjacent.ranges(), packed) && packed.size() == 2, "adjacent ranges packed");
+    if (packed.size() == 2) {
+        expect(packed[0].begin_low == 0xfffff000 && packed[0].begin_high == 0 && packed[0].end_low == 0 &&
+                   packed[0].end_high == 1 && packed[0].slot == 0 && packed[0].reserved == 0,
+               "range ending on the line");
+        expect(packed[1].begin_low == 0 && packed[1].begin_high == 1 && packed[1].end_low == 0x1000 &&
+                   packed[1].end_high == 1 && packed[1].slot == 1 && packed[1].reserved == 0,
+               "range starting on the line");
+    }
     using R = era_title_va::Range;
     expect(!era_title_va::shader_ranges({R{0x20000, 0x21000, 1}, R{0x10000, 0x11000, 2}}, packed) && packed.empty(),
            "unsorted ranges rejected");

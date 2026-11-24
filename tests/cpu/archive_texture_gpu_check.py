@@ -29,7 +29,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from archive_check import FIRST_RECORD, SECOND_RECORD, check
+from archive_check import FIRST_RECORD, SECOND_RECORD, check, report_cfg_skips, run_mapped_case
 from archive_texture_check import expected_texture
 
 SIDE = 16
@@ -109,15 +109,23 @@ def compare(mapper, native, lifted, codec, blast):
     ]
     mapped = [sys.executable, "-B", Path(__file__).with_name("archive_check.py"),
               "--mapped", mapper, native, codec, blast]
+    skipped = []
     for runner, command in (("native", [native]), ("pe_map", mapped), ("AOT", [lifted])):
         for label, case, data, output, status, events in cases:
             env = {**os.environ, "X2W_ARCHIVE_TEXTURE_CASE": case}
-            child = subprocess.run(command, input=data, capture_output=True, timeout=60, env=env)
+            if runner == "pe_map":
+                child, skip = run_mapped_case(command, data, events, 60, env)
+                if skip:
+                    skipped.append(label)
+                    continue
+            else:
+                child = subprocess.run(command, input=data, capture_output=True, timeout=60, env=env)
             trace = ("\n".join(events) + "\n").encode("utf-8")
             check(f"{runner} {label} trace and status", (child.stderr, child.returncode), (trace, status))
             check(f"{runner} {label} first differing pixel", first_difference(child.stdout, output), None)
             print(f"{runner} {label}: {len(child.stdout) // (SIDE * SIDE * 4)} frames, exit {status}")
+    return report_cfg_skips(skipped)
 
 
 if __name__ == "__main__":
-    compare(*map(Path, sys.argv[1:]))
+    sys.exit(compare(*map(Path, sys.argv[1:])))

@@ -1402,7 +1402,7 @@ bool dstorage_checks() {
         };
 
         void* status_ptr = nullptr;
-        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 6, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 7, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
             return false;
         }
         auto* status = static_cast<Object*>(status_ptr);
@@ -1421,6 +1421,7 @@ bool dstorage_checks() {
         std::vector<unsigned char> dest_truncated(32, 0xCC);
         std::vector<unsigned char> dest_bc1_valid(512, 0xEE);
         std::vector<unsigned char> dest_bc1_trailing(512, 0xDD);
+        std::vector<unsigned char> dest_bc6h_blank(64, 0xAA);
 
         // Request 0: valid BC7 Mode 6 memory request (32 bytes destination, 2 blocks)
         unsigned char req0[0x48] = {};
@@ -1488,6 +1489,18 @@ bool dstorage_checks() {
         *reinterpret_cast<unsigned*>(req5 + 0x30) = sizeof(bc1_packed_trailing);
         *reinterpret_cast<unsigned*>(req5 + 0x38) = 512;
 
+        // Request 6: BCPack format 6 (BC6H) is not decoded yet; it must be zero-filled and counted.
+        static const unsigned char bc6h_packed[] = {0x00, 0x01, 0x02, 0x03};
+        unsigned char req6[0x48] = {};
+        *reinterpret_cast<u64*>(req6 + 0x00) = (6ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req6 + 0x08) = dest_bc6h_blank.data();
+        *reinterpret_cast<u64*>(req6 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req6 + 0x18) = 64;
+        *reinterpret_cast<const unsigned char**>(req6 + 0x20) = bc6h_packed;
+        *reinterpret_cast<u64*>(req6 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req6 + 0x30) = sizeof(bc6h_packed);
+        *reinterpret_cast<unsigned*>(req6 + 0x38) = 64;
+
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
@@ -1500,10 +1513,12 @@ bool dstorage_checks() {
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 4);
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req5);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 5);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req6);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 6);
         reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
 
         for (int i = 0; i < 200; ++i) {
-            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5)) break;
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 6)) break;
             Sleep(10);
         }
         if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
@@ -1511,7 +1526,8 @@ bool dstorage_checks() {
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2) ||
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 3) ||
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 4) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5)) {
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 6)) {
             return false;
         }
 
@@ -1521,6 +1537,7 @@ bool dstorage_checks() {
         long hr3 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 3);
         long hr4 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 4);
         long hr5 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 5);
+        long hr6 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 6);
 
         if (hr0 != 0 || std::memcmp(dest_bc7_mode6.data(), bc7_mode6_expected, 32) != 0) return false;
         if (hr1 == 0) return false;
@@ -1536,6 +1553,10 @@ bool dstorage_checks() {
         if (hr5 == 0) return false;
         for (unsigned char b : dest_bc1_trailing) {
             if (b != 0xDD) return false;
+        }
+        if (hr6 != 0) return false;
+        for (unsigned char b : dest_bc6h_blank) {
+            if (b != 0) return false;
         }
     }
 

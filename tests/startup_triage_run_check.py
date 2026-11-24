@@ -188,6 +188,31 @@ def check_review_regressions(failures: list[str]) -> None:
         failures.append(f"failed/untraced slots missing from unhandled: {dict(unhandled)}")
 
 
+def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
+    # Each reason the producer can log keeps its own row; none is folded into "other".
+    cases = [
+        ("unsupported memory SRV arguments", "null_destination"),
+        ("unsupported memory SRV arguments", "unreadable_resource"),
+        ("unsupported memory SRV arguments", "unreadable_view"),
+        ("unsupported memory SRV arguments", "null_address"),
+        ("unsupported memory SRV arguments", "unsupported_description"),
+        ("unsupported memory SRV arguments", "destination_outside_view_heaps"),
+        ("unavailable buffer at the supplied address", "buffer_unavailable"),
+        ("unavailable texture at the supplied base and layout", "texture_unavailable"),
+    ]
+    reasons = [reason for _, reason in cases]
+    lines = [
+        f"x2w-d3d12 Device::slot70 {what}: reason={reason} "
+        "res{dim=3 fmt=98 size=128x128x2 mips=6 layout=0x105 flags=0x300000 align=65536 samples=1/0} "
+        "view{dim=5 fmt=98 map=0x1688} dest=0x1 dest_in_view_heap=1 address=0x2 address_readable=1\n"
+        for what, reason in cases
+    ]
+    refusals = triage_run.summarize_lines(lines)["slot70_refusals"]
+    reported = sorted(key[0] for key in refusals)
+    if reported != sorted(reasons):
+        failures.append(f"slot70 reasons reported as {reported}, expected {sorted(reasons)}")
+
+
 def check_empty_and_missing_dirs(failures: list[str]) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -228,6 +253,7 @@ def main() -> int:
     check_aggregation_and_redaction(failures)
     check_private_text_never_echoed(failures)
     check_review_regressions(failures)
+    check_every_slot70_reason_is_reported(failures)
     check_empty_and_missing_dirs(failures)
     check_cli_invocation(failures)
     for item in failures:

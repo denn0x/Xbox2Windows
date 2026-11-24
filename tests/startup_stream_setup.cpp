@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <wrl/client.h>
 
 #include <array>
@@ -29,6 +30,13 @@ struct Stream {
     Root root;
     Stage vs;
 };
+
+namespace {
+void* stream_root = nullptr;
+void* stream_alternate_root = nullptr;
+}
+void* stream_root_signature() { return stream_root; }
+void* stream_alternate_root_signature() { return stream_alternate_root; }
 
 int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char* root_path,
                             bool hardware, bool textured, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter,
@@ -77,6 +85,17 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
         root_desc.NumParameters = 1;
         root_desc.pParameters = &table;
     }
+    // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);
+    // "wrong_type" declares a shader resource view there instead.
+    D3D12_ROOT_PARAMETER root_cbv{};
+    char cbv_mode[16]{};
+    if (!textured && GetEnvironmentVariableA("X2W_TEST_ROOT_CBV", cbv_mode, sizeof(cbv_mode))) {
+        root_cbv.ParameterType = std::strcmp(cbv_mode, "wrong_type") == 0 ? D3D12_ROOT_PARAMETER_TYPE_SRV
+                                                                          : D3D12_ROOT_PARAMETER_TYPE_CBV;
+        root_cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        root_desc.NumParameters = 1;
+        root_desc.pParameters = &root_cbv;
+    }
     ComPtr<ID3DBlob> blob;
     if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr))) return 6;
     std::ofstream(root_path, std::ios::binary).write(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());
@@ -86,6 +105,15 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     ID3D12RootSignature* root = nullptr;
     if (FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, blob->GetBufferPointer(), blob->GetBufferSize(),
                                                         __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&root)))) return 7;
+    stream_root = root;
+    if (std::strcmp(cbv_mode, "switch_root") == 0) {
+        root_cbv.Descriptor.ShaderRegister = 1;
+        ComPtr<ID3DBlob> alternate;
+        if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &alternate, nullptr)) ||
+            FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, alternate->GetBufferPointer(),
+                                                            alternate->GetBufferSize(), __uuidof(ID3D12RootSignature),
+                                                            &stream_alternate_root))) return 7;
+    }
 
     Stream stream{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}},
                   {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
@@ -216,8 +244,17 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     invoke(list, 139, arg(allocator));
     for (UINT i = 0; i < count; ++i) invoke(list, 52, rtvs[i].ptr, arg(clear));
     invoke(list, 50, count, arg(rtvs.data()));
-    invoke(list, 21, 1, arg(&viewport));
-    invoke(list, 22, 1, arg(&rect));
+    // X2W_TEST_VIEWPORT: "none" and "grow" never set a viewport or scissor; "rect" and "reset" set a rectangle smaller than the target.
+    wchar_t mode[8] = L"";
+    GetEnvironmentVariableW(L"X2W_TEST_VIEWPORT", mode, 8);
+    const bool none = std::wcscmp(mode, L"none") == 0 || std::wcscmp(mode, L"grow") == 0;
+    const bool inset = std::wcscmp(mode, L"rect") == 0 || std::wcscmp(mode, L"reset") == 0;
+    const D3D12_VIEWPORT inner{2, 1, 4, 2, 0, 1};
+    const D3D12_RECT inner_rect{2, 1, 6, 3};
+    if (!none) {
+        invoke(list, 21, 1, inset ? arg(&inner) : arg(&viewport));
+        invoke(list, 22, 1, inset ? arg(&inner_rect) : arg(&rect));
+    }
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
     return 0;

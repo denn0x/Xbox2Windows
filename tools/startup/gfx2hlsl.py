@@ -128,6 +128,11 @@ def reg_range(tok):
 SAMPLER_CLAMP = {0: 'WRAP', 1: 'MIRROR', 2: 'CLAMP', 3: 'MIRROR_ONCE', 4: 'CLAMP', 5: 'MIRROR_ONCE', 6: 'BORDER', 7: 'BORDER'}
 
 
+def smem_offset(tok):
+    """The SMEM offset operand as a token: 'off' (no offset operand) is the literal 0, anything else unchanged."""
+    return '0' if tok == 'off' else tok
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
     uses_q = False
@@ -687,7 +692,8 @@ class Stage:
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
         try:
-            off = int(ops[2], 0)
+            # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
+            off = int(smem_offset(ops[2]), 0)
         except ValueError:
             if p[1] == ('smpheap',) and self.pipe.sampler_heap and count == 4:
                 # A sampler picked at run time from the sampler heap: keep the byte offset in the
@@ -779,10 +785,11 @@ class Stage:
     def op_s_buffer_load_dword(self, ops, mods, count=1):
         dst = reg_range(ops[0])
         buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
-        offset = self.u(ops[2])
+        token = smem_offset(ops[2])
+        offset = self.u(token)
         for i in range(count):
             self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, 4 * i))
-            if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', ops[2]):
+            if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', token):
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
@@ -1478,6 +1485,9 @@ class Stage:
             lines.append('    uint %s;' % ', '.join('s%d = 0' % n for n in sorted(self.used_s)))
         if self.used_v:
             lines.append('    uint %s;' % ', '.join('v%d = 0' % n for n in sorted(self.used_v)))
+        packed = self.pipe.packed_position_vgpr
+        if self.kind == 'ps' and packed in self.used_v:
+            lines.append('    v%d = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);' % packed)
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
         if self.uses_q:
             lines.append('    uint2 q = 0;')
@@ -1678,8 +1688,18 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 
 
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=()):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None):
         self.root = parse_root(root_blob)
+        self.packed_position_vgpr = None
+        if ps_hw_inputs is not None:
+            ena, addr = ps_hw_inputs
+            if ena != addr or not 0 <= ena <= 0xffff:
+                raise Unsupported('unverified pixel input enable/address combination')
+            if ena & (1 << 15):
+                # SPI PS inputs 0..6 supply IJ pairs (the pull model supplies three);
+                # line stipple through sample coverage each occupy one VGPR.
+                widths = (2, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1)
+                self.packed_position_vgpr = sum(w for bit, w in enumerate(widths) if addr & (1 << bit))
         self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
@@ -1839,11 +1859,41 @@ def pipeline_key(vs_code, ps_code, root_blob):
     return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-3'))))
 
 
-FXC = os.environ.get('X2W_FXC', r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe')
+DEFAULT_FXC = r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe'
+KITS_BIN = r'C:\Program Files (x86)\Windows Kits\10\bin'
+
+
+def find_fxc():
+    """The fxc.exe to compile with, '' when X2W_FXC is the empty string (manifest only), or None when none exists.
+
+    Order: X2W_FXC, the 10.0.26100.0 SDK, the newest KITS_BIN/<version>/x64, then PATH."""
+    configured = os.environ.get('X2W_FXC')
+    if configured == '':
+        return ''
+    if configured and os.path.isfile(configured):
+        return configured
+    if os.path.isfile(DEFAULT_FXC):
+        return DEFAULT_FXC
+    versions = []
+    try:
+        for entry in os.listdir(KITS_BIN):
+            if re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', entry):
+                versions.append((tuple(map(int, entry.split('.'))), entry))
+    except OSError:
+        pass
+    for _, entry in sorted(versions, reverse=True):
+        candidate = os.path.join(KITS_BIN, entry, 'x64', 'fxc.exe')
+        if os.path.isfile(candidate):
+            return candidate
+    import shutil
+    return shutil.which('fxc.exe')
 
 
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request=''):
-    """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason."""
+    """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
+
+    With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
+    check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
         pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats)
@@ -1861,10 +1911,15 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         return 'unsupported: %s' % reason
     open(name + '.vs.hlsl', 'w').write(vs)
     open(name + '.ps.hlsl', 'w').write(ps)
-    if check and os.path.exists(FXC):
+    fxc = find_fxc() if check else ''
+    if fxc is None:
+        message = 'fxc.exe not found (X2W_FXC=%s): set X2W_FXC to its path or install the Windows SDK' % os.environ.get('X2W_FXC', '<unset>')
+        open(name + '.fail', 'w').write(message + '\n')
+        return message
+    if fxc:
         import subprocess
         for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
-            r = subprocess.run([FXC, '/nologo', '/T', profile, '/E', 'main', '/Fo', name + '.%s.cso' % stage, name + '.%s.hlsl' % stage],
+            r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', name + '.%s.cso' % stage, name + '.%s.hlsl' % stage],
                                capture_output=True, text=True)
             if r.returncode:
                 open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, r.stderr[-2000:]))
@@ -1941,9 +1996,18 @@ def main():
                 continue
             done.add(w)
             p = cap.psos.get(w)
+            seen = {w}
             while p and p['path'] == 55 and p['base']:
+                if p['base'] in seen:
+                    print('pso %x: wrapper chain loops back to %x' % (w & 0xffffff, p['base'] & 0xffffff))
+                    p = None
+                    break
+                seen.add(p['base'])
                 p = cap.psos.get(p['base'])
             if not p or p['path'] != 57:
+                continue
+            if len(p['desc']) < 96:
+                print('pso %x: pipeline desc is %d bytes, need 96' % (w & 0xffffff, len(p['desc'])))
                 continue
             q = struct.unpack_from('<12Q', p['desc'], 0)
             a, b = cap.memory.read(q[5], q[6]), cap.memory.read(q[9], q[10])

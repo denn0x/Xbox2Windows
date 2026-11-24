@@ -62,7 +62,11 @@ if ($Render) {
     $env:X2W_SHADER_CACHE = (Resolve-Path $ShaderCache).Path
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
-python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
+$python = Join-Path $repo "out\pe-env\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
+& $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
     --trace-files 1 --continue-asserts $ContinueAsserts --fast-exit $(if ($FastExit) { 1 } else { 0 }) `
     --log-repeats $LogRepeats *> "$LogDir.out"
+$debuggerExit = $LASTEXITCODE
 Get-Content "$LogDir.out" -TotalCount 5
+exit $debuggerExit

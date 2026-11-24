@@ -1,4 +1,5 @@
 """Source-built SGD5 program groups and independently framed effect records."""
+import contextlib
 import hashlib
 import io
 import json
@@ -58,7 +59,12 @@ class EffectChecks(unittest.TestCase):
                         candidates(io.BytesIO(data), "probe", 0, len(data), 32, len(table), len(data))
 
     def test_candidates_and_boundaries(self) -> None:
-        tool = Path(__file__).resolve().parents[1] / "tools" / "sgd5_effects.py"
+        tools_dir = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        from sgd5_effects import main as sgd5_main
+
+        tool = Path(tools_dir) / "sgd5_effects.py"
         mesh, mesh_digest = program("shared", 13, 1, payload_magic=b"TEST")
         ps0, first_digest = program("shared", 0, 2)
         ps1, second_digest = program("shared", 0, 3)
@@ -74,20 +80,46 @@ class EffectChecks(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "fixture.bin"
 
+            def argv(label: str, start: int, stop: int, group_end: int) -> list[str]:
+                return [str(path), label, "--group", str(group_start), str(group_end),
+                        "--arrays", str(len(header)), "--record", str(start), str(stop)]
+
             def run(data: bytes, label: str = "choice", start: int = selected, stop: int = end,
                     group_end: int = end) -> subprocess.CompletedProcess[str]:
                 path.write_bytes(data)
-                return subprocess.run([sys.executable, "-B", tool, path, label, "--group", str(group_start),
-                                       str(group_end), "--arrays", str(len(header)), "--record", str(start), str(stop)],
+                args = argv(label, start, stop, group_end)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    try:
+                        rc = sgd5_main(args)
+                    except SystemExit as exc:
+                        if exc.code is None:
+                            rc = 0
+                        elif isinstance(exc.code, int):
+                            rc = int(exc.code)
+                        else:
+                            stderr.write(f"{exc.code}\n")
+                            rc = 1
+                return subprocess.CompletedProcess(args, rc, stdout.getvalue(), stderr.getvalue())
+
+            def run_subprocess(data: bytes, label: str = "choice", start: int = selected, stop: int = end,
+                               group_end: int = end) -> subprocess.CompletedProcess[str]:
+                path.write_bytes(data)
+                return subprocess.run([sys.executable, "-B", tool, *argv(label, start, stop, group_end)],
                                       capture_output=True, text=True)
 
-            result = run(archive)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {"effect": "choice", "candidates": [
+            expected_choice = {"effect": "choice", "candidates": [
                 {"group": "VS", "index": 0, "name": "shared", "dxil_kind": 13, "container_sha256": mesh_digest},
                 {"group": "PS", "index": 1, "name": "shared", "dxil_kind": 0, "container_sha256": second_digest},
                 {"group": "PS", "index": 0, "name": "shared", "dxil_kind": 0, "container_sha256": first_digest},
-            ]})
+            ]}
+            result = run_subprocess(archive)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), expected_choice)
+            in_proc = run(archive)
+            self.assertEqual(in_proc.returncode, 0, in_proc.stderr)
+            self.assertEqual(json.loads(in_proc.stdout), expected_choice)
             empty = run(archive, "empty", begin, selected)
             self.assertEqual(empty.returncode, 0, empty.stderr)
             self.assertEqual(json.loads(empty.stdout), {"effect": "empty", "candidates": []})

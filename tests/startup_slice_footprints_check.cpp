@@ -168,17 +168,24 @@ int main(int argc, char** argv)
     refused[11].desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     for (const auto& item : refused) expect(!SliceFootprints::supports(item.desc), item.name);
 
-    // recheck_cpu_texture(): a single R8 plane after one frame, anything else after 15, never past 32 MiB.
+    // recheck_cpu_texture(): a single R8 or A8 plane after one frame, anything else after 15, never past 32 MiB.
     constexpr UINT64 cap = 32ull << 20;
     const D3D12_RESOURCE_DESC r8 = texture(DXGI_FORMAT_R8_UNORM, 1920, 1080);
+    const D3D12_RESOURCE_DESC a8 = texture(DXGI_FORMAT_A8_UNORM, 2048, 2048);
     const D3D12_RESOURCE_DESC rgba = texture(DXGI_FORMAT_R8G8B8A8_UNORM, 1920, 1080);
     expect(!x2w_startup::recheck_cpu_texture(r8, 4096, 0), "R8 plane: not in the same frame");
     expect(x2w_startup::recheck_cpu_texture(r8, 4096, 1), "R8 plane: after one frame");
     expect(x2w_startup::recheck_cpu_texture(r8, cap, 1), "R8 plane: exactly 32 MiB");
     expect(!x2w_startup::recheck_cpu_texture(r8, cap + 1, 1), "R8 plane: one byte past 32 MiB");
     expect(!x2w_startup::recheck_cpu_texture(r8, cap + 1, 1000), "R8 plane: past 32 MiB, 1000 frames");
+    expect(!x2w_startup::recheck_cpu_texture(a8, 4096, 0), "A8 atlas: not in the same frame");
+    expect(x2w_startup::recheck_cpu_texture(a8, 4096, 1), "A8 atlas: after one frame");
+    expect(x2w_startup::recheck_cpu_texture(a8, cap, 1), "A8 atlas: exactly 32 MiB");
+    expect(!x2w_startup::recheck_cpu_texture(a8, cap + 1, 1), "A8 atlas: one byte past 32 MiB");
     const Named others[] = {{"R8 with 2 mips", texture(DXGI_FORMAT_R8_UNORM, 1920, 1080, 1, 2)},
                               {"R8 array of 2", texture(DXGI_FORMAT_R8_UNORM, 1920, 1080, 2, 1)},
+                              {"A8 with 2 mips", texture(DXGI_FORMAT_A8_UNORM, 2048, 2048, 1, 2)},
+                              {"A8 array of 2", texture(DXGI_FORMAT_A8_UNORM, 2048, 2048, 2, 1)},
                               {"R8G8", texture(DXGI_FORMAT_R8G8_UNORM, 960, 540)}, {"RGBA8", rgba}};
     for (const auto& other : others)
         for (const UINT frames : {1u, 14u, 15u}) {

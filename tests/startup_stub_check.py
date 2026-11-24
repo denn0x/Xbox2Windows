@@ -98,7 +98,19 @@ for scenario, stdout in (("none", ""), ("physical", "physical ok")):
 
 run = subprocess.run([consumer, "dstorage"], capture_output=True, text=True, env=env, timeout=20)
 traps_after = open(log, encoding="ascii").read().count("x2w-trap ") if os.path.exists(log) else 0
-ok = run.returncode == 0 and "dstorage ok" in run.stdout and "x2w-trap" not in run.stderr and traps_after == len(cases)
+summary = re.search(r"x2w-dstorage BCPack summary: requests formats=([^;]*); zero-filled formats=([^\r\n]*)",
+                    run.stderr)
+requests_by_format = {int(f): int(n) for f, n in re.findall(r"(\d+):(\d+)", summary.group(1))} if summary else {}
+blank_by_format = {int(f): int(n) for f, n in re.findall(r"(\d+):(\d+)", summary.group(2))} if summary else {}
+bcpack_ok = (requests_by_format.get(6) == 1 and blank_by_format.get(6) == 1
+             and requests_by_format.get(1) == 2 and blank_by_format.get(1, 0) == 0
+             and requests_by_format.get(7) == 4 and blank_by_format.get(7, 0) == 0)
+if summary:
+    print(summary.group(0))
+else:
+    print("BCPack summary: missing")
+ok = (run.returncode == 0 and "dstorage ok" in run.stdout and "x2w-trap" not in run.stderr
+      and traps_after == len(cases) and bcpack_ok)
 print(f"dstorage control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
 if not ok:
     failures.append(f"dstorage control: exit {run.returncode}, stderr {run.stderr.strip()!r}")

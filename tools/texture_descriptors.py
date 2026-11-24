@@ -215,7 +215,8 @@ def zlib_segment(stream: BinaryIO, index: int) -> ZlibSegment:
     return ZlibSegment(left.logical, address - left.logical, segment)
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """Run the texture descriptor CLI and return the process exit code."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archives", metavar="archive", type=Path, nargs="+")
     mode = parser.add_mutually_exclusive_group()
@@ -227,7 +228,7 @@ if __name__ == "__main__":
                       help="Verify the zlib interval containing the descriptor's first page and report its extents")
     mode.add_argument("--lookup-key", metavar="KEY",
                       help="Find all descriptor indices for a decimal or 0x-prefixed 64-bit texture key")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     archive = args.archives[0]
     try:
         if args.lookup_key is not None:
@@ -262,3 +263,8 @@ if __name__ == "__main__":
                     print(json.dumps(raw_page_map(file, args.raw_page_map)._asdict(), indent=2))
     except (OSError, ValueError) as exc:
         parser.exit(1, f"{archive}: {exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -148,7 +148,7 @@ int main(int argc, char** argv)
     expect(store.read_blob("slot-none", "profile.dat", bytes) == Status::not_found, "missing container is not_found");
 
     // Names that could leave the store are refused and nothing is created outside it.
-    const char* bad[] = {"", "..", ".", "../x", "a/b", "a\\b", "/abs", "\\abs", "C:x", "C:\\x", "a..b", "x.", "NUL", "com1.txt", "a\nb", "n*", "a.x2w-part"};
+    const char* bad[] = {"", "..", ".", "../x", "a/b", "a\\b", "/abs", "\\abs", "C:x", "C:\\x", "a..b", "x.", "NUL", "com1.txt", "a\nb", "n*", "a.x2w-part", " x", "x ", "  double-lead"};
     for (const char* name : bad) {
         expect(!x2w_save::valid_name(name), name);
         expect(store.create_container(name) == Status::bad_name, "bad container name refused");
