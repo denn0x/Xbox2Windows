@@ -50,7 +50,8 @@ def main():
     refused(1, (0x8100, 0x8000), 'enable/address')          # ENA outside ADDR (upstream #1634's control)
     refused(1, (0x18000, 0x18000), 'enable/address')        # not a 16-bit mask
     refused(1, (0x8002, 0x8002), 'persp_center (v1) at 0x0: not lowered')
-    refused(0, (0x0100, 0x0100), 'pos_x_float (v0) at 0x0: not lowered')  # packed position disabled
+    refused(0, (0x1000, 0x1000), 'front_face (v0) at 0x0: not lowered')  # packed position disabled
+    # (pos_x_float, refused here before, is lowered as SV_Position.x: tests/startup_mesh_spi_input_check.py)
     refused(0, (0x8002, 0x8003), 'persp_sample (v0) at 0x0, allocated but not enabled')
     refused(3, (0x0002, 0x0002), 'past the SPI inputs (ADDR allocates 2)')
     try:

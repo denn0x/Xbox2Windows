@@ -1924,6 +1924,9 @@ class Stage:
         packed = getattr(self.pipe, 'packed_position_vgpr', None)  # the tests' bare pipelines have none
         if self.kind == 'ps' and packed is not None and packed in self.used_v:
             lines.append('    v%d = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);' % packed)
+        if self.kind == 'ps':
+            for reg, bit in sorted(getattr(self.pipe, 'ps_input_vgprs', {}).items()):
+                lines.append('    v%d = %s;  // SPI input %s' % (reg, PS_INPUT_HLSL[bit], PS_INPUTS[bit][0]))
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
         if self.used_h:
             lines.append('    uint %s;' % ', '.join('h%d = 0' % k for k in sorted(self.used_h)))
@@ -2252,6 +2255,14 @@ PS_INPUTS = (('persp_sample', 2), ('persp_center', 2), ('persp_centroid', 2), ('
              ('pos_x_float', 1), ('pos_y_float', 1), ('pos_z_float', 1), ('pos_w_float', 1),
              ('front_face', 1), ('ancillary', 1), ('sample_coverage', 1), ('pos_fixed_pt', 1))
 POS_FIXED_PT = 15
+# SPI inputs lowered besides POS_FIXED_PT (bit -> HLSL uint expression over PSIn i). Mesa
+# ac_nir_lower_intrinsics_to_args.c reads frag_coord x/y/z from POS_X/Y/Z_FLOAT and frag_coord_w_rcp from
+# POS_W_FLOAT; nir_builder.c nir_build_frag_coord makes gl_FragCoord.w = frcp(frag_coord_w_rcp), and D3D
+# SV_Position.w is 1 / gl_FragCoord.w (vkd3d-shader spirv.c frag_coord_fixup), so POS_W_FLOAT is SV_Position.w.
+PS_INPUT_HLSL = {8: 'U(i.pos.x)', 9: 'U(i.pos.y)', 10: 'U(i.pos.z)', 11: 'U(i.pos.w)'}
+# The *_sample barycentrics: the stage runs per sample and the position inputs are at the sample, which a plain
+# SV_Position input is not.
+PS_SAMPLE_RATE = (1 << 0) | (1 << 4)
 
 
 def ps_input_layout(ena, addr):
@@ -2334,6 +2345,7 @@ class Pipeline:
         layout (packed_position_vgpr), but no pixel HLSL is ever written for it."""
         self.ps_entry_reads = dict(self.ps.entry_reads)
         self.ps_input_refusal = None
+        self.ps_input_vgprs = {}  # entry VGPR -> PS_INPUT_HLSL bit, initialized by Stage.declarations()
         if self.ps_input_layout is None:
             return
         for reg, off in sorted(self.ps_entry_reads.items(), key=lambda item: item[1]):
@@ -2344,12 +2356,17 @@ class Pipeline:
             elif not self.ps_input_ena >> bit & 1:
                 self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x, allocated but not enabled'
                                          % (PS_INPUTS[bit][0], reg, off))
+            elif bit in PS_INPUT_HLSL and self.ps_input_ena & PS_SAMPLE_RATE:
+                self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x with per-sample barycentrics '
+                                         'enabled (%#x)' % (PS_INPUTS[bit][0], reg, off, self.ps_input_ena))
+            elif bit in PS_INPUT_HLSL:
+                self.ps_input_vgprs[reg] = bit
             elif bit != POS_FIXED_PT:
                 self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x: not lowered'
                                          % (PS_INPUTS[bit][0], reg, off))
             if self.ps_input_refusal:
                 break
-        self.ps_entry_reads = {}  # every entry read is the lowered packed position (or refused above)
+        self.ps_entry_reads = {}  # every entry read is a lowered input (or refused above)
 
     def mrt_kind(self, slot):
         if slot >= len(self.rtv_formats):
