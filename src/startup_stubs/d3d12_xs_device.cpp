@@ -1867,7 +1867,7 @@ void reduce_presented(const D3D12_RESOURCE_DESC& desc, const D3D12_PLACED_SUBRES
     const LONG count = InterlockedIncrement(&shown_frames);
     std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
                   desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
-    if (count <= 3 || count % 5 == 0) log("x2w-render presented %s (frame %ld)", shown_note, frame_number);
+    if (x2w_local::first_of(count, 3) || count % 5 == 0) log("x2w-render presented %s (frame %ld)", shown_note, frame_number);
 }
 
 // LOCAL: render targets drawn into during a traced frame, in first-use order. At the end of the
@@ -2754,7 +2754,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
         const LONG n = InterlockedIncrement(&render_draws);
-        if (n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
+        if (x2w_local::first_of(n, 3)) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
         InterlockedIncrement(&render_draws_skipped);
     }
@@ -3026,7 +3026,7 @@ bool execute_dispatch_inner(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
     list->ResourceBarrier(1, &barrier);
     const LONG n = InterlockedIncrement(&compute_executed);
     dispatch_outcome = co_c62_run;
-    if (n <= 4 || n % 5000 == 0) log("x2w-compute dispatch %ld executed (%u, %u, %u)", n, x, y, z);
+    if (x2w_local::first_of(n, 4) || n % 5000 == 0) log("x2w-compute dispatch %ld executed (%u, %u, %u)", n, x, y, z);
     return true;
 }
 struct DispatchCount { LONG64 calls = 0; LONG64 groups = 0; UINT x = 0, y = 0, z = 0; };
@@ -3989,7 +3989,7 @@ D3D12_GPU_VIRTUAL_ADDRESS desktop_va(u64 address)
     ReleaseSRWLockExclusive(&va_lock);
     if (SUCCEEDED(hr)) note_window(buffer);
     const LONG n = SUCCEEDED(hr) ? InterlockedIncrement(&va_mapped) : InterlockedIncrement(&va_failed);
-    if (n <= 16)
+    if (x2w_local::first_of(n, 16))
         log("x2w-va window base=%p start=0x%llx heap=%p -> 0x%08lx desktop va 0x%llx", base, start, static_cast<void*>(heap),
             static_cast<unsigned long>(hr), SUCCEEDED(hr) ? buffer->GetGPUVirtualAddress() : 0ull);
     return SUCCEEDED(hr) ? buffer->GetGPUVirtualAddress() + (offset - start) : 0;

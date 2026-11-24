@@ -993,7 +993,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     list->ResourceBarrier(1, &barrier);
     const LONG done = InterlockedIncrement(&cx_dispatched);
     dispatch_outcome = co_c67_run;
-    if (done <= 8 || done % 5000 == 0)
+    if (x2w_local::first_of(done, 8) || done % 5000 == 0)
         log("x2w-cx dispatch %ld: %016llx (%u, %u, %u); ready %ld missing %ld null %ld bad-uav %ld; ranges ok %ld split %ld unmapped %ld", done, key, x, y, z,
             cx_ready, cx_missing, cx_null_res, cx_bad_uav, range_ok, range_split, range_unmapped);
     if ((done & 63) == 1) check_device("translated dispatch", 0);

@@ -297,7 +297,7 @@ bool rawaddr_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UI
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
     const LONG done = InterlockedIncrement(&key.dispatches);
-    if (done <= 2) log("x2w-rawaddr %016llx dispatch %ld (%u, %u, %u): regions %u, seeds resolved %u unresolved %u", key.key, done, x, y, z, count, resolved, unresolved);
+    if (x2w_local::first_of(done, 2)) log("x2w-rawaddr %016llx dispatch %ld (%u, %u, %u): regions %u, seeds resolved %u unresolved %u", key.key, done, x, y, z, count, resolved, unresolved);
     if ((done & 63) == 1) check_device("raw-address dispatch", 0);
     return true;
 }

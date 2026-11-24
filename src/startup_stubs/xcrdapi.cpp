@@ -399,7 +399,7 @@ bool decode_bc6h_fallback(const unsigned char* input, std::size_t size, unsigned
     InterlockedAdd64(&bc6h_copied, static_cast<LONG64>(st.copied));
     InterlockedAdd64(&bc6h_constant, static_cast<LONG64>(st.constant));
     const LONG n = InterlockedIncrement(&bc6h_streams);
-    if (n <= 16 || (n & 63) == 0)
+    if (x2w_local::first_of(n, 16) || (n & 63) == 0)
         log("x2w-dstorage BC6H fallback: stream %ld blocks %zu exact %zu endpoints-only %zu copied %zu constant %zu "
             "(totals: blocks %lld exact %lld endpoints-only %lld copied %lld constant %lld)",
             n, st.blocks, st.exact, st.endpoints_only, st.copied, st.constant, bc6h_blocks, bc6h_exact,
