@@ -5833,6 +5833,17 @@ is recorded, and it matched. Also recorded, not checked: with `/Gis` and `-Gis` 
 both matched every pixel. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_nan' -V`;
 `tests/startup_gfx2hlsl_f32_nan_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip the fixtures through
 LLVM 15.
+The SDWA forms of those conversions read the same table: after the split, `sdwa()` still looked only at the
+uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed at both (#1727). The
+restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
+conversion's output modifier inside an SDWA form is still refused rather than dropped.
+
+**An `op_sel` the lowering does not model is refused.** `set_vf()` used to accept an `op_sel` modifier and emit
+the same text as without it. `op_sel` selects which half of a packed source the operation reads, so dropping
+it silently changes the operand; the float path now refuses it (#1754). The same test pins the exact shift,
+mask and conversion expressions of the byte-extracting conversions, whose shift amounts escaped mutation
+checks before.
+Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_opsel$' -V`.
 
 ## Pixel color without a texture sample
 

@@ -1779,6 +1779,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # f32 nlt/nle/ngt/nge, o and u hold under FXC's and DXC's rewrites of float compares without -Gis (#1936).
     add_test(NAME startup_gfx2hlsl_f32_nan COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_nan_check.py")
+    # op_sel on a translated float operation is refused, not dropped (#1735).
+    add_test(NAME startup_gfx2hlsl_opsel COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_opsel_check.py")
     # Output modifiers on float-result conversions (#1705).
     add_test(NAME startup_gfx2hlsl_vcvt_omod COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vcvt_omod_check.py")

@@ -352,7 +352,9 @@ class Stage:
             elif m == 'div:2':
                 scale *= 0.5
             elif m.startswith('op_sel'):
-                pass
+                # op_sel selects which half of a packed source the operation reads. This path does not
+                # model that, so dropping it would change the operand: refuse instead of ignoring it.
+                raise Unsupported('modifier %s' % m)
             else:
                 raise Unsupported('modifier %s' % m)
         if scale != 1.0:
