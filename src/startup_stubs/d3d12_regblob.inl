@@ -8,8 +8,8 @@
 // X2W_REGBLOB_MAX_MB caps the bytes queued per run (default 512). State and patch records also wait for
 // the writer at most 16 MiB at a time; first sets of a key never wait-drop (counted apart if capped).
 //
-// Slot 57 record, 0x160 bytes: [0] root signature, [1]/[2] state block A, [3]/[4] state block B
-// (0xbc bytes), then 4-word stage slots from [5]: code pointer, code bytes, metadata pointer, metadata
+// Slot 57 record, 0x160 bytes: [0] root signature, [1]/[2] state block A (packed register values),
+// [3]/[4] block B (0x50-byte header + the vertex input layout; the file name .psregs is historic), then 4-word stage slots from [5]: code pointer, code bytes, metadata pointer, metadata
 // bytes ([5]/[6] code a, [7]/[8], [9]/[10] code b, [11]/[12], [13]/[14] ...). Layout of the blocks:
 // out/gamerun/translator_work/REG_LAYOUT.md.
 //
@@ -24,8 +24,9 @@
 //   <key>.states      every distinct content of [1], [3], [7], [11] seen for the key (the first one
 //                     too), appended: records {u32 'X2WS', u32 bytes after this word, u32 state hash,
 //                     u32 count, count x {u32 word, u32 bytes, bytes}}
-//   g57_<ck>.{vsregs,psregs,r78,p<N>,desc,rec}   a record without both code blobs (no request key);
-//                     code pairs are .p5 / .p9 / .p13; <ck> hashes the root blob and every pair
+//   g57_<ck>.{vsregs,psregs,r78,p<N>,desc,root,rec}   a record without both code blobs (no request
+//                     key; mesh pipelines: code at .p13, metadata .p15); code pairs are .p5 / .p9 / .p13;
+//                     <ck> hashes the root blob (.root) and every pair
 //   d55.txt           one line per distinct (base key, patch set): "<key or g57_ck> <n> <h1> ... <hn>\n",
 //                     record hashes in patch order
 //   d55_<h>.bin       one 0x14c-byte patch record {u32 kind; desktop desc} per distinct hash <h>:
@@ -190,6 +191,9 @@ void write_set(const Job& job)
             }
         }
         if (generic) {
+            // The root blob hashed into ck: mesh pipelines (code at [13]) need it to be translated.
+            swprintf(name, std::size(name), L"g57_%016llx.root", job.key);
+            ok = sub_path(path, name) && write_whole(path, job.root.data(), job.root.size()) && ok;
             swprintf(name, std::size(name), L"g57_%016llx.rec", job.key);
             ok = ok && sub_path(path, name) && write_whole(path, job.record.data(), job.record.size());
         } else {
@@ -437,6 +441,7 @@ u64 dump57(const void* desc, const Wrapper* self)
             job.b = bytes_of(b, b_bytes);
             job.root = root_blob;
         }
+        if (!keyed) job.root = root_blob;  // regblob\g57_<ck>.root
         push(std::move(job));
     }
     if (variant) {
