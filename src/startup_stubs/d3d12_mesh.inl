@@ -101,12 +101,34 @@ bool mesh_key_of(const Wrapper* pipeline, MeshRecordKey* out)
 
 // ---- Translations, per key (off draw_lock) ------------------------------------------------------------------
 
+// The multiply-add rule a mesh translation was built with (mesh_work/RUNTIME_NEEDS.md 8): manifest `fma exact` (fused
+// console ops as binary64 fma: needs DoublePrecisionFloatShaderOps) or `fma precise` (float only). No line: unstated,
+// treated as exact (the translator's default). A cache that mixes rules is logged once, never refused.
+enum MeshFma { mesh_fma_exact, mesh_fma_precise, mesh_fma_unstated, mesh_fma_rules };
+LONG mesh_fma_loaded[mesh_fma_rules];
+const char* const mesh_fma_names[mesh_fma_rules] = {"exact", "precise", "unstated"};
+
+bool mesh_double_ops()
+{
+    static const bool ok = [] {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        const HRESULT hr = device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
+        const bool doubles = SUCCEEDED(hr) && options.DoublePrecisionFloatShaderOps;
+        log("x2w-mesh DoublePrecisionFloatShaderOps %d (0x%08lx): `fma exact` translations %s", doubles ? 1 : 0, static_cast<unsigned long>(hr),
+            doubles ? "allowed" : "refused");
+        return doubles;
+    }();
+    return ok;
+}
+
 // load_translation's stage hook (d3d12_draw.inl): 0 not a mesh manifest, 1 `stage mesh` with .ms.cso (and the
-// optional .ps.cso) loaded, -1 a mesh manifest whose stage files cannot be read.
+// optional .ps.cso) loaded, -1 a mesh manifest whose stage files cannot be read or whose fma rule cannot run here.
 int load_mesh_stages(Translation& tr, const std::string& manifest)
 {
     bool mesh = false;
     unsigned threads = 0, vertices = 0, primitives = 0;
+    int fma = mesh_fma_unstated;
+    std::string fma_text;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
         if (end == std::string::npos) end = manifest.size();
@@ -114,9 +136,18 @@ int load_mesh_stages(Translation& tr, const std::string& manifest)
         if (!line.empty() && line.back() == '\r') line.pop_back();
         at = end + 1;
         if (line == "stage mesh") mesh = true;
+        else if (line.compare(0, 4, "fma ") == 0) fma_text = line.substr(4), fma = fma_text == "exact" ? mesh_fma_exact : fma_text == "precise" ? mesh_fma_precise : -1;
         else std::sscanf(line.c_str(), "ms %u %u %u", &threads, &vertices, &primitives);
     }
     if (!mesh) return 0;
+    if (fma < 0) {
+        log("x2w-mesh pipeline %016llx: translation failed (unknown fma rule \"%s\")", tr.key, fma_text.c_str());
+        return -1;
+    }
+    if (fma != mesh_fma_precise && !mesh_double_ops()) {
+        log("x2w-mesh pipeline %016llx: translation failed (fma %s needs DoublePrecisionFloatShaderOps)", tr.key, mesh_fma_names[fma]);
+        return -1;
+    }
     wchar_t path[MAX_PATH];
     if (!cache_path(path, L"", tr.key, L".ms.cso") || FAILED(D3DReadFileToBlob(path, &tr.ms))) {
         log("x2w-mesh pipeline %016llx: translation failed (no readable .ms.cso)", tr.key);
@@ -126,8 +157,15 @@ int load_mesh_stages(Translation& tr, const std::string& manifest)
         log("x2w-mesh pipeline %016llx: translation failed (.ps.cso present but unreadable)", tr.key);
         return -1;
     }
-    log("x2w-mesh pipeline %016llx: mesh stage %zu bytes (ms %u threads, %u vertices, %u primitives), pixel stage %s", tr.key,
-        tr.ms->GetBufferSize(), threads, vertices, primitives, tr.ps ? "yes" : "none (depth-only)");
+    log("x2w-mesh pipeline %016llx: mesh stage %zu bytes (ms %u threads, %u vertices, %u primitives), pixel stage %s, fma %s", tr.key,
+        tr.ms->GetBufferSize(), threads, vertices, primitives, tr.ps ? "yes" : "none (depth-only)", mesh_fma_names[fma]);
+    InterlockedIncrement(&mesh_fma_loaded[fma]);
+    int rules = 0;
+    for (LONG& n : mesh_fma_loaded) rules += InterlockedCompareExchange(&n, 0, 0) != 0;
+    static LONG mixed;
+    if (rules > 1 && InterlockedExchange(&mixed, 1) == 0)
+        log("x2w-mesh shader cache mixes fma rules (from %016llx): exact %ld, precise %ld, unstated %ld loaded so far; positions may differ "
+            "between pipelines (not refused)", tr.key, mesh_fma_loaded[mesh_fma_exact], mesh_fma_loaded[mesh_fma_precise], mesh_fma_loaded[mesh_fma_unstated]);
     return 1;
 }
 
