@@ -196,6 +196,23 @@ bool memory_srv_linear_on()
     }();
     return on;
 }
+// view_slot does not check mip, array or plane ranges, and desktop removes the device on a view it
+// rejects, so the range is checked here (MipLevels ~0u means "all from the most detailed mip").
+bool linear_view_in_range(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    const UINT mips = r.MipLevels, slices = r.DepthOrArraySize;
+    const auto mip_range = [&](UINT most, UINT count, float clamp) {
+        return most < mips && (count == ~0u || (count > 0 && count <= mips - most)) && clamp >= 0.0f && clamp <= static_cast<float>(mips);
+    };
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+        return mip_range(v.Texture2D.MostDetailedMip, v.Texture2D.MipLevels, v.Texture2D.ResourceMinLODClamp) && v.Texture2D.PlaneSlice == 0;
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+        const auto& a = v.Texture2DArray;
+        return mip_range(a.MostDetailedMip, a.MipLevels, a.ResourceMinLODClamp) && a.PlaneSlice == 0 && a.FirstArraySlice < slices &&
+               a.ArraySize > 0 && a.ArraySize <= slices - a.FirstArraySlice;
+    }
+    return false;
+}
 bool linear_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Width && r.Height &&
@@ -204,10 +221,11 @@ bool linear_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE
            static_cast<UINT>(r.Layout) == 0 && !tiled_bc_srv(r) && !x2w_startup::bc64::supports(r) &&
            !(r.Flags & (D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) &&
-           (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D || v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+           v.Format == r.Format && linear_view_in_range(r, v);
 }
 std::mutex linear_srv_mutex;
 std::unordered_multimap<u64, std::pair<D3D12_RESOURCE_DESC, Wrapper*>> linear_srv_textures;
+u64 linear_srv_bytes;  // desktop allocation size of the textures above (GetResourceAllocationInfo)
 Wrapper* publish_linear_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     std::lock_guard lock(linear_srv_mutex);
@@ -229,6 +247,7 @@ Wrapper* publish_linear_texture(Wrapper* device, u64 address, const D3D12_RESOUR
     Wrapper* w = wrap(created, resource_kind);
     w->own().title_memory = reinterpret_cast<void*>(address);
     note_resource(w, &desc, 0);
+    linear_srv_bytes += device_of(device)->GetResourceAllocationInfo(0, 1, &texture).SizeInBytes;
     linear_srv_textures.emplace(address, std::make_pair(desc, w));
     return w;
 }
@@ -280,7 +299,17 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         if (texture) {
             static LONG64 linear_views;
             const LONG64 n = InterlockedIncrement64(&linear_views);
-            if ((n & (n - 1)) == 0) log("x2w-memsrv linear memory SRVs written: %lld (latest destination 0x%llx)", n, destination);
+            if ((n & (n - 1)) == 0) {
+                std::size_t textures;
+                u64 bytes;
+                {
+                    std::lock_guard lock(linear_srv_mutex);
+                    textures = linear_srv_textures.size();
+                    bytes = linear_srv_bytes;
+                }
+                log("x2w-memsrv linear memory SRVs written: %lld, %zu textures, %llu KiB (latest destination 0x%llx)", n, textures,
+                    bytes >> 10, destination);
+            }
             view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
             return;
         }
