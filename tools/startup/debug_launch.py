@@ -795,6 +795,7 @@ def main():
     # X2W_PROFILE=<start s>,<samples>,<interval ms>[,<repeat every s>]: clock-driven samples of every
     # thread (CPU time, rip, return addresses) between debug events -> profile_<s>.txt (sample_profile.py).
     profiler = None
+    last_event = (0.0, 0)  # (seconds, tid) of the last debug event, for the profiler
     if os.environ.get("X2W_PROFILE"):
         import sample_profile
         plan = sample_profile.parse(os.environ["X2W_PROFILE"])
@@ -836,11 +837,16 @@ def main():
             if watches and time.time() >= watch_next:
                 watch_next = time.time() + 1.0
                 poll_watches()
-            if profiler:
-                profiler.poll(time.time() - start, live_threads)
-            if not k32.WaitForDebugEvent(event, profiler.timeout_ms(time.time() - start) if profiler else 200):
+            # A due profile sample is taken here, >= 1 ms after the last continue; an event that arrives
+            # meanwhile is handled first (pending).
+            pending = bool(profiler) and profiler.run(time.time() - start, live_threads, last_event,
+                                                       lambda: k32.WaitForDebugEvent(event, 0))
+            if not pending and not k32.WaitForDebugEvent(event, profiler.timeout_ms(time.time() - start) if profiler else 200):
                 continue
             code, pid, tid = struct.unpack_from("<III", event, 0)
+            if profiler:
+                last_event = (time.time() - start, tid)
+                profiler.event_seen()
             status = DBG_CONTINUE
             if code == CREATE_PROCESS:
                 live_threads.add(tid)

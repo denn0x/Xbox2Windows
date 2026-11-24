@@ -16,7 +16,7 @@ import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
 DEBUG = REPO / "tools/startup/debug_launch.py"
-ROW = re.compile(r"^\s*(\d+)\s+([\d.]+)\s+\d+\s+\d+\s+(\d+)/\s*(\d+)/\s*(\d+)\s+(\S+) /", re.M)
+ROW = re.compile(r"^\s*(\d+)\s+([\d.]+)\s+\d+\s+\d+\s+\d+\s+(\d+)/\s*(\d+)/\s*(\d+)\s+(\S+) /", re.M)
 
 
 def run(probe, work, name, variables):
@@ -48,9 +48,16 @@ def main(probe):
         assert waits and "NtWaitForSingleObject @ " in waits[0] and re.search(r"wait_(here|thread)", waits[0]), waits
         frozen = float(re.search(r"frozen per sample: median ([\d.]+) ms", report).group(1))
         assert frozen < 50.0, report
+        # The fault thread sleeps a timer tick between faults. Samples taken right after a continue, or at
+        # the end of a timed wait (the same tick it wakes on), find it at the fault every time; samples
+        # taken >= 1 ms after the last continue with no event pending see it sleep.
+        faults = rows["faults"]
+        assert int(faults.group(5)) >= 20, report
+        quiet = re.search(r"after the last ContinueDebugEvent with no event pending: (\d+)/(\d+)", report)
+        assert quiet and int(quiet.group(1)) >= 30, report
         assert "profile: 40 samples" in (logdir / "events.txt").read_text(encoding="utf-8")
         print(f"spin {spin.group(2)}% cpu, waiter {waiter.group(2)}% ({waiter.group(5)} waiting samples), "
-              f"frozen median {frozen} ms per sample")
+              f"faults {faults.group(5)}/40 waiting, quiet samples {quiet.group(1)}/40, frozen median {frozen} ms per sample")
 
         # Repeat: a second batch one second later.
         out, logdir = run(probe, work, "repeat", {"X2W_PROFILE": "0.3,5,20,1"})

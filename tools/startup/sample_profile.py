@@ -14,6 +14,7 @@ stall the debugger. Each report states how long the process was frozen per sampl
 import ctypes
 import ctypes.wintypes as wt
 import os
+import random
 import struct
 import time
 
@@ -101,7 +102,11 @@ class Profiler:
         self.next = self.first
         self.batch = self.first
         self.done = False
-        self.samples = []   # (seconds, {tid: (kernel 100ns, user 100ns, frames)})
+        self.samples = []   # (seconds, {tid: (kernel 100ns, user 100ns, frames)}, quiet, ms since last event, its tid)
+        self.previous = {}  # tid -> (rip, rsp, kernel, user, frames): an unchanged thread is not copied or walked again
+        self.reused = 0
+        self.awaiting_continue = False
+        self.last_continue = 0.0
         self.freeze = []    # seconds each process freeze lasted
         self.walk_cost = []
         self.handles = {}   # tid -> handle (SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION)
@@ -115,26 +120,59 @@ class Profiler:
         self.pdb = {}
 
     def timeout_ms(self, now):
-        """How long the debugger may wait for an event before the next sample is due."""
+        """How long the debugger may wait for an event: until the next sample is due (run() then takes it)."""
         if self.done:
             return 200
         return max(1, min(200, int((self.next - now) * 1000)))
 
-    def poll(self, now, live):
+    def event_seen(self):
+        """The debugger received an event; it is continued before the loop comes back to run()."""
+        self.awaiting_continue = True
+
+    def run(self, now, live, last_event, peek):
+        """Called at the top of the debugger loop. Returns True when peek() received a debug event that the
+        caller must handle now (the sample waits).
+
+        A due sample is taken only 1 ms or more after the last ContinueDebugEvent, with pending events
+        handled first (peek: WaitForDebugEvent with no wait). Sampling right after a continue, or at the
+        end of a timed wait, finds the thread whose event was just continued, or one woken on the same
+        timer tick, at its event site every time. A sample overdue by a whole interval (no 1 ms gap) is
+        taken anyway and counted as forced. last_event: (seconds, tid) of the last debug event."""
+        if self.awaiting_continue:
+            self.last_continue = time.perf_counter()
+            self.awaiting_continue = False
         if self.done or now < self.next:
-            return
-        self.sample(now, live)
-        self.next += self.interval
-        if self.next < now:
-            self.next = now  # late (a long debug event): no catch-up burst
-        if len(self.samples) >= self.count:
-            self.write()
-            self.samples, self.freeze, self.walk_cost = [], [], []
-            if self.repeat > 0:
-                self.batch += self.repeat
-                self.next = max(self.batch, now)
-            else:
-                self.done = True
+            return False
+        forced = now >= self.next + max(self.interval, 0.1)
+        if not forced:
+            settle = self.last_continue + 0.001
+            while time.perf_counter() < settle:
+                if peek():
+                    return True
+            if peek():
+                return True
+        self.poll(now, live, not forced, last_event)
+        return False
+
+    def poll(self, now, live, quiet, last_event):
+        """Takes the due sample (run() decides when); writes the batch when it is complete."""
+        try:
+            self.sample(now, live, quiet, last_event)
+            # Jitter (+-25 %, mean = the interval) keeps samples off any period of the title or the timer.
+            self.next += self.interval * random.uniform(0.75, 1.25)
+            if self.next < now:
+                self.next = now  # late (a long debug event): no catch-up burst
+            if len(self.samples) >= self.count:
+                self.write()
+                self.samples, self.freeze, self.walk_cost = [], [], []
+                if self.repeat > 0:
+                    self.batch += self.repeat
+                    self.next = max(self.batch, now)
+                else:
+                    self.done = True
+        except Exception as error:  # a profiler fault must never cost the run
+            self.done = True
+            self.log(f"{now:7.3f} profile: stopped after an error: {error!r}")
 
     def _read(self, _process, base, buffer, size, got):
         low, data = self.snapshot
@@ -160,9 +198,10 @@ class Profiler:
         ntdll.NtQueryInformationThread(handle, 9, ctypes.byref(start), 8, None)  # ThreadQuerySetWin32StartAddress
         return text, start.value
 
-    def sample(self, now, live):
+    def sample(self, now, live, quiet=True, last_event=(0.0, 0)):
         for tid in [t for t in self.handles if t not in live]:
             k32.CloseHandle(self.handles.pop(tid))
+            self.previous.pop(tid, None)
         if not self.session:
             dbghelp.SymSetOptions(0x2 | 0x4 | 0x10 | 0x200 | 0x80000)  # UNDNAME DEFERRED LINES FAIL_CRITICAL NO_PROMPTS
             folders = [self.logdir] + sorted({os.path.dirname(p) for p in self.module_paths.values() if p})
@@ -193,6 +232,11 @@ class Profiler:
                 continue
             ctx = bytes(ctx_view)
             rsp = struct.unpack_from("<Q", ctx, 0x98)[0]
+            rip = struct.unpack_from("<Q", ctx, 0xF8)[0]
+            before = self.previous.get(tid)
+            if before and before[:4] == (rip, rsp, times[2].value, times[3].value):
+                copies.append((tid, handle, times[2].value, times[3].value, ctx, rsp, None))  # still in the same wait
+                continue
             info = MBI()
             size = STACK_BYTES
             if k32.VirtualQueryEx(self.process, rsp, ctypes.byref(info), ctypes.sizeof(info)):
@@ -206,10 +250,16 @@ class Profiler:
         resumed = time.perf_counter()
         threads = {}
         for tid, handle, kernel, user, ctx, rsp, stack in copies:
-            threads[tid] = (kernel, user, self.walk(handle, ctx, rsp, stack))
+            if stack is None:
+                frames = self.previous[tid][4]
+                self.reused += 1
+            else:
+                frames = self.walk(handle, ctx, rsp, stack)
+            self.previous[tid] = (struct.unpack_from("<Q", ctx, 0xF8)[0], rsp, kernel, user, frames)
+            threads[tid] = (kernel, user, frames)
         self.freeze.append(resumed - began)
         self.walk_cost.append(time.perf_counter() - resumed)
-        self.samples.append((now, threads))
+        self.samples.append((now, threads, quiet, (now - last_event[0]) * 1000.0, last_event[1]))
 
     def walk(self, handle, ctx, rsp, stack):
         raw = (ctypes.c_ubyte * (1232 + 16))()
@@ -292,26 +342,33 @@ class Profiler:
         dbghelp.SymSetOptions(0x2 | 0x4 | 0x10 | 0x200 | 0x80000)  # the thread dumps reset the options
         if self.session:
             dbghelp.SymRefreshModuleList(self.process)
-        tids = sorted({tid for _, threads in samples for tid in threads})
+        tids = sorted({tid for s in samples for tid in s[1]})
         rows = []
         for tid in tids:
-            seen = [threads[tid] for _, threads in samples if tid in threads]
-            first = next(threads[tid] for _, threads in samples if tid in threads)
-            last = seen[-1]
+            seen = [s[1][tid] for s in samples if tid in s[1]]
+            first, last = seen[0], seen[-1]
             kernel, user = (last[0] - first[0]) / 1e4, (last[1] - first[1]) / 1e4  # ms
-            rows.append((kernel + user, kernel, user, tid, seen))
+            events = sum(1 for s in samples if s[4] == tid and s[3] < 5.0)
+            rows.append((kernel + user, kernel, user, tid, seen, events))
         rows.sort(key=lambda r: -r[0])
         ms = sorted(self.freeze)
-        out = [f"# profile {t0:.1f}-{t1:.1f} s: {len(samples)} samples, {self.interval * 1000:g} ms apart, "
-               f"{len(tids)} threads",
+        quiet = [s[3] for s in samples if s[2]]
+        since = sorted(s[3] for s in samples)
+        out = [f"# profile {t0:.1f}-{t1:.1f} s: {len(samples)} samples, {self.interval * 1000:g} ms apart on average "
+               f"(+-25 % jitter), {len(tids)} threads",
                f"# process frozen per sample: median {ms[len(ms) // 2] * 1000:.1f} ms, max {ms[-1] * 1000:.1f} ms "
                f"(suspend, context, {STACK_BYTES // 1024} KiB stack copy); stack walks afterwards "
-               f"{sum(self.walk_cost) / len(self.walk_cost) * 1000:.1f} ms per sample",
-               "# a thread whose leaf is a stand-in probe (an access violation) may be blocked reporting a debug event",
+               f"{sum(self.walk_cost) / len(self.walk_cost) * 1000:.1f} ms per sample; unchanged threads reused "
+               f"{self.reused} times",
+               f"# taken >= 1 ms after the last ContinueDebugEvent with no event pending: {len(quiet)}/{len(samples)}, forced "
+               f"{len(samples) - len(quiet)}; ms since the last debug event: median {since[len(since) // 2]:.1f}, "
+               f"min {since[0]:.1f}",
+               "# CPU time (cpu%) is the arbiter. 'ev' = samples taken < 5 ms after this thread's own debug event;",
+               "# a thread with many 'run' samples but little CPU is blocked in a debug event or waiting for a CPU",
                "", f"## (a) CPU per thread between the first and the last sample ({wall:.2f} s wall)",
-               "   tid  cpu%  user_ms kernel_ms  run/sys/wait  name / start address / most frequent leaf"]
+               "   tid  cpu%  user_ms kernel_ms  ev  run/sys/wait  name / start address / most frequent leaf"]
         total = 0.0
-        for cpu, kernel, user, tid, seen in rows:
+        for cpu, kernel, user, tid, seen, events in rows:
             total += cpu
             states = [self.state(s[2])[0] for s in seen]
             leaves = {}
@@ -319,12 +376,13 @@ class Profiler:
                 leaves[s[2][0]] = leaves.get(s[2][0], 0) + 1
             top = max(leaves.items(), key=lambda kv: kv[1])[0]
             text, begin = self.info.get(tid, ("", 0))
-            out.append(f"{tid:6d} {cpu / 10 / wall:5.1f} {user:8.0f} {kernel:9.0f}  "
+            flag = "  RUN>>CPU" if states.count("run") > 0.5 * len(seen) and cpu / 10 / wall < 10 else ""
+            out.append(f"{tid:6d} {cpu / 10 / wall:5.1f} {user:8.0f} {kernel:9.0f} {events:3d}  "
                        f"{states.count('run'):3d}/{states.count('syscall'):3d}/{states.count('wait'):3d}  "
-                       f"{text or '-'} / {self.where(begin) if begin else '-'} / {self.name(top)}")
+                       f"{text or '-'} / {self.where(begin) if begin else '-'} / {self.name(top)}{flag}")
         out.append(f"total: {total / 1000 / wall:.2f} cores")
         out += ["", "## (b) per thread, busiest first: leaf and inclusive frame histograms, top stacks"]
-        for cpu, kernel, user, tid, seen in rows:
+        for cpu, kernel, user, tid, seen, _ in rows:
             states = [self.state(s[2]) for s in seen]
             if cpu / 10 / wall < 1.0 and all(k == "wait" for k, _ in states):
                 continue  # idle waiters: section (c)
@@ -338,8 +396,8 @@ class Profiler:
             for stack, n in _count([s[2][:6] for s in seen])[:4]:
                 out.append(f"  x{n}: " + " < ".join(self.name(f) for f in stack))
         out += ["", "## (c) wait sites (waiting samples: wait call @ first two frames outside the system modules)"]
-        for cpu, kernel, user, tid, seen in rows:
-            waits = [f"{self.state(s[2])[1]} @ {self.site(s[2])}" for s in seen if self.state(s[2])[0] == "wait"]
+        for cpu, kernel, user, tid, seen, _ in rows:
+            waits =[f"{self.state(s[2])[1]} @ {self.site(s[2])}" for s in seen if self.state(s[2])[0] == "wait"]
             if waits:
                 out.append(f"thread {tid}: " + ", ".join(f"{w} x{n}" for w, n in _count(waits)[:3]) +
                            f"  ({len(waits)}/{len(seen)} samples waiting)")
