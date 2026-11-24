@@ -61,7 +61,11 @@ MESH_HELPERS = {
                  'r |= x2w_perm_byte(s0, s1, (s2 >> (8u * i)) & 255u) << (8u * i); return r; }'),
     # v_mbcnt_{lo,hi}_u32_b32 D, S0, S1 in a 64-lane wave: S1 + the number of set S0 bits below this lane in the
     # low (lanes 0-31) or high (lanes 32-63) half of the wave mask.
-    'x2w_fma': 'float x2w_fma(float a, float b, float c) { return (float)fma((double)a, (double)b, (double)c); }',
+    'x2w_fclass': ('uint x2w_fclass(uint u) { uint e = (u >> 23) & 255u, m = u & 0x7fffffu, s = u >> 31; '
+                   'if (e == 255u) return m != 0u ? ((m >> 22) != 0u ? 1u : 0u) : (s != 0u ? 2u : 9u); '
+                   'if (e == 0u) return m == 0u ? (s != 0u ? 5u : 6u) : (s != 0u ? 4u : 7u); '
+                   'return s != 0u ? 3u : 8u; }'),
+    'x2w_fma':'float x2w_fma(float a, float b, float c) { return (float)fma((double)a, (double)b, (double)c); }',
     'x2w_mbcnt_lo':'uint x2w_mbcnt_lo(uint m, uint lane) { return countbits(m & (lane >= 32u ? 0xffffffffu : ((1u << lane) - 1u))); }',
     'x2w_mbcnt_hi': 'uint x2w_mbcnt_hi(uint m, uint lane) { return lane < 32u ? 0u : countbits(m & ((1u << (lane - 32u)) - 1u)); }',
 }
@@ -691,6 +695,74 @@ class MeshStage(G.Stage):
 
     def op_s_pack_hh_b32_b16(self, ops, mods):
         self.pack(ops, '(({0} >> 16) | ({1} & 0xffff0000u))')
+
+    # v_min3 / v_max3 / v_med3 on integers (RDNA 2 ISA): three-way min, max, median
+    def three(self, ops, fn, signed):
+        a, b, c = [self.u(o) for o in ops[1:4]]
+        if signed:
+            a, b, c = ['asint(%s)' % x for x in (a, b, c)]
+        expr = {'min': 'min(min({0}, {1}), {2})', 'max': 'max(max({0}, {1}), {2})',
+                'med': 'max(min({0}, {1}), min(max({0}, {1}), {2}))'}[fn].format(a, b, c)
+        self.set_v(reg_range(ops[0])[1], 'asuint(%s)' % expr if signed else expr)
+
+    def op_v_min3_u32(self, ops, mods):
+        self.three(ops, 'min', False)
+
+    def op_v_max3_u32(self, ops, mods):
+        self.three(ops, 'max', False)
+
+    def op_v_med3_u32(self, ops, mods):
+        self.three(ops, 'med', False)
+
+    def op_v_min3_i32(self, ops, mods):
+        self.three(ops, 'min', True)
+
+    def op_v_max3_i32(self, ops, mods):
+        self.three(ops, 'max', True)
+
+    def op_v_med3_i32(self, ops, mods):
+        self.three(ops, 'med', True)
+
+    SEL = {'BYTE_0': (0, 8), 'BYTE_1': (8, 8), 'BYTE_2': (16, 8), 'BYTE_3': (24, 8), 'WORD_0': (0, 16),
+           'WORD_1': (16, 16), 'DWORD': (0, 32)}
+
+    def sdwa_src(self, tok, sel):
+        sx = tok.startswith('sext(') and tok.endswith(')')
+        u = self.u(tok[5:-1] if sx else tok)
+        sh, w = self.SEL[sel]
+        if w == 32:
+            return u
+        if sx:
+            return 'asuint(asint(%s << %du) >> %du)' % (u, 32 - sh - w, 32 - w)
+        return '((%s >> %du) & 0x%xu)' % (u, sh, (1 << w) - 1)
+
+    def op_v_mov_b32_sdwa(self, ops, mods):
+        """D = the selected field of S0 placed at dst_sel; other bits zero (UNUSED_PAD) or kept (UNUSED_PRESERVE)
+        (RDNA 2 ISA, SDWA)."""
+        f = dict(m.partition(':')[::2] for m in mods)
+        if set(f) - {'dst_sel', 'dst_unused', 'src0_sel'} or len(ops) != 2:
+            raise Unsupported('v_mov_b32_sdwa with %s' % mods)
+        d = reg_range(ops[0])[1]
+        sh, w = self.SEL[f.get('dst_sel', 'DWORD')]
+        val = '((%s & 0x%xu) << %du)' % (self.sdwa_src(ops[1], f.get('src0_sel', 'DWORD')), (1 << w) - 1 if w < 32 else 0xffffffff, sh)
+        unused = f.get('dst_unused', 'UNUSED_PAD')
+        if unused == 'UNUSED_PRESERVE':
+            keep = 0xffffffff & ~((((1 << w) - 1) << sh))
+            val = '(%s | (v%d & 0x%08xu))' % (val, d, keep)
+            self.used_v.add(d)
+        elif unused != 'UNUSED_PAD':
+            raise Unsupported('v_mov_b32_sdwa %s' % unused)
+        self.set_v(d, val)
+
+    def op_v_cmp_class_f32_sdwa(self, ops, mods):
+        """V_CMP_CLASS_F32 (SDWA, VOPC into an SGPR mask): bit class(S0) of the selected S1 field; class bits 0 sNaN,
+        1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf (RDNA 2 ISA)."""
+        f = dict(m.partition(':')[::2] for m in mods)
+        if set(f) - {'src0_sel', 'src1_sel'} or f.get('src0_sel', 'DWORD') != 'DWORD' or len(ops) != 3:
+            raise Unsupported('v_cmp_class_f32_sdwa with %s %s' % (ops, mods))
+        x = self.u(ops[1])
+        mask = self.sdwa_src(ops[2], f.get('src1_sel', 'DWORD'))
+        return self.write_compare(False, ops[0], '((%s >> x2w_fclass(%s)) & 1u)' % (mask, x))
 
     def carry_op(self, base, ops, mods):
         """v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 and the _ci forms: D, carry-out mask, S0, S1[, carry-in mask].
