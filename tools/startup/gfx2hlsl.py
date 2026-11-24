@@ -1411,10 +1411,10 @@ class Stage:
         return 'f16tof32(%s)' % ('%s >> 16' % self.u(reg) if half else self.u(reg))
 
     def image_compare(self, ops, mods, how):
-        """image_sample_c and image_sample_c_lz: a 2D depth comparison returning one float.
+        """image_sample_c and image_sample_c_lz: a 2D or 2D-array depth comparison returning one float.
 
-        The address dwords are the reference, then u and v, which is what SampleCmp* takes as its third
-        argument and its location. The comparison function and the filter live in the sampler descriptor,
+        The address dwords are the reference, then u and v (and the slice of a 2D array), which is what
+        SampleCmp* takes as its third argument and its location. The comparison function and the filter live in the sampler descriptor,
         so they are read from its constant words by the decoder the pixel AOT path already checks against
         D3D12 (pixel_aot.comparison_sampler_state) and bound as a SamplerComparisonState. HLSL has no
         SampleCmpLevel before shader model 6.7 (the stages here compile as 5.1 and 6.0), so
@@ -1431,8 +1431,9 @@ class Stage:
         if len(dims) != 1 or len(masks) != 1:
             raise Unsupported('%s without exactly one dim and dmask' % base)
         dim, dmask = dims[0], int(masks[0], 0)
-        if dim != 'SQ_RSRC_IMG_2D':
+        if dim not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_2D_ARRAY'):
             raise Unsupported('%s on %s' % (base, dim))
+        array = dim == 'SQ_RSRC_IMG_2D_ARRAY'
         if dmask != 1:
             raise Unsupported('%s with dmask %#x: a comparison returns one channel' % (base, dmask))
         if len(ops) != 4:
@@ -1443,7 +1444,8 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
-        if len(cs) != 3:
+        # The reference, u and v; a 2D array adds the slice as the last address register.
+        if len(cs) != (4 if array else 3):
             raise Unsupported('%s with %d address registers' % (base, len(cs)))
         if self.heap_sampler(ops[3]):
             raise Unsupported('%s through a sampler heap' % base)
@@ -1455,9 +1457,12 @@ class Stage:
             pixel_aot.comparison_sampler_state(tuple(words))
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (base, error))
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2da' if array else 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
-        args = '%s, float2(%s, %s), %s' % (smp, self.f(cs[1]), self.f(cs[2]), self.f(cs[0]))
+        # Texture2DArray takes the slice as the third location component, like Sample and Load on the same type.
+        location = ('float3(%s, %s, %s)' % (self.f(cs[1]), self.f(cs[2]), self.f(cs[3])) if array
+                    else 'float2(%s, %s)' % (self.f(cs[1]), self.f(cs[2])))
+        args = '%s, %s, %s' % (smp, location, self.f(cs[0]))
         # MAX_LOD (word 1 bits 23:12) is not carried into the static sampler, and the comparison-state mapping ignores
         # the mip filter and uses level zero. Only a source limited to level zero is therefore exact for the implicit
         # form; any other limit would need mip selection and blending that is not lowered in this slice, so it is refused.

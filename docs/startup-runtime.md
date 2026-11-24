@@ -535,6 +535,13 @@ These are measured on one executable; treat them as hypotheses for others.
   (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
   and 1D images are still refused. Not covered: binding a single-slice 2D view to an array declaration
   in the draw path.
+- **2D array depth comparison.** `image_sample_c_lz` and `image_sample_c` (sampler MAX_LOD 0) with
+  `dim:SQ_RSRC_IMG_2D_ARRAY` take the reference, u, v and the slice as four address registers and lower to
+  `Texture2DArray.SampleCmpLevelZero(smp, float3(u, v, slice), reference)` on the same constant comparison
+  sampler as the 2D form. Before, they were refused with `image_sample_c on SQ_RSRC_IMG_2D_ARRAY`.
+  `python -B tests/startup_image_sample_c_check.py` translates the fixtures (words checked against `llvm-mc`) and
+  fails seven edited array lowerings. No draw runs this form yet, so the compare result on WARP or hardware is
+  not measured; `image_sample_c_l` stays refused (shader model 6.7).
 - **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
