@@ -62,10 +62,19 @@ void __stdcall list_copy_buffer(Wrapper* self, Wrapper* dest, u64 dest_offset, W
         done = true;
     }
     InterlockedIncrement(done ? &buffer_copies_done : &buffer_copies_skipped);
+    // The first copy to each destination title address (at most 256 lines); copies of up to 0x100
+    // bytes show the whole source, longer ones its first 16 bytes.
+    static SRWLOCK seen_lock = SRWLOCK_INIT;
+    static std::unordered_set<u64>* seen = new std::unordered_set<u64>;
+    const u64 where = to ? reinterpret_cast<u64>(to) + dest_offset : reinterpret_cast<u64>(dest) ^ (dest_offset << 1);
+    AcquireSRWLockExclusive(&seen_lock);
+    const bool fresh = seen->size() < 4096 && seen->insert(where).second;
+    ReleaseSRWLockExclusive(&seen_lock);
     static LONG shown;
-    if (first_calls(shown, 64)) {
-        char head[3 * 16 + 1] = "";
-        if (from && x2w_local::readable(from + source_offset, 16)) hex_text(from + source_offset, 16, head, sizeof(head));
+    if (fresh && first_calls(shown, 256)) {
+        const std::size_t dumped = bytes && bytes <= 0x100 ? static_cast<std::size_t>(bytes) : 16;
+        char head[3 * 0x100 + 1] = "";
+        if (from && x2w_local::readable(from + source_offset, dumped)) hex_text(from + source_offset, dumped, head, sizeof(head));
         log("x2w-copy CopyBufferRegion dest %p+0x%llx (title %p) source %p+0x%llx (title %p) bytes 0x%llx: %s; source [%s]",
             static_cast<void*>(dest), dest_offset, to ? static_cast<void*>(to + dest_offset) : nullptr, static_cast<void*>(source),
             source_offset, from ? static_cast<const void*>(from + source_offset) : nullptr, bytes, outcome, head);
