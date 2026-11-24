@@ -190,8 +190,11 @@ def main():
     # slab budget in the guard below. X2W_XMEM_GPU_POOL=0: off.
     pooled_bytes = 0
     if os.environ.get("X2W_XMEM_SLAB_DIR") and os.environ.get("X2W_XMEM_GPU_POOL") != "0":
-        import gpu_slab_pool
-        pooled_bytes = gpu_slab_pool.ensure(max(1, int(os.environ.get("X2W_XMEM_SLAB_BUDGET_MIB") or "3072") // 256)) << 28
+        try:  # a pool failure must never cost a run: xmem then falls back to fresh sections
+            import gpu_slab_pool
+            pooled_bytes = gpu_slab_pool.ensure(max(1, int(os.environ.get("X2W_XMEM_SLAB_BUDGET_MIB") or "3072") // 256)) << 28
+        except Exception as error:
+            print(f"GPU slab pool not started: {error}")
         print(f"GPU slab pool: {pooled_bytes >> 20} MiB reachable (X2W_XMEM_GPU_POOL)")
     # Host safety (runtime_work/NOTES.md): the job limit covers private commit only. Pagefile page
     # slabs are capped by X2W_XMEM_SLAB_BUDGET_MIB; a launch whose job limit plus slab budget does not

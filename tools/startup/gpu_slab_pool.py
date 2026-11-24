@@ -87,16 +87,20 @@ def ensure(count, mib=256):
         return reachable()
     # Detached, outside any job of the caller, no console: it must outlive the run that started it.
     flags = 0x00000008 | 0x00000200 | 0x01000000  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
-    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "out", "gpu_slab_pool.log")
+    out_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "out"))
+    os.makedirs(out_dir, exist_ok=True)
     args = [sys.executable, "-B", os.path.abspath(__file__), "hold", "--count", str(count), "--mib", str(mib)]
-    with open(log_path, "a") as log:
+    # Neutral working directory: the holder must not keep the caller's (e.g. the title's data drive) in use.
+    cwd = os.environ.get("SystemRoot", out_dir)
+    with open(os.path.join(out_dir, "gpu_slab_pool.log"), "a") as log:
         try:
-            subprocess.Popen(args, creationflags=flags, stdout=log, stderr=log, stdin=subprocess.DEVNULL, close_fds=True)
+            subprocess.Popen(args, creationflags=flags, stdout=log, stderr=log, stdin=subprocess.DEVNULL, close_fds=True,
+                             cwd=cwd)
         except OSError:  # the caller's job may refuse breakaway: start without it
-            print("gpu_slab_pool: the holder could not leave the caller's job and ends with it; a later holder charges "
-                  "its pool again", flush=True)
+            print("gpu_slab_pool: the holder could not leave the caller's job and ends with it; the pool then "
+                  "only helps within that job's lifetime", flush=True)
             subprocess.Popen(args, creationflags=flags & ~0x01000000, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-                             close_fds=True)
+                             close_fds=True, cwd=cwd)
     for _ in range(100):
         if running():
             return reachable()
