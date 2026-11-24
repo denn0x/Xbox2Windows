@@ -687,10 +687,16 @@ class Stage:
     # float forms are not lowered yet, and dst_unused UNUSED_SEXT has no lowering.
     def sdwa(self, base, ops, mods):
         fields = {}
+        outmods = []
         for m in mods:
             key, _, value = m.partition(':')
             if key in ('src0_sel', 'src1_sel', 'src2_sel', 'dst_sel', 'dst_unused') and value:
                 fields[key] = value
+            elif m in ('clamp', 'mul:2', 'mul:4', 'div:2') and base in VEC_U_TO_F:
+                # The SDWA9 encoding (gfx9+, LLVM VOPInstructions.td VOP_SDWA9 has omod and clamp for VOP1/VOP2)
+                # carries the output modifiers; on a float-result conversion they act on the binary32 result as
+                # in VOP3. Taken only with dst_sel:DWORD (below), where no field placement follows them.
+                outmods.append(m)
             else:
                 raise Unsupported('%s with SDWA modifier %s' % (base, m))
         if base == 'v_cndmask_b32':
@@ -721,6 +727,10 @@ class Stage:
         select = fields.get('dst_sel')
         if not select:
             raise Unsupported('%s SDWA without dst_sel' % base)
+        if outmods:
+            if select != 'DWORD':
+                raise Unsupported('%s SDWA with %s and dst_sel:%s' % (base, ' '.join(outmods), select))
+            return self.set_vf(reg_range(ops[0])[1], text_f.format(*sources), outmods)
         # The operation's HLSL carries its own operators, so it has to be grouped before the
         # destination field masks it: "v7 | v8 & 0xffff" would otherwise bind as "v7 | (v8 & 0xffff)".
         if SDWA_SEL[select][1] < 32:
