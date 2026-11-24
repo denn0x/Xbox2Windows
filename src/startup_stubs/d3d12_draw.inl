@@ -496,6 +496,121 @@ HRESULT create_draw_root(Translation& tr)
     return hr;
 }
 
+// LOCAL stall: a pipeline whose manifest is absent no longer re-reads it on the draw path (every 1000 ms
+// per key, under draw_lock; run 91: about 15 failed opens a second, each a traced file open that stops
+// the process under the startup debugger). The draw path only reloads a translation that the watcher
+// thread has seen appear: it reads the cache directory's change records (the created or renamed file
+// names, so no query per key) and, every 30 s or after a record overflow, checks the missing keys'
+// manifests outside draw_lock. X2W_MANIFEST_POLL=1 restores the 1 s retry.
+struct ManifestWatch {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<std::pair<Translation*, std::string>> missing;  // translation, its rtv request
+};
+ManifestWatch& manifest_watch() { static ManifestWatch w; return w; }
+std::unordered_map<const Translation*, volatile LONG>& manifest_seen() { static std::unordered_map<const Translation*, volatile LONG> m; return m; }
+bool manifest_poll() { static const bool on = x2w_local::env_on("X2W_MANIFEST_POLL"); return on; }
+
+// Marks a missing translation as seen. name: a file name from a change notification (only that key
+// matches), or null for a full scan (one attribute query per missing key).
+void manifest_check(const wchar_t* name)
+{
+    std::vector<std::pair<Translation*, std::string>> look;
+    AcquireSRWLockShared(&manifest_watch().lock);
+    look = manifest_watch().missing;
+    ReleaseSRWLockShared(&manifest_watch().lock);
+    for (const auto& [tr, request] : look) {
+        wchar_t path[MAX_PATH];
+        if (!cache_path(path, L"", tr->key, L".txt")) continue;
+        if (name) {
+            const wchar_t* slash = std::wcsrchr(path, L'\\');
+            if (_wcsicmp(slash ? slash + 1 : path, name) != 0) continue;
+        } else if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+            continue;
+        }
+        AcquireSRWLockExclusive(&manifest_watch().lock);
+        auto& m = manifest_watch().missing;
+        m.erase(std::remove_if(m.begin(), m.end(), [&](const auto& e) { return e.first == tr; }), m.end());
+        InterlockedExchange(&manifest_seen()[tr], 1);
+        ReleaseSRWLockExclusive(&manifest_watch().lock);
+        log("x2w-draw manifest for %016llx appeared: reloaded at its next draw", tr->key);
+    }
+}
+
+DWORD WINAPI manifest_watcher(void*)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    wchar_t dir[MAX_PATH];
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    if (cache_path(dir, L"", 0, L".txt")) {
+        if (wchar_t* slash = std::wcsrchr(dir, L'\\')) *slash = 0;
+        handle = CreateFileW(dir, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+    }
+    log("x2w-draw manifest watcher: %s", handle != INVALID_HANDLE_VALUE ? "directory change records" : "30 s rescans");
+    manifest_check(nullptr);  // a manifest published before the watch started
+    alignas(DWORD) static unsigned char buffer[64 * 1024];
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool pending = false;
+    for (;;) {
+        // File names only: the stand-in itself writes req_* files here; a manifest is published by rename
+        // or creation, both name changes, and the record names the file, so no query is needed.
+        if (!pending && handle != INVALID_HANDLE_VALUE && overlapped.hEvent) {
+            ResetEvent(overlapped.hEvent);
+            pending = ReadDirectoryChangesW(handle, buffer, sizeof(buffer), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME, nullptr,
+                                            &overlapped, nullptr) != FALSE;
+        }
+        // 30 s rescan: a manifest published between a failed open and its registration has no record.
+        if (!pending || WaitForSingleObject(overlapped.hEvent, 30000) != WAIT_OBJECT_0) {
+            if (!pending) Sleep(30000);
+            manifest_check(nullptr);
+            continue;
+        }
+        pending = false;
+        DWORD bytes = 0;
+        if (!GetOverlappedResult(handle, &overlapped, &bytes, FALSE) || bytes == 0) {  // overflow: names lost
+            manifest_check(nullptr);
+            continue;
+        }
+        for (DWORD at = 0;;) {
+            const auto* record = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer + at);
+            if (record->Action == FILE_ACTION_ADDED || record->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+                wchar_t name[MAX_PATH];
+                const std::size_t chars = record->FileNameLength / sizeof(wchar_t);
+                if (chars < MAX_PATH) {
+                    std::wmemcpy(name, record->FileName, chars);
+                    name[chars] = 0;
+                    if (chars > 4 && _wcsicmp(name + chars - 4, L".txt") == 0) manifest_check(name);
+                }
+            }
+            if (!record->NextEntryOffset) break;
+            at += record->NextEntryOffset;
+        }
+    }
+}
+
+void watch_missing_manifest(Translation& tr, const std::string& request)
+{
+    static const HANDLE thread = CreateThread(nullptr, 0, manifest_watcher, nullptr, 0, nullptr);
+    (void)thread;
+    AcquireSRWLockExclusive(&manifest_watch().lock);
+    manifest_watch().missing.emplace_back(&tr, request);
+    manifest_seen()[&tr] = 0;
+    ReleaseSRWLockExclusive(&manifest_watch().lock);
+}
+
+// draw_lock held: true when the translation's absent manifest should be read again now.
+bool manifest_retry_due(Translation& tr)
+{
+    if (!tr.retry_manifest_at) return false;
+    if (manifest_poll()) return GetTickCount64() >= tr.retry_manifest_at;
+    AcquireSRWLockShared(&manifest_watch().lock);
+    const auto found = manifest_seen().find(&tr);
+    const bool seen = found != manifest_seen().end() && InterlockedExchange(&found->second, 0) != 0;
+    ReleaseSRWLockShared(&manifest_watch().lock);
+    return seen;
+}
+
 void load_translation(Translation& tr, const std::string& rtv_request = {})
 {
     tr.state = 2;
@@ -510,6 +625,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                 log("x2w-draw no translation for pipeline %016llx", tr.key);
         }
         tr.retry_manifest_at = GetTickCount64() + 1000;
+        if (!manifest_poll()) watch_missing_manifest(tr, rtv_request);
         return;
     }
     // The writer publishes this marker last. A malformed published result stays rejected.
@@ -803,7 +919,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
     if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
-        if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
+        if (manifest_retry_due(*base))
             load_translation(*base);
         return base;
     }
@@ -820,7 +936,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
             publish_shader_request(key, L".rtv", request.data(), request.size());
             log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
         }
-    } else if (entry->retry_manifest_at && GetTickCount64() >= entry->retry_manifest_at) {
+    } else if (manifest_retry_due(*entry)) {
         load_translation(*entry, request);
     }
     return entry;
