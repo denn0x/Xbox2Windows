@@ -646,6 +646,34 @@ set_tests_properties(startup_slice_footprints_padded_control PROPERTIES WILL_FAI
 
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
+
+# LOCAL: ExecuteIndirect (list slot 61) with Dispatch arguments a compute writer stored in title memory.
+set(startup_indirect_headers)
+foreach(entry IN ITEMS Writer Counter)
+    string(TOLOWER "${entry}" entry_lower)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/startup_indirect_${entry_lower}.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E ${entry} -Vn startup_indirect_${entry_lower} -Fh "${header}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_indirect_dispatch.hlsl"
+        DEPENDS tests/startup_indirect_dispatch.hlsl VERBATIM)
+    list(APPEND startup_indirect_headers "${header}")
+endforeach()
+add_executable(startup_indirect_dispatch tests/startup_indirect_dispatch.cpp ${startup_indirect_headers})
+target_include_directories(startup_indirect_dispatch PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_indirect_dispatch PRIVATE cxx_std_17)
+target_link_libraries(startup_indirect_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS gpu no-writer zero off)
+        add_test(NAME startup_indirect_dispatch_${mode}_${backend} COMMAND startup_indirect_dispatch ${backend} ${mode})
+        set(indirect_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(mode STREQUAL "off")
+            set(indirect_env "${indirect_env};X2W_INDIRECT_OFF=1")
+        endif()
+        set_tests_properties(startup_indirect_dispatch_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${indirect_env}")
+    endforeach()
+endforeach()
+
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp
     tests/descriptor_heap_paging.cpp)
