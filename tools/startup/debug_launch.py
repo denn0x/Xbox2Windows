@@ -142,7 +142,8 @@ def main():
     stub_area = [0, 0]  # next free address and end of the block the stubs go to
     os.makedirs(logdir, exist_ok=True)
     trap_log = os.path.join(logdir, "trap.log")
-    for stale in (trap_log, os.path.join(logdir, "finished.txt")):  # a reused run directory starts clean
+    stop_file = os.path.join(logdir, "stop")  # created from outside: end the run as at a timeout
+    for stale in (trap_log, os.path.join(logdir, "finished.txt"), stop_file):  # a reused run directory starts clean
         if os.path.exists(stale):
             os.remove(stale)
     if os.path.exists(trap_log):
@@ -737,6 +738,8 @@ def main():
         return (committed, limit) if limit - committed < headroom_stop_mib else None
 
     interrupted = False
+    stop_requested = False
+    stop_next = 0.0
     asserts_total = 0
     exception_repeats = {}  # (code, address) -> events not logged because of --log-repeats
     try:
@@ -748,6 +751,12 @@ def main():
                 log(f"{time.time() - start:7.3f} host commit headroom {low[1] - low[0]} MiB < {headroom_stop_mib} MiB "
                     f"(committed {low[0]} / limit {low[1]} MiB): ending the run (X2W_HEADROOM_STOP_MIB)")
                 break
+            if time.time() >= stop_next:
+                stop_next = time.time() + 0.5
+                if os.path.exists(stop_file):
+                    stop_requested = True
+                    log(f"{time.time() - start:7.3f} stop file {stop_file} found: ending the run")
+                    break
             if dump_at and time.time() - start >= dump_at[0]:
                 dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
             if watches and time.time() >= watch_next:
@@ -994,7 +1003,9 @@ def main():
             print(f"stopped: host commit headroom {headroom_stop[1] - headroom_stop[0]} MiB below {headroom_stop_mib} MiB "
                   f"(committed {headroom_stop[0]} / limit {headroom_stop[1]} MiB) after {elapsed:.2f} s")
             fast_exit = True
-        print(f"{'interrupted' if interrupted else 'headroom stop' if headroom_stop else 'timeout'} after {elapsed:.2f} s")
+        if stop_requested:
+            print(f"stopped by request after {elapsed:.2f} s (stop file {stop_file})")
+        print(f"{'interrupted' if interrupted else 'headroom stop' if headroom_stop else 'stop requested' if stop_requested else 'timeout'} after {elapsed:.2f} s")
         # --fast-exit: each thread's rip only (no stack walk); the full walk otherwise.
         dumped = timed("threads.txt", dump_threads, os.path.join(logdir, "threads.txt"), not fast_exit)
         for item in filter(None, os.environ.get("X2W_DUMP", "").split(",")):
