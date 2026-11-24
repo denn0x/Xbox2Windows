@@ -1109,46 +1109,20 @@ D3D12_GPU_VIRTUAL_ADDRESS draw_title_heap(const Pass& pass)
     return last_va;
 }
 
-// gfx10 SQ_BUF_RSRC_WORD3 for a buffer view the title created (udsrc bufword3 / uavword3 of a view token):
-// identity DST_SEL (0xfac) and FORMAT [18:12] numbered as tools/disasm_rdna2.py MTBUF_FORMATS (8_UNORM = 1),
-// the same numbering compute-rt uses for vinfo word 1. Raw, structured, constant-buffer and unmapped views: 0.
+// gfx10 SQ_BUF_RSRC_WORD3 for a buffer view the title created (udsrc bufword3 / uavword3 of a view token): the
+// word gfx10_view_words.h synthesizes, the same value compute hands to compute programs (d3d12_compute.inl): typed
+// views only (FORMAT, DST_SEL, OOB_SELECT); raw, structured, constant-buffer and unmapped views: 0.
+bool typed_views_off();
 std::uint32_t view_buffer_word3(const ViewRecord& record)
 {
-    if ((record.slot != 18 && record.slot != 19) || record.desc_bytes < 36) return 0;
-    DXGI_FORMAT format{};
-    std::uint32_t dimension = 0, stride = 0, flags = 0;
-    std::memcpy(&format, record.desc, 4);
-    std::memcpy(&dimension, record.desc + 4, 4);
-    std::memcpy(&stride, record.desc + (record.slot == 18 ? 16 : 8) + 12, 4);
-    std::memcpy(&flags, record.desc + 32, 4);
-    if (dimension != 1 || stride || (flags & 1)) return 0;
-    std::uint32_t code = 0;
-    switch (desktop_format(format)) {
-    case DXGI_FORMAT_R8_UNORM: code = 1; break;            case DXGI_FORMAT_R8_SNORM: code = 2; break;
-    case DXGI_FORMAT_R8_UINT: code = 5; break;             case DXGI_FORMAT_R8_SINT: code = 6; break;
-    case DXGI_FORMAT_R16_UNORM: code = 7; break;           case DXGI_FORMAT_R16_SNORM: code = 8; break;
-    case DXGI_FORMAT_R16_UINT: code = 11; break;           case DXGI_FORMAT_R16_SINT: code = 12; break;
-    case DXGI_FORMAT_R16_FLOAT: code = 13; break;          case DXGI_FORMAT_R8G8_UNORM: code = 14; break;
-    case DXGI_FORMAT_R8G8_SNORM: code = 15; break;         case DXGI_FORMAT_R8G8_UINT: code = 18; break;
-    case DXGI_FORMAT_R8G8_SINT: code = 19; break;          case DXGI_FORMAT_R32_UINT: code = 20; break;
-    case DXGI_FORMAT_R32_SINT: code = 21; break;           case DXGI_FORMAT_R32_FLOAT: code = 22; break;
-    case DXGI_FORMAT_R16G16_UNORM: code = 23; break;       case DXGI_FORMAT_R16G16_SNORM: code = 24; break;
-    case DXGI_FORMAT_R16G16_UINT: code = 27; break;        case DXGI_FORMAT_R16G16_SINT: code = 28; break;
-    case DXGI_FORMAT_R16G16_FLOAT: code = 29; break;       case DXGI_FORMAT_R11G11B10_FLOAT: code = 43; break;
-    case DXGI_FORMAT_R10G10B10A2_UNORM: code = 44; break;  case DXGI_FORMAT_R10G10B10A2_UINT: code = 48; break;
-    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: code = 56; break;
-    case DXGI_FORMAT_R8G8B8A8_SNORM: code = 57; break;     case DXGI_FORMAT_R8G8B8A8_UINT: code = 60; break;
-    case DXGI_FORMAT_R8G8B8A8_SINT: code = 61; break;      case DXGI_FORMAT_R32G32_UINT: code = 62; break;
-    case DXGI_FORMAT_R32G32_SINT: code = 63; break;        case DXGI_FORMAT_R32G32_FLOAT: code = 64; break;
-    case DXGI_FORMAT_R16G16B16A16_UNORM: code = 65; break; case DXGI_FORMAT_R16G16B16A16_SNORM: code = 66; break;
-    case DXGI_FORMAT_R16G16B16A16_UINT: code = 69; break;  case DXGI_FORMAT_R16G16B16A16_SINT: code = 70; break;
-    case DXGI_FORMAT_R16G16B16A16_FLOAT: code = 71; break; case DXGI_FORMAT_R32G32B32_UINT: code = 72; break;
-    case DXGI_FORMAT_R32G32B32_SINT: code = 73; break;     case DXGI_FORMAT_R32G32B32_FLOAT: code = 74; break;
-    case DXGI_FORMAT_R32G32B32A32_UINT: code = 75; break;  case DXGI_FORMAT_R32G32B32A32_SINT: code = 76; break;
-    case DXGI_FORMAT_R32G32B32A32_FLOAT: code = 77; break;
-    default: return 0;
-    }
-    return 0xfacu | code << 12;
+    if ((record.slot != 18 && record.slot != 19) || typed_views_off()) return 0;
+    x2w_startup::BufferViewLayout l;
+    if (!x2w_startup::buffer_view_layout_from_desc(record.slot == 19, record.desc, record.desc_bytes, l) ||
+        l.kind != x2w_startup::BufferViewKind::typed)
+        return 0;
+    std::uint32_t v[8];
+    x2w_startup::gfx10_buffer_words(l, v);
+    return v[3];
 }
 
 // Title ranges a translated draw bound as UAV. Raw srvs overlapping one are bound in place instead of
