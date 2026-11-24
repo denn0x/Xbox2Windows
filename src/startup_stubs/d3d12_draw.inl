@@ -303,15 +303,21 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         tr.key, tr.uds.size(), tr.srvs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
 
-// draw_lock held. Both pipeline forms use the same request writer and shader cache.
-Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
-                                const std::vector<unsigned char>& root_blob)
+u64 pipeline_key(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
+                 const std::vector<unsigned char>& root_blob)
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
     constexpr char revision[] = "x2w-startup-shader-3";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
-    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
+    return fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
+}
+
+// draw_lock held. Both pipeline forms use the same request writer and shader cache.
+Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
+                                const std::vector<unsigned char>& root_blob)
+{
+    const u64 key = pipeline_key(a, a_bytes, b, b_bytes, root_blob);
     auto& entry = translation_by_key()[key];
     if (!entry) {
         entry = new Translation;

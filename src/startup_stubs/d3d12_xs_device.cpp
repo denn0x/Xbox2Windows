@@ -2439,6 +2439,7 @@ struct TextureWrite {
 std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 #include "startup_stubs/d3d12_draw.inl"
+#include "startup_stubs/d3d12_regblob.inl"
 
 
 LONG frame_dispatches;  // dispatches since the last present (LOCAL instrumentation)
@@ -3835,7 +3836,8 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
-    if (N == 67 && x2w_local::readable(desc, 0x28)) {
+    if (N == 57) regblob::dump57(desc);
+    if (N == 67 &&x2w_local::readable(desc, 0x28)) {
         u64 words[5];
         std::memcpy(words, desc, sizeof(words));
         std::vector<unsigned char> regs;
@@ -4156,6 +4158,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("%s", line);
         report_dispatches();
         report_indirect(300);  // LOCAL: d3d12_indirect.inl
+        regblob::report();
     }
     if (now - last_report >= 5000) {
         last_report = now;
