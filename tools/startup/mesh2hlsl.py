@@ -41,6 +41,10 @@ GROUP = 128           # PSV0 numthreads (128, 1, 1) in all 9282 archive mesh rec
 MAX_VERTICES = 128    # PSV0 MaxOutputVertices
 MAX_PRIMITIVES = 128  # PSV0 MaxOutputPrimitives
 ALL_LANES = (1 << 64) - 1
+# User SGPRs of the mesh stage start at s16 (MEASURED: in all 4045 distinct run programs the SGPRs read before any
+# write lie in s16..s24, and the real root signatures (regblob g57_*.root) give 9 = 3 tables + 1 root SRV + 2
+# constants + resource heap + sampler heap; s8..s15 are written first. Pixel and vertex stages start at s8.)
+MESH_USER_SGPR = 16
 FUSED = ('v_fma_f32', 'v_fmac_f32', 'v_fmamk_f32', 'v_fmaak_f32')
 # X2W_MESH_EXACT_FMA=1: fused multiply-adds through binary64 (needs double-precision shader ops); default off,
 # as the pipeline translator (`a * b + c`, which the compiler may or may not fuse)
@@ -278,7 +282,7 @@ class MeshStage(G.Stage):
     # ---- entry ---------------------------------------------------------------------------------
     def setup_entry(self):
         root = self.pipe.root
-        reg = 8  # user SGPRs from s8, as the pixel and vertex stages (setup_entry in gfx2hlsl)
+        reg = MESH_USER_SGPR
         for index, p in enumerate(root['params']):
             if p['type'] == 0:
                 self.sym[reg] = ('ptr', ('table', index))
@@ -1175,7 +1179,7 @@ def translate_request(out_dir, key):
 
 # ---- root signature synthesis for coverage runs over the archive (no real root blob there) ----------------------
 def synth_root(*codes):
-    """A root signature blob whose SGPR layout from s8 matches how the programs (the stages of one pipeline, which
+    """A root signature blob whose SGPR layout from s16 (MESH_USER_SGPR) matches how the programs (the stages of one pipeline, which
     share the layout) use their entry SGPRs: a register read as a 32-bit table pointer (with a zero high word)
     becomes a descriptor table, a pair used as a 64-bit base a root SRV, everything else 32-bit constants.
     COVERAGE ONLY: the title's real root signature comes with the request."""
@@ -1225,8 +1229,8 @@ def synth_scan(code, tables, pairs, used):
 
 
 def synth_layout(tables, pairs, used):
-    params, r = [], 8
-    top = max(used | {7}) + 1
+    params, r = [], MESH_USER_SGPR
+    top = max(used | {MESH_USER_SGPR - 1}) + 1
     while r < top:
         if r in tables:
             params.append((0, None))
