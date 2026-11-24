@@ -4316,7 +4316,16 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         hex_text(present_parameters, 0x40, b, sizeof(b));
         log("x2w-d3d12 CommandQueue::slot32(present) planes=%u plane=[%s] present=[%s]", planes, a, b);
     }
-    if (render_mode() && frame % (shown_in_window ? 60 : 6) == 0 && planes && plane_parameters) {
+    // LOCAL: X2W_D3D12_SHOT_FRAMES=<n> reads the presented surface back (and writes a numbered shot) every
+    // n frames while the window shows frames, instead of every 60 (0.5 s at 120 fps): the setup driver
+    // waits for fresh shots between presses.
+    static const ULONGLONG shot_frames = [] {
+        char value[8]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_D3D12_SHOT_FRAMES", value, sizeof(value));
+        const unsigned long frames = n && n < sizeof(value) ? std::strtoul(value, nullptr, 10) : 0ul;
+        return frames ? static_cast<ULONGLONG>(frames) : 60ull;
+    }();
+    if (render_mode() && frame % (shown_in_window ? shot_frames : 6) == 0 && planes && plane_parameters) {
         // Plane parameters: +0x00 frame token, +0x08 resource count, +0x10 pointer to the resources.
         const auto* words = static_cast<const u64*>(plane_parameters);
         if (x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8)) {
