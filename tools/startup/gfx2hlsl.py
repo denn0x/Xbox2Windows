@@ -753,10 +753,22 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
+        word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
+        if word_complement:
+            # A lane mask operand or destination is the whole wave's mask, and SCC is set when any bit of the
+            # complemented 32-bit result is set; the one-lane projection keeps only this lane's bit.
+            def lane_mask(t):
+                r = reg_range(t)
+                return t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or bool(r and r[0] == 's' and r[1] in self.masks)
+            if lane_mask(dname) or any(lane_mask(t) for t in srcs):
+                raise Unsupported('%s on a lane mask' % base)
         if dname == 'm0':
             return None
         syms = [self.sym.get(reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else None for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+            if word_complement:
+                # the descriptor path below records the word symbolically and emits no SCC
+                raise Unsupported('scc from descriptor data')
             if dname in ('exec', 'vcc', 'exec_lo', 'vcc_lo'):
                 raise Unsupported('mask from descriptor data')
             d = reg_range(dname)[1]
