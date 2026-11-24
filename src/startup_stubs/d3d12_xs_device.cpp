@@ -1819,7 +1819,17 @@ bool timing()
     static const bool value = x2w_local::env_on("X2W_FENCE_TIMES");
     return value;
 }
-bool on() { return timing(); }
+// X2W_FENCE_STORE=probe: the probe thread also stores the completed value as soon as its wait returns
+// (the threadpool callback still stores it too; fence_reached only ever raises the value).
+bool store_early()
+{
+    static const bool value = [] {
+        char text[16]{};
+        return GetEnvironmentVariableA("X2W_FENCE_STORE", text, sizeof(text)) && std::strcmp(text, "probe") == 0;
+    }();
+    return value;
+}
+bool on() { return timing() || store_early(); }
 SRWLOCK lock = SRWLOCK_INIT;
 std::deque<Entry*> entries;
 HANDLE wake;
@@ -1874,6 +1884,8 @@ DWORD WINAPI probe(void*)
         if (e->fence->GetCompletedValue() < e->value && SUCCEEDED(e->fence->SetEventOnCompletion(e->value, event)) &&
             WaitForSingleObject(event, 5000) != WAIT_OBJECT_0)
             InterlockedIncrement64(&timeouts);
+        else if (store_early())
+            fence_reached(e->wrapper, e->value);
         e->t1 = now();
         finish(e);
     }
