@@ -2270,6 +2270,11 @@ def translate_request(out_dir, key):
             raise Unsupported('RTV variant source key mismatch')
         ps_hw_inputs = read_ps_inputs(name + '.psin')
         vs_out_cntl = read_vs_out(name + '.vsout')
+        dumped = dumped_state(name) if ps_hw_inputs is None or vs_out_cntl is None else (None, None)
+        if ps_hw_inputs is None and dumped[0] is not None:
+            ps_hw_inputs = (dumped[0], dumped[0])  # ADDR assumed equal to ENA (no ADDR field located)
+        if vs_out_cntl is None:
+            vs_out_cntl = dumped[1]
         if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
             # Slot 86 records complete containers in canonical (VS, PS) order.
             # Keep the container bytes in the cache key; translate only the bounded native code.
@@ -2294,6 +2299,34 @@ def translate_request(out_dir, key):
         return 'stages %s' % sorted(kinds)
     return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
                         ps_hw_inputs=ps_hw_inputs, vs_out_cntl=vs_out_cntl)
+
+
+# Fields of the pipeline's state block A ([1]/[2] of the slot-57 record, dumped by the runtime as
+# req_<key>.vsregs), located from run-84 dumps: SPI_PS_INPUT_ENA = u16 at +0x58 (1530 of 1547 dumped pixel
+# requests consistent with their own VGPR use), PA_CL_VS_OUT_CNTL = u32 at +0x98 (0x01400303 on every request
+# exporting pos1, low byte 0 on every other). Measured offsets, not documented ones.
+VSREGS_PS_INPUT_ENA = 0x58
+VSREGS_VS_OUT_CNTL = 0x98
+
+
+def dumped_state(name):
+    """(ENA or None, PA_CL_VS_OUT_CNTL or None) from <name>.vsregs, else from the per-state dumps
+    <name>.<8 hex>.vsregs when they all agree. (None, None) when nothing is dumped."""
+    paths = [name + '.vsregs'] if os.path.isfile(name + '.vsregs') else []
+    if not paths:
+        folder, base = os.path.split(name)
+        try:
+            paths = [os.path.join(folder, n) for n in os.listdir(folder or '.')
+                     if re.fullmatch(re.escape(os.path.basename(base)) + r'\.[0-9a-f]{8}\.vsregs', n)]
+        except OSError:
+            paths = []
+    enas, cntls = set(), set()
+    for path in paths:
+        with open(path, 'rb') as file:
+            blob = file.read(0x400)
+        enas.add(struct.unpack_from('<H', blob, VSREGS_PS_INPUT_ENA)[0] if len(blob) >= VSREGS_PS_INPUT_ENA + 2 else None)
+        cntls.add(struct.unpack_from('<I', blob, VSREGS_VS_OUT_CNTL)[0] if len(blob) >= VSREGS_VS_OUT_CNTL + 4 else None)
+    return (enas.pop() if len(enas) == 1 else None), (cntls.pop() if len(cntls) == 1 else None)
 
 
 def read_vs_out(path):
