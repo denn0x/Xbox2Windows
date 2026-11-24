@@ -7,7 +7,7 @@
 // space100) and the raw UAVs u0..u9 space100 (rawaddr_table.h). The pipeline gets the title root plus
 // those two parameters; each dispatch fills the table from the sidecar's seeds (root-constant addresses,
 // root descriptors) and from addresses the GPU missed in earlier dispatches of the same key.
-// Off: X2W_RAWADDR_OFF=1.
+// On only with X2W_RAWADDR=1; off: X2W_RAWADDR_OFF=1 (wins).
 
 namespace ra = x2w_startup::rawaddr;
 
@@ -34,9 +34,11 @@ ID3D12Resource* rawaddr_stats;
 volatile std::uint32_t* rawaddr_stats_words;  // CPU view of the custom-heap statistics buffer
 LONG rawaddr_stats_failed;
 
+// Opt-in: the raw-address shaders have not run on title data yet, so a published sidecar stays inert
+// unless X2W_RAWADDR=1 (X2W_RAWADDR_OFF=1 still wins).
 bool rawaddr_enabled()
 {
-    static const bool enabled = !x2w_local::env_on("X2W_RAWADDR_OFF");
+    static const bool enabled = x2w_local::env_on("X2W_RAWADDR") && !x2w_local::env_on("X2W_RAWADDR_OFF");
     return enabled;
 }
 
@@ -76,7 +78,7 @@ bool rawaddr_pipeline(u64 key, Wrapper* root, Wrapper* pipeline)
     if (!cache_path(path, L"", key, L".rawaddr.txt") || !read_text(path, sidecar)) return false;
     if (!rawaddr_enabled()) {
         static LONG logged;
-        if (first_calls(logged, 4)) log("x2w-rawaddr %016llx: sidecar present, X2W_RAWADDR_OFF set: no pipeline", key);
+        if (first_calls(logged, 4)) log("x2w-rawaddr %016llx: sidecar present, path off (needs X2W_RAWADDR=1, no X2W_RAWADDR_OFF): no pipeline", key);
         return true;
     }
     std::vector<ra::Seed> seeds;
