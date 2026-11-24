@@ -158,21 +158,26 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
     return SUCCEEDED(hr);
 }
 
-// LOCAL (video): X2W_PRESENT_PLANES_LOG=1 logs the present call's planes whenever the plane count,
-// the first plane's resource count, its surface or that surface's size and format change (at most
-// 32 lines). Run 77 logged planes=1 for frames 1 and 2 only; this shows whether a later present
-// (a movie, the loading screen) brings more planes, which the window presenter does not draw.
+// LOCAL (video): X2W_PRESENT_PLANES_LOG=1 logs the present call's planes when the plane count, the
+// first plane's resource count or the surface's size and format change, or a surface not seen before
+// appears (at most 32 lines). The title flips between two swap surfaces every frame, which is not a
+// change. Plus one summary line per 300 frames (at most 200). Run 84 showed planes=1 throughout
+// frames 1-32; this shows whether a later present (a movie, the loading screen) brings more planes,
+// which the window presenter does not draw.
 void note_present_planes(LONG frame, UINT planes, const void* plane_parameters, const void* present_parameters)
 {
     static const bool on = [] {
         const bool value = x2w_local::env_on("X2W_PRESENT_PLANES_LOG");
-        if (value) log("x2w-present X2W_PRESENT_PLANES_LOG=1: plane changes are logged");
+        if (value) log("x2w-present X2W_PRESENT_PLANES_LOG=1: plane changes and one line per 300 frames are logged");
         return value;
     }();
     if (!on) return;
     static UINT last_planes = ~0u;
-    static u64 last_count = ~0ull, last_surface = ~0ull, last_shape = ~0ull;
-    static LONG lines;
+    static u64 last_count = ~0ull, last_shape = ~0ull;
+    static u64 known[8];
+    static UINT known_count, flips_since, extra_planes_since;
+    static u64 last_surface;
+    static LONG lines, summaries;
     const auto* words = static_cast<const u64*>(plane_parameters);
     const bool header = planes && words && x2w_local::readable(words, 0x18);
     const u64 count = header ? words[1] : 0;
@@ -185,10 +190,28 @@ void note_present_planes(LONG frame, UINT planes, const void* plane_parameters, 
             shape = (desc.Width & 0xFFFFF) | (u64{desc.Height & 0xFFFFF} << 20) | (u64{static_cast<UINT>(desc.Format) & 0xFFF} << 40);
         }
     }
-    if (planes == last_planes && count == last_count && surface == last_surface && shape == last_shape) return;
+    // Called from queue_present only, one thread at a time per queue; the statics are diagnostics.
+    if (surface != last_surface) ++flips_since;
+    last_surface = surface;
+    if (planes > 1 || count > 1) ++extra_planes_since;
+    bool fresh = false;
+    if (surface) {
+        UINT i = 0;
+        while (i < known_count && known[i] != surface) ++i;
+        if (i == known_count && known_count < 8) {
+            known[known_count++] = surface;
+            fresh = true;
+        }
+    }
+    if (frame % 300 == 0 && first_calls(summaries, 200)) {
+        log("x2w-present planes summary frame %ld: planes=%u resources=%llu %llux%llu format %llu; surfaces seen %u; surface changes %u and "
+            "presents with more than one plane or resource %u in the last 300 frames",
+            frame, planes, count, shape & 0xFFFFF, (shape >> 20) & 0xFFFFF, (shape >> 40) & 0xFFF, known_count, flips_since, extra_planes_since);
+        flips_since = extra_planes_since = 0;
+    }
+    if (planes == last_planes && count == last_count && shape == last_shape && !fresh) return;
     last_planes = planes;
     last_count = count;
-    last_surface = surface;
     last_shape = shape;
     if (!first_calls(lines, 32)) return;
     char a[3 * 0x60 + 1] = "", b[3 * 0x40 + 1] = "";
@@ -196,6 +219,47 @@ void note_present_planes(LONG frame, UINT planes, const void* plane_parameters, 
     if (present_parameters && x2w_local::readable(present_parameters, 0x40)) hex_text(present_parameters, 0x40, b, sizeof(b));
     log("x2w-present planes frame %ld: planes=%u resources=%llu surface=0x%llx %llux%llu format %llu; plane=[%s] present=[%s]", frame, planes,
         count, surface, shape & 0xFFFFF, (shape >> 20) & 0xFFFFF, (shape >> 40) & 0xFFF, a, b);
+}
+
+// LOCAL (video): X2W_D3D12_TRACE_QUIET=<n> traces one frame ("x2w-frame" lines, as X2W_D3D12_TRACE_FRAME)
+// once n presented frames in a row each had 1 to 8 translated draws, after at least one frame with 20
+// or more (a menu page). This fires on the flat loading screen after setup without knowing its
+// frame number: run 84 drew 3 per frame at boot, 6 during the title movie, 22-58 on the setup pages
+// and 5 after setup. At most 3 traces, at least 3000 frames apart. With X2W_DRAW_DUMP_DIR set and no
+// X2W_DRAW_DUMP_FRAME, the first traced frame also gets the per-draw target dumps.
+void note_quiet_frame(LONG frame)
+{
+    static const LONG wanted = [] {
+        char value[16]{};
+        const LONG n = GetEnvironmentVariableA("X2W_D3D12_TRACE_QUIET", value, sizeof(value)) ? std::atol(value) : 0L;
+        if (n > 0) log("x2w-frame X2W_D3D12_TRACE_QUIET=%ld: one frame is traced after %ld quiet frames (1-8 translated draws) past a busy one", n, n);
+        return n > 0 ? n : 0L;
+    }();
+    if (!wanted) return;
+    static const bool dump_dir = GetEnvironmentVariableA("X2W_DRAW_DUMP_DIR", nullptr, 0) != 0;
+    static LONG last_total, quiet_run, end_frame, next_allowed, traces;
+    static bool armed;
+    const LONG total = translated_draws;
+    const LONG drawn = total - last_total;
+    last_total = total;
+    if (end_frame && frame == end_frame) {
+        InterlockedExchange(&trace_frame_active, 0);
+        log("x2w-frame ---- end quiet frame %ld (%ld translated draws)", frame, drawn);
+        summarise_indirect_calls();
+        end_frame = 0;
+        return;
+    }
+    if (drawn >= 20) armed = true;
+    quiet_run = armed && drawn >= 1 && drawn <= 8 ? quiet_run + 1 : 0;
+    if (end_frame || quiet_run < wanted || frame < next_allowed || traces >= 3) return;
+    ++traces;
+    quiet_run = 0;
+    next_allowed = frame + 3000;
+    end_frame = frame + 1;
+    if (dump_dir && !draw_dump_frame()) InterlockedExchange(&quiet_dump_frame, frame);
+    log("x2w-frame ---- begin quiet frame %ld (previous frame: %ld translated draws, %ld quiet frames)%s", frame + 1, drawn, wanted,
+        quiet_dump_frame == frame ? "; per-draw target dumps on" : "");
+    InterlockedExchange(&trace_frame_active, 1);
 }
 
 // Draws `surface` (resting in COMMON) into the window and flips. Returns false if not shown.

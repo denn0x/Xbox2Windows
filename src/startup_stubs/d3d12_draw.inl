@@ -209,6 +209,40 @@ void note_null_texture(u64 key, UINT srv, u64 entry, const std::uint32_t* words,
     log("x2w-draw null texture %016llx srv %u cause %s frame %ld: entry 0x%llx words %08x %08x %08x %08x %08x %08x %08x %08x", key, srv,
         x2w_local::null_cause_names[static_cast<int>(cause)], frame_number, entry, words[0], words[1], words[2], words[3], words[4],
         words[5], words[6], words[7]);
+    // Run 84: every null texture of this kind held a small integer and seven zero words (0x25, 0x12e,
+    // 0x1d4, 0x212, 0x215, 0x2f16), neither a view token nor a hardware descriptor. Test whether that
+    // integer is an index into one of the title's descriptor heaps: show what each heap holds there.
+    bool rest_zero = true;
+    for (int i = 1; i < 8; ++i) rest_zero = rest_zero && words[i] == 0;
+    if (!words[0] || words[0] == view_token_magic || !rest_zero) return;
+    AcquireSRWLockShared(&note_lock);
+    const std::vector<HeapInfo> heaps = heap_infos();
+    ReleaseSRWLockShared(&note_lock);
+    int shown = 0;
+    for (std::size_t h = 0; h < heaps.size() && shown < 6; ++h) {
+        const HeapInfo& heap = heaps[h];
+        if (!heap.title_cpu || words[0] >= heap.count) continue;
+        const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
+        const u64 at = heap.title_cpu + u64{words[0]} * stride;
+        std::uint32_t there[8]{};
+        const bool readable = x2w_local::readable(reinterpret_cast<const void*>(at), sizeof(there));
+        if (readable) std::memcpy(there, reinterpret_cast<const void*>(at), sizeof(there));
+        const std::uint32_t shadow = heap.shadow ? heap.shadow[words[0]] : 0;
+        ViewRecord record{};
+        const bool token = readable && there[0] == view_token_magic;
+        AcquireSRWLockShared(&note_lock);
+        const bool known = token && there[1] < view_records().size();
+        if (known) record = view_records()[there[1]];
+        ReleaseSRWLockShared(&note_lock);
+        log("x2w-draw null texture %016llx srv %u: index 0x%x in heap %zu (type %u, count %u, title 0x%llx, stride %u): %s words %08x %08x %08x "
+            "%08x; shadow id %u%s; view slot %u resource 0x%llx desc %u bytes",
+            key, srv, words[0], h, heap.type, heap.count, heap.title_cpu, stride, readable ? (token ? (known ? "token" : "unknown token") : "no token")
+            : "unreadable", there[0], there[1], there[2], there[3], shadow, shadow ? "" : " (none)", known ? record.slot : 0u,
+            known ? record.resource : 0ull, known ? record.desc_bytes : 0u);
+        ++shown;
+    }
+    if (!shown)
+        log("x2w-draw null texture %016llx srv %u: index 0x%x is beyond every title descriptor heap (%zu heaps)", key, srv, words[0], heaps.size());
 }
 LONG frame_number;
 
@@ -998,13 +1032,15 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 // target 0 is copied to a readback buffer after each translated draw (at most 48).
 // Poll the fence of the queue that actually executed the recording before writing its image.
 using x2w_startup::DrawDump;
+// LOCAL (video): set once by X2W_D3D12_TRACE_QUIET (d3d12_present.inl) when no X2W_DRAW_DUMP_FRAME is given.
+LONG quiet_dump_frame;
 LONG draw_dump_frame()
 {
     static const LONG frame = [] {
         char value[16]{};
         return GetEnvironmentVariableA("X2W_DRAW_DUMP_FRAME", value, sizeof(value)) ? std::atol(value) : 0L;
     }();
-    return frame;
+    return frame ? frame : quiet_dump_frame;
 }
 void draw_dump_after(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT count)
 {
