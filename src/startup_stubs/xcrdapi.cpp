@@ -532,7 +532,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
         // A zlib or a decoded BCPack format, not both (the table has one codec per interval).
-        const unsigned codec = zlib ? (bcpack ? 0u : 8u) : (bcpack == 7 || bcpack == 1 ? bcpack : 0u);
+        const unsigned codec = zlib ? (bcpack ? 0u : 8u) : (bcpack == 7 || bcpack == 1 || (bcpack >= 3 && bcpack <= 5) ? bcpack : 0u);
         interval_request = codec && file_object && file_object->kind == file &&
                            rds5_slice(file_object->handle, offset, source_size, destination_size, codec, slice);
         if (file_object && file_object->kind == file &&
@@ -713,20 +713,30 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         }
         bool bcpack_decoded = interval_request && data;
         if (data && bcpack && !interval_request) {
-            if (bcpack == 7 || bcpack == 1) {
-                std::vector<unsigned char> decoded(destination_size);
-                std::size_t produced = 0;
-                if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
-                    output = std::move(decoded);
-                    data = output.data();
-                    decode_length = produced;
-                    outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
-                    bcpack_decoded = true;
-                } else {
-                    outcome = "bcpack failed";
-                    data = nullptr;
-                }
+            // BC3/BC4/BC5 (3-5) decode since 42cd462f; a failure there zero-fills as before (counted as
+            // bcpack-blank), because a failed request has crashed the title and a blank texture has not.
+            const bool bcn_fallback = bcpack >= 3 && bcpack <= 5;
+            std::vector<unsigned char> decoded;
+            std::size_t produced = 0;
+            const bool tried = bcpack == 7 || bcpack == 1 || bcn_fallback;
+            const bool ok = tried && (decoded.resize(destination_size),
+                x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced));
+            if (ok) {
+                output = std::move(decoded);
+                data = output.data();
+                decode_length = produced;
+                outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
+                bcpack_decoded = true;
+            } else if (tried && !bcn_fallback) {
+                outcome = "bcpack failed";
+                data = nullptr;
             } else {
+                if (bcn_fallback) {
+                    static LONG bcn_failed;
+                    if (InterlockedIncrement(&bcn_failed) <= 16)
+                        log("x2w-dstorage BCPack format %u decode failed: zero-filled as before (dest_size=0x%x offset=0x%llx size=0x%x)",
+                            bcpack, destination_size, offset, source_size);
+                }
                 // shortcut for formats not decoded yet: texels are left zero (a blank texture) so the
                 // title's loading continues. Counted as bcpack_blank.
                 output.assign(destination_size, 0);

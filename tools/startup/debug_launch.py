@@ -182,6 +182,24 @@ def main():
     emulate_on = os.environ.get("X2W_DEBUG_EMULATE", "1") != "0"
     fast_exit = opts.get("--fast-exit") == "1"
 
+    # Host safety (runtime_work/NOTES.md): the job limit covers private commit only. Pagefile page
+    # slabs are capped by X2W_XMEM_SLAB_BUDGET_MIB; a launch whose job limit plus slab budget does not
+    # fit in the host's commit headroom minus 2 GiB is refused. X2W_ALLOW_UNBUDGETED=1 skips this.
+    if os.environ.get("X2W_XMEM_PERMISSIVE") == "1" and os.environ.get("X2W_ALLOW_UNBUDGETED") != "1":  # title runs (run.ps1)
+        class _PI(ctypes.Structure):
+            _fields_ = [("cb", wt.DWORD)] + [(n, ctypes.c_size_t) for n in (
+                "CommitTotal", "CommitLimit", "CommitPeak", "PhysicalTotal", "PhysicalAvailable", "SystemCache",
+                "KernelTotal", "KernelPaged", "KernelNonpaged", "PageSize")] + [(n, wt.DWORD) for n in (
+                "HandleCount", "ProcessCount", "ThreadCount")]
+        info0 = _PI()
+        info0.cb = ctypes.sizeof(info0)
+        ctypes.WinDLL("psapi").GetPerformanceInfo(ctypes.byref(info0), info0.cb)
+        headroom = (info0.CommitLimit - info0.CommitTotal) * info0.PageSize
+        budget = int(os.environ.get("X2W_XMEM_SLAB_BUDGET_MIB") or "0") << 20
+        if not budget or memory + budget > headroom - (2 << 30):
+            print(f"refused to launch: job limit {memory >> 20} MiB + pagefile slab budget {budget >> 20} MiB "
+                  f"(X2W_XMEM_SLAB_BUDGET_MIB) must be set and fit in the commit headroom {headroom >> 20} MiB - 2048")
+            return 3
     k32.SetErrorMode(0x8003)
     job = k32.CreateJobObjectW(None, None)
     info = EXTENDED_LIMIT()
@@ -687,7 +705,7 @@ def main():
     psapi = ctypes.WinDLL("psapi")
     psapi.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD]
     k32.GetCurrentProcess.restype = wt.HANDLE
-    headroom_stop_mib = int(os.environ.get("X2W_HEADROOM_STOP_MIB") or "1536")
+    headroom_stop_mib = int(os.environ.get("X2W_HEADROOM_STOP_MIB") or "3072")
     headroom_stop = None
     commit_log = open(os.path.join(logdir, "commit.txt"), "w", encoding="utf-8")
     commit_log.write("# seconds system_committed_MiB commit_limit_MiB title_private_MiB debugger_private_MiB\n")
@@ -706,7 +724,7 @@ def main():
         now = time.time()
         if now < commit_next[0]:
             return None
-        commit_next[0] = now + 1.0
+        commit_next[0] = now + 0.1
         perf = PERF_INFO()
         perf.cb = ctypes.sizeof(perf)
         if not psapi.GetPerformanceInfo(ctypes.byref(perf), perf.cb):

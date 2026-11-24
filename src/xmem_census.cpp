@@ -117,11 +117,12 @@ void report(ULONGLONG second) noexcept
     const long long delta = static_cast<long long>(committed) - static_cast<long long>(commit_at_load);
     int at = std::snprintf(line, sizeof(line),
                            "x2w-mem %llu s: system %+lld MiB since load (committed %llu / limit %llu MiB, headroom %llu); "
-                           "private %llu MiB (peak %llu); slabs %llu = %llu MiB (pages %llu live, %llu free slots%s%llu%s); "
+                           "private %llu MiB (peak %llu); slabs %llu = %llu MiB, %llu file-backed, %llu moved for the GPU%s (pages %llu live, %llu free slots%s%llu%s); "
                            "xmem commits: startup blocks %llu MiB (%llu), permissive %llu MiB (%llu);",
                            second, delta / static_cast<long long>(mib), committed / mib, limit / mib,
                            limit > committed ? (limit - committed) / mib : 0, counters.PrivateUsage / mib,
-                           counters.PeakPagefileUsage / mib, x.slabs, x.slab_bytes / mib, x.live_pages, x.free_slots,
+                           counters.PeakPagefileUsage / mib, x.slabs, x.slab_bytes / mib, x.file_slabs, x.migrations,
+                           x.migration_failures ? " (SOME MOVES FAILED)" : "", x.live_pages, x.free_slots,
                            x.slab_budget_bytes ? ", budget " : "", x.slab_budget_bytes / mib,
                            x.slab_refusals ? " MiB, REFUSED pages" : (x.slab_budget_bytes ? " MiB" : ""),
                            x.startup_block_bytes / mib, x.startup_block_calls, x.permissive_commit_bytes / mib,
@@ -247,7 +248,7 @@ DWORD WINAPI reporter(void*)
             p = *end ? end + 1 : end;
         }
     std::sort(census_at.begin(), census_at.end());
-    ULONGLONG next_report = 2;
+    ULONGLONG next_report = 0;  // a first line at once: a run may end within seconds
     for (;;) {
         const ULONGLONG second = (GetTickCount64() - tick_at_load) / 1000;
         if (second >= next_report) {

@@ -34,6 +34,7 @@ struct X2wXmemStats {
     ULONGLONG slabs, slab_bytes, live_pages, free_slots, slab_budget_bytes, slab_refusals;
     ULONGLONG startup_block_bytes, startup_block_calls, permissive_commit_bytes, permissive_commit_calls;
     ULONGLONG reservations;
+    ULONGLONG file_slabs, migrations, migration_failures;  // X2W_XMEM_SLAB_DIR
 };
 extern "C" BOOL WINAPI x2w_xmem_memory_stats(X2wXmemStats* stats);
 // Copies up to capacity (base, bytes) pairs of the stand-in's page reservations; returns the count

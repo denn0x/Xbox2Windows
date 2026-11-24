@@ -18,6 +18,10 @@ param(
     [int]$Seconds = 120,
     [string]$BuildDir = "out/build/release",
     [int]$MemoryGiB = 14,
+    # Host safety (runtime_work/NOTES.md): pagefile page-slab cap in MiB (X2W_XMEM_SLAB_BUDGET_MIB) and a
+    # directory for file-backed slabs, which carry no commit charge (X2W_XMEM_SLAB_DIR, absolute, off G:/S:).
+    [int]$SlabBudgetMiB = 0,
+    [string]$SlabDir = "",
     [int]$ContinueAsserts = 0,                 # main-image int3s to log and step over (title soft asserts)
     [string]$InputScript = "",                 # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
     [string]$StoragePath = "",                 # X2W_STORAGE_PATH: persistent local storage root (a trailing \ is added when missing)
@@ -48,6 +52,8 @@ if ($StoragePath) { $env:X2W_STORAGE_PATH = $StoragePath }
 if ($InputScript) { $env:X2W_INPUT_SCRIPT = $InputScript }
 if ($FakeUser) { $env:X2W_FAKE_USER = "1" }
 if ($GpuMirror) { $env:X2W_XMEM_GPU_MIRROR = "1" }
+if ($SlabBudgetMiB -gt 0) { $env:X2W_XMEM_SLAB_BUDGET_MIB = "$SlabBudgetMiB" }
+if ($SlabDir) { $env:X2W_XMEM_SLAB_DIR = $SlabDir }
 if ($HostCpu) { $env:X2W_HOST_CPU = "1" }
 if ($SharedViews) { $env:X2W_XMEM_SHARED_VIEWS = "1" }
 if ($Render) {
