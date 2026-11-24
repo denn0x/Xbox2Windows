@@ -223,7 +223,7 @@ void note_present_planes(LONG frame, UINT planes, const void* plane_parameters, 
 
 // LOCAL (video): X2W_D3D12_TRACE_QUIET=<n> traces one frame ("x2w-frame" lines, as X2W_D3D12_TRACE_FRAME)
 // once n presented frames in a row each had 1 to 8 translated draws, after at least one frame with 20
-// or more (a menu page). This fires on the flat loading screen after setup without knowing its
+// or more (menu pages) seen 300 times. This fires on the flat loading screen after setup without knowing its
 // frame number: run 84 drew 3 per frame at boot, 6 during the title movie, 22-58 on the setup pages
 // and 5 after setup. At most 3 traces, at least 3000 frames apart. With X2W_DRAW_DUMP_DIR set and no
 // X2W_DRAW_DUMP_FRAME, the first traced frame also gets the per-draw target dumps.
@@ -249,7 +249,10 @@ void note_quiet_frame(LONG frame)
         end_frame = 0;
         return;
     }
-    if (drawn >= 20) armed = true;
+    // Armed by 300 busy frames in all, so a short busy stretch before the title movie (run 84 frames
+    // 6600-6900 averaged 12.9 draws) does not point the trace at the movie.
+    static LONG busy_frames;
+    if (drawn >= 20 && ++busy_frames >= 300) armed = true;
     quiet_run = armed && drawn >= 1 && drawn <= 8 ? quiet_run + 1 : 0;
     if (end_frame || quiet_run < wanted || frame < next_allowed || traces >= 3) return;
     ++traces;
