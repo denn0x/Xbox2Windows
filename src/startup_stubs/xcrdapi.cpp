@@ -799,8 +799,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
 
-            if (!direct_decoded && !memory_source && !bcpack) {
-                // LOCAL: a later piece that missed the submission's cache (see remember_stream).
+            if (!direct_decoded && !decode_error && !memory_source && !bcpack) {
+                // LOCAL: a later piece that missed the submission's cache (see remember_stream). Not for a
+                // request whose own bytes start a zlib stream that failed to decode: that is a damaged
+                // stream, and it fails like on the queue-cache path above.
                 std::shared_ptr<const std::vector<unsigned char>> whole;
                 u64 base = 0;
                 auto* file_object = reinterpret_cast<Object*>(source);
