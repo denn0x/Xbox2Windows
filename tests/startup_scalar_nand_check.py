@@ -2,8 +2,8 @@
 
 Synthetic words (SOP2: op [29:23], sdst [22:16], ssrc1 [15:8], ssrc0 [7:0]; gfx10 opcodes 0x18, 0x1a, 0x1c, names
 asserted from the decoder). RDNA2 ISA: D = ~(S0 & S1), ~(S0 | S1), ~(S0 ^ S1); SCC = (D != 0). The emitted
-expression is evaluated on a value grid; with a lane-mask source (vcc_lo) the result is a lane mask like the b64
-forms. Control: the existing s_and_b32 output is unchanged.
+expression is evaluated on a value grid; a lane-mask source (vcc_lo) is refused (SCC would need every lane's bit).
+Control: the existing s_and_b32 output is unchanged.
 """
 import itertools
 import re
@@ -53,12 +53,16 @@ def main():
             got = eval(py, {'__builtins__': {}, 'MASK': MASK}, {'s0': a, 's1': b}) & MASK
             assert got == ref(a, b) & MASK, (name, a, b, got)
         s = stage()
-        run_one(s, 0x80000000 | op << 23 | 2 << 16 | 1 << 8 | 106)  # S0 = vcc_lo, a lane mask
-        assert 2 in s.masks, (name, 'result of a lane-mask source is a lane mask')
+        try:  # S0 = vcc_lo, a lane mask: SCC needs every lane's bit (startup_scalar_complement_mask_check)
+            run_one(s, 0x80000000 | op << 23 | 2 << 16 | 1 << 8 | 106)
+        except G.Unsupported as error:
+            assert 'on a lane mask' in str(error), str(error)
+        else:
+            raise AssertionError((name, 'lane-mask source accepted'))
     s = stage()
     assert run_one(s, 0x80000000 | 0x0e << 23 | 2 << 16 | 1 << 8) == 's_and_b32 s2, s0, s1'
     assert re.search(r's2 = s0 & s1;', '\n'.join(s.lines)), s.lines
-    print('scalar nand/nor/xnor b32: %d forms match the reference on %d inputs; mask source gives a mask'
+    print('scalar nand/nor/xnor b32: %d forms match the reference on %d inputs; mask source refused'
           % (len(OPS), len(GRID) ** 2))
 
 

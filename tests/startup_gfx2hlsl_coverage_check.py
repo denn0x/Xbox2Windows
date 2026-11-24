@@ -630,7 +630,9 @@ def sdwa_and_misc():
     check('image_load on a 1D image is Texture1D.Load(int2(x, 0)) with manifest kind tex1d',
           asm_of(load1d).endswith('dmask:0x1 dim:SQ_RSRC_IMG_1D') and
           text == 't = r0.Load(int2(v2, 0));\nv8 = U(t.x);' and list(s.pipe.resources.values())[0]['kind'] == 'tex1d')
-    check('image_sample d16 refused', refused(None, setup=gather_setup, words=[sample[0], sample[1] | 1 << 31]))
+    _, text = lines([sample[0], sample[1] | 1 << 31], setup=gather_setup)
+    check('image_sample d16 packs two binary16 results into one VGPR (gfx9+ packed D16)',
+          text.endswith('v8 = f32tof16(t.x) | (f32tof16(t.y) << 16);') and 'v9' not in text)
     check('image_sample unorm refused', refused(None, setup=gather_setup, words=[sample[0] | 1 << 12, sample[1]]))
     check('image_load tfe refused', refused(None, setup=gather_setup, words=[load[0] | 1 << 16, load[1]]))
 
