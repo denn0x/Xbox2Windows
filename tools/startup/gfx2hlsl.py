@@ -982,6 +982,41 @@ class Stage:
     def op_tbuffer_load_format_xyzw(self, ops, mods):
         self.tbuffer(ops, mods, 4)
 
+    def format_load(self, ops, mods, count, name):
+        """buffer_load_format_*: the format and swizzle are in the descriptor's word 3, known only at draw time.
+
+        Behind X2W_DRAW_FEATURES=bufword3: the draw runtime passes srv i's word 3 as an entry constant (manifest
+        `udsrc <n> bufword3 <i>`: the real word of a title-written descriptor, the synthesized one of a typed
+        buffer view, 0 for raw-copy, vertex and root sources) and x2w_fmt_load decodes the element. The idxen
+        stride is `udsrc stride` (element size of a typed view, descriptor stride otherwise; d3d12_draw.inl)."""
+        if 'bufword3' not in getattr(self.pipe, 'features', ()):
+            raise Unsupported(name)
+        for m in mods:
+            if not (m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:')):
+                raise Unsupported('%s modifier %s' % (name, m))
+        key = self.descriptor(ops[2])
+        if key[0][0] != 'table':
+            # word 3 reaches the shader only for table entries (root and vertex sources give 0)
+            raise Unsupported('%s through %s' % (name, key[0][0]))
+        dst = reg_range(ops[0])
+        buf, address = self.buffer_address(ops, mods)
+        w3 = self.pipe.ud(('bufword3', self.pipe.resources[key]['index']))
+        self.emit('a = %s;' % address)
+        for i in range(count):
+            self.set_v(dst[1] + i, 'x2w_fmt_load(%s, a, ud%d, %du)' % (buf, w3, i))
+
+    def op_buffer_load_format_x(self, ops, mods):
+        self.format_load(ops, mods, 1, 'buffer_load_format_x')
+
+    def op_buffer_load_format_xy(self, ops, mods):
+        self.format_load(ops, mods, 2, 'buffer_load_format_xy')
+
+    def op_buffer_load_format_xyz(self, ops, mods):
+        self.format_load(ops, mods, 3, 'buffer_load_format_xyz')
+
+    def op_buffer_load_format_xyzw(self, ops, mods):
+        self.format_load(ops, mods, 4, 'buffer_load_format_xyzw')
+
     def image(self, ops, mods, how):
         dst = reg_range(ops[0])
         dim = [m for m in mods if m.startswith('dim:')][0][4:]
@@ -1819,6 +1854,70 @@ HELPERS = {
     'x2w_pknorm_i16': ('uint x2w_pknorm_i16(float x) { if ((asuint(x) & 0x7fffffffu) > 0x7f800000u) return 0x8001u; '
                        'return uint(int(round(clamp(x, -1.0, 1.0) * 32767.0))) & 0xffffu; }'),
 }
+
+# gfx10 buffer FORMAT codes (V# word 3 [18:12]) the draw runtime can synthesize for a typed buffer view
+# (gfx10_view_words.h gfx10_buffer_words; raw and structured views get 22, 32_FLOAT) and their channels, x first
+# from bit 0: (bit widths, numeric kind). Mixed widths list x, y, z, w as the bits rise: 10_11_11_FLOAT is x 11, y
+# 11, z 10; 2_10_10_10 is x 10, y 10, z 10, w 2. Codes from Mesa's gfx10 format table, as in gfx10_view_words.h.
+BUF_FORMATS = {
+    1: ((8,), 'unorm'), 2: ((8,), 'snorm'), 5: ((8,), 'uint'), 6: ((8,), 'sint'),
+    7: ((16,), 'unorm'), 8: ((16,), 'snorm'), 11: ((16,), 'uint'), 12: ((16,), 'sint'), 13: ((16,), 'float'),
+    14: ((8, 8), 'unorm'), 15: ((8, 8), 'snorm'), 18: ((8, 8), 'uint'), 19: ((8, 8), 'sint'),
+    20: ((32,), 'uint'), 21: ((32,), 'sint'), 22: ((32,), 'float'),
+    23: ((16, 16), 'unorm'), 24: ((16, 16), 'snorm'), 27: ((16, 16), 'uint'), 28: ((16, 16), 'sint'),
+    29: ((16, 16), 'float'),
+    36: ((11, 11, 10), 'float'),
+    50: ((10, 10, 10, 2), 'unorm'), 54: ((10, 10, 10, 2), 'uint'),
+    56: ((8, 8, 8, 8), 'unorm'), 57: ((8, 8, 8, 8), 'snorm'), 60: ((8, 8, 8, 8), 'uint'), 61: ((8, 8, 8, 8), 'sint'),
+    62: ((32, 32), 'uint'), 63: ((32, 32), 'sint'), 64: ((32, 32), 'float'),
+    65: ((16,) * 4, 'unorm'), 66: ((16,) * 4, 'snorm'), 69: ((16,) * 4, 'uint'), 70: ((16,) * 4, 'sint'),
+    71: ((16,) * 4, 'float'),
+    72: ((32,) * 3, 'uint'), 73: ((32,) * 3, 'sint'), 74: ((32,) * 3, 'float'),
+    75: ((32,) * 4, 'uint'), 76: ((32,) * 4, 'sint'), 77: ((32,) * 4, 'float'),
+}
+
+
+def buf_format_channel(widths, kind, k):
+    """HLSL for channel k (a Python int) of an element at byte address a of ByteAddressBuffer b, as a uint."""
+    pos, n = sum(widths[:k]), widths[k]
+    field = 'b.Load(a + %du)' % (pos // 8) if n == 32 else \
+        '((ldu(b, a + %du) >> %du) & 0x%xu)' % (4 * (pos // 32), pos % 32, (1 << n) - 1)
+    if kind == 'uint' or (kind == 'float' and n == 32):
+        return field
+    if kind == 'sint':
+        return field if n == 32 else 'uint(int(%s << %du) >> %du)' % (field, 32 - n, 32 - n)
+    if kind == 'unorm':
+        return 'U(float(%s) / %d.0)' % (field, (1 << n) - 1)
+    if kind == 'snorm':
+        return 'U(max(float(int(%s << %du) >> %du) / %d.0, -1.0))' % (field, 32 - n, 32 - n, (1 << (n - 1)) - 1)
+    # binary16, and the unsigned 11-bit (5-bit exponent, 6-bit mantissa) and 10-bit (5, 5) floats, which are the
+    # upper bits of a binary16 without its sign
+    return 'U(f16tof32(%s))' % (field if n == 16 else '(%s << %du)' % (field, 15 - n))
+
+
+def buf_format_helper():
+    """x2w_fmt_load(b, a, w3, c): channel c of a buffer_load_format_* result, from V# word 3 w3 (udsrc bufword3).
+
+    DST_SEL_X/Y/Z/W ([2:0] [5:3] [8:6] [11:9]): 0 -> 0, 1 -> 1 (1.0 for a float format, 1 for an integer one),
+    4..7 -> element channel x..w. A channel the format lacks reads 0 (w reads 1, as the fill 0001); a FORMAT code
+    not in BUF_FORMATS (0 = invalid, which the runtime gives for raw-copy, vertex and root sources) reads 0 in
+    every channel, as do selectors 2 and 3. These fills are assumptions, not measured."""
+    lines = ['uint x2w_fmt_chan(ByteAddressBuffer b, uint a, uint f, uint k, uint one) {']
+    for code, (widths, kind) in sorted(BUF_FORMATS.items()):
+        chans = ' '.join('if (k == %du) return %s;' % (k, buf_format_channel(widths, kind, k)) for k in range(len(widths)))
+        lines.append('    if (f == %du) { %s return k == 3u ? one : 0u; }' % (code, chans))
+    lines.append('    return 0u; }')
+    known = ' || '.join('f == %du' % c for c in sorted(BUF_FORMATS))
+    ints = ' || '.join('f == %du' % c for c, (_, kind) in sorted(BUF_FORMATS.items()) if kind in ('uint', 'sint'))
+    lines.append('uint x2w_fmt_load(ByteAddressBuffer b, uint a, uint w3, uint c) {')
+    lines.append('    uint f = (w3 >> 12) & 127u, s = (w3 >> (3u * c)) & 7u;')
+    lines.append('    if (!(%s) || s == 0u || s == 2u || s == 3u) return 0u;' % known)
+    lines.append('    uint one = (%s) ? 1u : 0x3f800000u;' % ints)
+    lines.append('    return s == 1u ? one : x2w_fmt_chan(b, a, f, s - 4u, one); }')
+    return '\n'.join(lines)
+
+
+HELPERS['x2w_fmt_load'] = buf_format_helper()
 # VEC_U conversions whose result is a binary32 value, so the VOP3 output modifiers apply to it.
 FLOAT_RESULT_U = frozenset(('v_cvt_f32_u32', 'v_cvt_f32_i32', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1',
                             'v_cvt_f32_ubyte2', 'v_cvt_f32_ubyte3', 'v_cvt_f32_f16'))
@@ -1914,8 +2013,9 @@ SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
 
 
 # Draw lowerings that need the draw runtime to parse a manifest line, named in X2W_DRAW_FEATURES (comma list):
-# heap (`heap 1`). Off by default until the runtime side is integrated.
-KNOWN_DRAW_FEATURES = frozenset(('heap',))
+# heap (`heap 1`), bufword3 (`udsrc <n> bufword3 <srv>` for buffer_load_format_*), uav (`uav <i> buf table ...`
+# with `udsrc <n> uavbase <i>` for buffer stores). Off by default until a build with the runtime side is announced.
+KNOWN_DRAW_FEATURES = frozenset(('heap', 'bufword3', 'uav'))
 
 
 def draw_features():
