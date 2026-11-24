@@ -914,7 +914,9 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
         list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     }
     ReleaseSRWLockExclusive(&draw_lock);
+    gpu_time::dispatch(self, list, key, false);  // LOCAL: X2W_CX_GPU_TIME (d3d12_gpu_time.inl)
     indirect_dispatch(self, list, x, y, z);  // LOCAL: Dispatch, or the pending ExecuteIndirect (d3d12_indirect.inl)
+    gpu_time::dispatch(self, list, key, true);
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);

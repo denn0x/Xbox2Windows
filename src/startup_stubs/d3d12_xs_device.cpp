@@ -1464,6 +1464,13 @@ extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* al
 }
 
 void forget_list_dispatches(ID3D12GraphicsCommandList* list);  // LOCAL, by execute_dispatch
+namespace gpu_time {  // LOCAL: X2W_CX_GPU_TIME (d3d12_gpu_time.inl)
+void dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, bool after);
+void close(Wrapper* self, ID3D12GraphicsCommandList* list);
+void submitted(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& wrappers);
+void reset(Wrapper* self);
+void report();
+}  // namespace gpu_time
 // List slot 139 (Xbox order): (allocator, 0, 0), the per-frame reset.
 HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
 {
@@ -1485,6 +1492,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     }
     if (SUCCEEDED(hr)) {
         forget_list_dispatches(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
+        gpu_time::reset(self);
         self->own().list_ready = false;
         reset_viewport_state(self);
         discard_draw_sampler_heaps(self);
@@ -1503,6 +1511,7 @@ HRESULT __stdcall list_close(Wrapper* self)
 {
     if (self->own().list_open) {
         release_targets(self);
+        gpu_time::close(self, static_cast<ID3D12GraphicsCommandList*>(self->own().real));  // LOCAL: X2W_CX_GPU_TIME
         const HRESULT hr = static_cast<ID3D12GraphicsCommandList*>(self->own().real)->Close();
         self->own().list_open = false;
         self->own().list_ready = SUCCEEDED(hr);
@@ -3048,6 +3057,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             }
             retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
+            gpu_time::submitted(queue, submitted);  // LOCAL: X2W_CX_GPU_TIME
             ReleaseSRWLockExclusive(&draw_lock);
             InterlockedIncrement(&render_executes);
         }
@@ -4440,6 +4450,7 @@ void draw_overlay(LONG frame, double seconds)
 }
 
 #include "startup_stubs/d3d12_compute.inl"
+#include "startup_stubs/d3d12_gpu_time.inl"
 #include "startup_stubs/d3d12_indirect.inl"
 #include "startup_stubs/d3d12_rawaddr.inl"
 #include "startup_stubs/d3d12_present.inl"
@@ -4573,6 +4584,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         report_indirect(300);  // LOCAL: d3d12_indirect.inl
         regblob::report();
         report_cx_views();
+        gpu_time::report();  // LOCAL: X2W_CX_GPU_TIME
     }
     if (now - last_report >= 5000) {
         last_report = now;
