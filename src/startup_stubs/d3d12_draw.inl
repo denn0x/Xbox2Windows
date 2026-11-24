@@ -2008,6 +2008,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
         if (bytes > (16u << 20)) bytes = 16u << 20;
+        if (const int r = range_watch_hit(address, bytes); r >= 0) {
+            static LONG shown;
+            if (first_calls(shown, 16) && range_watch_line(r))
+                log("x2w-watch 0x%llx: draw %016llx srv %u reads 0x%llx (%zu bytes) frame %ld", range_watch_address(r), tr->key, i, address, bytes,
+                    frame_number);
+            range_watch_sample("draw-bind", tr->key);
+        }
         // A buffer binding that ends up without a readable range counts as a null binding with its cause.
         const auto count_buffer = [&](bool bound) {
             x2w_local::BindingFacts buffer_facts;

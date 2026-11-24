@@ -162,6 +162,11 @@ bool noop_census_on()
 }
 void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
+int range_watch_count();                                    // X2W_RANGE_WATCH, below
+int range_watch_hit(std::uint64_t address, std::uint64_t bytes);
+bool range_watch_line(int i);
+std::uint64_t range_watch_address(int i);
+extern LONG frame_number;
 bool noop_census_enabled()
 {
     static const bool on = [] {
@@ -204,6 +209,23 @@ void noop_census_note(int kind, int slot, const std::uint64_t* args, std::uint64
     const LONG64 calls = InterlockedIncrement64(&noop_census[kind & 15][slot & 511]);
     const LONG64 total = InterlockedIncrement64(&noop_census_total);
     static const char* const names[8] = {"rcx", "rdx", "r8", "r9", "s0", "s1", "s2", "s3"};
+    for (int i = 1; i < 8 && range_watch_count(); ++i) {
+        const int r = range_watch_hit(args[i], 1);
+        if (r >= 0 && range_watch_line(r))
+            log("x2w-watch 0x%llx: no-op %s::slot%d call %lld %s=0x%llx frame %ld; ret=+0x%llx", range_watch_address(r), kind_names[kind],
+                slot, calls, names[i], args[i], frame_number, ret);
+        std::uint64_t words[8]{};
+        SIZE_T got = 0;
+        if (args[i] < 0x10000 || r >= 0 ||
+            !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(args[i]), words, sizeof(words), &got) || got != sizeof(words))
+            continue;
+        for (int w = 0; w < 8; ++w) {
+            const int rw = range_watch_hit(words[w], 1);
+            if (rw >= 0 && range_watch_line(rw))
+                log("x2w-watch 0x%llx: no-op %s::slot%d call %lld [%s+0x%x]=0x%llx frame %ld; ret=+0x%llx", range_watch_address(rw),
+                    kind_names[kind], slot, calls, names[i], w * 8, words[w], frame_number, ret);
+        }
+    }
     for (int i = 1; i < 8 && noop_census_hits[kind & 15][slot & 511] < 6; ++i) {
         CensusHeap h{};
         const char* weak = i >= 4 ? " (stack word: weak)" : "";
@@ -241,6 +263,89 @@ void noop_census_dropped_view(int slot, std::uint64_t title_dest)
     const LONG64 n = InterlockedIncrement64(&dropped);
     if (first_calls(logged, 32) || (n & (n - 1)) == 0)
         log("x2w-noop-census view slot %d dropped (destination 0x%llx is in no known heap); %lld dropped so far", slot, title_dest, n);
+}
+
+// LOCAL (video): X2W_RANGE_WATCH=<hex title address>[,<hex>...] (up to 4) watches [address, address + 0x100):
+// - its bytes at slot-133 creation of a placed buffer that overlaps it;
+// - its bytes at every queue submit, frame and draw/compute bind, logged only when they changed since the last
+//   sample (site, frame, first 48 bytes, hash of all 0x100);
+// - every translated compute binding and every no-op census argument (or one word it points to) in the range.
+// Which path writes the 208-byte constant block of the final upscale (342e9584749d47da)? At most 64 lines per address.
+extern LONG frame_number;
+constexpr std::uint64_t range_watch_span = 0x100;
+struct RangeWatch {
+    std::uint64_t address;
+    std::uint64_t hash;
+    bool sampled;
+    LONG lines;
+};
+RangeWatch range_watches[4];
+int range_watch_count()
+{
+    static const int count = [] {
+        char text[128]{};
+        int n = 0;
+        if (GetEnvironmentVariableA("X2W_RANGE_WATCH", text, sizeof(text))) {
+            for (char* at = text; *at && n < 4;) {
+                char* end = nullptr;
+                const std::uint64_t value = std::strtoull(at, &end, 16);
+                if (end == at) break;
+                if (value) range_watches[n++].address = value;
+                at = *end == ',' ? end + 1 : end;
+            }
+            log("x2w-watch X2W_RANGE_WATCH: %d range(s) of 0x%llx bytes watched (%s)", n, range_watch_span, text);
+        }
+        return n;
+    }();
+    return count;
+}
+// Index of the first watched range that [address, address + bytes) overlaps, else -1.
+int range_watch_hit(std::uint64_t address, std::uint64_t bytes)
+{
+    if (!range_watch_count() || !address) return -1;
+    if (!bytes) bytes = 1;
+    for (int i = 0; i < range_watch_count(); ++i) {
+        const std::uint64_t a = range_watches[i].address;
+        if (address < a + range_watch_span && address + bytes > a) return i;
+    }
+    return -1;
+}
+bool range_watch_line(int i) { return InterlockedIncrement(&range_watches[i].lines) <= 64; }
+std::uint64_t range_watch_address(int i) { return range_watches[i].address; }
+// Reads the watched range without faulting; false if it is not readable.
+bool range_watch_read(int i, unsigned char (&bytes)[range_watch_span], std::uint64_t* hash)
+{
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(range_watches[i].address), bytes, sizeof(bytes), &got) ||
+        got != sizeof(bytes))
+        return false;
+    std::uint64_t h = 14695981039346656037ull;
+    for (unsigned char b : bytes) h = (h ^ b) * 1099511628211ull;
+    *hash = h;
+    return true;
+}
+void range_watch_text(const unsigned char* bytes, char (&text)[3 * 48 + 1])
+{
+    for (int k = 0; k < 48; ++k) std::snprintf(text + 3 * k, 4, "%02x ", bytes[k]);
+}
+// Samples every watched range; logs the ones whose bytes changed since the last sample (or the first sample).
+void range_watch_sample(const char* site, std::uint64_t key = 0)
+{
+    for (int i = 0; i < range_watch_count(); ++i) {
+        unsigned char bytes[range_watch_span];
+        std::uint64_t hash = 0;
+        if (!range_watch_read(i, bytes, &hash)) continue;
+        RangeWatch& w = range_watches[i];
+        if (w.sampled && w.hash == hash) continue;
+        const bool first = !w.sampled;
+        w.sampled = true;
+        w.hash = hash;
+        if (!range_watch_line(i)) continue;
+        char text[3 * 48 + 1];
+        range_watch_text(bytes, text);
+        log("x2w-watch 0x%llx %s at %s %016llx frame %ld: hash %016llx [%s]", w.address, first ? "first sample" : "CHANGED", site, key,
+            frame_number, hash, text);
+    }
 }
 
 // Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: the
@@ -3257,6 +3362,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
             const UINT ready_count = static_cast<UINT>(ready.size());
             lock_draw(0 + __LINE__);
+            if (range_watch_count()) range_watch_sample("submit");
             if (draw_dump_frame()) {
                 const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
                 if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
@@ -4182,6 +4288,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) address=%p base=%p offset=0x%llx width=0x%llx flags=0x%x "
         "state=0x%x clear=%p riid=%s -> 0x%08lx %s gpuva=0x%llx", address, base, offset, desc->Width, desc->Flags, state,
         clear, text, static_cast<unsigned long>(hr), placement, resource ? resource->GetGPUVirtualAddress() : 0ull);
+    if (const int r = range_watch_hit(reinterpret_cast<u64>(address), desc->Width); r >= 0 && range_watch_line(r))
+        log("x2w-watch 0x%llx: slot133 placed buffer at %p width 0x%llx flags 0x%x -> 0x%08lx %s frame %ld", range_watch_address(r), address,
+            desc->Width, desc->Flags, static_cast<unsigned long>(hr), placement, frame_number);
+    if (range_watch_count()) range_watch_sample("slot133-create");
     log_time.stop();
     if (FAILED(hr)) return hr;
     Wrapper* w = wrap(resource, resource_kind);
@@ -4758,6 +4868,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
     }
     frame_number = frame;
+    if (range_watch_count()) range_watch_sample("present");
     note_present_planes(frame, planes, plane_parameters, present_parameters);
     note_quiet_frame(frame);
     note_descriptor_watch(frame);

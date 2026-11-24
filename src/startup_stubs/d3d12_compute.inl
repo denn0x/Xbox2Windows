@@ -897,6 +897,25 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
                 bound = true;
                 res_address[i] = address;
                 res_bytes[i] = bytes;
+                // LOCAL (video): X2W_CX_UAV_WRITTEN=1 registers a translated compute buffer UAV as GPU-written, as draw UAVs and
+                // GPU copies are, so translated draws read the range in place instead of from a record-time copy. Ranges above
+                // 1 MiB are not registered (counted), so a wide UAV does not turn every buffer in its window into an in-place read.
+                static const bool uav_written = x2w_local::env_on("X2W_CX_UAV_WRITTEN");
+                if (r.uav && uav_written) {
+                    static LONG registered, too_wide;
+                    const bool wide = bytes > (1u << 20);
+                    if (!wide) note_gpu_written(address, bytes);
+                    const LONG n = InterlockedIncrement(wide ? &too_wide : &registered);
+                    if ((n & (n - 1)) == 0)
+                        log("x2w-cx X2W_CX_UAV_WRITTEN: %s %ld (latest %016llx uav %u 0x%llx, %zu bytes)", wide ? "not registered (> 1 MiB)" : "registered",
+                            n, key, i, address, bytes);
+                }
+            }
+            if (const int rw = range_watch_hit(address, bytes); rw >= 0) {
+                if (range_watch_line(rw))
+                    log("x2w-watch 0x%llx: compute %016llx %s %u 0x%llx (%zu bytes) frame %ld: %s", range_watch_address(rw), key, r.uav ? "uav" : "srv",
+                        i, address, bytes, frame_number, bound ? "bound" : "NULL");
+                range_watch_sample("compute-bind", key);
             }
         }
         if (!bound) null_view(r, dest, r.uav);
