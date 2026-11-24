@@ -1499,11 +1499,12 @@ class MeshPipeline(G.Pipeline):
         if self.ps is not None:
             self.spi_reads()
             self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
+            self.half = sorted(a for a, how in self.ps.attrs.items() if 'half' in how)
             missing = [a for a in self.ps.attrs if a not in self.params]
             if missing:
                 raise Unsupported('pixel stage reads attributes %s the mesh stage does not export' % missing)
         else:
-            self.ps_entry_reads, self.flat = {}, []
+            self.ps_entry_reads, self.flat, self.half = {}, [], []
         if 'pos' not in self.vs.exports:
             raise Unsupported('mesh stage exports no position')
         if not self.vs.exported_prim:
@@ -1557,8 +1558,10 @@ class MeshPipeline(G.Pipeline):
         flat = re.compile(r'.*o\.fparam(\d+) = ')
         body = []
         for line in s.body():
-            # attributes the pixel stage reads only interpolated: drop the flat copy (as hlsl_vs)
-            line = re.sub(r'o\.fparam(\d+) = [^;]*;', lambda mm: mm.group(0) if int(mm.group(1)) in self.flat else '', line)
+            # attributes the pixel stage reads only interpolated: drop the flat copy (as hlsl_vs), and the
+            # binary16 half copies unless it reads them (v_interp_p2_f16)
+            line = re.sub(r'o\.(f|lo|hi)param(\d+) = [^;]*;', lambda mm: mm.group(0) if int(mm.group(2)) in (
+                self.flat if mm.group(1) == 'f' else self.half) else '', line)
             body.append(line)
         if dump:
             # progress markers (tests only): header word 1 = 1 at entry, word 2 = phases completed

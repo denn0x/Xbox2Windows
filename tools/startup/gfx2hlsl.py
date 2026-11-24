@@ -147,13 +147,14 @@ class Stage:
 
     def __init__(self, pipe, kind, code):
         self.pipe, self.kind = pipe, kind
-        self.ins = decode(strip_header(code))
+        self.raw = strip_header(code)  # instruction words, for encoding bits the decoder does not print
+        self.ins = decode(self.raw)
         self.lines = []           # body statements (per block)
         self.sym = {}             # scalar register -> symbolic value
         self.used_s, self.used_v = set(), set()
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
-        self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
+        self.attrs = {}           # pixel: attr index -> 'linear' | 'flat' | 'half'
         self.uses_pos = False
         self.masks = set()        # scalar registers currently holding lane masks
         self.uses_q = False       # the uint2 temporary of the 64-bit operations
@@ -1625,6 +1626,44 @@ class Stage:
         attr, comp = self.note_attr(ops[2], 'flat')
         self.set_v(reg_range(ops[0])[1], 'i.fparam%d.%s' % (attr, comp))
 
+    def interp_f16_mods(self, name, mods):
+        if any(m != 'high' for m in mods):
+            raise Unsupported('%s with %s' % (name, ' '.join(mods)))
+        return 'hi' if 'high' in mods else 'lo'
+
+    def op_v_interp_p1ll_f16(self, ops, mods):
+        # First pass of a binary16 attribute (Mesa ACO emit_interp_instr: p1ll then p2_f16). Like p1_f32 it
+        # produces no value of its own here: the interpolated half comes from p2.
+        self.interp_f16_mods('v_interp_p1ll_f16', mods)
+        if len(ops) != 3:
+            raise Unsupported('v_interp_p1ll_f16 with %d operands' % len(ops))
+        self.note_attr(ops[2], 'half')
+
+    def op_v_interp_p2_f16(self, ops, mods):
+        """The f16 attribute half (`high`: bits 31:16 of the exported word) interpolated, rounded to binary16.
+
+        The vertex/mesh stage exports a second and third interpolated copy of the attribute, each half converted to
+        f32 (loparamN / hiparamN, see export); the result is f32tof16 of the interpolant. The hardware
+        interpolates in f32 and rounds once, as this does (LLVM SIInstrInfo / ACO: p1ll is f32 out, p2 f16 out).
+        A 16-bit write: the other half of the VGPR is kept (Mesa aco_ir.cpp instr_is_16bit lists v_interp_p2_f16
+        and v_interp_p2_hi_f16 for GFX9+). op_sel bit 3 (VOP3 word 0 bit 14, which LLVM 15 and the decoder do not
+        print) writes the high half: Mesa aco_assembler.cpp emits v_interp_p2_hi_f16 as v_interp_p2_f16 with
+        opsel 0x8. Other op_sel bits are refused."""
+        half = self.interp_f16_mods('v_interp_p2_f16', mods)
+        if len(ops) != 4:
+            raise Unsupported('v_interp_p2_f16 with %d operands' % len(ops))
+        attr, comp = self.note_attr(ops[2], 'half')
+        opsel = struct.unpack_from('<I', self.raw, self.pc)[0] >> 11 & 15
+        if opsel not in (0, 8):
+            raise Unsupported('v_interp_p2_f16 with op_sel %#x' % opsel)
+        d = reg_range(ops[0])[1]
+        self.used_v.add(d)
+        value = 'f32tof16(i.%sparam%d.%s)' % (half, attr, comp)
+        if opsel:
+            self.set_v(d, '(v%d & 0xffffu) | (%s << 16)' % (d, value))
+        else:
+            self.set_v(d, '(v%d & 0xffff0000u) | %s' % (d, value))
+
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
         attr = int(m.group(1))
@@ -1896,6 +1935,12 @@ class Stage:
             # denormals (#1259). hlsl_vs() drops the line for attributes the pixel stage reads only
             # interpolated.
             self.emit('o.f%s = uint4(%s);' % (name, ', '.join(words)))
+            # The binary16 halves of each word as f32, interpolated for v_interp_p2_f16 (the hardware interpolates
+            # each half of the parameter word). Dropped like the flat copy when the pixel stage does not read them.
+            self.emit('o.lo%s = float4(%s);' % (name, ', '.join(
+                '0.0' if w == '0u' else 'f16tof32(%s)' % w for w in words)))
+            self.emit('o.hi%s = float4(%s);' % (name, ', '.join(
+                '0.0' if w == '0u' else 'f16tof32((%s) >> 16)' % w for w in words)))
         return None
 
     # ---- output ------------------------------------------------------------------------------
@@ -2327,6 +2372,7 @@ class Pipeline:
         self.spi_reads()
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
+        self.half = sorted(a for a, how in self.ps.attrs.items() if 'half' in how)
         missing = [a for a in self.ps.attrs if a not in self.params]
         if missing:
             raise Unsupported('pixel stage reads attributes %s the vertex stage does not export' % missing)
@@ -2479,6 +2525,10 @@ class Pipeline:
         # Attributes read without interpolation get a second, flat copy of the vertex output.
         for p in self.flat:
             fields.append('    nointerpolation uint4 fparam%d : FPARAM%d;' % (p, p))
+        # Attributes read as binary16 halves (v_interp_p2_f16) get the two halves as interpolated f32 copies.
+        for p in getattr(self, 'half', ()):
+            fields.append('    float4 loparam%d : LOPARAM%d;' % (p, p))
+            fields.append('    float4 hiparam%d : HIPARAM%d;' % (p, p))
         fields.append('    float4 pos : SV_Position;')
         clip = self.vs.exports.get('clip')
         if clip:
@@ -2489,8 +2539,12 @@ class Pipeline:
         s = self.vs
         out = self.common() + ['struct VSOut {'] + self.interface(False) + ['};', 'VSOut body(uint vid) {', '    VSOut o = (VSOut)0;']
         s.used_v.add(0)
-        flat = re.compile(r'\s*o\.fparam(\d+) = ')
-        body = [line for line in s.body() if not (flat.match(line) and int(flat.match(line).group(1)) not in self.flat)]
+        flat = re.compile(r'\s*o\.(f|lo|hi)param(\d+) = ')
+
+        def unread(line):
+            m = flat.match(line)
+            return m and int(m.group(2)) not in (self.flat if m.group(1) == 'f' else getattr(self, 'half', ()))
+        body = [line for line in s.body() if not unread(line)]
         out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}',
             '// Rectangle lists arrive as six vertices per rectangle: corners 0 1 2, 0 2 and the fourth corner 0 + 2 - 1.',
             'VSOut main(uint vid : SV_VertexID) {',
@@ -2503,6 +2557,8 @@ class Pipeline:
         for p in range(max(self.params) + 1 if self.params else 0):
             out.append('    o.param%d = p.param%d + r.param%d - q.param%d;' % (p, p, p, p))
         out += ['    o.fparam%d = p.fparam%d;' % (p, p) for p in self.flat]
+        for p in getattr(self, 'half', ()):
+            out += ['    o.%sparam%d = p.%sparam%d + r.%sparam%d - q.%sparam%d;' % ((h, p) * 4) for h in ('lo', 'hi')]
         if self.vs.exports.get('clip'):
             out.append('    o.clip0 = p.clip0 + r.clip0 - q.clip0;')  # linear in the corner, like the params
         out += ['    o.pos = p.pos + r.pos - q.pos;', '    return o;', '}']
