@@ -171,7 +171,14 @@ void write_set(const Job& job)
     const bool generic = job.kind == Kind::generic_set;
     if (generic) {
         swprintf(name, std::size(name), L"g57_%016llx.rec", job.key);
-        if (!sub_path(path, name) || exists(path)) return;
+        if (!sub_path(path, name)) return;
+        if (exists(path)) {
+            // A set from before .root existed (run 84, or migrated): add only the root blob.
+            swprintf(name, std::size(name), L"g57_%016llx.root", job.key);
+            if (sub_path(path, name) && !exists(path) && !write_whole(path, job.root.data(), job.root.size()))
+                InterlockedIncrement(&failures);
+            return;
+        }
     } else if (!cache_path(path, L"req_", job.key, L".rec")) {
         return;
     }
@@ -301,8 +308,16 @@ void append_derived(const Job& job)
         records.insert(job.patch_hashes[i]);
     }
     line[n++] = '\n';
-    if (ok && append(path, line, static_cast<std::size_t>(n))) InterlockedIncrement(&derived_lines);
-    else InterlockedIncrement(&failures);
+    // One handle for the run: thousands of lines, and every open is a traced file call under the debugger.
+    static HANDLE out = INVALID_HANDLE_VALUE;
+    if (out == INVALID_HANDLE_VALUE)
+        out = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD written = 0;
+    if (ok && out != INVALID_HANDLE_VALUE && WriteFile(out, line, static_cast<DWORD>(n), &written, nullptr) &&
+        written == static_cast<DWORD>(n))
+        InterlockedIncrement(&derived_lines);
+    else
+        InterlockedIncrement(&failures);
 }
 
 DWORD __stdcall worker(void*)
