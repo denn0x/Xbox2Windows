@@ -541,6 +541,11 @@ target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
 # Input for the startup debugger's diagnostics check (tests/startup_debug_check.py).
 add_executable(startup_debug_probe tests/startup_debug_probe.cpp)
 target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
+# Input for the sampling-profiler check (tests/startup_profile_check.py); with a pdb so frames get names.
+add_executable(startup_profile_probe tests/startup_profile_probe.cpp)
+target_compile_features(startup_profile_probe PRIVATE cxx_std_17)
+target_compile_options(startup_profile_probe PRIVATE /Zi)
+target_link_options(startup_profile_probe PRIVATE /DEBUG)
 # Input for tests/startup_inflate_check.py: the DirectStorage stand-in's zlib decoder on one stream.
 add_executable(startup_inflate_probe tests/startup_inflate_probe.cpp)
 target_compile_features(startup_inflate_probe PRIVATE cxx_std_17)
@@ -1859,6 +1864,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_debug COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>")
     set_tests_properties(startup_debug PROPERTIES TIMEOUT 300)
+    add_test(NAME startup_profile COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_profile_check.py" "$<TARGET_FILE:startup_profile_probe>")
+    set_tests_properties(startup_profile PROPERTIES TIMEOUT 120)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")

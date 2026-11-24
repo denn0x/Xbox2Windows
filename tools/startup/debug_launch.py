@@ -114,9 +114,11 @@ def apply_emulation(plan, address, ctx, read, write):
     return True
 
 
-def final_path(handle):
+def final_path(handle, full=False):
     buf = ctypes.create_unicode_buffer(1024)
     n = k32.GetFinalPathNameByHandleW(wt.HANDLE(handle), buf, 1024, 0)
+    if full:
+        return buf.value[4:] if n and buf.value.startswith("\\\\?\\") else (buf.value if n else "")
     return os.path.basename(buf.value) if n else "?"
 
 
@@ -267,6 +269,7 @@ def main():
             builtins.print(f"live console not started: {error}")
 
     modules = {}  # base -> name
+    module_paths = {}  # base -> full path (symbol search for the sampling profiler)
     main_base = None
     event = (ctypes.c_ubyte * 176)()
     start = time.time()
@@ -789,6 +792,17 @@ def main():
                              f"{private_mib(k32.GetCurrentProcess())}\n")
         return (committed, limit) if limit - committed < headroom_stop_mib else None
 
+    # X2W_PROFILE=<start s>,<samples>,<interval ms>[,<repeat every s>]: clock-driven samples of every
+    # thread (CPU time, rip, return addresses) between debug events -> profile_<s>.txt (sample_profile.py).
+    profiler = None
+    if os.environ.get("X2W_PROFILE"):
+        import sample_profile
+        plan = sample_profile.parse(os.environ["X2W_PROFILE"])
+        if plan:
+            profiler = sample_profile.Profiler(plan, wt.HANDLE(pi.hProcess), logdir, lambda a: where(a), modules,
+                                               module_paths, log)
+        else:
+            print(f"X2W_PROFILE={os.environ['X2W_PROFILE']} ignored: expected <start s>,<samples>,<interval ms>[,<repeat s>]")
     interrupted = False
     stop_requested = False
     stop_next = 0.0
@@ -822,7 +836,9 @@ def main():
             if watches and time.time() >= watch_next:
                 watch_next = time.time() + 1.0
                 poll_watches()
-            if not k32.WaitForDebugEvent(event, 200):
+            if profiler:
+                profiler.poll(time.time() - start, live_threads)
+            if not k32.WaitForDebugEvent(event, profiler.timeout_ms(time.time() - start) if profiler else 200):
                 continue
             code, pid, tid = struct.unpack_from("<III", event, 0)
             status = DBG_CONTINUE
@@ -849,6 +865,7 @@ def main():
                 h_file, base = struct.unpack_from("<QQ", event, 16)
                 name = final_path(h_file) if h_file else "?"
                 modules[base] = name
+                module_paths[base] = final_path(h_file, True) if h_file else ""
                 log(f"{time.time() - start:7.3f} load {name} at {base:#x}")
                 if trace and name.lower() == "xgameruntime.dll":
                     # Gaming runtime: log which API interfaces the title asks for and the result.
@@ -962,6 +979,8 @@ def main():
         interrupted = True
         fast_exit = True
     finally:
+        if profiler:
+            profiler.close()
         # Also on an unexpected error in the loop: the buffered last half second is the part
         # that explains a crash.
         flush_logs(force=True)
