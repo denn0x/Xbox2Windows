@@ -1492,16 +1492,17 @@ HRESULT __stdcall list_close(Wrapper* self)
 
 // List slot 52 (desktop 48 + 4), ClearRenderTargetView(view, colour, rect count, rects). Desktop
 // resources rest in COMMON here, so the target is moved to RENDER_TARGET around the clear.
+LONG clears_dropped[2];  // slot 52 dropped: [0] list not open or no colour, [1] view resolves to no target
 void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour, UINT rect_count, const D3D12_RECT* rects)
 {
-    if (!self->own().list_open || !colour) return;
+    if (!self->own().list_open || !colour) return (void)InterlockedIncrement(&clears_dropped[0]);
     const u64 desktop = desktop_cpu_handle(handle);
     ID3D12Resource* target = view_target(desktop);
     static LONG logged;
     if (first_calls(logged, 4))
         log("x2w-render ClearRenderTargetView view=0x%llx target=%p colour=%.3f %.3f %.3f %.3f rects=%u", handle,
             static_cast<void*>(target), colour[0], colour[1], colour[2], colour[3], rect_count);
-    if (!target) return;
+    if (!target) return (void)InterlockedIncrement(&clears_dropped[1]);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     use_as_target(self, target);
     list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
@@ -2224,6 +2225,7 @@ enum TargetBind {
 LONG target_binds[bind_outcomes], target_unresolved_at[8];
 LONG target_depth_unreadable, target_depth_unmapped;  // bound without the depth the title passed
 LONG draws_without_targets;  // translated draws refused because no bind succeeded on the list (d3d12_draw.inl)
+LONG state_dropped[3];  // while recording: viewports, scissors (count 0, over 16 or unreadable), blend factor unreadable
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
 // With single_range the title passes only the first handle; target i is at handle + i * the title's RTV
 // stride (title_descriptor_stride: for RTV heaps the same desktop increment the title reads from the
@@ -2323,7 +2325,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.dsv_format = dsv_format;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
-    InterlockedIncrement(&target_binds[single_range && count ? bind_single_range_bound : bind_bound]);
+    InterlockedIncrement(&target_binds[single_range ? bind_single_range_bound : bind_bound]);
 }
 // One line per 300 presented frames: slot 50 outcomes since the last line (counters reset here).
 void report_target_binds()
@@ -2335,12 +2337,15 @@ void report_target_binds()
     log("x2w-targets 300 frames: binds %ld bound %ld single-range %ld refused by reason (not recording %ld, count over 8 %ld, "
         "handles unreadable %ld, range past heap %ld, wrong kind %ld, unresolved target %ld [at %ld %ld %ld %ld %ld %ld %ld %ld], "
         "empty %ld, depth wrong kind %ld, depth unknown %ld, depth one read-only plane %ld), bound without depth (unreadable %ld, "
-        "unmapped %ld), draws without targets %ld",
+        "unmapped %ld), draws without targets %ld; also dropped: clears (list closed or no colour %ld, no target %ld), "
+        "viewports %ld, scissors %ld, blend factor %ld",
         calls, n[bind_bound] + n[bind_single_range_bound], n[bind_single_range_bound], n[bind_not_recording],
         n[bind_count_over_8], n[bind_handles_unreadable], n[bind_range_past_heap], n[bind_wrong_kind], n[bind_unresolved],
         at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7], n[bind_empty], n[bind_depth_wrong_kind],
         n[bind_depth_unknown], n[bind_depth_one_plane], InterlockedExchange(&target_depth_unreadable, 0),
-        InterlockedExchange(&target_depth_unmapped, 0), InterlockedExchange(&draws_without_targets, 0));
+        InterlockedExchange(&target_depth_unmapped, 0), InterlockedExchange(&draws_without_targets, 0),
+        InterlockedExchange(&clears_dropped[0], 0), InterlockedExchange(&clears_dropped[1], 0), InterlockedExchange(&state_dropped[0], 0),
+        InterlockedExchange(&state_dropped[1], 0), InterlockedExchange(&state_dropped[2], 0));
 }
 // Fixtures: slot 50 outcome counts since the last report, in TargetBind order (bound, single-range bound,
 // then the refusal reasons). Returns how many outcomes exist.
@@ -2355,15 +2360,18 @@ void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* v
 {
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports)))
         list->RSSetViewports(count, viewports);
+    else if (list) InterlockedIncrement(&state_dropped[0]);
 }
 void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
 {
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects)))
         list->RSSetScissorRects(count, rects);
+    else if (list) InterlockedIncrement(&state_dropped[1]);
 }
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 {
     if (auto* list = recording(self); list && x2w_local::readable(factor, 16)) list->OMSetBlendFactor(factor);
+    else if (list) InterlockedIncrement(&state_dropped[2]);
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)

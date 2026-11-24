@@ -18,6 +18,8 @@
 //   8. single range, count 0, null handles         refused: empty
 //   9. count 9                                     refused: count over 8
 //  10. view 0 copied into slot 2 (CopyDescriptorsSimple), then slot 2 bound    bound
+//  11-13. the same heap shape over title memory (title handles map to other desktop handles):
+//      single range count 2 bound, count 3 unresolved, count 4 refused as range past heap
 //
 // Then the list is closed and submitted; the desktop device must not be removed and the debug layer must
 // store no errors. Draws are not covered.
@@ -200,6 +202,28 @@ int main(int argc, char** argv)
     invoke(device, 24, 1, rtv[2].ptr, staging.ptr, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     invoke(list, 50, 1, arg(&rtv[2]), FALSE, 0);
     if (!step("10 copied view in the empty slot", bound, seen)) return 19;
+
+    // An RTV heap over title memory: title handles differ from desktop ones and each target of a single range
+    // must be mapped on its own; the heap's end is known, so a range past it has its own reason.
+    void* backing = VirtualAlloc(nullptr, 3 * stride, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word backing, bytes;
+    } backed_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3}, reinterpret_cast<Word>(backing), Word{3} * stride};
+    void* backed_heap = nullptr;
+    if (!backing || !ok(invoke(device, 14, arg(&backed_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&backed_heap)))) return 30;
+    const D3D12_CPU_DESCRIPTOR_HANDLE title_first{static_cast<SIZE_T>(invoke(backed_heap, 9))};
+    std::printf("backed heap: title start 0x%llx, backing 0x%llx\n", static_cast<unsigned long long>(title_first.ptr),
+                static_cast<unsigned long long>(reinterpret_cast<Word>(backing)));
+    if (title_first.ptr != reinterpret_cast<SIZE_T>(backing)) return 31;
+    invoke(device, 20, arg(targets[0].Get()), arg(&view), title_first.ptr);
+    invoke(device, 20, arg(targets[1].Get()), arg(&view), title_first.ptr + stride);
+    invoke(list, 50, 2, arg(&title_first), TRUE, 0);
+    if (!step("11 backed heap, single range, count 2", single_bound, seen)) return 32;
+    invoke(list, 50, 3, arg(&title_first), TRUE, 0);
+    if (!step("12 backed heap, single range reaching the empty view", unresolved, seen)) return 33;
+    invoke(list, 50, 4, arg(&title_first), TRUE, 0);
+    if (!step("13 backed heap, single range past the heap end", past_heap, seen)) return 34;
 
     if (!ok(invoke(list, 9))) return 20;
     void* lists[] = {list};
