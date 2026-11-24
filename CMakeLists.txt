@@ -1009,6 +1009,17 @@ add_executable(startup_state_block_blend_check tests/startup_state_block_blend_c
 target_include_directories(startup_state_block_blend_check PRIVATE src)
 target_compile_features(startup_state_block_blend_check PRIVATE cxx_std_17)
 add_test(NAME startup_state_block_blend COMMAND startup_state_block_blend_check)
+# Fixed-function state of slot 57 / 55 pipelines (src/startup_stubs/pipeline_state_decode.h): depth-stencil,
+# rasterizer and blend write masks from hand-built register words, both state block layouts, derived
+# records, depth-target adjustments and the X2W_DRAW_STATE_* switches. The mutated runs (front-face
+# convention inverted, mesh fields unshifted) are the negative controls.
+add_executable(startup_pipeline_state_check tests/startup_pipeline_state_check.cpp)
+target_include_directories(startup_pipeline_state_check PRIVATE src)
+target_compile_features(startup_pipeline_state_check PRIVATE cxx_std_17)
+add_test(NAME startup_pipeline_state COMMAND startup_pipeline_state_check)
+add_test(NAME startup_pipeline_state_winding_control COMMAND startup_pipeline_state_check --mutate winding)
+add_test(NAME startup_pipeline_state_mesh_shift_control COMMAND startup_pipeline_state_check --mutate mesh-shift)
+set_tests_properties(startup_pipeline_state_winding_control startup_pipeline_state_mesh_shift_control PROPERTIES WILL_FAIL TRUE)
 # Root table handles resolved against a logical view heap, and the records a translated draw reads
 # from the window (src/startup_stubs/logical_view_table.h).
 add_executable(startup_logical_view_table_check tests/startup_logical_view_table_check.cpp)
