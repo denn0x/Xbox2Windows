@@ -184,6 +184,15 @@ def main():
     emulate_on = os.environ.get("X2W_DEBUG_EMULATE", "1") != "0"
     fast_exit = opts.get("--fast-exit") == "1"
 
+    # LOCAL (out/gamerun/memleak_work/NOTES.md): a pagefile section opened as a D3D12 heap keeps its commit after the
+    # title is gone, until reboot. With file-backed slabs, the slabs xmem moves for the GPU come from a long-lived pool
+    # (gpu_slab_pool.py) so that every run reuses the same sections. Already-charged pool bytes are taken off the
+    # slab budget in the guard below. X2W_XMEM_GPU_POOL=0: off.
+    pooled_bytes = 0
+    if os.environ.get("X2W_XMEM_SLAB_DIR") and os.environ.get("X2W_XMEM_GPU_POOL") != "0":
+        import gpu_slab_pool
+        pooled_bytes = gpu_slab_pool.ensure(max(1, int(os.environ.get("X2W_XMEM_SLAB_BUDGET_MIB") or "3072") // 256)) << 28
+        print(f"GPU slab pool: {pooled_bytes >> 20} MiB reachable (X2W_XMEM_GPU_POOL)")
     # Host safety (runtime_work/NOTES.md): the job limit covers private commit only. Pagefile page
     # slabs are capped by X2W_XMEM_SLAB_BUDGET_MIB; a launch whose job limit plus slab budget does not
     # fit in the host's commit headroom minus 2 GiB is refused. X2W_ALLOW_UNBUDGETED=1 skips this.
@@ -198,7 +207,7 @@ def main():
         ctypes.WinDLL("psapi").GetPerformanceInfo(ctypes.byref(info0), info0.cb)
         headroom = (info0.CommitLimit - info0.CommitTotal) * info0.PageSize
         budget = int(os.environ.get("X2W_XMEM_SLAB_BUDGET_MIB") or "0") << 20
-        if not budget or memory + budget > headroom - (2 << 30):
+        if not budget or memory + max(0, budget - pooled_bytes) > headroom - (2 << 30):
             print(f"refused to launch: job limit {memory >> 20} MiB + pagefile slab budget {budget >> 20} MiB "
                   f"(X2W_XMEM_SLAB_BUDGET_MIB) must be set and fit in the commit headroom {headroom >> 20} MiB - 2048")
             return 3
