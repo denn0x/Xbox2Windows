@@ -84,6 +84,31 @@ int main() {
     check(ok && ok3 && st.exact == nb && std::memcmp(out2.data(), out3.data(), out2.size()) == 0,
           "a known dictionary slot is used like a stream reference");
 
+    // Fallback classes against the independent model: a mixed stream (all four paths but constant)
+    // and a stream whose every endpoint chain is rooted (constant blocks only).
+    struct FbVec { const char* name; const uint16_t* symbols; const uint8_t* expected; const size_t* counts; };
+    const FbVec fbv[] = { { "mixed", BC6H_MIX_SYMBOLS, BC6H_MIX_OUT, BC6H_MIX_COUNTS },
+                          { "all rooted", BC6H_ROOTED_SYMBOLS, BC6H_ROOTED_OUT, BC6H_ROOTED_COUNTS } };
+    for (const FbVec& v : fbv) {
+        const size_t n = 40;
+        std::vector<uint16_t> s(v.symbols, v.symbols + 16 * 2 * n);
+        std::vector<uint8_t> o(16 * n);
+        bc6h::Stats fs;
+        const bool d = bc6h::decode_blocks(s, n, o.data(), o.size(), &fs);
+        const bool counts = fs.exact == v.counts[0] && fs.endpoints_only == v.counts[1] && fs.copied == v.counts[2] &&
+                            fs.constant == v.counts[3];
+        std::printf("  %s: exact %zu endpoints_only %zu copied %zu constant %zu\n", v.name, fs.exact, fs.endpoints_only,
+                    fs.copied, fs.constant);
+        check(d && counts && std::memcmp(o.data(), v.expected, o.size()) == 0,
+              v.name[0] == 'm' ? "mixed fallback stream matches the model (bytes and counts)"
+                               : "all-rooted stream gives the model's constant blocks");
+    }
+    // The constant block: mode 13 (5-bit code 0x0f), base 16913 in all channels, x = 0, indices 0.
+    {
+        const uint8_t* c = BC6H_ROOTED_OUT;
+        check((c[0] & 31) == 0x0f, "constant block uses mode 13");
+    }
+
     std::vector<uint16_t> bad = sym;
     bad[15 * t + 2 * 5] = 14;
     check(!bc6h::decode_blocks(bad, nb, out.data(), out.size(), &st), "mode code 14 is rejected");

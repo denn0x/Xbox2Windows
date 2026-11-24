@@ -287,12 +287,16 @@ inline bool decode_blocks(const std::vector<uint16_t>& symbols, size_t nb, uint8
         const uint8_t v = MODES[f.mode].two_regions ? 3 : 7;  // anchors stay legal
         std::memset(f.idx, v, sizeof f.idx);
     };
-    // nearest endpoint-known block: previous, else next
+    // nearest endpoint-known block in stream order (a tie takes the earlier one)
     std::vector<int64_t> nearest(nb, -1);
     int64_t last = -1;
     for (size_t i = 0; i < nb; ++i) { if (kep[i]) last = static_cast<int64_t>(i); nearest[i] = last; }
     last = -1;
-    for (size_t i = nb; i-- > 0;) { if (kep[i]) last = static_cast<int64_t>(i); if (nearest[i] < 0) nearest[i] = last; }
+    for (size_t i = nb; i-- > 0;) {
+        if (kep[i]) last = static_cast<int64_t>(i);
+        const int64_t at = static_cast<int64_t>(i);
+        if (last >= 0 && (nearest[i] < 0 || last - at < at - nearest[i])) nearest[i] = last;
+    }
     for (size_t i = 0; i < nb; ++i) {
         Fields f = fl[i];
         if (kep[i] && kix[i]) {
