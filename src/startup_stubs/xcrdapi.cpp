@@ -342,7 +342,7 @@ LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
 // the end of the file). Why the executable adds the shift is not known. A request is read from the shifted
 // offset when the table has a boundary there and none at the requested offset, or when only the shifted
 // range fits in the file. LOCAL SHORTCUT until the offset arithmetic is understood.
-struct Rds5Boundary { u64 stored, logical; unsigned codec; };
+struct Rds5Boundary { u64 stored, logical; unsigned codec, padding; };
 const std::vector<Rds5Boundary>* rds5_table(HANDLE handle)
 {
     static std::mutex lock;
@@ -368,7 +368,7 @@ const std::vector<Rds5Boundary>* rds5_table(HANDLE handle)
     slot->reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint32_t low = raw[2 * i], high = raw[2 * i + 1];
-        slot->push_back({u64{low & 0x03ffffffu} * 256, (u64{high & 0xfffffu} * 4 + (low >> 30)) * 4096, (low >> 26) & 15});
+        slot->push_back({u64{low & 0x03ffffffu} * 256, (u64{high & 0xfffffu} * 4 + (low >> 30)) * 4096, (low >> 26) & 15, high >> 20});
     }
     return slot.get();
 }
@@ -398,6 +398,38 @@ u64 archive_read_offset(HANDLE handle, u64 offset, unsigned size)
     return offset;
 }
 
+// LOCAL: a compressed request into an RDS5 interval (measured offline on one executable's archives,
+// out/gamerun/storage_work/repro.py). Every zlib interval inflates to exactly its logical size and every
+// BCPack interval (table codec = the request's format number, 1 or 7 checked) decodes to exactly its
+// logical size; the request names the interval's compressed size (stored span minus the padding in
+// the table's high 12 bits) but a destination smaller than that, and its offset is the interval's
+// stored start plus the request's offset in the decoded data (k * destination size for the pieces of
+// one stream). The interval is the last one at or before the offset with that compressed size whose
+// decoded data holds the whole destination; a request for the whole interval, or one that would run
+// past the interval's end, is left to the paths below (the 0xE0000-shifted requests above name the
+// whole interval as destination).
+struct Rds5Slice { u64 stored; std::size_t decoded_size, at; };
+LONG requests_interval_slices;
+bool rds5_slice(HANDLE handle, u64 offset, unsigned compressed, unsigned destination_size, unsigned codec, Rds5Slice& slice)
+{
+    const auto* table = rds5_table(handle);
+    if (!table || !compressed || !destination_size) return false;
+    auto it = std::upper_bound(table->begin(), table->end(), offset, [](u64 v, const Rds5Boundary& b) { return v < b.stored; });
+    for (int steps = 0; it != table->begin() && steps < 0x10000; ++steps) {
+        --it;
+        const u64 at = offset - it->stored;
+        if (at >= (64u << 20)) break;
+        if (it + 1 == table->end()) continue;
+        const u64 span = (it + 1)->stored - it->stored, decoded = (it + 1)->logical - it->logical;
+        if (it->codec != codec || span <= it->padding || span - it->padding != compressed) continue;
+        // A request for the whole interval already works below (and must not evict cached streams).
+        if (at + destination_size > decoded || (!at && destination_size == decoded)) return false;
+        slice ={it->stored, static_cast<std::size_t>(decoded), static_cast<std::size_t>(at)};
+        return true;
+    }
+    return false;
+}
+
 // LOCAL: multi-piece zlib streams across queues and submissions (measured on one executable). One
 // stream that inflates to several destination-sized pieces is enqueued as one request per piece;
 // every piece names the same compressed size and piece k's offset is the stream's offset plus k
@@ -414,6 +446,13 @@ void remember_stream(u64 source, u64 base, unsigned compressed, std::shared_ptr<
     const std::lock_guard guard(streams_lock);
     streams.push_front({source, base, compressed, std::move(data)});
     if (streams.size() > 16) streams.pop_back();
+}
+std::shared_ptr<const std::vector<unsigned char>> remembered_stream(u64 source, u64 base, unsigned compressed)
+{
+    const std::lock_guard guard(streams_lock);
+    for (const InflatedStream& s : streams)
+        if (s.source == source && s.base == base && s.compressed == compressed) return s.data;
+    return nullptr;
 }
 bool find_stream(u64 source, u64 offset, unsigned compressed, unsigned piece, std::shared_ptr<const std::vector<unsigned char>>& data, u64& base)
 {
@@ -482,6 +521,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const char* outcome = "done";
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
+    bool interval_request = false;
+    Rds5Slice slice{};
     if (options & ~known) {
         outcome = "unknown option bits, not done";
     } else if (!destination || !source_size) {
@@ -490,8 +531,12 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         input = reinterpret_cast<const unsigned char*>(source);
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
+        // A zlib or a decoded BCPack format, not both (the table has one codec per interval).
+        const unsigned codec = zlib ? (bcpack ? 0u : 8u) : (bcpack == 7 || bcpack == 1 ? bcpack : 0u);
+        interval_request = codec && file_object && file_object->kind == file &&
+                           rds5_slice(file_object->handle, offset, source_size, destination_size, codec, slice);
         if (file_object && file_object->kind == file &&
-            x2w_startup::read_storage_file(file_object->handle, archive_read_offset(file_object->handle, offset, source_size), source_size, packed))
+            x2w_startup::read_storage_file(file_object->handle, interval_request ? slice.stored : archive_read_offset(file_object->handle, offset, source_size), source_size, packed))
             input = packed.data();
         else
             outcome = "read failed";
@@ -503,7 +548,32 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
 
     if (input) {
         data = input;
-        if (zlib) {
+        if (interval_request) {
+            // LOCAL: decode the whole interval to its logical size once (kept for its other pieces), then
+            // serve this request's slice of it (see rds5_slice).
+            std::shared_ptr<const std::vector<unsigned char>> whole = remembered_stream(source, slice.stored, source_size);
+            if (!whole || whole->size() != slice.decoded_size) {
+                whole = nullptr;
+                auto decoded = std::make_shared<std::vector<unsigned char>>(slice.decoded_size);
+                std::size_t produced = 0;
+                const bool ok = zlib ? x2w_inflate::inflate_zlib(input, source_size, decoded->data(), decoded->size(), &produced)
+                                     : x2w_bcpack::decode_bcpack(input, source_size, bcpack, decoded->data(), decoded->size(), &produced);
+                if (ok && produced == decoded->size()) {
+                    whole = std::move(decoded);
+                    remember_stream(source, slice.stored, source_size, whole);
+                }
+            }
+            if (whole) {
+                output.assign(whole->begin() + slice.at, whole->begin() + slice.at + destination_size);
+                data = output.data();
+                decode_length = destination_size;
+                outcome = zlib ? "inflated (RDS5 interval slice)" : "bcpack decoded (RDS5 interval slice)";
+                InterlockedIncrement(&requests_interval_slices);
+            } else {
+                outcome = zlib ? "zlib failed (RDS5 interval)" : "bcpack failed (RDS5 interval)";
+                data = nullptr;
+            }
+        } else if (zlib) {
             bool direct_decoded = false;
             bool decode_error = false;
             if (has_zlib_header(input, source_size)) {
@@ -641,8 +711,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
         }
-        bool bcpack_decoded = false;
-        if (data && bcpack) {
+        bool bcpack_decoded = interval_request && data;
+        if (data && bcpack && !interval_request) {
             if (bcpack == 7 || bcpack == 1) {
                 std::vector<unsigned char> decoded(destination_size);
                 std::size_t produced = 0;
@@ -663,6 +733,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 data = output.data();
                 decode_length = destination_size;
                 outcome = "BCPack not decoded: zero-filled";
+                static LONG blank_logged;
+                if (InterlockedIncrement(&blank_logged) <= 16)
+                    log("x2w-dstorage BCPack format %u not decoded: zero-filled (options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x)",
+                        bcpack, options, destination_size, offset, source_size);
             }
         }
         if (data) {
@@ -736,9 +810,15 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             file_object->handle != INVALID_HANDLE_VALUE) {
             if (!GetFinalPathNameByHandleW(file_object->handle, path, 300, FILE_NAME_NORMALIZED)) std::wcscpy(path, L"?");
         }
-        log("x2w-dstorage FAIL options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x outcome=\"%s\" file=\"%ls\"", options,
-            destination_size, offset, source_size, outcome, path);
+        const u64* words = reinterpret_cast<const u64*>(request);
+        log("x2w-dstorage FAIL options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x outcome=\"%s\" file=\"%ls\" +10=0x%llx +38=0x%llx +40=0x%llx", options,
+            destination_size, offset, source_size, outcome, path, words[2], words[7], words[8]);
     }
+    static LONG slices_logged;
+    if (interval_request && slice.at && InterlockedIncrement(&slices_logged) <= 32)
+        log("x2w-dstorage RDS5 slice options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x: interval 0x%llx decoded 0x%zx at 0x%zx +10=0x%llx -> %s",
+            options, destination_size, offset, source_size, slice.stored, slice.decoded_size, slice.at,
+            *reinterpret_cast<const u64*>(request + 0x10), outcome);
 }
 
 void signal_fence(void* fence, u64 value);
@@ -1052,9 +1132,9 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                     std::snprintf(section_text, sizeof(section_text), "unknown");
                 // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
-                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld archive-shifted=%ld past-end=%ld stream-pieces=%ld found-on-disk=%ld; page tokens 0 at enqueue=%ld, "
+                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld archive-shifted=%ld past-end=%ld stream-pieces=%ld found-on-disk=%ld rds5-slices=%ld; page tokens 0 at enqueue=%ld, "
                     "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
-                    requests_failed, requests_bcpack_blank, requests_archive_shifted, requests_archive_past_end, requests_stream_pieces, requests_pieces_found_on_disk, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
+                    requests_failed, requests_bcpack_blank, requests_archive_shifted, requests_archive_past_end, requests_stream_pieces, requests_pieces_found_on_disk, requests_interval_slices, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
                     section_text);
                 char tally[512];
                 int at = 0;
