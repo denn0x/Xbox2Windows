@@ -9,7 +9,11 @@ forms it does not prove.
 
 Semantics sources: LLVM AMDGPU (SIDefines.h ClassFlags, llvm.amdgcn.class(value, mask); GCNSubtarget
 zeroesHigh16BitsOfDest for the gfx10 16-bit results; SIFoldOperands "Clamp is applied after omod";
-ConstantFoldAMDGCNCubeIntrinsic for v_cube*; SIInstrInfo s_and/s_cmp -> s_bitcmp folds).
+ConstantFoldAMDGCNCubeIntrinsic for v_cube*; SIInstrInfo s_and/s_cmp -> s_bitcmp folds; SOPInstructions.td for
+the s_lshlN_add / s_abs / s_pack_ll patterns and which scalar ops define SCC; SIShrinkInstructions for the signed
+SOPK immediate; AMDGPUISelDAGToDAG SelectVOP3PMadMixModsImpl and VOP3PInstructions.td VOP3P_Mix_Profile for the
+mix operands; SIISelLowering packImage16bitOpsToDwords for a16) and Mesa main 13ebbc00 (ACO selection of
+pack_[us]norm_2x16 to v_cvt_pknorm_*, nir_constant_expressions pack_[us]norm_1x16, util/macros.h CLAMP).
 """
 import math
 import re
@@ -381,6 +385,263 @@ def joins():
         check('a join of a descriptor and a loaded word refused', False)
 
 
+# ---- v_cvt_pknorm_{u16,i16}_f32 ---------------------------------------------------------------------------
+def f32(x):
+    return struct.unpack('<f', struct.pack('<f', x))[0]
+
+
+def roundeven(x):
+    # Python's round() on a float is round-half-to-even, like _mesa_roundevenf and HLSL round()
+    return float(round(x))
+
+
+def ref_pknorm(x, signed_form):
+    """Mesa main 13ebbc00: nir_constant_expressions.py pack_[us]norm_1x16 with util/macros.h CLAMP.
+
+    (uint16_t)(int)_mesa_roundevenf(CLAMP(x, lo, 1.0f) * K), with CLAMP(X, MIN, MAX) = X > MIN ? (X > MAX ? MAX : X)
+    : MIN, so NaN takes MIN; the product is a binary32 multiply.
+    """
+    lo, scale = (-1.0, 32767.0) if signed_form else (0.0, 65535.0)
+    clamped = (1.0 if x > 1.0 else x) if x > lo else lo
+    return int(roundeven(f32(clamped * scale))) & 0xffff
+
+
+def pknorm_helper(name):
+    """The HLSL of x2w_pknorm_[ui]16 as a Python function over a binary32 value (the bits come in as a float)."""
+    text = G.HELPERS[name]
+    body = text[text.index('{') + 1:text.rindex('}')]
+    body = re.sub(r'\b(0x[0-9a-f]+|\d+)u\b', r'\1', body)
+    body = re.sub(r'round\((.*) \* ([\d.]+)\)', r'rne(f32(\1 * \2))', body)
+    source = 'def helper(x):\n'
+    for statement in filter(None, (s.strip() for s in body.split(';'))):
+        m = re.fullmatch(r'if \((.*)\) (return .*)', statement)
+        source += ('    if %s:\n        %s\n' % m.groups()) if m else '    %s\n' % statement
+    space = dict(asuint=lambda v: struct.unpack('<I', struct.pack('<f', v))[0], f32=f32, rne=roundeven,
+                 clamp=lambda v, lo, hi: min(max(v, lo), hi), uint=lambda v: int(v) & MASK, int=int)
+    exec(source, space)
+    return space['helper']
+
+
+def pknorm():
+    def bits(b):
+        return struct.unpack('<f', struct.pack('<I', b))[0]
+    nans = [float('nan'), -float('nan'), bits(0x7f800001), bits(0xffc00000)]
+    values = nans + [0.0, -0.0, 1.0, -1.0, 2.0, -2.0, 1e30, -1e30, float('inf'), float('-inf'), 0.5, -0.5, 0.25,
+                     bits(1), bits(0x80000001), f32(1.5 / 65535), f32(2.5 / 65535), f32(-1.5 / 32767), f32(0.5 / 32767),
+                     f32(1 - 2 ** -24), f32(-1 + 2 ** -24), 0.1, -0.1, 0.999, -0.999]
+    values += [f32(i / 1000.0 - 1.2) for i in range(2401)]
+    for name, signed_form in (('x2w_pknorm_u16', False), ('x2w_pknorm_i16', True)):
+        helper = pknorm_helper(name)
+        bad = [(x, helper(x), ref_pknorm(x, signed_form)) for x in values if helper(x) != ref_pknorm(x, signed_form)]
+        check('%s matches Mesa pack_%snorm_1x16 on %d inputs (NaN, +-0, ties, out of range)%s'
+              % (name, 's' if signed_form else 'u', len(values), (' first %r' % (bad[0],)) if bad else ''), not bad)
+    check('NaN packs as Mesa clamps it: unorm 0, snorm -32767',
+          pknorm_helper('x2w_pknorm_u16')(nans[0]) == 0 and pknorm_helper('x2w_pknorm_i16')(nans[0]) == 0x8001)
+    check('ties round to even: unorm 0.5 -> 32768, snorm 0.5 -> 16384',
+          pknorm_helper('x2w_pknorm_u16')(0.5) == 32768 and pknorm_helper('x2w_pknorm_i16')(0.5) == 16384)
+    vop3 = lambda op, extra=0, w1extra=0: [0xd4000000 | op << 16 | extra | 7, (256 + 7) | (256 + 4) << 9 | w1extra]
+    w = vop3(0x369)
+    _, text = lines(w)
+    check('v_cvt_pknorm_u16_f32: S0 in the low half, S1 in the high half',
+          asm_of(w) == 'v_cvt_pknorm_u16_f32 v7, v7, v4' and
+          text == 'v7 = x2w_pknorm_u16(F(v7)) | (x2w_pknorm_u16(F(v4)) << 16);')
+    w = vop3(0x368, w1extra=1 << 29)
+    _, text = lines(w)
+    check('v_cvt_pknorm_i16_f32 applies the source neg before packing',
+          asm_of(w) == 'v_cvt_pknorm_i16_f32 v7, -v7, v4' and
+          text == 'v7 = x2w_pknorm_i16((-F(v7))) | (x2w_pknorm_i16(F(v4)) << 16);')
+    check('v_cvt_pknorm_u16_f32 clamp refused', refused(None, words=vop3(0x369, 1 << 15)))
+    check('v_cvt_pknorm_u16_f32 omod refused', refused(None, words=vop3(0x369, 0, 1 << 27)))
+
+
+# ---- scalar ALU: shift-add, abs, SOPK arithmetic, pack, and the SCC liveness check -------------------------
+SOP2 = lambda op, d, a, b: 0x80000000 | op << 23 | d << 16 | b << 8 | a
+LSHL2_ADD = SOP2(0x2f, 20, 21, 22)            # s_lshl2_add_u32 s20, s21, s22
+CSELECT = SOP2(0x0a, 23, 20, 21)              # s_cselect_b32 s23, s20, s21 (reads SCC)
+CMP_EQ = 0xbf000000 | 6 << 16 | 21 << 8 | 20  # s_cmp_eq_u32 s20, s21 (writes SCC)
+NOP = 0xbf800000
+SOPP = lambda op, n: 0xbf800000 | op << 16 | (n & 0xffff)  # s_branch 2, s_cbranch_scc1 5, vccz 6, vccnz 7
+
+
+class SignedExpr(Expr):
+    """Expr plus the signed max of s_abs_i32's lowering."""
+    @staticmethod
+    def call(name, args):
+        if name == 'max':
+            (a, sa), (b, sb) = args
+            assert sa and sb
+            return max(G_signed(a), G_signed(b)) & MASK, True
+        return Expr.call(name, args)
+
+
+def G_signed(v):
+    return v - (1 << 32) if v >> 31 else v
+
+
+def translates(words):
+    try:
+        stage(words)
+    except G.Unsupported as error:
+        return str(error)
+    return None
+
+
+def scalar_alu():
+    grid = [0, 1, 2, 0x7fff, 0x8000, 0xffff, 0x10000, 0x12345678, 0x7fffffff, 0x80000000, 0x80000001, 0xfffffffe, MASK]
+    _, text = lines([LSHL2_ADD])
+    check('s_lshl2_add_u32 is (S0 << 2) + S1', asm_of([LSHL2_ADD]) == 's_lshl2_add_u32 s20, s21, s22' and
+          text == 's20 = (s21 << 2) + s22;')
+    e = Expr(text.split(' = ', 1)[1].rstrip(';'))
+    check('s_lshl2_add_u32 wraps modulo 2^32 on the grid',
+          all(e.run({'s21': a, 's22': b})[0] == ((a << 2) + b) & MASK for a in grid for b in grid))
+    for n, op in ((1, 0x2e), (3, 0x30), (4, 0x31)):
+        _, text = lines([SOP2(op, 20, 21, 22)])
+        check('s_lshl%d_add_u32 shifts by %d' % (n, n), text == 's20 = (s21 << %d) + s22;' % n)
+    w = 0xbe800000 | 20 << 16 | 0x34 << 8 | 21
+    _, text = lines([w])
+    e = SignedExpr(text.split(' = ', 1)[1].rstrip(';'))
+    check('s_abs_i32 is smax(x, -x): INT_MIN stays INT_MIN (LLVM selects it for that pattern)',
+          asm_of([w]) == 's_abs_i32 s20, s21' and
+          all(e.run({'s21': a})[0] == (abs(G_signed(a)) & MASK) for a in grid) and
+          e.run({'s21': 0x80000000})[0] == 0x80000000)
+    w = SOP2(0x32, 20, 21, 22)
+    _, text = lines([w])
+    e = Expr(text.split(' = ', 1)[1].rstrip(';'))
+    check('s_pack_ll_b32_b16 puts S0[15:0] low and S1[15:0] high',
+          asm_of([w]) == 's_pack_ll_b32_b16 s20, s21, s22' and
+          all(e.run({'s21': a, 's22': b})[0] == (a & 0xffff) | (b & 0xffff) << 16 for a in grid for b in grid))
+    for op, name, sym in ((0xf, 's_addk_i32', '+'), (0x10, 's_mulk_i32', '*')):
+        w = 0xb0000000 | op << 23 | 20 << 16 | 0xfff0
+        _, text = lines([w])
+        check('%s sign-extends its simm16 (0xfff0 is -16)' % name,
+              asm_of([w]) == '%s s20, 0xfff0' % name and text == 's20 = s20 %s 0xfffffff0u;' % sym)
+        w = 0xb0000000 | op << 23 | 20 << 16 | 0x150
+        _, text = lines([w])
+        check('%s with a positive simm16' % name, text == 's20 = s20 %s 0x00000150u;' % sym)
+    # SCC: refused only when an unmodelled SCC value can reach a reader
+    addk = 0xb0000000 | 0xf << 23 | 20 << 16 | 4
+    mulk = 0xb0000000 | 0x10 << 23 | 20 << 16 | 4
+    cases = [
+        ('unmodelled SCC read straight after', [LSHL2_ADD, CSELECT], True),
+        ('SCC redefined by s_cmp before the read', [LSHL2_ADD, CMP_EQ, CSELECT], False),
+        ('no reader at all', [LSHL2_ADD, NOP], False),
+        ('s_cbranch_scc1 reads it', [LSHL2_ADD, SOPP(5, 0), NOP], True),
+        ('a branch around the redefinition reaches the reader',
+         [LSHL2_ADD, SOPP(6, 1), CMP_EQ, CSELECT], True),
+        ('both paths redefine it', [LSHL2_ADD, SOPP(6, 2), CMP_EQ, SOPP(2, 1), CMP_EQ, CSELECT], False),
+        ('a loop carries it back to a reader at the head', [CSELECT, LSHL2_ADD, SOPP(7, -3)], True),
+        ('a loop that redefines it at the head', [CMP_EQ, CSELECT, LSHL2_ADD, SOPP(7, -4)], False),
+        ('s_addk_i32 defines SCC (signed overflow, not modelled)', [addk, CSELECT], True),
+        ('s_mulk_i32 does not define SCC', [CMP_EQ, mulk, CSELECT], False),
+        ('src_scc as an operand is a reader', [LSHL2_ADD, SOP2(0x00, 23, 0xfd, 21)], True),
+    ]
+    for label, words, want_refused in cases:
+        reason = translates(words)
+        check('SCC liveness: %s -> %s%s' % (label, 'refused' if want_refused else 'translated',
+                                            (' (%s)' % reason) if reason else ''),
+              (reason is not None and 'SCC of' in reason) if want_refused else reason is None)
+
+
+# ---- v_fma_mix_f32 and the f16 operands of the mix family -------------------------------------------------
+def mix_word(op, vdst, srcs, op_sel=0, op_sel_hi=0, neg=0, absolute=0, clamp=0):
+    return [0xcc000000 | op << 16 | (op_sel_hi >> 2 & 1) << 14 | op_sel << 11 | absolute << 8 | clamp << 15 | vdst,
+            srcs[0] | srcs[1] << 9 | srcs[2] << 18 | (op_sel_hi & 3) << 27 | neg << 29]
+
+
+def mixes():
+    # op_sel / op_sel_hi as [src0, src1, src2] bit 0, 1, 2
+    cases = [
+        (mix_word(0x20, 1, (258, 20, 128), op_sel=2, op_sel_hi=2, neg=4),
+         'v_fma_mix_f32 v1, v2, s20, -0 op_sel:[0,1,0] op_sel_hi:[0,1,0]',
+         'v1 = U(F(v2) * f16tof32(s20 >> 16) + (-0.0));',
+         'f32 result; op_sel_hi makes src1 an f16 and op_sel takes its high half; -0 is +0 negated'),
+        (mix_word(0x20, 1, (242, 32, 268), op_sel_hi=2, neg=6),
+         'v_fma_mix_f32 v1, 1.0, -s32, -v12 op_sel_hi:[0,1,0]',
+         'v1 = U(1.0 * (-f16tof32(s32)) + (-F(v12)));',
+         'neg applies to the converted f16 and to the f32 operand'),
+        (mix_word(0x20, 1, (258, 259, 260), op_sel_hi=1, absolute=1, clamp=1),
+         'v_fma_mix_f32 v1, |v2|, v3, v4 op_sel_hi:[1,0,0] clamp',
+         'v1 = U(saturate(abs(f16tof32(v2)) * F(v3) + F(v4)));',
+         'abs on a low-half f16 source, clamp on the f32 result'),
+        (mix_word(0x21, 1, (242, 258, 240), op_sel_hi=4),
+         'v_fma_mixlo_f16 v1, 1.0, v2, 0.5 op_sel_hi:[0,0,1]',
+         'v1 = (v1 & 0xffff0000u) | f32tof16(1.0 * F(v2) + f16tof32(0x3800u));',
+         'an inline 0.5 read as f16 is 0x3800 (not the low half of the f32 0x3f000000)'),
+    ]
+    for words, want_asm, want_text, label in cases:
+        got_asm = asm_of(words)
+        _, text = lines(words) if got_asm == want_asm else (None, None)
+        check('fma_mix: %s' % label, got_asm == want_asm and text == want_text)
+    check('fma_mix: op_sel on an f32 operand refused',
+          refused(None, words=mix_word(0x20, 1, (258, 259, 260), op_sel=1)))
+    check('fma_mix: high half of an inline f16 constant refused',
+          refused(None, words=mix_word(0x20, 1, (240, 259, 260), op_sel=1, op_sel_hi=1)))
+    check('fma_mix: literal f16 operand refused',
+          refused(None, words=mix_word(0x20, 1, (255, 259, 260), op_sel_hi=1) + [0x3c00]))
+    check('fma_mix: inline 1/(2*pi) refused', refused(None, words=mix_word(0x20, 1, (248, 259, 260))))
+
+
+# ---- SDWA select and compare, null-export classification, a16 image addresses, entry VGPR reads -------------
+def sdwa_and_misc():
+    w = [0x1 << 25 | 10 << 17 | 10 << 9 | 0xf9, 10 | 6 << 8 | 4 << 16 | 5 << 24]
+    _, text = lines(w)
+    check('v_cndmask_b32_sdwa selects between the source fields by vcc',
+          asm_of(w) == 'v_cndmask_b32_sdwa v10, v10, v10, vcc_lo dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 '
+                       'src1_sel:WORD_1' and
+          text == 'v10 = (vcc & 1) ? ((v10 >> 16u) & 0xffffu) : ((v10 >> 0u) & 0xffffu);')
+    w = [0x7c000000 | 0x95 << 17 | 15 << 9 | 0xf9, 20 | 6 << 16 | 1 << 23 | 4 << 24]
+    _, text = lines(w)
+    check('v_cmpx_ne_i32_sdwa compares the selected fields and writes exec',
+          asm_of(w) == 'v_cmpx_ne_i32_sdwa s20, v15 src0_sel:DWORD src1_sel:WORD_0' and
+          text == 'exec = ((int(s20) != int(((v15 >> 0u) & 0xffffu))) ? 1u : 0u);')
+    w = [0x7c000000 | 0x85 << 17 | 15 << 9 | 0xf9, 20 | 6 << 16 | 1 << 23 | 4 << 24 | 1 << 27]
+    _, text = lines(w)
+    check('v_cmp_ne_i32_sdwa with sext() sign-extends the field into vcc',
+          asm_of(w) == 'v_cmp_ne_i32_sdwa vcc_lo, s20, sext(v15) src0_sel:DWORD src1_sel:WORD_0' and
+          text == 'vcc = ((int(s20) != int(asuint(asint(v15 << 16u) >> 16u))) ? 1u : 0u);')
+    check('v_cmp_lt_f32_sdwa (a float SDWA compare) refused',
+          refused(None, words=[0x7c000000 | 0x01 << 17 | 15 << 9 | 0xf9, 20 | 6 << 16 | 1 << 23 | 4 << 24]))
+    null = words_bytes([0xf8000000 | 9 << 4 | 1 << 11 | 1 << 12, 0, 0xbf810000])
+    check('a stage whose only export is "exp null ... done vm" is a pixel stage', G.classify(null) == 'ps')
+
+    load = [0xf0000000 | 3 << 8 | 1 << 3, 2 | 8 << 8 | (24 // 4) << 16 | 1 << 30]
+    _, text = lines(load, setup=gather_setup)
+    check('image_load a16 takes x and y from the halves of one address dword',
+          asm_of(load).endswith('dim:SQ_RSRC_IMG_2D a16') and
+          text == 't = r0.Load(int3((v2 & 0xffffu), (v2 >> 16), 0));\nv8 = U(t.x);\nv9 = U(t.y);')
+    sample = [0xf0000000 | 0x20 << 18 | 3 << 8 | 1 << 3, 2 | 8 << 8 | (24 // 4) << 16 | (16 // 4) << 21 | 1 << 30]
+    _, text = lines(sample, setup=gather_setup)
+    check('image_sample a16 takes binary16 u and v from the halves of one address dword',
+          'f16tof32(v2), f16tof32(v2 >> 16)' in text and 'v3' not in text)
+    check('image_sample d16 refused', refused(None, setup=gather_setup, words=[sample[0], sample[1] | 1 << 31]))
+    check('image_sample unorm refused', refused(None, setup=gather_setup, words=[sample[0] | 1 << 12, sample[1]]))
+    check('image_load tfe refused', refused(None, setup=gather_setup, words=[load[0] | 1 << 16, load[1]]))
+
+    mov = 0x7e000000 | 3 << 17 | 1 << 9 | (256 + 1)          # v_mov_b32 v3, v1
+    s = stage([0x7e000000 | 1 << 17 | 1 << 9 | 0x80, mov])  # v_mov_b32 v1, 0 first
+    t = stage([mov])
+    check('a pixel read of a VGPR before any write is recorded as an entry (SPI input) read',
+          s.entry_reads == {} and t.entry_reads == {1: 0})
+    # A whole request: the interpolated v0..v11 then four moves into the exported v12..v15. Reading v20, which no
+    # instruction writes, is a read of an SPI input: translate_to writes a .fail instead of a result.
+    import tempfile
+    import startup_gfx2hlsl_bit_alu_check as B
+    def moves(sources):
+        return words_bytes([0x7e000000 | (12 + i) << 17 | 1 << 9 | (256 + r) for i, r in enumerate(sources)])
+    vs = B.vs_words([(0, 0, 0)] * 4)
+    results = {}
+    with tempfile.TemporaryDirectory() as directory:
+        for label, sources in (('control', (0, 1, 2, 3)), ('entry', (0, 1, 20, 3))):
+            ps = B.PRE_WORDS + moves(sources) + B.POST_WORDS
+            outcome = G.translate_to(directory, 1, vs, ps, B.root_blob(), check=False)
+            results[label] = (outcome, Path(directory, '%016x.txt' % 1).exists())
+            for leftover in Path(directory).iterdir():
+                leftover.unlink()
+    check('translate_to refuses a pixel stage that reads an entry VGPR (%s); its control translates'
+          % results['entry'][0],
+          results['control'] == ('ok', True) and results['entry'][1] is False and 'entry VGPR v20' in results['entry'][0])
+
+
 def main():
     exports()
     output_modifiers()
@@ -391,6 +652,10 @@ def main():
     gather()
     typed_fetch()
     joins()
+    pknorm()
+    scalar_alu()
+    mixes()
+    sdwa_and_misc()
     if failures:
         raise SystemExit('FAILED: %s' % '; '.join(failures))
     print('startup gfx2hlsl coverage checks: 0 failed')

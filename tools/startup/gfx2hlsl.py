@@ -144,6 +144,9 @@ class Stage:
         self.uses_pos = False
         self.masks = set()        # scalar registers currently holding lane masks
         self.uses_q = False       # the uint2 temporary of the 64-bit operations
+        self.written_v = set()    # VGPRs assigned so far in program order
+        self.entry_reads = {}     # VGPR read before any write (its entry value) -> offset of the first such read
+        self.pc = 0
         self.setup_entry()
         self.translate()
 
@@ -207,6 +210,9 @@ class Stage:
         r = reg_range(tok)
         if r:
             if r[0] == 'v':
+                written = getattr(self, 'written_v', None)  # absent on the tests' bare one-instruction stages
+                if written is not None and r[1] not in written:
+                    self.entry_reads.setdefault(r[1], self.pc)
                 self.used_v.add(r[1])
                 return 'v%d' % r[1]
             return self.S(r[1])
@@ -264,6 +270,8 @@ class Stage:
         self.lines.append(text)
 
     def set_v(self, n, expr):
+        if hasattr(self, 'written_v'):
+            self.written_v.add(n)
         self.uniform_v.discard(n)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
@@ -372,6 +380,7 @@ class Stage:
         start = 0
         incoming = {}             # branch target -> symbolic states of the forward branches seen so far
         previous = None
+        scc_written, scc_unknown = set(), set()
         for off, n, name, asm in self.ins:
             if off in targets and off != start:
                 self.blocks.append((start, self.lines, None))
@@ -386,7 +395,14 @@ class Stage:
                 if states:
                     self.merge(states)
             self.pc = off
+            before = len(self.lines)
             term = self.one(name, asm)
+            if any('scc = ' in line for line in self.lines[before:]):
+                scc_written.add(off)
+            elif re.sub(r'_e(32|64)$', '', name) in SCC_UNMODELLED or (name in SCA and SCA[name][1]):
+                # a hardware SCC write the HLSL did not make (or, for an SCA op with an SCC rule, one that a
+                # descriptor or m0 path skipped)
+                scc_unknown.add(off)
             previous = name
             if name.startswith('s_cbranch') or name == 's_branch':
                 incoming.setdefault(int(parse(asm)[1][0].split('_')[1], 16), []).append(self.snapshot())
@@ -395,6 +411,45 @@ class Stage:
                 self.lines, start = [], off + n
         if self.lines:
             self.blocks.append((start, self.lines, None))
+        self.check_scc(scc_written, scc_unknown)
+
+    def check_scc(self, written, unknown):
+        """Refuse when an SCC value the translation does not compute can be read.
+
+        The instructions in `unknown` write SCC in hardware but the HLSL leaves `scc` as it was. That is only
+        a wrong translation if some path from one of them reaches an SCC reader before an instruction whose
+        translation assigns `scc` (one in `written`). Paths follow fall-through and branch targets, loops
+        included; s_endpgm and s_branch end the fall-through.
+        """
+        if not unknown:
+            return
+        order = [ins[0] for ins in self.ins]
+        info = {off: (name, asm) for off, n, name, asm in self.ins}
+        following = dict(zip(order, order[1:]))
+        def successors(off):
+            name, asm = info[off]
+            if name == 's_endpgm':
+                return []
+            nxt = [following[off]] if off in following else []
+            if name == 's_branch':
+                nxt = []
+            if name.startswith('s_cbranch') or name == 's_branch':
+                nxt.append(int(parse(asm)[1][0].split('_')[1], 16))
+            return [o for o in nxt if o in info]
+        for start in sorted(unknown):
+            seen, todo = set(), list(successors(start))
+            while todo:
+                off = todo.pop()
+                if off in seen:
+                    continue
+                seen.add(off)
+                name, asm = info[off]
+                if reads_scc(name, asm):
+                    raise Unsupported('SCC of %s at %#x (not modelled) is read by %s at %#x'
+                                      % (info[start][0], start, name, off))
+                if off in written or off in unknown:
+                    continue
+                todo.extend(successors(off))
 
     def one(self, name, asm):
         _, ops, mods = parse(asm)
@@ -416,7 +471,7 @@ class Stage:
         if handler:
             return handler(ops, mods)
         if base.startswith('v_cmp'):
-            return self.compare(base, ops)
+            return self.compare(base, ops, mods)
         if base.endswith('_sdwa'):
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_F:
@@ -452,9 +507,15 @@ class Stage:
                 fields[key] = value
             else:
                 raise Unsupported('%s with SDWA modifier %s' % (base, m))
-        if base not in VEC_U:
+        if base == 'v_cndmask_b32':
+            # VOP2 SDWA select: the mask is always vcc; the selected source fields are moved as bits.
+            if len(ops) != 4 or ops[3] not in ('vcc', 'vcc_lo'):
+                raise Unsupported('SDWA v_cndmask_b32 form %s' % ops)
+            arity, text = 2, '(vcc & 1) ? {1} : {0}'
+        elif base not in VEC_U:
             raise Unsupported('SDWA form of %s' % base)
-        arity, text = VEC_U[base]
+        else:
+            arity, text = VEC_U[base]
         sources = []
         for index in range(arity):
             token = ops[1 + index]
@@ -581,6 +642,24 @@ class Stage:
         self.masks.add(d)
 
     op_s_andn2_wrexec_b32 = op_s_andn2_wrexec_b64
+
+    # SOPK s_addk_i32 / s_mulk_i32: D = D op sext(simm16). LLVM's SIShrinkInstructions forms them from s_add_i32 /
+    # s_mul_i32 only when isInt<16> of the constant, so the immediate is signed. s_addk_i32 defines SCC (signed
+    # overflow, not modelled: see SCC_UNMODELLED); s_mulk_i32 does not.
+    def sopk_arith(self, ops, op):
+        d = reg_range(ops[0])
+        if not d or d[0] != 's' or d[1] != d[2]:
+            raise Unsupported('SOPK destination %s' % ops[0])
+        imm = int(ops[1], 0) & 0xffff
+        imm = (imm - 0x10000 if imm & 0x8000 else imm) & 0xffffffff
+        self.masks.discard(d[1])
+        self.set_s(d[1], '%s %s 0x%08xu' % (self.S(d[1]), op, imm))
+
+    def op_s_addk_i32(self, ops, mods):
+        self.sopk_arith(ops, '+')
+
+    def op_s_mulk_i32(self, ops, mods):
+        self.sopk_arith(ops, '*')
 
     def op_s_cselect_b32(self, ops, mods):
         self.scalar_select(ops, False)
@@ -806,6 +885,23 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        # Every form takes only dim, dmask, the cache-policy bits and, for the loads, unorm (a load addresses texels by
+        # integer coordinates either way) and a16. a16 packs the 16-bit address components two to a dword, the first
+        # in the low half (LLVM SIISelLowering packImage16bitOpsToDwords): unsigned texel coordinates for a load and
+        # binary16 coordinates for a sample. d16, tfe, lwe and r128 change the result or resource layout and are
+        # refused, as is any modifier not named here.
+        # (image_sample_l and image_load_mip check their own modifier lists below.)
+        allowed = ('dlc', 'glc', 'slc', 'a16') + (('unorm',) if how == 'load' else ())
+        for m in mods:
+            if how in ('sample', 'lz', 'load') and not (m.startswith(('dim:', 'dmask:')) or m in allowed):
+                raise Unsupported('image_%s modifier %s' % (how, m))
+        a16 = 'a16' in mods
+        if a16:
+            axes = 3 if three else 2
+            if len(cs) < (axes + 1) // 2:
+                raise Unsupported('a16 image address with %d registers' % len(cs))
+            # component i is the (i % 2) half of address dword i // 2; unpacked to one 32-bit value each
+            cs = [('a16', cs[i // 2], i % 2) for i in range(axes)]
         lod = None
         if how == 'l':
             # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
@@ -833,14 +929,14 @@ class Stage:
                 if unsupported or len(cs) != axes + 1 or not dmask:
                     raise Unsupported('image_load_mip address or modifiers: %s' % ' '.join(mods))
                 mip = self.u(cs[axes])
-            address = [self.u(c) for c in cs[:axes]] + [mip]
+            address = [self.a16_u(c) if isinstance(c, tuple) else self.u(c) for c in cs[:axes]] + [mip]
             call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address))
         else:
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
-            uv = ('float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
-                  else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
+            fs = [self.a16_f(c) if isinstance(c, tuple) else self.f(c) for c in cs[:3 if three else 2]]
+            uv = ('float3(%s, %s, %s)' % tuple(fs) if three else 'float2(%s, %s)' % tuple(fs))
             if how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
@@ -853,6 +949,14 @@ class Stage:
             if dmask & (1 << bit):
                 self.set_v(n, 'U(t.%s)' % comp)
                 n += 1
+
+    def a16_u(self, component):
+        _, reg, half = component
+        return '(%s >> 16)' % self.u(reg) if half else '(%s & 0xffffu)' % self.u(reg)
+
+    def a16_f(self, component):
+        _, reg, half = component
+        return 'f16tof32(%s)' % ('%s >> 16' % self.u(reg) if half else self.u(reg))
 
     def image_compare(self, ops, mods, how):
         """image_sample_c and image_sample_c_lz: a 2D depth comparison returning one float.
@@ -1118,46 +1222,114 @@ class Stage:
         self.attrs.setdefault(attr, set()).add(how)
         return attr, m.group(2)
 
-    def mix(self, ops, mods, high):
-        """v_fma_mix{lo,hi}_f16: fma of operands that are f32 or f16 halves; the f16 result goes to one half."""
-        sel = [0, 0, 0]
+    def mix(self, ops, mods, dest):
+        """v_fma_mix{_f32,lo_f16,hi_f16}: fma of operands that are f32 or f16 halves.
+
+        LLVM AMDGPUISelDAGToDAG::SelectVOP3PMadMixModsImpl: op_sel_hi[i] makes operand i an f16 converted to f32
+        and op_sel[i] then picks its high half; abs and neg act on the converted value (abs first). The result is
+        f32 (dest 'f32') or rounds to f16 in the low or high half, the other half kept.
+        """
+        sel, high = [0, 0, 0], [0, 0, 0]
         for m in mods:
             if m.startswith('op_sel_hi:'):
-                sel = [int(x) for x in m[11:-1].split(',')]
+                sel = [int(x) for x in m[len('op_sel_hi:['):-1].split(',')]
             elif m.startswith('op_sel:'):
-                raise Unsupported('op_sel on fma_mix')
-        def operand(tok, is_half):
-            if not is_half or tok in ('-0', '0'):
-                return self.f(tok)
-            return 'f16tof32(%s)' % self.u(tok)
-        expr = '%s * %s + %s' % tuple(operand(t, s) for t, s in zip(ops[1:4], sel))
+                high = [int(x) for x in m[len('op_sel:['):-1].split(',')]
+            elif m != 'clamp':
+                raise Unsupported('modifier %s on fma_mix' % m)
+        if len(ops) != 4 or len(sel) != 3 or len(high) != 3:
+            raise Unsupported('fma_mix form %s %s' % (ops, mods))
+        def operand(tok, is_half, is_high):
+            if not is_half:
+                if is_high:
+                    raise Unsupported('op_sel on an f32 fma_mix operand')
+                if tok.lstrip('-') == '0.15915494':
+                    raise Unsupported('fma_mix inline constant 1/(2*pi)')
+                # "-0" is the inline 0 with the neg modifier: -0.0 (f() reads it as +0.0)
+                return '(-0.0)' if tok == '-0' else self.f(tok)
+            if tok in ('0', '-0'):
+                return '0.0' if tok == '0' else '(-0.0)'
+            if tok in FLOATS and not is_high and tok != '0.15915494':
+                # An inline float constant read as an f16 operand is that constant's binary16 form: 0.5 is 0x3800,
+                # not the low half of the f32 0x3f000000 (LLVM VOP3PInstructions.td, VOP3P_Mix_Profile: "The inline
+                # immediate values are really f16 converted to f32"; its fadd pattern passes FP16_ONE with op_sel_hi).
+                # 1/(2*pi) is refused: its f16 and f32 forms differ and only the f16 one is documented here.
+                return 'f16tof32(%s)' % self.h(tok)
+            neg = tok.startswith('-')
+            body = tok[1:] if neg else tok
+            absolute = body.startswith('|') and body.endswith('|')
+            if absolute:
+                body = body[1:-1]
+            r = reg_range(body)
+            if not r or r[1] != r[2]:
+                raise Unsupported('f16 fma_mix operand %s' % tok)
+            text = 'f16tof32(%s%s)' % (self.u(body), ' >> 16' if is_high else '')
+            if absolute:
+                text = 'abs(%s)' % text
+            return '(-%s)' % text if neg else text
+        expr = '%s * %s + %s' % tuple(operand(t, s, h) for t, s, h in zip(ops[1:4], sel, high))
         if 'clamp' in mods:
             expr = 'saturate(%s)' % expr
         d = reg_range(ops[0])[1]
+        if dest == 'f32':
+            return self.set_v(d, 'U(%s)' % expr)
         self.used_v.add(d)
-        if high:
+        if dest == 'hi':
             self.set_v(d, '(v%d & 0xffffu) | (f32tof16(%s) << 16)' % (d, expr))
         else:
             self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(%s)' % (d, expr))
 
+    def op_v_fma_mix_f32(self, ops, mods):
+        self.mix(ops, mods, 'f32')
+
     def op_v_fma_mixlo_f16(self, ops, mods):
-        self.mix(ops, mods, False)
+        self.mix(ops, mods, 'lo')
 
     def op_v_fma_mixhi_f16(self, ops, mods):
-        self.mix(ops, mods, True)
+        self.mix(ops, mods, 'hi')
 
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 
-    def compare(self, base, ops):
+    def pknorm(self, ops, mods, kind):
+        # S0 packs into D[15:0] and S1 into D[31:16] (per Mesa ACO selection: pack_[us]norm_2x16 of (x, y) is
+        # v_cvt_pknorm_[ui]16_f32 x, y); each half is x2w_pknorm_[ui]16, see HELPERS. Source neg/abs apply first.
+        if mods or len(ops) != 3:
+            raise Unsupported('v_cvt_pknorm_%s16_f32 with %s' % (kind, mods or ops))
+        helper = 'x2w_pknorm_%s16' % kind
+        self.set_v(reg_range(ops[0])[1], '%s(%s) | (%s(%s) << 16)' % (helper, self.f(ops[1]), helper, self.f(ops[2])))
+
+    def op_v_cvt_pknorm_u16_f32(self, ops, mods):
+        self.pknorm(ops, mods, 'u')
+
+    def op_v_cvt_pknorm_i16_f32(self, ops, mods):
+        self.pknorm(ops, mods, 'i')
+
+    def compare(self, base, ops, mods=()):
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|f16)(_sdwa)?', base)
-        if not m or m.group(4) or (m.group(3) == 'f16' and m.group(2) != 'class'):
+        if not m or (m.group(4) and m.group(3) not in ('i32', 'u32')) or (m.group(3) == 'f16' and m.group(2) != 'class'):
             raise Unsupported(base)
         writes_exec, cond, typ = m.group(1) == 'x', m.group(2), m.group(3)
         if len(ops) == 3:
             dst, a, b = ops
-        else:
+        elif len(ops) == 2:
             dst, (a, b) = ('exec' if writes_exec else 'vcc'), ops
+        else:
+            raise Unsupported('%s with %d operands' % (base, len(ops)))
+        if m.group(4):
+            # VOPC SDWA on integers: each source is its selected field (zero- or, with sext(), sign-extended)
+            # compared as a 32-bit value; the result goes to vcc, an SGPR mask or (cmpx) exec as for e32.
+            fields = dict(mod.partition(':')[::2] for mod in mods)
+            if set(fields) != {'src0_sel', 'src1_sel'} or any(v not in SDWA_SEL for v in fields.values()):
+                raise Unsupported('%s with %s' % (base, mods))
+            words = []
+            for token, key in ((a, 'src0_sel'), (b, 'src1_sel')):
+                sext = token.startswith('sext(') and token.endswith(')')
+                words.append(sdwa_source(self.u(token[5:-1] if sext else token), fields[key], sext))
+            x, y = words if typ == 'u32' else ['int(%s)' % w for w in words]
+            return self.compare_result(base, cond, writes_exec, dst, x, y)
+        elif mods:
+            raise Unsupported('%s with %s' % (base, mods))
         if cond == 'class':
             # v_cmp_class: S0 is the value, S1 the class mask (llvm.amdgcn.class(x, mask)); neg/abs on S0 act on
             # its sign bit, and an f16 value sits in the low half with inline float constants in half form.
@@ -1173,6 +1345,9 @@ class Stage:
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)
         else:
             x, y = self.u(a), self.u(b)
+        return self.compare_result(base, cond, writes_exec, dst, x, y)
+
+    def compare_result(self, base, cond, writes_exec, dst, x, y):
         table = {'lt': '{0} < {1}', 'eq': '{0} == {1}', 'le': '{0} <= {1}', 'gt': '{0} > {1}', 'lg': '{0} != {1}', 'ne': '{0} != {1}',
                  'ge': '{0} >= {1}', 'neq': '!({0} == {1})', 'nlt': '!({0} < {1})', 'nle': '!({0} <= {1})', 'ngt': '!({0} > {1})',
                  'nge': '!({0} >= {1})', 'nlg': '!({0} != {1})', 'o': '({0} == {0} && {1} == {1})', 'u': '({0} != {0} || {1} != {1})',
@@ -1393,6 +1568,16 @@ HELPERS = {
                  'if (abs(c) >= abs(a) && abs(c) >= abs(b)) return float4(c < 0.0 ? 5.0 : 4.0, c < 0.0 ? -a : a, -b, c + c); '
                  'if (abs(b) >= abs(a)) return float4(b < 0.0 ? 3.0 : 2.0, a, b < 0.0 ? -c : c, b + b); '
                  'return float4(a < 0.0 ? 1.0 : 0.0, a < 0.0 ? c : -c, -b, a + a); }'),
+    # One 16-bit half of v_cvt_pknorm_{u16,i16}_f32, per Mesa ACO selection (Mesa main 13ebbc00,
+    # src/amd/compiler/instruction_selection/aco_select_nir_alu.cpp selects nir pack_[us]norm_2x16 to these
+    # opcodes) with the NIR definition (src/compiler/nir/nir_constant_expressions.py pack_[us]norm_1x16):
+    # (uint16_t)(int)roundeven(CLAMP(x, lo, 1) * 65535 or 32767). Mesa's CLAMP (src/util/macros.h) is
+    # "X > MIN ? (X > MAX ? MAX : X) : MIN", so NaN gives MIN: unorm 0, snorm -32767 (0x8001). The NaN case is
+    # decided on the bits so no compiler min/max rewrite can change it; HLSL round() rounds half to even.
+    'x2w_pknorm_u16': ('uint x2w_pknorm_u16(float x) { if ((asuint(x) & 0x7fffffffu) > 0x7f800000u) return 0u; '
+                       'return uint(round(clamp(x, 0.0, 1.0) * 65535.0)); }'),
+    'x2w_pknorm_i16': ('uint x2w_pknorm_i16(float x) { if ((asuint(x) & 0x7fffffffu) > 0x7f800000u) return 0x8001u; '
+                       'return uint(int(round(clamp(x, -1.0, 1.0) * 32767.0))) & 0xffffu; }'),
 }
 # VEC_U conversions whose result is a binary32 value, so the VOP3 output modifiers apply to it.
 FLOAT_RESULT_U = frozenset(('v_cvt_f32_u32', 'v_cvt_f32_i32', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1',
@@ -1415,7 +1600,26 @@ SCA = {
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
     's_mul_hi_u32': ('x2w_mul_hi_u32({0}, {1})', None),
+    # LLVM SOPInstructions.td: s_lshlN_add_u32 selects shlN_add, (S0 << N) + S1; it defines SCC, not modelled.
+    's_lshl1_add_u32': ('({0} << 1) + {1}', None), 's_lshl2_add_u32': ('({0} << 2) + {1}', None),
+    's_lshl3_add_u32': ('({0} << 3) + {1}', None), 's_lshl4_add_u32': ('({0} << 4) + {1}', None),
+    # s_abs_i32 is what LLVM selects for smax(x, -x) (so abs(INT_MIN) stays INT_MIN); it defines SCC, not modelled.
+    's_abs_i32': ('uint(max(int({0}), -int({0})))', None),
+    # s_pack_ll_b32_b16 selects build_vector(src0, src1): S0[15:0] in the low half, S1[15:0] in the high half.
+    # It does not define SCC.
+    's_pack_ll_b32_b16': ('({0} & 0xffffu) | ({1} << 16)', None),
 }
+# Scalar ops whose SCC result the translation does not compute (LLVM SOPInstructions.td lists SCC in their Defs).
+# Stage.check_scc refuses a program only when that SCC can reach a reader.
+SCC_UNMODELLED = frozenset(('s_add_u32', 's_add_i32', 's_sub_u32', 's_sub_i32', 's_min_u32', 's_max_u32', 's_min_i32',
+                            's_max_i32', 's_abs_i32', 's_addk_i32', 's_lshl1_add_u32', 's_lshl2_add_u32',
+                            's_lshl3_add_u32', 's_lshl4_add_u32', 's_lshl_b64', 's_lshr_b64', 's_ashr_i64'))
+SCC_READERS = ('s_cbranch_scc0', 's_cbranch_scc1', 's_cselect_b32', 's_cselect_b64', 's_cmov_b32', 's_cmov_b64',
+               's_cmovk_i32', 's_addc_u32', 's_subb_u32')
+
+
+def reads_scc(name, asm):
+    return re.sub(r'_e(32|64)$', '', name) in SCC_READERS or 'src_scc' in parse(asm)[1]
 for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt', '<'), ('le', '<=')):
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
         def _make(op=_op, cast=_cast):
@@ -1483,6 +1687,12 @@ class Pipeline:
         self.rect = self.ud(('rect',))
         self.vs = Stage(self, 'vs', vs_code)
         self.ps = Stage(self, 'ps', ps_code)
+        # A pixel stage starts with its SPI inputs in the VGPRs (barycentrics, position, face, ancillary data). The
+        # interpolation instructions name them without reading them (they take the attribute); any other read before
+        # a write sees 0 in the HLSL instead of the hardware input. Which input sits in which VGPR depends on the
+        # SPI_PS_INPUT_ENA/ADDR state, which a request does not carry, so this is reported, not refused (existing
+        # fixtures read entry VGPRs as zero): VGPR -> offset of the first read.
+        self.ps_entry_reads = dict(self.ps.entry_reads)
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         missing = [a for a in self.ps.attrs if a not in self.params]
@@ -1632,6 +1842,12 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     name = os.path.join(out_dir, '%016x' % key)
     try:
         pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats)
+        if pipe.ps_entry_reads:
+            # A request does not carry the SPI input layout, so the HLSL would read that input as 0 (for example
+            # the packed pixel position a dither or a full-screen copy addresses with). Not written as a result.
+            reg, off = min(pipe.ps_entry_reads.items(), key=lambda item: item[1])
+            raise Unsupported('pixel stage reads entry VGPR v%d (an SPI input; layout not in the request) at %#x'
+                              % (reg, off))
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
         if rtv_request:
             manifest += rtv_request + '\n'
@@ -1657,7 +1873,9 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
 
 def classify(blob):
     text = ' '.join(x[3] for x in decode(strip_header(blob)) if x[2] == 'exp')
-    return 'vs' if 'pos' in text else 'ps' if 'mrt' in text or not text else 'other'  # no export: a depth-only pixel shader
+    # No export: a depth-only pixel shader. Only a pixel stage exports to the null target (a stage that ends with
+    # "exp null ... done vm" and writes no colour, e.g. for its discards or depth).
+    return 'vs' if 'pos' in text else 'ps' if 'mrt' in text or 'null' in text or not text else 'other'
 
 
 def translate_request(out_dir, key):
