@@ -2003,14 +2003,23 @@ UavTextureSkip bind_uav_texture(const Pass& pass, const Translation& tr, UINT j,
     return tex_ok;
 }
 
+// LOCAL (scene): the key and refusal of the latest draw on this thread, for the traced-frame draw lines.
+thread_local u64 last_draw_key;
+thread_local const char* last_draw_why;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     const bool mesh = mesh_issue_active(self);  // LOCAL meshrt: a DispatchMesh call (d3d12_mesh.inl); no topology, rect entry value 0
     const bool rect = !mesh && pass.topology == 0x11;
+    last_draw_key = 0;
+    last_draw_why = nullptr;
     if (list && pass.pipeline && !pass.targets_bound) InterlockedIncrement(&draws_without_targets);
-    if (!list || !pass.pipeline || !pass.targets_bound || !(mesh || rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
+    if (!list || !pass.pipeline || !pass.targets_bound || !(mesh || rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) {
+        last_draw_why = !list ? "not recording" : !pass.pipeline ? "no pipeline" : !pass.targets_bound ? "no targets"
+                      : (rect && indexed) ? "indexed rectangle list" : "topology";
+        return false;
+    }
     lock_draw(100000 + __LINE__);
     report_draw_rt();
     static const bool pso_locked = x2w_local::env_on("X2W_DRAW_PSO_LOCKED");
@@ -2029,7 +2038,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         build_pipeline(build);
         lock_draw(100000 + __LINE__);
     }
+    if (bound && bound->translation) last_draw_key = bound->translation->key;
     if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
+        last_draw_why = !bound || !bound->translation ? "no translation record"
+                      : !tr ? "no translation for the bound targets (rtv variant)"
+                      : tr->state != 1 ? "no translation" : !pipeline ? "no desktop pipeline" : "sampler heap";
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -2047,6 +2060,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             InterlockedIncrement(&rt_heap_skipped);
             static LONG shown;
             if (first_calls(shown, 4)) log("x2w-draw-rt %016llx: heap draw skipped: %s", tr->key, reason);
+            last_draw_why = reason;
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
@@ -2076,6 +2090,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (skip != tex_ok) {
         static LONG shown[tex_skip_count];
         if (first_calls(shown[skip], 2)) log("x2w-draw-rt %016llx: draw skipped: texture uav: %s", tr->key, uav_texture_skip_names[skip]);
+        last_draw_why = uav_texture_skip_names[skip];
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -2437,6 +2452,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             pass.ib.SizeInBytes, pass.ib.Format, indices, pass.vb[0].BufferLocation, pass.vb[0].SizeInBytes, pass.vb[0].StrideInBytes,
             pass.target_count);
     }
+    if (!drawn) last_draw_why = "skipped (index data)";
     return drawn;
 }
 
@@ -2517,7 +2533,18 @@ void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const 
 // List slot 13, DrawIndexedInstanced(index count, instances, start index, base vertex, start instance).
 void __stdcall list_draw_indexed(Wrapper* self, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
-    InterlockedIncrement(draw_translated(self, true, count, instances, start, base_vertex, start_instance) ? &translated_draws : &untranslated_draws);
+    const bool done = draw_translated(self, true, count, instances, start, base_vertex, start_instance);
+    InterlockedIncrement(done ? &translated_draws : &untranslated_draws);
+    // LOCAL (scene): restored from f5e0f425 (lost in a merge): in a traced frame, note the target for the
+    // X2W_D3D12_TRACE_TARGETS read-back and log every draw, also the ones not drawn, with key and reason.
+    if (trace_frame_active) {
+        const Pass& pass = pass_of(self);
+        note_traced_target(self, pass.target0, done);
+        const D3D12_RESOURCE_DESC rd = pass.target0 ? pass.target0->GetDesc() : D3D12_RESOURCE_DESC{};
+        log("x2w-frame draw-indexed %u %s target %p %llux%u fmt %d key %016llx %s", count, done ? "drawn" : "NOT drawn",
+            static_cast<void*>(pass.target0), static_cast<unsigned long long>(rd.Width), rd.Height, rd.Format, last_draw_key,
+            done ? "" : (last_draw_why ? last_draw_why : "draw failed"));
+    }
 }
 
 // LOCAL draw-rt: command-list slot 15, CopyBufferRegion, on the GPU at its place in the list

@@ -787,7 +787,8 @@ bool list_noop()
 extern LONG draw_calls_seen;
 // X2W_D3D12_TRACE_FRAME=<n>: every command-list call of presented frame n is logged ("x2w-frame")
 // with its slot, the kinds of any wrapped objects among its arguments, and stack arguments.
-LONG trace_frame_active;
+// LOCAL (scene): X2W_D3D12_TRACE_ALL=1 traces from the start (fixtures that never present).
+LONG trace_frame_active = x2w_local::env_on("X2W_D3D12_TRACE_ALL") ? 1 : 0;
 extern LONG capture_active;
 extern LONG frame_number;
 // Command-list methods with a real implementation (render mode). Every list call enters through
@@ -3062,6 +3063,8 @@ bool indirect_draw_issue(Wrapper* self, ID3D12GraphicsCommandList* list, bool in
 void indirect_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z);
 void mesh_note57(const void* desc, const Wrapper* self);  // LOCAL meshrt: d3d12_mesh.inl
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
+extern thread_local u64 last_draw_key;          // LOCAL (scene): defined in d3d12_draw.inl, for the traced-frame draw lines
+extern thread_local const char* last_draw_why;
 extern thread_local u64 last_draw_key;
 extern thread_local const char* last_draw_why;
 // List slot 12, DrawInstanced.
@@ -3070,8 +3073,16 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     if (list && !pass.pipeline_real) {
-        InterlockedIncrement(draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance) ? &translated_draws
-                                                                                                                : &untranslated_draws);
+        const bool done = draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance);
+        InterlockedIncrement(done ? &translated_draws : &untranslated_draws);
+        // LOCAL (scene): restored from f5e0f425 (lost in a merge), as in list_draw_indexed.
+        if (trace_frame_active) {
+            note_traced_target(self, pass.target0, done);
+            const D3D12_RESOURCE_DESC rd = pass.target0 ? pass.target0->GetDesc() : D3D12_RESOURCE_DESC{};
+            log("x2w-frame draw %u %s target %p %llux%u fmt %d topology 0x%x key %016llx %s", vertices, done ? "drawn" : "NOT drawn",
+                static_cast<void*>(pass.target0), static_cast<unsigned long long>(rd.Width), rd.Height, rd.Format, pass.topology,
+                last_draw_key, done ? "" : (last_draw_why ? last_draw_why : "draw failed"));
+        }
         return;
     }
     // The translated vertex shaders read their fetch table through root parameter 0.
