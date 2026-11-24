@@ -29,6 +29,10 @@ Checks (pure Python; the differential run on WARP is mesh_work/difftest.py with 
   3. negative controls: X2W_MESH_LANE_SCC=0 refuses the program again ("branch on an SCC that depends on lane
      masks"); X2W_MESH_TEST_DROP=publish / restore remove the publish / restore statements (the WARP difftest
      must then FAIL; see the --write output).
+Program B (active-uniform SCC in a per-lane range, no publish) and program C (a lane-dependent SCC inside a
+per-lane execz range, made group-uniform for the publish, with a vccz branch and an s_branch over the other side:
+the taint at the join is merged; X2W_MESH_JOIN_TAINT=0, the linear scan, translates it WITHOUT the publish, which
+the WARP difftest shows wrong) are described at their definitions.
 """
 import os
 import struct
@@ -52,7 +56,7 @@ def check(label, condition, detail=''):
 # ---- a minimal gfx10 encoder: field layout per format, opcode found by decoding -----------------------------
 def src(tok):
     """9-bit source operand code (VOP); SALU uses the low 8 bits of the same table."""
-    named = {'vcc_lo': 106, 'vcc_hi': 107, 'm0': 124, 'exec_lo': 126, 'exec_hi': 127}
+    named = {'vcc_lo': 106, 'vcc_hi': 107, 'm0': 124, 'exec_lo': 126, 'exec_hi': 127, 'src_scc': 253}
     if tok in named:
         return named[tok], None
     if tok[0] == 's':
@@ -171,6 +175,35 @@ UNIFORM_B = PROLOGUE + [
     ('s_cbranch_scc0 AFTER', 'scc0'),
     ('v_mov_b32_e32 v1, 60', lambda: ins('vop1', 'v_mov_b32_e32', d=1, s0='60')),
 ] + EPILOGUE
+# Program C: a lane-dependent SCC inside a per-lane execz range that writes no scalar read after it (a plain
+# per-lane range before), then a per-lane vccz branch with an s_branch over the other side, both sides copying
+# SCC to s20 (the shape of the run's programs). The publish needs every thread of the group at its barrier, so
+# the range becomes group-uniform; the s_lshl on the first side leaves a lane-tainted SCC that the linear scan
+# would carry into the other side (the join merge takes the state of the vccz branch instead).
+# N = 40 + 60 * (g & 1), T = 30 * (g & 3). Expected param0.x: lanes v0 < N of a wave with a lane v0 < min(N, T):
+# 60; every other lane 5. (g = 2: wave 1 has no lane in the range; g = 3: wave 1 lanes 64..99 get 60.)
+PROLOGUE_C = PROLOGUE[:-1] + [
+    ('s_mul_i32 s22, s22, 30', lambda: ins('sop2', 's_mul_i32', d=22, s0='s22', s1='30')),
+]
+SPLIT_C = PROLOGUE_C + [
+    ('v_mov_b32_e32 v1, 5', lambda: ins('vop1', 'v_mov_b32_e32', d=1, s0='5')),
+    ('v_mov_b32_e32 v4, s22', lambda: ins('vop1', 'v_mov_b32_e32', d=4, s0='s22')),
+    ('v_cmpx_gt_u32_e32 s21, v0', lambda: ins('vopc', 'v_cmpx_gt_u32_e32', s0='s21', s1='v0')),
+    ('s_cbranch_execz AFTER', 'execz'),
+    ('v_cmp_gt_u32_e32 vcc_lo, s22, v0', lambda: ins('vopc', 'v_cmp_gt_u32_e32', s0='s22', s1='v0')),
+    ('s_and_b64 s[12:13], vcc, exec', lambda: ins('sop2', 's_and_b64', d=12, s0='vcc_lo', s1='exec_lo')),
+    ('v_cmp_lt_u32_e32 vcc_lo, 30, v4', lambda: ins('vopc', 'v_cmp_lt_u32_e32', s0='30', s1='v4')),
+    ('s_cbranch_vccz ELSE', 'vccz'),
+    ('s_mov_b32 s20, src_scc', lambda: ins('sop1', 's_mov_b32', d=20, s0='src_scc')),
+    ('s_lshl_b32 s23, vcc_lo, 2', lambda: ins('sop2', 's_lshl_b32', d=23, s0='vcc_lo', s1='2')),
+    ('s_branch JOIN', 'branch'),
+    ('ELSE:', None),
+    ('s_mov_b32 s20, src_scc', lambda: ins('sop1', 's_mov_b32', d=20, s0='src_scc')),
+    ('JOIN:', None),
+    ('s_cmp_lg_i32 s20, 0', lambda: ins('sopc', 's_cmp_lg_i32', s0='s20', s1='0')),
+    ('s_cbranch_scc0 AFTER', 'scc0'),
+    ('v_mov_b32_e32 v1, 60', lambda: ins('vop1', 'v_mov_b32_e32', d=1, s0='60')),
+] + EPILOGUE
 
 
 def program(items=None):
@@ -229,7 +262,7 @@ def assemble(items):
             words = make()
         else:
             target = labels[text.split()[1]]
-            words = ins('sopp', 's_cbranch_' + make, imm=(target - off - 4) // 4)
+            words = ins('sopp', 's_branch' if make == 'branch' else 's_cbranch_' + make, imm=(target - off - 4) // 4)
             text = '%s label_%#x' % (text.split()[0], target)
         out += words
         texts.append((off, text))
@@ -305,6 +338,27 @@ def main():
     check('B negative control: X2W_MESH_LANE_SCC=0 refuses again',
           off.startswith('REFUSED branch on an SCC that depends on lane masks'), off[:200])
     print('program B written to %s' % BIN)
+    # program C: publish inside a formerly per-lane range (made group-uniform) + taint merged at the join
+    code_c, texts_c = program(SPLIT_C)
+    BIN = os.path.join(out_dir, 'lane_scc_split.bin')
+    with open(BIN, 'wb') as f:
+        f.write(code_c)
+    got = decoded(code_c)
+    check('C decodes to the intended %d instructions' % len(texts_c), [t for _, t in got] == [t for _, t in texts_c],
+          ' | '.join('%x %s / %s' % (o, t, g) for (o, t), (_, g) in zip(texts_c, got) if t != g))
+    on = translate({})
+    check('C translates: range made group-uniform, SCC published',
+          on.startswith('OK') and 'x2w_any[0][wave] = 1u' in on and 'x2w_sany[0][wave] = 1u' in on
+          and 'scc = x2w_sany[0][wave]' in on, on[:300])
+    off = translate({'X2W_MESH_LANE_SCC': '0'})
+    check('C negative control: X2W_MESH_LANE_SCC=0 refuses again',
+          off.startswith('REFUSED branch on an SCC that depends on lane masks'), off[:200])
+    lin = translate({'X2W_MESH_JOIN_TAINT': '0'})
+    # the linear scan carries the s_lshl's active-uniform SCC into the ELSE side and takes the branch per lane
+    # without a publish: a WRONG translation (the WARP difftest of it must FAIL)
+    check('C negative control: X2W_MESH_JOIN_TAINT=0 (linear taint) translates WITHOUT the publish',
+          lin.startswith('OK') and 'x2w_sany' not in lin, lin[:200])
+    print('program C written to %s (difftest also with X2W_MESH_TEST_DROP=publish: must FAIL)' % BIN)
     if failures:
         print('%d check(s) failed' % len(failures))
         return 1

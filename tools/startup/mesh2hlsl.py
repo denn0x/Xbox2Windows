@@ -107,6 +107,8 @@ if MESH_FEATURES - {'heapwords'}:
 # publish of such an SCC / the restore of hit scalars after a group-uniform execz range: both give wrong results.
 LANE_SCC = os.environ.get('X2W_MESH_LANE_SCC', '1') != '0'
 TEST_DROP = frozenset(os.environ.get('X2W_MESH_TEST_DROP', '').replace(' ', '').split(',')) - {''}
+# Lane taint merged at joins of forward edges (MeshStage.merge): on unless X2W_MESH_JOIN_TAINT=0 (the linear scan).
+JOIN_TAINT = os.environ.get('X2W_MESH_JOIN_TAINT', '1') != '0'
 
 
 class LaneScc(Unsupported):
@@ -755,14 +757,30 @@ class MeshStage(G.Stage):
         return lines
 
     def snapshot(self):
-        return super().snapshot() + (self.exec_static, dict(self.static_copies))
+        snap = super().snapshot() + (self.exec_static, dict(self.static_copies))
+        if JOIN_TAINT:
+            snap += (frozenset(self.tainted), dict(self.au), self.epoch)
+        return snap
 
     def merge(self, states):
         super().merge(states)
-        # the two mesh fields are the last two of the snapshot, whatever the base snapshot holds before them
-        statics = [s[-2] for s in states]
+        # the mesh fields are the last ones of the snapshot, whatever the base snapshot holds before them
+        n = 5 if JOIN_TAINT else 2
+        statics = [s[-n] for s in states]
         self.exec_static = statics[0] if all(x == statics[0] for x in statics) else None
-        self.static_copies = {r: m for r, m in states[0][-1].items() if all(s[-1].get(r) == m for s in states)}
+        copies = [s[-n + 1] for s in states]
+        self.static_copies = {r: m for r, m in copies[0].items() if all(c.get(r) == m for c in copies)}
+        if JOIN_TAINT:
+            # Taint at a join of forward edges (the base merges only its own fields; the linear scan otherwise kept
+            # the state of the instruction above, which after an unconditional jump is no incoming path at all):
+            # tainted on any incoming path; active-uniform only where every path that taints the register has it
+            # active-uniform at the current epoch (no exec widening the linear scan saw since that branch).
+            self.tainted = set().union(*(s[-3] for s in states))
+            au = {}
+            for r in self.tainted:
+                if all(r not in s[-3] or (s[-2].get(r) == s[-1] == self.epoch) for s in states):
+                    au[r] = self.epoch
+            self.au = au
 
     def format_load(self, ops, mods, count, name):
         """buffer_load_format_* through a resource-heap descriptor (X2W_DRAW_FEATURES heap + bufword3): the format
@@ -914,8 +932,9 @@ class MeshStage(G.Stage):
 
     def group_branches(self):
         """execz branches (offsets) translated as group-uniform branches: those whose range writes a scalar that
-        is live at its end, and every execz range enclosing one of them (the inner barrier needs every thread of
-        the group to reach it). Exec-write refusals are left to the translation."""
+        is live at its end or holds a published lane-mask SCC (pipe.scc_publish), and every execz range enclosing
+        one of them (the inner barrier needs every thread of the group to reach it). Exec-write refusals are left
+        to the translation."""
         if getattr(self, '_group', None) is None:
             ranges = []
             for o, n, name, asm in self.ins:
@@ -930,6 +949,13 @@ class MeshStage(G.Stage):
                         need.add(o)
                 except Unsupported:
                     pass
+            # a lane-mask SCC published inside the range: the publish barrier needs every thread of the group, and
+            # the wave's SCC is then the OR over all 64 lanes' bits (the SALU op reads every bit, whatever exec is;
+            # the inactive lanes run the range with exec 0, their compare bits 0, as VOPC writes them)
+            publish = getattr(self.pipe, 'scc_publish', ()) if LANE_SCC else ()
+            for o, t in ranges:
+                if any(o < p < t for p in publish):
+                    need.add(o)
             for o, t in ranges:
                 if any(o < o2 < t for o2 in need):
                     need.add(o)
@@ -1069,6 +1095,14 @@ class MeshStage(G.Stage):
             self.sym[d] = ('descnum',) if own[0] == 'descnum' else own
             return None
         self.set_s(d, '%s | (1u << (%s & 31u))' % (self.S(d), self.u(ops[1])))
+
+    def op_s_bitset0_b32(self, ops, mods):
+        # RDNA 2 ISA S_BITSET0_B32: D.u[S0.u[4:0]] = 0 (no SCC); a descriptor word is refused (no rule for it)
+        d = reg_range(ops[0])[1]
+        own = self.sym.get(d)
+        if own and own[0] not in ('const', 'fixed_buffer_word'):
+            raise Unsupported('s_bitset0_b32 on s%d holding %s' % (d, own[0]))
+        self.set_s(d, '%s & ~(1u << (%s & 31u))' % (self.S(d), self.u(ops[1])))
 
     # s_pack_{lh,hl,hh}_b32_b16: D = low half from S0 (l = bits 15:0, h = bits 31:16), high half from S1
     # (RDNA 2 ISA, S_PACK_*). s_pack_ll is in the base table.
