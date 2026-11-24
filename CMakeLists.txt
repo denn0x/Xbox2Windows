@@ -766,6 +766,15 @@ add_custom_command(OUTPUT "${cpu_srv_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 
     -Vn cpu_srv_refresh_cs -Fh "${cpu_srv_cs}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_srv_refresh.hlsl"
     DEPENDS tests/cpu_srv_refresh.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE "${cpu_srv_cs}")
+# Argument, resource, fence and partial-read refusals and the Map/Unmap ranges of cpu_srv::refresh
+# (src/cpu_srv_upload.h), with a fake upload buffer and fence instead of a device. The mutated run
+# is the negative control.
+add_executable(cpu_srv_upload_check tests/cpu_srv_upload_check.cpp)
+target_include_directories(cpu_srv_upload_check PRIVATE src)
+target_compile_features(cpu_srv_upload_check PRIVATE cxx_std_17)
+add_test(NAME cpu_srv_upload COMMAND cpu_srv_upload_check)
+add_test(NAME cpu_srv_upload_written_range_control COMMAND cpu_srv_upload_check --mutate written-range)
+set_tests_properties(cpu_srv_upload_written_range_control PROPERTIES WILL_FAIL TRUE)
 set(startup_sampler_x_cs "${CMAKE_CURRENT_BINARY_DIR}/startup_sampler_x_cs.h")
 add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main
     -Vn startup_sampler_x_cs -Fh "${startup_sampler_x_cs}"
@@ -1634,10 +1643,16 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_capture COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_capture_check.py")
     set_tests_properties(startup_gfx2hlsl_capture PROPERTIES TIMEOUT 120)
+    # gfx2hlsl refuses a binary32 or integer vector operation with a source too few or too many.
+    add_test(NAME startup_gfx2hlsl_operand_count COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_operand_count_check.py")
     # VOP1/VOP2 sub-dword addressing (SDWA) in the translator (#1141), checked against the pixel AOT
     # lowering of the same selections.
     add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_check.py")
+    # Output modifiers on float-result conversions (#1705).
+    add_test(NAME startup_gfx2hlsl_vcvt_omod COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vcvt_omod_check.py")
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
     find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
@@ -6058,6 +6073,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_mimg_load_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mimg_load_${adapter}.txt")
+        add_test(NAME compute_store_aot_alu_cvt_pk_u8_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_alu_cvt_pk_u8_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_alu_cvt_pk_u8_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME compute_store_aot_mimg_mip_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mimg-mip "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6068,6 +6087,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_mimg_resinfo_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mimg_resinfo_${adapter}.txt")
+        add_test(NAME compute_store_aot_salu_absdiff_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_salu_absdiff_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_salu_absdiff_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME compute_store_aot_mimg_packed_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mimg-packed "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6112,6 +6135,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_mimg_atomic_counter_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mimg_atomic_counter_${adapter}.txt")
+        add_test(NAME compute_store_aot_mimg_atomic_float_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mimg-atomic-float "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_mimg_atomic_float_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mimg_atomic_float_${adapter}.txt")
         add_test(NAME compute_store_aot_ds_route_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-ds-route "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6762,6 +6790,14 @@ foreach(adapter IN ITEMS warp hardware)
         vm_raw_uav_${adapter}
         PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
+# Bounds, alignment, 64-bit offsets and view fields of make_raw_buffer_srv (src/raw_buffer_srv.h),
+# without a device. The mutated run is the negative control.
+add_executable(raw_buffer_srv_check tests/raw_buffer_srv_check.cpp)
+target_include_directories(raw_buffer_srv_check PRIVATE src)
+target_compile_features(raw_buffer_srv_check PRIVATE cxx_std_17)
+add_test(NAME raw_buffer_srv COMMAND raw_buffer_srv_check)
+add_test(NAME raw_buffer_srv_first_32_control COMMAND raw_buffer_srv_check --mutate first-32)
+set_tests_properties(raw_buffer_srv_first_32_control PROPERTIES WILL_FAIL TRUE)
 # Window validation and touching-window boundaries of resolve_raw_uav_store (src/raw_buffer_uav.h),
 # without a device. The mutated run is the negative control.
 add_executable(raw_buffer_uav_check tests/raw_buffer_uav_check.cpp)

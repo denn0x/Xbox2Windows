@@ -1280,6 +1280,9 @@ DPP_CVT = {
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
     "bfrev_b32": (1, "reversebits({0})", None),
+    # Each signed halfword clamped to [0, 255] into bits 7:0 and 15:8, as the e32 form (INTEGER).
+    "sat_pk_u8_i16": (1, "(uint(clamp(asint({0} << 16) >> 16, 0, 255)) | "
+                         "(uint(clamp(asint({0}) >> 16, 0, 255)) << 8))", None),
     "ffbl_b32": (1, "firstbitlow({0})", None),
     "ffbh_u32": (1, "dpp_ffbh_u32({0})", "dpp_ffbh_u32"),
     "ffbh_i32": (1, "dpp_ffbh_i32({0})", "dpp_ffbh_i32"),
@@ -3085,6 +3088,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     mask = "entry"
     wqm_width = None
     samples = 0
+    sampled_textures = set()
     sample_kind = None  # "plain", "comparison" or "gather" resource interpretation
     vector_loads = 0  # image samples and title loads issued, in vmcnt order
     title_loads = False
@@ -4303,6 +4307,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     call = f"Sample(samp, {coordinate}{offset_arg})"
             lines.append(f"    float4 sample{i} = {texture}.{call};")
             samples += 1
+            sampled_textures.add(texture)
             vector_loads += 1
             for ch, n in zip(channels, dest):
                 vector[f"v{n}"] = f"sample{i}.{ch}"
@@ -4330,6 +4335,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                          f"tex.CalculateLevelOfDetailUnclamped(samp, {coord}));")
             sample_kind = "plain"
             samples += 1
+            sampled_textures.add(bindings[texture_offset])
             vector_loads += 1
             for channel, n in zip("xy", dest):
                 vector[f"v{n}"] = f"sample{i}.{channel}"
@@ -4398,6 +4404,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             method = "SampleCmpLevelZero" if explicit_zero else "SampleCmp"
             lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), {reference}{offset_arg});")
             samples += 1
+            sampled_textures.add("tex")
             vector_loads += 1
             vector[dst] = f"sample{i}"
             sample_dest[dst] = vector_loads
@@ -4460,6 +4467,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    float4 sample{i} = {function}(float2({u}, {v}), int2({xoff}, {yoff}), {mip}, {operand});")
             sample_kind = "gather"
             samples += 1
+            sampled_textures.add("tex")
             vector_loads += 1
             for lane, reg in zip("xyzw", dest):
                 vector[f"v{reg}"] = f"sample{i}.{lane}"
@@ -6148,7 +6156,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Program ends inside a masked region")
     if gather_mips is not None and sample_kind != "gather":
         raise ValueError("Expected one gather for the declared view")
-    if not ended or samples != len(bindings):
+    if not ended or sampled_textures != set(bindings.values()):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]

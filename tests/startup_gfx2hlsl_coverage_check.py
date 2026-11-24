@@ -144,7 +144,8 @@ def exports():
 def output_modifiers():
     w = [0xd4000000 | 0x185 << 16, 256 | 1 << 27]
     check('v_cvt_f32_i32 omod prints mul:2', asm_of(w) == 'v_cvt_f32_i32_e64 v0, v0 mul:2')
-    check('  the converted value is doubled', 'v0 = U((F(U(float(int(v0))))) * 2.0);' in lines(w)[1])
+    # Upstream #1707 (VEC_U_TO_F) scales the float value directly, without the U()/F() round trip.
+    check('  the converted value is doubled', 'v0 = U((float(int(v0))) * 2.0);' in lines(w)[1])
     check('omod on an integer result refused', refused('v_add_nc_u32_e64 v0, v0, v1 mul:2'))
     check('clamp on an integer result refused', refused('v_add_nc_u32_e64 v0, v0, v1 clamp'))
     w = [0xd4000000 | 0x14b << 16 | 1 << 15 | 1, 258 | 259 << 9 | 0xf2 << 18 | 3 << 27 | 1 << 29]

@@ -50,6 +50,8 @@ ALU = {
 # shift of src0 by src1[4:0].
 SALU = {
     "s_add_u32": "({0} + {1})",
+    # |S0.i - S1.i| on the 32-bit wrapped difference, so 0x80000000 stays 0x80000000; SCC = result != 0, unread.
+    "s_absdiff_i32": "asuint(abs(asint({0} - {1})))",
     "s_sub_u32": "({0} - {1})",
     "s_and_b32": "({0} & {1})",
     "s_or_b32": "({0} | {1})",
@@ -76,6 +78,14 @@ F32_HELPERS = {
 FLOAT_INLINE = {
     "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000, "2.0": 0x40000000,
     "-2.0": 0xc0000000, "4.0": 0x40800000, "-4.0": 0xc0800000, "0.15915494": 0x3e22f983,
+}
+# v_cvt_pk_u8_f32 D, S0, S1, S2 (VOP3A opcode 350 of the RDNA 1.0 and RDNA 2 ISA guides): D = (S2 & ~(0xff << 8 * S1[1:0]))
+# | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0]). The guides leave flt32_to_uint8 undefined: its rounding, its bounds and
+# its NaN and negative results are not stated. The lowering holds only where every reading agrees, a binary32 S0 that is
+# +0.0 or an integer in [1, 255]. A constant S0 outside that set is refused; a word read from memory is not known
+# statically, so the caller must keep it inside the set.
+CVT_PK_U8 = {
+    "v_cvt_pk_u8_f32": "(({2} & ~(0xffu << (({1} & 3u) << 3u))) | ((uint(asfloat({0})) & 0xffu) << (({1} & 3u) << 3u)))",
 }
 FLOAT_SOURCE = r"(s\d+|v\d+|-?\d+\.\d+|0x[0-9a-f]+|-?\d+)"
 SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
@@ -110,8 +120,9 @@ MUBUF_ATOMIC_METHODS = {
     "inc": "CompareExchange", "dec": "CompareExchange", "csub": "CompareExchange",
 }
 
-IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap|inc|dec"
-IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int"}
+IMAGE_FLOAT_ATOMIC_OPS = ("fcmpswap", "fmin", "fmax")
+IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap|inc|dec|" + "|".join(IMAGE_FLOAT_ATOMIC_OPS)
+IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int", "R32_FLOAT": "uint"}
 
 
 # LLVM's spellings of a 32-bit immediate: decimal, hex, an inline float (`1.0`, `0.15915494`, `-2.5e-3`) and
@@ -243,8 +254,8 @@ MUBUF_SOURCE_TEXELS = {MUBUF_SOURCE_FORMAT: MUBUF_TEXEL_BYTES, MUBUF_D16_SOURCE_
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
-          image_uav_mip=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None,
-          mubuf_d16_xyz_mode=None, rsrc2=None):
+          image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
+          lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None, rsrc2=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     rsrc2 is the program's COMPUTE_PGM_RSRC2. When given, it places the group IDs
@@ -264,7 +275,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     for writes, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
     R32_UINT selects the 4-sample Texture2DMS profile for an SRV or the
     non-returning 2D integer atomic profile for a UAV. R32_SINT is UAV-only
-    and selects signed min/max.
+    and selects signed min/max. R32_FLOAT declares a native atomic image carried as raw words
+    in a desktop R32_UINT UAV. The caller guarantees finite-normal binary32 in the accessed texels
+    and operand VGPRs by setting image_float_domain="finite-normal".
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -281,6 +294,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if not 0 <= table_reg <= 105:
         raise ValueError("Invalid table or thread group binding")
     image_output = image_uav_mip is not None
+    image_float = image_format == "R32_FLOAT"
+    if (image_float and (not image_output or image_float_domain != "finite-normal")
+            or (not image_float and image_float_domain is not None)):
+        raise ValueError("The finite-normal image domain requires an R32_FLOAT atomic UAV and vice versa")
     image_msaa = not image_output and image_format == "R32_UINT"
     if image_msaa and cpu != "gfx1030":
         raise ValueError("The R32_UINT MSAA image binding requires gfx1030")
@@ -492,7 +509,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if not -(1 << 31) <= value <= 0xffffffff:
                     raise ValueError("Invalid scalar immediate")
                 scalar[dst] = value & 0xffffffff
-        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
+        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32|absdiff_i32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
                                line):
             op, dst = m[1], int(m[2])
             words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
@@ -1132,6 +1149,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 vector[regs[0]] = lds_word
             lds_word = ("alu", expression)
             ds_wait = True
+        elif m := re.fullmatch(rf"(v_cvt_pk_u8_f32) v(\d+), {FLOAT_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line):
+            # VOP3 without input or output modifiers. S0 is the binary32 value, S1 the byte select, S2 the other bytes.
+            op, dst = m[1], int(m[2])
+            words = [float_word(m[3], scalar, vector, pending),
+                     *(alu_word(token, scalar, vector, pending) for token in m.groups()[3:])]
+            if (dst > 255 or None in words or isinstance(words[0], int)
+                    and not (words[0] == 0 or 0x3f800000 <= words[0] <= 0x437f0000
+                             and struct.unpack("<f", struct.pack("<I", words[0]))[0].is_integer())):
+                raise ValueError("Unverified ALU operand")
+            expression = CVT_PK_U8[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), v(\d+), (\d+), v(\d+)", line):
             dst, row, shift, column = map(int, m.groups())
             row_tag, column_tag = vector.get(row), vector.get(column)
@@ -1341,9 +1371,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                r"dmask:0x(?P<mask>[0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?", line):
             op = m["op"]
             signed = op in ("smin", "smax")
-            if image_atomic_type != ("int" if signed else "uint") or guard_span is not None or stores:
+            if (image_atomic_type != ("int" if signed else "uint") or image_float != (op in IMAGE_FLOAT_ATOMIC_OPS)
+                    or guard_span is not None or stores):
                 raise ValueError("Unsupported image atomic target or binding")
-            compare_swap = op == "cmpswap"
+            compare_swap = op in ("cmpswap", "fcmpswap")
             data = int(m["single"] or m["first"])
             if (int(m["mask"], 16) != (3 if compare_swap else 1) or data + int(compare_swap) > 255
                     or (compare_swap and (m["last"] is None or int(m["last"]) != data + 1))
@@ -1372,8 +1403,21 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                f"        uint next = ({condition}) ? {wrap} : expected {step} 1u;",
                                f"        InterlockedCompareExchange({destination}, expected, next, observed);",
                                "    } while (observed != expected);"))
+            elif op in ("fmin", "fmax"):
+                comparison = "<" if op == "fmin" else ">"
+                # The sign-dependent key orders finite-normal binary32 as unsigned integers.
+                # The zero seed is outside the caller's domain and can only fetch the old word.
+                stores.extend((f"    uint value = {value};",
+                               "    uint valueKey = value ^ ((value & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
+                               "    uint observed = 0u;", "    uint expected;",
+                               "    [allow_uav_condition] do {", "        expected = observed;",
+                               "        uint oldKey = expected ^ ((expected & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
+                               f"        uint next = (valueKey {comparison} oldKey) ? value : expected;",
+                               f"        InterlockedCompareExchange({destination}, expected, next, observed);",
+                               "    } while (observed != expected);"))
             elif compare_swap:
-                # RDNA stores VDATA on a match against VDATA+1; HLSL takes the comparison first.
+                # RDNA stores VDATA on a match against VDATA+1. HLSL takes the comparison first.
+                # Numeric equality and bit equality agree for finite-normal binary32.
                 stores.append(f"    InterlockedCompareStore({destination}, {hlsl_word(sources[1])}, {value});")
             else:
                 if op == "swap":
@@ -1751,7 +1795,9 @@ def main():
                         help="Separate image descriptor at t0 when u0 is a gfx1013 RGBA32 FLOAT image")
     parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS.keys() | IMAGE_ATOMIC_TYPES.keys() | {RGBA32_FLOAT}),
                         help="Caller-declared image format (R32_UINT for MSAA SRVs or atomic UAVs, "
-                             "R32_SINT for signed min/max UAVs)")
+                             "R32_SINT for signed min/max UAVs, R32_FLOAT for finite-normal atomics)")
+    parser.add_argument("--image-float-domain", choices=("finite-normal",),
+                        help="Required for R32_FLOAT atomics. All accessed texels and operands are finite normals.")
     args = parser.parse_args()
     if (args.descriptor_offset is None) == (args.image_uav_mip is None):
         parser.error("Choose either --descriptor-offset or --image-uav-mip")
@@ -1770,7 +1816,8 @@ def main():
                    source_stride=args.source_stride, source_format=args.source_format,
                    output_format=args.output_format,
                    image_descriptor=args.image_descriptor, image_format=args.image_format,
-                   image_uav_mip=args.image_uav_mip, cpu=args.cpu, lds_bytes=args.lds_bytes,
+                   image_uav_mip=args.image_uav_mip, image_float_domain=args.image_float_domain,
+                   cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
                    rsrc2=args.rsrc2)

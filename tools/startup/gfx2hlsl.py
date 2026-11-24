@@ -282,20 +282,24 @@ class Stage:
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
     def set_vf(self, n, expr, mods=()):
-        # The output modifier scales the result before the clamp (VOP3 OMOD, then CLMP), whatever order the
-        # disassembler prints them in: "clamp div:2" is saturate(x * 0.5), not saturate(x) * 0.5.
+        # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
+        # first, so the order of `mods` is not the order of the operations: scale first, saturate last.
+        scale = 1.0
         clamp = False
         for m in mods:
             if m == 'clamp':
                 clamp = True
             elif m in ('mul:2', 'mul:4'):
-                expr = '(%s) * %s.0' % (expr, m[-1])
+                scale *= float(m[-1])
             elif m == 'div:2':
-                expr = '(%s) * 0.5' % expr
+                scale *= 0.5
             elif m.startswith('op_sel'):
                 pass
             else:
                 raise Unsupported('modifier %s' % m)
+        if scale != 1.0:
+            factor = ('%d.0' % int(scale)) if scale == int(scale) else ('%g' % scale)
+            expr = '(%s) * %s' % (expr, factor)
         if clamp:
             expr = 'saturate(%s)' % expr
         self.set_v(n, 'U(%s)' % expr)
@@ -481,10 +485,23 @@ class Stage:
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
+            # A missing source used to raise IndexError and an extra one was dropped without a word.
+            if len(ops) != arity + 1:
+                raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
             args = [self.f(o) for o in ops[1:1 + arity]]
             if base in ('v_fmac_f32', 'v_mac_f32'):
                 args.append(self.f(ops[0]))
             return self.set_vf(reg_range(ops[0])[1], text.format(*args), mods)
+        if base in VEC_U_TO_F:
+            arity, text_f = VEC_U_TO_F[base]
+            if len(ops) != arity + 1:
+                raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
+            # Only the output modifiers a conversion can carry; op_sel and the source modifiers are not
+            # accepted here, because ignoring them would silently change the operand.
+            if any(m not in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods):
+                raise Unsupported('%s with %s' % (base, mods))
+            return self.set_vf(reg_range(ops[0])[1],
+                               text_f.format(*[self.u(o) for o in ops[1:1 + arity]]), mods)
         if base in VEC_U:
             arity, text = VEC_U[base]
             if len(ops) != arity + 1:
@@ -1202,6 +1219,8 @@ class Stage:
         # gfx10 keeps D[31:16] for 16-bit results (see half_op); the SDWA form keeps its own dst_sel handling.
         if mods:
             raise Unsupported('v_cvt_f16_f32 with %s' % mods)
+        if len(ops) != 2:  # the VEC_U operand-count rule (#1716); this local handler bypasses the table
+            raise Unsupported('v_cvt_f16_f32 with %d operands, expected 2' % len(ops))
         d = reg_range(ops[0])[1]
         self.used_v.add(d)
         self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(F(%s))' % (d, self.u(ops[1])))
@@ -1512,6 +1531,15 @@ VEC_F = {
     'v_cubeid_f32': (3, 'x2w_cube({0}, {1}, {2}).x'), 'v_cubesc_f32': (3, 'x2w_cube({0}, {1}, {2}).y'),
     'v_cubetc_f32': (3, 'x2w_cube({0}, {1}, {2}).z'), 'v_cubema_f32': (3, 'x2w_cube({0}, {1}, {2}).w'),
 }
+# Conversions whose result is binary32. The expression is the float value, so an output modifier
+# (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
+# conversions stay in VEC_U.
+VEC_U_TO_F = {
+    'v_cvt_f32_u32': (1, 'float({0})'), 'v_cvt_f32_i32': (1, 'float(int({0}))'),
+    'v_cvt_f32_ubyte0': (1, 'float({0} & 255)'), 'v_cvt_f32_ubyte1': (1, 'float(({0} >> 8) & 255)'),
+    'v_cvt_f32_ubyte2': (1, 'float(({0} >> 16) & 255)'), 'v_cvt_f32_ubyte3': (1, 'float({0} >> 24)'),
+    'v_cvt_f32_f16': (1, 'f16tof32({0})'),
+}
 # operands are uints; the result is a uint expression
 VEC_U = {
     'v_add_nc_u32': (2, '{0} + {1}'), 'v_sub_nc_u32': (2, '{0} - {1}'), 'v_subrev_nc_u32': (2, '{1} - {0}'),
@@ -1519,11 +1547,8 @@ VEC_U = {
     'v_not_b32': (1, '~{0}'), 'v_lshlrev_b32': (2, '{1} << ({0} & 31)'), 'v_lshrrev_b32': (2, '{1} >> ({0} & 31)'),
     'v_ashrrev_i32': (2, 'uint(int({1}) >> ({0} & 31))'), 'v_min_u32': (2, 'min({0}, {1})'), 'v_max_u32': (2, 'max({0}, {1})'),
     'v_min_i32': (2, 'uint(min(int({0}), int({1})))'), 'v_max_i32': (2, 'uint(max(int({0}), int({1})))'),
-    'v_cvt_f32_u32': (1, 'U(float({0}))'), 'v_cvt_f32_i32': (1, 'U(float(int({0})))'),
     'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'),
-    'v_cvt_f32_ubyte0': (1, 'U(float({0} & 255))'), 'v_cvt_f32_ubyte1': (1, 'U(float(({0} >> 8) & 255))'),
-    'v_cvt_f32_ubyte2': (1, 'U(float(({0} >> 16) & 255))'), 'v_cvt_f32_ubyte3': (1, 'U(float({0} >> 24))'),
-    'v_cvt_f32_f16': (1, 'U(f16tof32({0}))'), 'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
+    'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
     'v_lshl_add_u32': (3, '({0} << ({1} & 31)) + {2}'), 'v_add_lshl_u32': (3, '({0} + {1}) << ({2} & 31)'), 'v_add3_u32': (3, '{0} + {1} + {2}'),
     'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),

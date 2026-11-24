@@ -112,6 +112,13 @@ RE_D3D12_PIPELINE_TRAP = re.compile(
 RE_D3D12_IID_PASS = re.compile(r'x2w-d3d12\s+Device::slot([0-9]{1,4})\s+passes an IID:')
 RE_D3D12_VIEW_SKIPPED = re.compile(r'x2w-d3d12\s+Device::slot(\d+)\s+view skipped:\s+(.+)$')
 RE_D3D12_FORWARDED_RESULT = re.compile(r'::slot\d+\(.*\)\s*->\s*(0x[0-9a-fA-F]+)\s*$')
+# Device::slot133 (console CreatePlacedResource at a title address) logs every handled call as
+# "... -> 0x<hresult> aliased|not aliased [gpuva=0x...]", so the line does not end at the HRESULT.
+RE_D3D12_SLOT133 = re.compile(
+    r'x2w-d3d12\s+Device::slot133\(CreatePlacedResourceX\?\)\s.*?->\s*(0x[0-9a-fA-F]+)\s+(not aliased|aliased)\b'
+)
+RE_D3D12_SLOT133_UNCOMMITTED = re.compile(r'x2w-d3d12\s+Device::slot133\(CreatePlacedResourceX\?\)\s+address=\S+\s+not committed\b')
+SLOT133_OUTCOMES = ("aliased", "not_aliased", "failed")
 RE_D3D12_SLOT_CALL = re.compile(r'x2w-d3d12\s+([A-Za-z0-9_]+::slot\d+)\b')
 RE_D3D12_REMOVED = re.compile(
     r'x2w-d3d12\s+DEVICE REMOVED,\s+reason\s+(0x[0-9a-fA-F]+),\s+first noticed after\s+(.+)$'
@@ -190,6 +197,7 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
     """Aggregate startup telemetry counters from an iterable of log lines."""
     slot70_refusals: Counter[tuple[str, str, str, str, str, str, str]] = Counter()
     d3d12_unhandled: Counter[str] = Counter()
+    slot133_outcomes: Counter[str] = Counter()
     d3d12_debug: Counter[tuple[str, str]] = Counter()
     dstorage_failures: Counter[str] = Counter()
     dstorage_hresults: Counter[str] = Counter()
@@ -255,6 +263,15 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
             if m:
                 d3d12_unhandled[f"Device::slot{_dec(m.group(1))} view skipped"] += 1
                 continue
+            m = RE_D3D12_SLOT133.search(line)
+            if m:
+                _, norm_hr = _is_failed_hresult(m.group(1))
+                if norm_hr == "0x00000000":
+                    slot133_outcomes[m.group(2).replace(" ", "_")] += 1
+                    continue  # a handled placement; only an HRESULT other than 0 is a finding
+                slot133_outcomes["failed"] += 1  # and falls through to the unhandled count below
+            elif RE_D3D12_SLOT133_UNCOMMITTED.search(line):
+                slot133_outcomes["failed"] += 1  # E_INVALIDARG for an uncommitted address, no HRESULT text
             m = RE_D3D12_FORWARDED_RESULT.search(line)
             if m and not _is_failed_hresult(m.group(1))[0]:
                 continue  # forward_slot()/create_slot() telemetry of a call the desktop device implemented
@@ -319,6 +336,7 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
     return {
         "slot70_refusals": slot70_refusals,
         "d3d12_unhandled": d3d12_unhandled,
+        "slot133_outcomes": slot133_outcomes,
         "d3d12_debug": d3d12_debug,
         "dstorage_failures": dstorage_failures,
         "dstorage_hresults": dstorage_hresults,
@@ -431,6 +449,13 @@ def format_markdown(
             max_items,
         )
     )
+
+    # 2b. Device::slot133 placed resources, by outcome
+    s133 = summary["slot133_outcomes"]
+    if s133:
+        out.extend(["### `Device::slot133` Placed Resources", ""])
+        s133_rows = [[s133[name], name] for name in SLOT133_OUTCOMES if s133[name]]
+        out.extend(_format_table(["Count", "Outcome"], s133_rows, len(s133_rows), sum(s133.values()), max_items))
 
     # 3. x2w-d3d12-debug
     dbg = summary["d3d12_debug"]
