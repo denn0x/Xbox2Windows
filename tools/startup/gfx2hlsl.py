@@ -742,11 +742,15 @@ class Stage:
     def scalar_select(self, ops, pair):
         low = [('s%d' % reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else t for t in ops]
         expr = 'scc ? %s : %s' % (self.u(low[1]), self.u(low[2]))
-        if low[0] in ('exec', 'vcc'):
-            if low[0] == 'exec':
+        if low[0] in ('exec', 'vcc', 'exec_lo', 'vcc_lo'):
+            # wave32: vcc_lo / exec_lo are the whole lane mask, as in the generic scalar path
+            var = low[0][:4].rstrip('_') if low[0].startswith('exec') else 'vcc'
+            if var == 'exec':
                 self.exec_known = False
-            self.emit('%s = (%s) & 1;' % (low[0], expr))
+            self.emit('%s = (%s) & 1;' % (var, expr))
             return
+        if not reg_range(low[0]) or reg_range(low[0])[0] != 's':
+            raise Unsupported('s_cselect into %s' % low[0])
         d = reg_range(low[0])[1]
         self.set_s(d, '(%s) & 1' % expr if pair else expr)
         if pair:
