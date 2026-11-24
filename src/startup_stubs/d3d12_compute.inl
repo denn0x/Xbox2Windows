@@ -114,7 +114,8 @@ bool desktop_range(u64 address, u64 bytes, ID3D12Resource** buffer, u64* offset)
 
 struct ComputeTranslation {
     struct Res { bool uav; int kind, source, a, b; };  // kind 0 buffer, 1 2D, 2 2D array, 3 3D, 4 1D; source 0 table(param a, byte b), 2 root a
-    struct Ud { int kind, a, b; };                     // 3 root constant(param a, word b), 4 stride of res a, 5 word 3 of res a, 6 base of res a
+    struct Ud { int kind, a, b; };                     // 3 root constant(param a, word b), 4 stride of res a, 5 word 3 of res a, 6 base of res a,
+                                                       // 7 descriptor dword at byte b of table param a (descword)
     int state = 0;                                     // 1 ready, 2 unavailable
     std::vector<Res> res;
     std::vector<Ud> uds;
@@ -156,6 +157,7 @@ void load_compute(u64 key, ComputeTranslation& tr)
             else if (!std::strcmp(source, "stride")) ud.kind = 4;
             else if (!std::strcmp(source, "bufword3")) ud.kind = 5;
             else if (!std::strcmp(source, "bufbase")) ud.kind = 6;
+            else if (!std::strcmp(source, "descword")) ud.kind = 7;
             if (ud.kind < 0 || static_cast<std::size_t>(i) != tr.uds.size()) {
                 log("x2w-cx %016llx: entry value %d from %s not supported", key, i, source);
                 return;
@@ -366,6 +368,7 @@ bool typed_views_off()
     return off;
 }
 LONG cxv_typed_heap, cxv_typed_table, cxv_misaligned, cxv_word3;  // heap: views filled; table: bindings
+LONG cxd_image, cxd_buffer, cxd_title, cxd_null, cxd_unmapped;  // descword values by source
 void note_typed_view(const x2w_startup::BufferViewLayout& l, const ViewRecord& record, bool heap)
 {
     if (l.kind != x2w_startup::BufferViewKind::typed) return;
@@ -382,9 +385,11 @@ void note_typed_view(const x2w_startup::BufferViewLayout& l, const ViewRecord& r
 // Called every 300 frames (render mode): view facts handed to translated programs since the last report.
 void report_cx_views()
 {
-    log("x2w-cx view facts (300 frames): typed buffer views heap %ld table %ld (heap misaligned %ld), bufword3 synthesized %ld%s",
+    log("x2w-cx view facts (300 frames): typed buffer views heap %ld table %ld (heap misaligned %ld), bufword3 synthesized %ld%s; "
+        "descword values image %ld buffer %ld title %ld null %ld (unmapped format %ld)",
         InterlockedExchange(&cxv_typed_heap, 0), InterlockedExchange(&cxv_typed_table, 0), InterlockedExchange(&cxv_misaligned, 0),
-        InterlockedExchange(&cxv_word3, 0), typed_views_off() ? " (X2W_CX_TYPED_OFF)" : "");
+        InterlockedExchange(&cxv_word3, 0), typed_views_off() ? " (X2W_CX_TYPED_OFF)" : "", InterlockedExchange(&cxd_image, 0),
+        InterlockedExchange(&cxd_buffer, 0), InterlockedExchange(&cxd_title, 0), InterlockedExchange(&cxd_null, 0), InterlockedExchange(&cxd_unmapped, 0));
 }
 void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
 {
@@ -512,6 +517,88 @@ bool title_view_heap(const Pass& pass, u64* address, u64* bytes)
     }
     ReleaseSRWLockShared(&note_lock);
     return best != nullptr;
+}
+
+// LOCAL: `udsrc <i> descword <param> <byte offset>`: the dword at <byte offset> of the descriptor table bound at root
+// parameter <param>, as the console would hold it. Entries are 32 bytes: entry = offset & ~31, word = (offset & 31) / 4.
+// A view token becomes the synthesized gfx10 T# (texture view) or V# (buffer view, CBV) word (gfx10_view_words.h);
+// any other readable entry gives the title's own dword; null, unreadable or unknown views give 0.
+std::uint32_t descword_value(const Pass& pass, int param, int offset, u64 key)
+{
+    if (param < 0 || param >= 16 || offset < 0 || pass.compute_kind[param] != 5 || !pass.compute_address[param]) {
+        static LONG logged;
+        if (first_calls(logged, 4))
+            log("x2w-cx %016llx descword %d %d: root parameter is not a bound descriptor table (kind %d): value 0", key, param, offset,
+                param >= 0 && param < 16 ? pass.compute_kind[param] : -1);
+        InterlockedIncrement(&cxd_null);
+        return 0;
+    }
+    const u64 entry = pass.compute_address[param] + (static_cast<u64>(offset) & ~31ull);
+    const int word = (offset & 31) / 4;
+    std::uint32_t words[8] = {};
+    if (!x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) {
+        InterlockedIncrement(&cxd_null);
+        return 0;
+    }
+    std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+    if (words[0] != view_token_magic) {
+        InterlockedIncrement(words[word] ? &cxd_title : &cxd_null);
+        return words[word];
+    }
+    ViewRecord record{};
+    AcquireSRWLockShared(&note_lock);
+    const bool known = words[1] < view_records().size();
+    if (known) record = view_records()[words[1]];
+    ReleaseSRWLockShared(&note_lock);
+    Wrapper* resource = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
+    ID3D12Resource* real = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
+    std::uint32_t out[8] = {};
+    bool made = false, image = false;
+    x2w_startup::BufferViewLayout l;
+    if (known && record.slot == 17 && record.desc_bytes >= 12) {
+        std::uint32_t size = 0;
+        std::memcpy(&size, record.desc + 8, 4);
+        l = x2w_startup::buffer_view_layout(DXGI_FORMAT_R32_TYPELESS, 0, size / 4, 0, 1);  // a CBV reads as a raw buffer
+        made = true;
+    } else if (known && (record.slot == 18 || record.slot == 19) &&
+               x2w_startup::buffer_view_layout_from_desc(record.slot == 19, record.desc, record.desc_bytes, l, typed_views_off())) {
+        made = true;
+    } else if (known && real && (record.slot == 18 || record.slot == 19)) {
+        x2w_startup::ImageViewFacts v;
+        if (x2w_startup::image_view_from_desc(record.slot == 19, record.desc, record.desc_bytes, v)) {
+            const D3D12_RESOURCE_DESC rd = real->GetDesc();
+            v.dimension = rd.Dimension;
+            v.width = rd.Width;
+            v.height = rd.Height;
+            v.depth_or_array = rd.DepthOrArraySize;
+            v.mip_levels = rd.MipLevels;
+            v.format = typeless_to_float(desktop_format(v.format ? v.format : rd.Format));
+            bool unmapped = false;
+            image = made = x2w_startup::gfx10_image_words(v, out, &unmapped);
+            if (made && unmapped) {
+                InterlockedIncrement(&cxd_unmapped);
+                static LONG logged;
+                if (first_calls(logged, 8))
+                    log("x2w-cx descword: view format %u has no gfx10 format here: FORMAT 0 (word 1 may then read as a null view)", v.format);
+            }
+        }
+    }
+    if (made && !image) x2w_startup::gfx10_buffer_words(l, out);
+    if (!made) {
+        InterlockedIncrement(&cxd_null);
+        return 0;
+    }
+    InterlockedIncrement(image ? &cxd_image : &cxd_buffer);
+    static LONG logged_image, logged_buffer;
+    if (first_calls(image ? logged_image : logged_buffer, 1))
+        log("%s", image ? "x2w-cx descword: image views give T# FORMAT, WIDTH, HEIGHT, DST_SEL, BASE_LEVEL, LAST_LEVEL, TYPE, DEPTH, BASE_ARRAY, "
+                    "ARRAY_PITCH, MAX_MIP; left 0: base address, MIN_LOD, RESOURCE_LEVEL, SW_MODE, BC_SWIZZLE, PERF_MOD, words 6-7"
+                  : "x2w-cx descword: buffer views give V# STRIDE, NUM_RECORDS, DST_SEL, FORMAT, OOB_SELECT; left 0: base address, "
+                    "SWIZZLE_ENABLE, CACHE_SWIZZLE, INDEX_STRIDE, ADD_TID_ENABLE, RESOURCE_LEVEL, words 4-7");
+    static LONG logged_value;
+    if (first_calls(logged_value, 8))
+        log("x2w-cx %016llx descword %d %d: view %u slot %u %s word %d = %08x", key, param, offset, record.id, record.slot, image ? "T#" : "V#", word, out[word]);
+    return out[word];
 }
 
 // Runs a dispatch through the translation of compute key `key`. False: not translated (or no list).
@@ -658,6 +745,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
         const bool in = ud.a >= 0 && ud.a < 64;
         values[i] = ud.kind == 3 ? ((ud.a < 16 && ud.b < 16) ? pass.compute_constants[ud.a][ud.b] : 0)
             : ud.kind == 4 ? (in ? strides[ud.a] : 0) : ud.kind == 5 ? (in ? word3[ud.a] : 0) : (in ? bases[ud.a] : 0);
+        if (ud.kind == 7) values[i] = descword_value(pass, ud.a, ud.b, key);
     }
     list->SetPipelineState(tr.pso);
     if (!pass.heap_set) {
