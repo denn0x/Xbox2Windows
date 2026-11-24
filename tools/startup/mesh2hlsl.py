@@ -46,9 +46,23 @@ ALL_LANES = (1 << 64) - 1
 # constants + resource heap + sampler heap; s8..s15 are written first. Pixel and vertex stages start at s8.)
 MESH_USER_SGPR = 16
 FUSED = ('v_fma_f32', 'v_fmac_f32', 'v_fmamk_f32', 'v_fmaak_f32')
-# X2W_MESH_EXACT_FMA=1: fused multiply-adds through binary64 (needs double-precision shader ops); default off,
-# as the pipeline translator (`a * b + c`, which the compiler may or may not fuse)
-EXACT_FMA = os.environ.get('X2W_MESH_EXACT_FMA') == '1'
+UNFUSED = ('v_mad_f32', 'v_mac_f32', 'v_madmk_f32', 'v_madak_f32')
+# Multiply-add rule (MESH.md 4.5; the same rule is asked of the vertex-stage translator): positions must come out
+# bit-equal in every pipeline that computes them (depth pre-pass vs colour pass with depth EQUAL), so no lowering
+# may leave the choice "fuse or not" to the compiler, which decides per shader.
+#  * v_fma / v_fmac / v_fmamk / v_fmaak are fused on the console (one rounding). Default (X2W_MESH_FMA unset or
+#    `exact`): x2w_fma, fma in binary64 then one rounding to binary32. The product is exact in binary64; the result
+#    is the fused one except in rare double-rounding cases, and it is deterministic in every shader. Needs
+#    double-precision shader ops (D3D12_FEATURE_DATA_D3D12_OPTIONS.DoublePrecisionFloatShaderOps).
+#  * X2W_MESH_FMA=precise: `precise` multiply then add (two roundings): deterministic and cheap, but not the
+#    console's value (measured up to 1239 ulp on a position z after cancellation).
+#  * v_mad / v_mac / v_madmk / v_madak are unfused on the console: always the precise multiply then add.
+FMA_MODE = os.environ.get('X2W_MESH_FMA', 'exact')
+if os.environ.get('X2W_MESH_EXACT_FMA') == '0':
+    FMA_MODE = 'precise'          # the round-1 switch, kept
+if FMA_MODE not in ('exact', 'precise'):
+    raise SystemExit('X2W_MESH_FMA: exact or precise, not %r' % FMA_MODE)
+EXACT_FMA = FMA_MODE == 'exact'
 LDS_DWORDS = 1024     # groupshared x2w_lds (4 KB of the 28 KB a D3D12 mesh shader may use); addresses are clamped
 TOKEN = re.compile(r'\b(v\d+|s\d+|exec|vcc|m0|scc|a|w|t|q|tid|lane)\b')
 SIMPLE = re.compile(r'^\s*(?:if \(exec & 1\) )?(v\d+|s\d+|exec|vcc|m0|scc|a|w|t|q)\s*=\s*(.*)$')
@@ -70,6 +84,7 @@ MESH_HELPERS = {
                    'if (e == 0u) return m == 0u ? (s != 0u ? 5u : 6u) : (s != 0u ? 4u : 7u); '
                    'return s != 0u ? 3u : 8u; }'),
     'x2w_fma':'float x2w_fma(float a, float b, float c) { return (float)fma((double)a, (double)b, (double)c); }',
+    'x2w_madp': 'float x2w_madp(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }',
     'x2w_mbcnt_lo':'uint x2w_mbcnt_lo(uint m, uint lane) { return countbits(m & (lane >= 32u ? 0xffffffffu : ((1u << lane) - 1u))); }',
     'x2w_mbcnt_hi': 'uint x2w_mbcnt_hi(uint m, uint lane) { return lane < 32u ? 0u : countbits(m & ((1u << (lane - 32u)) - 1u)); }',
     # word 3 of a resource-heap buffer view: vinfo dword 2 of its view id (PROPOSED runtime field, RUNTIME_NEEDS.md
@@ -166,7 +181,27 @@ class MeshStage(G.Stage):
                 self.ins = self.ins[:i]
                 break
         self.has_lds = any(x[2].startswith('ds_') for x in self.ins)
-        return super().translate()
+        self.wave_any = []           # group-uniform execz branches (offsets): x2w_any[k][wave] = some lane active
+        self.group_restore = {}      # range end -> statements restoring hit scalars in a wave that had no lane on
+        self.group_checks = {}       # range end -> (register, symbolic value before the range, branch offset)
+        result = super().translate()
+        # A group-uniform branch block ends in a barrier (the lanes publish their exec bit); the block after it
+        # skips the range when no lane of the group was active (group_branch).
+        blocks = []
+        for b in self.blocks:
+            if b[2] and b[2][0] == 'barrier' and len(b[2]) > 1 and b[2][1] == 'wave-branch':
+                k = b[2][2]
+                blocks.append((b[0], self.group_restore.get(b[0], []) + b[1], ('barrier',)))
+                blocks.append((b[0] + 0.5, [], ('branch', '(x2w_any[%d][0] | x2w_any[%d][1]) == 0u' % (k, k), b[2][3])))
+            elif b[0] in self.group_restore:
+                blocks.append((b[0], self.group_restore[b[0]] + b[1], b[2]))
+            else:
+                blocks.append(b)
+        missing = set(self.group_restore) - {b[0] for b in self.blocks}
+        if missing:
+            raise Unsupported('execz range end %#x is not a block start' % min(missing))
+        self.blocks = blocks
+        return result
 
     def next_offset(self):
         for off, n, _, _ in self.ins:
@@ -356,6 +391,9 @@ class MeshStage(G.Stage):
         if self.pending:
             self.lines.extend(self.pending)
             self.pending = []
+        for r, before, at in self.group_checks.get(self.pc, ()):
+            if self.sym.get(r) != before:
+                raise Unsupported('execz range %#x-%#x changes s%d from %s to %s' % (at, self.pc, r, before[0], self.sym.get(r)))
         if self.pc in self.branch_targets():
             self.shadow.clear()      # another path may arrive here without the shadow assignments
         if self.pc in self.loop_heads():
@@ -371,15 +409,14 @@ class MeshStage(G.Stage):
             return ('jump', int(ops[0].split('_')[1], 16)) if taken else None
         if base.startswith('ds_'):
             return self.lds(base, ops, mods)
-        if base in FUSED and EXACT_FMA:
-            # v_fma / v_fmac / v_fmamk / v_fmaak are fused (one rounding); `a * b + c` lets the compiler round the
-            # product first. The product of two binary32 values is exact in binary64, so fma in double then one
-            # rounding to float gives the fused result (except for rare double-rounding ties).
+        if base in FUSED or base in UNFUSED:
+            # the multiply-add rule at FMA_MODE: fused ops exact (x2w_fma) or precise; unfused ops always precise
             arity, _ = G.VEC_F[base]
             args = [self.f(o) for o in ops[1:1 + arity]]
-            if base == 'v_fmac_f32':
+            if base in ('v_fmac_f32', 'v_mac_f32'):
                 args.append(self.f(ops[0]))
-            return self.set_vf(reg_range(ops[0])[1], 'x2w_fma(%s, %s, %s)' % tuple(args), mods)
+            helper = 'x2w_fma' if base in FUSED and EXACT_FMA else 'x2w_madp'
+            return self.set_vf(reg_range(ops[0])[1], '%s(%s, %s, %s)' % ((helper,) + tuple(args)), mods)
         if base == 's_sendmsg':
             if ops != ['0x9']:
                 raise Unsupported('s_sendmsg %s' % ops)
@@ -451,9 +488,57 @@ class MeshStage(G.Stage):
                 # take the branch the way execz would, which the skipped-range check below covers
                 if base[10:] in ('vccz', 'vccnz') and self.lane_dependent('vcc'):
                     raise Unsupported('%s on a lane-dependent vcc at %#x' % (base, off))
+                if base == 's_cbranch_execz' and off in self.group_branches():
+                    return self.group_branch(off, target)
                 self.check_skipped_scalars(off, target)
                 self.divergent_until = max(self.divergent_until, target)
         return term
+
+    def group_branch(self, off, target):
+        """s_cbranch_execz over a range that writes a scalar live at its end (or encloses such a range).
+
+        Per lane, the lanes that skip would keep the old scalar where the wave computed a new one. Instead every
+        lane publishes its exec bit (x2w_any[k][wave]), a group barrier follows, and the range is skipped only when
+        no lane of the GROUP is active; otherwise all 128 threads run it, the inactive lanes with exec 0 (vector
+        writes, exports, LDS and buffer stores stay guarded by exec; inner per-lane branches still skip per lane).
+        A whole wave with no active lane (which the hardware skips) then gets back, at the end of the range, the
+        values the hit scalars had before it. Because every thread of the group runs the range, barriers inside
+        it are allowed. Refused: exec writes the per-lane model cannot follow (as before), the branch inside a
+        per-lane range, a hit scalar holding a descriptor before the range, and other ways into the target."""
+        if off < self.divergent_until or self.exec_known or self.pending:
+            raise Unsupported('group-uniform execz at %#x inside a per-lane range' % off)
+        hits = self.skipped_scalars(off, target)
+        restore = []
+        if hits:
+            for o, n, name, asm in self.ins:
+                if (name.startswith('s_cbranch') or name == 's_branch') and not off <= o < target and \
+                        int(parse(asm)[1][0].split('_')[1], 16) == target:
+                    raise Unsupported('execz range %#x-%#x: its end is also reached from %#x' % (off, target, o))
+        k = len(self.wave_any)
+        self.wave_any.append(off)
+        for r in sorted(hits):
+            reg = 'vcc' if r == -1 else 's%d' % r
+            if r != -1 and r not in self.sym and r not in self.used_s:
+                continue   # no value before the range: a wave that skips it reads an undefined register
+            before = self.sym.get(r) if r != -1 else None
+            if before is not None and before[0] not in ('const', 'fixed_buffer_word'):
+                # a symbolic value (descriptor, pointer): no run-time copy exists. Right only when the range leaves
+                # the same symbolic value (a reload of the same descriptor): checked at the target.
+                self.group_checks.setdefault(target, []).append((r, before, off))
+                continue
+            try:
+                value = self.u(reg)
+            except Unsupported:
+                raise Unsupported('execz range %#x-%#x writes %s, which holds %s before it' % (off, target, reg, before))
+            var = 'x2w_u%d' % len(self.shadow_vars)
+            self.shadow_vars.append(var)
+            self.emit('%s = %s;' % (var, value))
+            if r != -1:
+                self.used_s.add(r)
+            restore.append('if (x2w_any[%d][wave] == 0u) %s = %s;' % (k, reg, var))
+        self.emit('if (exec & 1) x2w_any[%d][wave] = 1u;' % k)
+        self.group_restore.setdefault(target, []).extend(restore)
+        return ('barrier', 'wave-branch', k, target)
 
     @staticmethod
     def exec_written(name, ops):
@@ -631,6 +716,38 @@ class MeshStage(G.Stage):
     def check_skipped_scalars(self, off, target):
         """Refuse when a scalar register written in (off, target) is live at target (some path reads it before a
         write): lanes that skip the range would see the old value where the wave saw the new one."""
+        hit = self.skipped_scalars(off, target)
+        if hit:
+            raise Unsupported('scalar %s written in the per-lane skipped range %#x-%#x is live at its end'
+                              % ('vcc' if min(hit) == -1 else 's%d' % min(hit), off, target))
+
+    def group_branches(self):
+        """execz branches (offsets) translated as group-uniform branches: those whose range writes a scalar that
+        is live at its end, and every execz range enclosing one of them (the inner barrier needs every thread of
+        the group to reach it). Exec-write refusals are left to the translation."""
+        if getattr(self, '_group', None) is None:
+            ranges = []
+            for o, n, name, asm in self.ins:
+                if name == 's_cbranch_execz':
+                    t = int(parse(asm)[1][0].split('_')[1], 16)
+                    if t > o:
+                        ranges.append((o, t))
+            need = set()
+            for o, t in ranges:
+                try:
+                    if self.skipped_scalars(o, t):
+                        need.add(o)
+                except Unsupported:
+                    pass
+            for o, t in ranges:
+                if any(o < o2 < t for o2 in need):
+                    need.add(o)
+            self._group = {o: t for o, t in ranges if o in need}
+        return self._group
+
+    def skipped_scalars(self, off, target):
+        """Scalar registers (-1 = vcc) written in (off, target) and live at target; Unsupported for exec writes
+        the per-lane model cannot follow."""
         written = set()
         copies = set()   # registers holding exec as it was inside the range (nested if/else masks)
         for o, n, name, asm in self.ins:
@@ -664,10 +781,7 @@ class MeshStage(G.Stage):
                                           % (name, off, target))
                 for t in w:
                     copies.discard(t)
-        hit = written & self.liveness().get(target, frozenset())
-        if hit:
-            raise Unsupported('scalar %s written in the per-lane skipped range %#x-%#x is live at its end'
-                              % ('vcc' if min(hit) == -1 else 's%d' % min(hit), off, target))
+        return written & self.liveness().get(target, frozenset())
 
     def scalar(self, base, ops):
         dname = ops[0]
@@ -840,6 +954,27 @@ class MeshStage(G.Stage):
         if neg:
             x = '(%s ^ 0x8000u)' % x
         return self.write_compare(False, ops[0], 'x2w_class_f16(%s, %s)' % (x, self.u(ops[2])))
+
+    def compare(self, base, ops, mods=()):
+        """16-bit integer compares (v_cmp[x]_<cond>_{i16,u16}, e32/e64 without modifiers): the low halves,
+        sign- or zero-extended, compared as 32-bit integers; everything else as the base translator."""
+        m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(i16|u16)', base)
+        if not m:
+            return super().compare(base, ops, mods)
+        if mods or any(t.startswith(('-', '|')) for t in ops):
+            raise Unsupported('%s with modifiers %s' % (base, mods))
+        writes_exec, cond, typ = m.group(1) == 'x', m.group(2), m.group(3)
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, (a, b) = ('exec' if writes_exec else 'vcc'), ops
+        else:
+            raise Unsupported('%s with %d operands' % (base, len(ops)))
+        if typ == 'i16':
+            x, y = ('(asint(%s << 16u) >> 16)' % self.u(t) for t in (a, b))
+        else:
+            x, y = ('(%s & 0xffffu)' % self.u(t) for t in (a, b))
+        return self.compare_result(base.replace(typ, 'i32' if typ == 'i16' else 'u32'), cond, writes_exec, dst, x, y)
 
     def op_v_bfm_b32(self, ops, mods):
         """V_BFM_B32: D = ((1 << S0[4:0]) - 1) << S1[4:0] (RDNA 2 ISA)."""
@@ -1105,14 +1240,17 @@ class MeshPipeline(G.Pipeline):
                 ['groupshared uint x2w_rfl[%d][2];  // v_readfirstlane broadcasts, one slot per instruction' % s.broadcasts]
                 if s.broadcasts else []) + (
                 ['groupshared uint x2w_lds[%d];  // LDS (ds_read / ds_write), dword addressed' % LDS_DWORDS]
-                if s.lds_used else []) + [
+                if s.lds_used else []) + (
+                ['groupshared uint x2w_any[%d][2];  // wave-level execz branches: some lane of the wave active'
+                 % len(s.wave_any)] if s.wave_any else []) + [
                 '[outputtopology("triangle")]',
                 '[numthreads(%d, 1, 1)]' % GROUP,
                 'void main(uint tid : SV_GroupIndex, uint3 group : SV_GroupID,',
                 '          out vertices MSOut verts[%d], out indices uint3 tris[%d], out primitives MSPrim prims[%d]) {'
                 % (MAX_VERTICES, MAX_PRIMITIVES, MAX_PRIMITIVES),
                 '    uint gid = group.x, lane = tid & 63u, wave = tid >> 6, wbase = tid & ~63u;',
-                '    if (tid == 0) x2w_alloc = 0;',
+                '    if (tid == 0) x2w_alloc = 0;'] + (
+                ['    if (tid < %du) x2w_any[tid >> 1][tid & 1u] = 0u;' % (2 * len(s.wave_any))] if s.wave_any else []) + [
                 '    GroupMemoryBarrierWithGroupSync();',
                 '    MSOut o = (MSOut)0;',
                 '    uint x2w_prim = 0x80000000u;']
