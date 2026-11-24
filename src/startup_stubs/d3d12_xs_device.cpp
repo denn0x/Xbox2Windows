@@ -101,6 +101,7 @@ struct WrapperOwn {
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
+    bool linear_memory_srv; // LOCAL (video): texture made by X2W_MEMORY_SRV_LINEAR; 1D/3D ones are uploaded too.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
@@ -4888,6 +4889,7 @@ void build_tables()
     // Xbox order from here.
     tables[device_kind][48] = reinterpret_cast<void*>(&device_create_command_queue_x);
     tables[device_kind][70] = reinterpret_cast<void*>(&device_memory_srv);
+    if (memory_srv_buffer_on()) tables[device_kind][71] = reinterpret_cast<void*>(&device_memory_uav);  // LOCAL (video)
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);

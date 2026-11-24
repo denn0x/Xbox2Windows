@@ -1281,8 +1281,12 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (InterlockedCompareExchange(&resource->own().refs, 0, 0) <= 0) x2w_memcut::note_after_release(true);  // LOCAL memcut
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-    const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-        (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc.DepthOrArraySize == 1 && desc.Height == 1);
+    // LOCAL (video): linear memory-SRV textures (X2W_MEMORY_SRV_LINEAR) are written by the XG stand-in in
+    // desktop footprint order for every dimension (a volume as one slice), so 1D arrays and 3D upload too.
+    const bool linear_srv = resource->own().linear_memory_srv;
+    const bool volume = linear_srv && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || volume ||
+        (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc.Height == 1 && (desc.DepthOrArraySize == 1 || linear_srv));
     {
         static LONG reasons;
         if ((!memory || (desc.Flags & 0x7) || !uploadable) && !texture_uploads().count(texture) &&
@@ -1296,7 +1300,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return;
     if (!uploadable) return;
     const UINT mips = desc.MipLevels ? desc.MipLevels : 1;
-    const UINT slices = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
+    const UINT slices = volume ? 1 : desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
     if (mips > 15) return;
     const x2w_startup::SliceFootprints plan(device_of(the_device), desc, mips);
     const UINT64 slice_total = plan.size;

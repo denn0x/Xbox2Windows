@@ -13,8 +13,37 @@ bool same_texture_description(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE
            a.SampleDesc.Quality == b.SampleDesc.Quality && a.Layout == b.Layout && a.Flags == b.Flags;
 }
 
+// LOCAL (video): X2W_MEMORY_SRV_TILED_ANY=1 widens the single-mip tiled BC form below to every 16-byte
+// block format (BC2, BC3, BC5, BC6H, BC7, with their SRGB/SNORM/SF16 twins) and to any size. The 4 KiB
+// standard equation in Bc16Surface depends only on the 16-byte element, and pads the surface to whole
+// 64x64-texel tiles; sizes that are not multiples of 64 and the formats other than BC3/BC7 are an
+// extrapolation of that equation, not separately verified. Run 92: 512x468 BC3 (slots 0x211, 0x214).
+bool tiled_any_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MEMORY_SRV_TILED_ANY");
+        if (v) log("x2w-memsrv X2W_MEMORY_SRV_TILED_ANY=1: single-mip tiled memory SRVs of any 16-byte BC format and size");
+        return v;
+    }();
+    return on;
+}
+bool bc16_format(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+        return true;
+    default:
+        return false;
+    }
+}
 bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
 {
+    if (tiled_any_on() && bc16_format(r.Format) && static_cast<UINT>(r.Layout) == 0x105 && r.Alignment == 0 &&
+        (r.Flags == D3D12_RESOURCE_FLAG_NONE || static_cast<UINT>(r.Flags) == 0x300000) && r.Width && r.Height &&
+        r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+        return true;
     return (r.Format == DXGI_FORMAT_BC3_UNORM || r.Format == DXGI_FORMAT_BC7_UNORM) &&
            static_cast<UINT>(r.Layout) == 0x105 && r.Alignment == 0 &&
            (r.Flags == D3D12_RESOURCE_FLAG_NONE || static_cast<UINT>(r.Flags) == 0x300000) &&
@@ -211,12 +240,61 @@ bool linear_view_in_range(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOU
         return mip_range(a.MostDetailedMip, a.MipLevels, a.ResourceMinLODClamp) && a.PlaneSlice == 0 && a.FirstArraySlice < slices &&
                a.ArraySize > 0 && a.ArraySize <= slices - a.FirstArraySlice;
     }
+    // LOCAL (video, run 92 forms): cubes (1x1x6, view dim 9), 1D and 3D views of linear memory textures.
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Width == r.Height && slices == 6 &&
+               mip_range(v.TextureCube.MostDetailedMip, v.TextureCube.MipLevels, v.TextureCube.ResourceMinLODClamp);
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) {
+        const auto& c = v.TextureCubeArray;
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Width == r.Height && slices % 6 == 0 && c.NumCubes > 0 &&
+               c.First2DArrayFace < slices && u64{c.NumCubes} * 6 <= u64{slices} - c.First2DArrayFace &&
+               mip_range(c.MostDetailedMip, c.MipLevels, c.ResourceMinLODClamp);
+    }
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1D)
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+               mip_range(v.Texture1D.MostDetailedMip, v.Texture1D.MipLevels, v.Texture1D.ResourceMinLODClamp);
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY) {
+        const auto& a = v.Texture1DArray;
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && mip_range(a.MostDetailedMip, a.MipLevels, a.ResourceMinLODClamp) &&
+               a.FirstArraySlice < slices && a.ArraySize > 0 && a.ArraySize <= slices - a.FirstArraySlice;
+    }
+    if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D)
+        return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+               mip_range(v.Texture3D.MostDetailedMip, v.Texture3D.MipLevels, v.Texture3D.ResourceMinLODClamp);
     return false;
+}
+// Which description forms the linear and stand-in paths wrote, one counter each.
+enum LinearForm { lf_2d, lf_2d_array, lf_cube, lf_cube_array, lf_1d, lf_1d_array, lf_3d, lf_buffer_srv, lf_buffer_uav, lf_count };
+const char* const linear_form_names[lf_count] = {"2d", "2d-array", "cube", "cube-array", "1d", "1d-array", "3d", "buffer-srv", "buffer-uav"};
+LONG64 linear_forms[lf_count];
+int linear_form(D3D12_SRV_DIMENSION d)
+{
+    switch (d) {
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: return lf_2d_array;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE: return lf_cube;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: return lf_cube_array;
+    case D3D12_SRV_DIMENSION_TEXTURE1D: return lf_1d;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: return lf_1d_array;
+    case D3D12_SRV_DIMENSION_TEXTURE3D: return lf_3d;
+    default: return lf_2d;
+    }
+}
+void note_linear_form(int form, u64 destination)
+{
+    const LONG64 n = InterlockedIncrement64(&linear_forms[form]);
+    if ((n & (n - 1)) == 0)
+        log("x2w-memsrv form %s: %lld views written (latest destination 0x%llx)", linear_form_names[form], n, destination);
 }
 bool linear_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
-    return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Width && r.Height &&
-           r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+    const bool sized = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        ? r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
+        : r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+        ? r.Width <= D3D12_REQ_TEXTURE1D_U_DIMENSION && r.Height == 1 && r.DepthOrArraySize <= D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION
+        : r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+          r.Width <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION && r.Height <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION &&
+          r.DepthOrArraySize <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION;
+    return sized && r.Width && r.Height &&
            r.DepthOrArraySize >= 1 && r.MipLevels >= 1 && r.MipLevels <= 15 && r.SampleDesc.Count == 1 &&
            static_cast<UINT>(r.Layout) == 0 && !tiled_bc_srv(r) && !x2w_startup::bc64::supports(r) &&
            !(r.Flags & (D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
@@ -246,10 +324,95 @@ Wrapper* publish_linear_texture(Wrapper* device, u64 address, const D3D12_RESOUR
     x2w_startup::mark_packed_stand_in(created, desktop_format(desc.Format));
     Wrapper* w = wrap(created, resource_kind);
     w->own().title_memory = reinterpret_cast<void*>(address);
+    w->own().linear_memory_srv = true;
     note_resource(w, &desc, 0);
     linear_srv_bytes += device_of(device)->GetResourceAllocationInfo(0, 1, &texture).SizeInBytes;
     linear_srv_textures.emplace(address, std::make_pair(desc, w));
     return w;
+}
+
+// LOCAL (video): X2W_MEMORY_SRV_BUFFER=1. A memory buffer view (slot 70 SRV, slot 71 UAV) whose address
+// no buffer resource covers gets a stand-in resource wrapper without a desktop resource: its title memory
+// is the view address and its console desc the one the title passed. Translated draws and dispatches read
+// a buffer view through its record (resource title memory + FirstElement * element) and bind the
+// title-memory window there, so no desktop buffer is needed; the desktop descriptor is a null-resource
+// buffer view. In run 92, 1641 of the 2048 logged slot-70 refusals were buffer_unavailable.
+bool memory_srv_buffer_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MEMORY_SRV_BUFFER");
+        if (v) log("x2w-memsrv X2W_MEMORY_SRV_BUFFER=1: memory buffer SRVs/UAVs without a buffer resource get a stand-in at the address");
+        return v;
+    }();
+    return on;
+}
+std::mutex standin_buffer_mutex;
+std::unordered_map<u64, std::pair<u64, Wrapper*>> standin_buffers;  // address -> (bytes, wrapper)
+Wrapper* standin_memory_buffer(u64 address, const D3D12_RESOURCE_DESC& desc, u64 span)
+{
+    if (!address || !span || span > (u64{256} << 20) || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        !x2w_local::readable(reinterpret_cast<const void*>(address), 1))
+        return nullptr;
+    const u64 bytes = desc.Width > span ? desc.Width : span;
+    std::lock_guard lock(standin_buffer_mutex);
+    if (const auto found = standin_buffers.find(address); found != standin_buffers.end() && found->second.first >= bytes)
+        return found->second.second;
+    D3D12_RESOURCE_DESC console = desc;
+    console.Width = bytes;
+    Wrapper* w = wrap(nullptr, resource_kind);
+    w->own().title_memory = reinterpret_cast<void*>(address);
+    note_resource(w, &console, bytes);
+    standin_buffers[address] = {bytes, w};
+    static LONG shown;
+    const std::size_t count = standin_buffers.size();
+    if (first_calls(shown, 16) || (count & (count - 1)) == 0)
+        log("x2w-memsrv stand-in buffer at 0x%llx: %llu bytes (%zu stand-ins)", address, bytes, count);
+    return w;
+}
+
+// Device slot 71 (Xbox order), the UAV twin of slot 70: (resource desc, UAV desc + address at +0x28,
+// destination). Run 88/92 first call: a 0x18cc-byte buffer, an R32_UINT typed view of 0x633 elements,
+// destination in a 3128-entry CPU heap. Installed only with X2W_MEMORY_SRV_BUFFER=1 (a no-op otherwise).
+struct MemoryUnorderedAccessView {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view;
+    u64 address;
+};
+static_assert(offsetof(MemoryUnorderedAccessView, address) == 0x28);
+void __stdcall device_memory_uav(Wrapper* self, const D3D12_RESOURCE_DESC* resource, const MemoryUnorderedAccessView* input, u64 destination)
+{
+    static LONG refused;
+    const char* reason = nullptr;
+    if (!destination) reason = "null_destination";
+    else if (!x2w_local::readable(resource, sizeof(*resource))) reason = "unreadable_resource";
+    else if (!x2w_local::readable(input, sizeof(*input))) reason = "unreadable_view";
+    else if (!input->address) reason = "null_address";
+    else if (resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || input->view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+        reason = "not_a_buffer";
+    else if (!memory_srv_destination(destination)) reason = "destination_outside_view_heaps";
+    u64 span = 0;
+    if (!reason) {
+        const auto& b = input->view.Buffer;
+        const bool raw = (b.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+        const UINT element = b.StructureByteStride ? b.StructureByteStride : raw ? 4 : x2w_startup::typed_buffer_format_bytes(input->view.Format);
+        if (b.CounterOffsetInBytes) reason = "counter";
+        else if (raw && (input->view.Format != DXGI_FORMAT_R32_TYPELESS || b.StructureByteStride)) reason = "bad_raw_view";
+        else if (b.StructureByteStride && input->view.Format != DXGI_FORMAT_UNKNOWN) reason = "bad_structured_view";
+        else if (!element || !b.NumElements) reason = "bad_element";
+        else if ((span = (b.FirstElement + b.NumElements) * element) > resource->Width) reason = "view_past_resource";
+    }
+    Wrapper* standin = reason ? nullptr : standin_memory_buffer(input->address, *resource, span);
+    if (!reason && !standin) reason = "no_stand_in";
+    if (reason) {
+        if (first_calls(refused, noop_census_enabled() ? 512 : 8))
+            log("x2w-memsrv Device::slot71 memory UAV refused: reason=%s res{dim=%d width=%llu} view{dim=%d fmt=%d} dest=0x%llx", reason,
+                x2w_local::readable(resource, sizeof(*resource)) ? resource->Dimension : -1,
+                x2w_local::readable(resource, sizeof(*resource)) ? resource->Width : 0ull,
+                x2w_local::readable(input, sizeof(*input)) ? input->view.ViewDimension : -1,
+                x2w_local::readable(input, sizeof(*input)) ? input->view.Format : -1, destination);
+        return;
+    }
+    note_linear_form(lf_buffer_uav, destination);
+    view_slot<19, 3>(self, reinterpret_cast<u64>(standin), 0, reinterpret_cast<u64>(&input->view), destination);
 }
 
 // The first check that refuses a call, in the order the checks run; null when every check passes.
@@ -310,6 +473,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                 log("x2w-memsrv linear memory SRVs written: %lld, %zu textures, %llu KiB (latest destination 0x%llx)", n, textures,
                     bytes >> 10, destination);
             }
+            note_linear_form(linear_form(input->view.ViewDimension), destination);
             view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
             return;
         }
@@ -324,6 +488,14 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
+        if ((!buffer || !info) && memory_srv_buffer_on()) {
+            // LOCAL (video): no buffer resource covers the address; a stand-in whose title memory starts there.
+            if (Wrapper* standin = standin_memory_buffer(input->address, *resource, span_bytes)) {
+                note_linear_form(lf_buffer_srv, destination);
+                view_slot<18, 2>(self, reinterpret_cast<u64>(standin), reinterpret_cast<u64>(&input->view), destination, 0);
+                return;
+            }
+        }
         if (!buffer || !info ||
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
