@@ -2338,10 +2338,12 @@ std::vector<IndirectCall>& indirect_trace()
     static std::vector<IndirectCall> calls;
     return calls;
 }
+void indirect_execute(Wrapper* self, void* signature, UINT max_count, Wrapper* arguments, u64 offset, Wrapper* count_resource, u64 count_offset);
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT max_count, Wrapper* arguments, u64 offset,
                                      Wrapper* count_resource, u64 count_offset)
 {
     InterlockedIncrement(&indirect_calls);
+    indirect_execute(self, signature, max_count, arguments, offset, count_resource, count_offset);  // LOCAL: d3d12_indirect.inl
     if (!trace_frame_active) return;
     SignatureInfo info;
     AcquireSRWLockShared(&signature_lock);
@@ -4007,6 +4009,7 @@ void draw_overlay(LONG frame, double seconds)
 }
 
 #include "startup_stubs/d3d12_compute.inl"
+#include "startup_stubs/d3d12_indirect.inl"
 #include "startup_stubs/d3d12_present.inl"
 
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
@@ -4122,6 +4125,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
         log("%s", line);
         report_dispatches();
+        report_indirect(300);  // LOCAL: d3d12_indirect.inl
     }
     if (now - last_report >= 5000) {
         last_report = now;
