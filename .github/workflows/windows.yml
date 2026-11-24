@@ -89,6 +89,7 @@ jobs:
           python -B tests/bidi_controls_check.py
           python -B tests/hardware_reports_check.py
           python -B tests/rectlist_topology_check.py
+          python -B tests/startup_translator_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025

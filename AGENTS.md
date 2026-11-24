@@ -131,6 +131,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/bidi_controls_check.py
 ./out/pe-env/bin/python -B tests/hardware_reports_check.py
 ./out/pe-env/bin/python -B tests/rectlist_topology_check.py
+./out/pe-env/bin/python -B tests/startup_translator_check.py
 ```
 
 `tests/pixel_aot_check.py binary` additionally needs LLVM with gfx1013 support
