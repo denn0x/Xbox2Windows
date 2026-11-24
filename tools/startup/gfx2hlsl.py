@@ -1700,11 +1700,15 @@ class Stage:
         # HLSL != is unordered, so lg reads as less or greater, behind {2}: both source words not NaN,
         # tested on their bits. DXC marks float compares fast unless -Gis, and a driver may then fold
         # less-or-greater into an unordered not-equal.
+        # FXC without /Gis compiles !(a < b) to a >= b, false on NaN, and DXC without -Gis folds x != x
+        # and x == x to constants (#1936). So nlt, nle, ngt and nge negate an ordered relation behind {2},
+        # and o and u read {2} alone; the startup cache compiles with FXC and no flags.
         table = {'lt': '{0} < {1}', 'eq': '{0} == {1}', 'le': '{0} <= {1}', 'gt': '{0} > {1}',
                  'lg': '({2} && ({0} < {1} || {0} > {1}))', 'ne': '{0} != {1}',
-                 'ge': '{0} >= {1}', 'neq': '!({0} == {1})', 'nlt': '!({0} < {1})', 'nle': '!({0} <= {1})', 'ngt': '!({0} > {1})',
-                 'nge': '!({0} >= {1})', 'nlg': '!({2} && ({0} < {1} || {0} > {1}))', 'o': '({0} == {0} && {1} == {1})',
-                 'u': '({0} != {0} || {1} != {1})', 't': 'true', 'f': 'false'}
+                 'ge': '{0} >= {1}', 'neq': '!({0} == {1})', 'nlt': '!({2} && {0} < {1})',
+                 'nle': '!({2} && {0} <= {1})', 'ngt': '!({2} && {0} > {1})', 'nge': '!({2} && {0} >= {1})',
+                 'nlg': '!({2} && ({0} < {1} || {0} > {1}))', 'o': '({2})', 'u': '!({2})',
+                 't': 'true', 'f': 'false'}
         if cond not in table:
             raise Unsupported(base)
         if '{2}' in table[cond] and not ordered:

@@ -346,11 +346,11 @@ def first_mismatch(expr, cond, mods, model=reference):
     return None
 
 
-# The lowering of every other condition before #1920, for v_cmp_*_f32_e32 vcc_lo, v1, v2.
+# The lowering of every other condition before #1920, for v_cmp_*_f32_e32 vcc_lo, v1, v2. nlt, nle, ngt, nge, o and u
+# changed with #1936 and are checked in tests/startup_gfx2hlsl_f32_nan_check.py.
 UNCHANGED = {'f': 'false', 'lt': 'F(v1) < F(v2)', 'eq': 'F(v1) == F(v2)', 'le': 'F(v1) <= F(v2)',
-             'gt': 'F(v1) > F(v2)', 'ge': 'F(v1) >= F(v2)', 'o': '(F(v1) == F(v1) && F(v2) == F(v2))',
-             'u': '(F(v1) != F(v1) || F(v2) != F(v2))', 'nge': '!(F(v1) >= F(v2))', 'ngt': '!(F(v1) > F(v2))',
-             'nle': '!(F(v1) <= F(v2))', 'neq': '!(F(v1) == F(v2))', 'nlt': '!(F(v1) < F(v2))'}
+             'gt': 'F(v1) > F(v2)', 'ge': 'F(v1) >= F(v2)', 'neq': '!(F(v1) == F(v2))'}
+NAN_FORMS = ('nlt', 'nle', 'ngt', 'nge', 'o', 'u')
 
 
 def controls():
@@ -375,7 +375,7 @@ def controls():
         (old_reference(cond, a, b) != reference(cond, a, b)) == (is_nan(a) or is_nan(b))
         for cond in ('lg', 'nlg') for a, b in PAIRS))
     check('every f32 condition of the table is checked (%d opcodes)' % len(F32_OPS), len(F32_OPS) == 30 and sorted(
-        {COMPARES[op][1] for op in F32_OPS}) == sorted(set(UNCHANGED) | {'lg', 'nlg'}))
+        {COMPARES[op][1] for op in F32_OPS}) == sorted(set(UNCHANGED) | {'lg', 'nlg'} | set(NAN_FORMS)))
 
     # 2. The new lowering's text; every other condition keeps its text.
     asm, stage = translate(compare_code(0x05, 'e32'))
@@ -391,12 +391,12 @@ def controls():
     changed = []
     for op in F32_OPS:
         cmpx, cond, _ = COMPARES[op]
-        if cmpx or cond in ('lg', 'nlg'):
+        if cmpx or cond in ('lg', 'nlg') + NAN_FORMS:
             continue
         asm, stage = translate(compare_code(op, 'e32'))
         if stage.lines != ['vcc = ((%s) ? 1u : 0u);' % UNCHANGED[cond]]:
             changed.append((asm, stage.lines))
-    check('the 13 other conditions keep their lowering', not changed, str(changed))
+    check('the %d other conditions keep their lowering' % len(UNCHANGED), not changed, str(changed))
 
     # 3. Every form of every condition equals the reference on every pair; the old lg/nlg lowering does not.
     forms = evaluations = 0
