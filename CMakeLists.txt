@@ -759,6 +759,16 @@ add_executable(startup_sampler_comparison_check tests/startup_sampler_comparison
 target_include_directories(startup_sampler_comparison_check PRIVATE src)
 target_compile_features(startup_sampler_comparison_check PRIVATE cxx_std_17)
 add_test(NAME startup_sampler_comparison COMMAND startup_sampler_comparison_check)
+# LOCAL: console view facts for translated compute programs (src/startup_stubs/gfx10_view_words.h): typed buffer
+# view layout, GFX10_FORMAT codes, synthesized V#/T# words, integer UAV format. Mutated runs are negative controls.
+add_executable(startup_gfx10_view_words_check tests/startup_gfx10_view_words_check.cpp)
+target_include_directories(startup_gfx10_view_words_check PRIVATE src)
+target_compile_features(startup_gfx10_view_words_check PRIVATE cxx_std_17)
+add_test(NAME startup_gfx10_view_words COMMAND startup_gfx10_view_words_check)
+foreach(mutation IN ITEMS legacy width order uint)
+    add_test(NAME startup_gfx10_view_words_${mutation}_control COMMAND startup_gfx10_view_words_check --mutate ${mutation})
+    set_tests_properties(startup_gfx10_view_words_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Diagnostic line for a refused device slot 70 call (src/startup_stubs/memory_srv_report.h).
 add_executable(startup_memory_srv_report_check tests/startup_memory_srv_report_check.cpp)
 target_include_directories(startup_memory_srv_report_check PRIVATE src)
