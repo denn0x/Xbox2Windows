@@ -89,6 +89,10 @@ def main():
     si.dwFlags = 0x100
     si.hStdOutput, si.hStdError = out, err
     env = dict(os.environ, X2W_TRAP_LOG=trap_log)
+    # A process started under a debugger gets the debug heap: no low-fragmentation heap and checks on
+    # every allocation and free. That multiplies the cost of each free, and a startup run frees a lot.
+    # _NO_DEBUG_HEAP=1 keeps the ordinary heap; a caller who wants the checks sets _NO_DEBUG_HEAP=0.
+    env.setdefault("_NO_DEBUG_HEAP", "1")
     block = "".join(f"{k}={v}\0" for k, v in env.items()) + "\0"
     pi = PROCESS_INFORMATION()
     flags = 0x2 | 0x4 | 0x400  # DEBUG_ONLY_THIS_PROCESS | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
