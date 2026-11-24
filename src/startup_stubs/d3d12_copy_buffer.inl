@@ -25,7 +25,7 @@ int copy_buffer_mode()
         const DWORD length = GetEnvironmentVariableA("X2W_D3D12_COPY_BUFFER", value, sizeof(value));
         SetLastError(saved);
         if (!length || value[0] == '0') return 0;
-        return value[0] == '1' ? 2 : (value[0] == 'l' || value[0] == 'L') ? 1 : 0;
+        return value[0] == '1' ? 2 : (value[0] == 'l' || value[0] == 'L') ? 1 : (value[0] == 'g' || value[0] == 'G') ? 3 : 0;  // 3: LOCAL draw-rt
     }();
     return mode;
 }
@@ -92,7 +92,7 @@ void install_copy_buffer(ListTyped* typed)
 {
     const int mode = copy_buffer_mode();
     if (!mode) return;
-    typed[15] = reinterpret_cast<ListTyped>(&list_copy_buffer);
-    log("x2w-copy X2W_D3D12_COPY_BUFFER=%s: command-list slot 15 (CopyBufferRegion) %s", mode == 2 ? "1" : "log",
-        mode == 2 ? "copies title memory at record time" : "is logged only");
+    typed[15] = mode == 3 ? reinterpret_cast<ListTyped>(&list_copy_buffer_gpu) : reinterpret_cast<ListTyped>(&list_copy_buffer);  // LOCAL draw-rt
+    log("x2w-copy X2W_D3D12_COPY_BUFFER=%s: command-list slot 15 (CopyBufferRegion) %s", mode == 3 ? "gpu" : mode == 2 ? "1" : "log",
+        mode == 3 ? "runs on the GPU in list order (record-time copy as fallback)" : mode == 2 ? "copies title memory at record time" : "is logged only");
 }

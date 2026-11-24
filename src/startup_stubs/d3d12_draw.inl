@@ -179,10 +179,31 @@ LONG rt_word3_set, rt_word3_zero;
 LONG rt_uav_draws, rt_uav_buf_bound, rt_uav_buf_unresolved, rt_uav_buf_misaligned, rt_srv_in_place, rt_srv_stale_copy;
 LONG rt_heap_draws, rt_heap_skipped;
 LONG rt_uav_tex[6];  // texture uavs: [0] bound; [1..5] draws skipped (unresolved, flag, shape, format, typed store)
+LONG rt_written_evicted;  // GPU-written ranges dropped (registry full)
+// GPU-ordered CopyBufferRegion (slot 15, X2W_D3D12_COPY_BUFFER=gpu): copies run on the GPU, and record-time
+// fallbacks by reason (the record-time copy of d3d12_copy_buffer.inl).
+enum CopyFallback { cf_no_list, cf_no_title_memory, cf_range, cf_unaligned, cf_overlap, cf_dest_unresolved, cf_source_unresolved,
+                    cf_no_pipeline, cf_reasons };
+const char* const copy_fallback_names[cf_reasons] = {"list not recording", "no title memory", "size or offset out of range",
+    "offset or size not a multiple of 4", "overlapping ranges in one window", "destination not in one window",
+    "source not in one window", "copy pipeline unavailable"};
+LONG cg_gpu, cg_same_window, cg_fallback[cf_reasons];
+LONG64 cg_bytes;
+std::size_t gpu_written_count();  // draw_lock held
 LONG rt_report_frame = -1;
 void report_draw_rt()  // draw_lock held
 {
-    if (frame_number % 300 || frame_number == rt_report_frame || !(rt_loaded_word3 | rt_loaded_uav | rt_loaded_heap)) return;
+    if (frame_number % 300 || frame_number == rt_report_frame) return;
+    LONG fallbacks = 0;
+    for (LONG f : cg_fallback) fallbacks += f;
+    if (cg_gpu || fallbacks) {
+        rt_report_frame = frame_number;
+        log("x2w-copy-gpu totals: frame %ld; on the GPU %ld (same window %ld, %lld KiB); record-time fallback %ld (list %ld, title memory %ld, "
+            "range %ld, unaligned %ld, overlap %ld, dest unresolved %ld, source unresolved %ld, pipeline %ld); gpu-written ranges %zu evicted %ld",
+            frame_number, cg_gpu, cg_same_window, cg_bytes >> 10, fallbacks, cg_fallback[0], cg_fallback[1], cg_fallback[2], cg_fallback[3],
+            cg_fallback[4], cg_fallback[5], cg_fallback[6], cg_fallback[7], gpu_written_count(), rt_written_evicted);
+    }
+    if (!(rt_loaded_word3 | rt_loaded_uav | rt_loaded_heap)) return;
     rt_report_frame = frame_number;
     log("x2w-draw-rt totals: frame %ld; loaded bufword3 %ld uav %ld heap %ld; bufword3 values set %ld zero %ld; "
         "uav draws %ld, buffer uavs bound %ld null (unresolved %ld misaligned %ld); srvs in place %ld stale copy %ld; "
@@ -1292,29 +1313,43 @@ std::uint32_t view_buffer_word3(const ViewRecord& record)
     return v[3];
 }
 
-// Title ranges a translated draw bound as UAV. Raw srvs overlapping one are bound in place instead of
-// copied at record time, so a later draw reads what an earlier one stored. draw_lock held.
-struct GpuWritten { u64 begin, end; };
-std::vector<GpuWritten>& gpu_written() { static std::vector<GpuWritten> v; return v; }
+// Title ranges the GPU writes: translated-draw UAVs and GPU-ordered CopyBufferRegion destinations (slot 15,
+// X2W_D3D12_COPY_BUFFER=gpu). Raw srvs overlapping one are bound in place instead of copied at record time, so a
+// later draw reads what the GPU stored. Disjoint merged ranges, begin -> end; at most gpu_written_max, the lowest
+// other range is dropped beyond that (counted: rt_written_evicted). draw_lock held.
+std::map<u64, u64>& gpu_written() { static std::map<u64, u64> m; return m; }
+constexpr std::size_t gpu_written_max = 16384;
 void note_gpu_written(u64 address, u64 bytes)
 {
-    auto& v = gpu_written();
-    for (auto& r : v)
-        if (address <= r.end && address + bytes >= r.begin) {
-            r.begin = address < r.begin ? address : r.begin;
-            r.end = address + bytes > r.end ? address + bytes : r.end;
-            return;
+    auto& m = gpu_written();
+    u64 begin = address, end = address + bytes;
+    auto it = m.upper_bound(begin);
+    if (it != m.begin()) {
+        const auto before = std::prev(it);
+        if (before->second >= begin) {
+            begin = before->first;
+            if (before->second > end) end = before->second;
+            it = m.erase(before);
         }
-    static std::size_t next;
-    if (v.size() < 256) v.push_back({address, address + bytes});
-    else v[next++ % v.size()] = {address, address + bytes};
+    }
+    while (it != m.end() && it->first <= end) {
+        if (it->second > end) end = it->second;
+        it = m.erase(it);
+    }
+    if (m.size() >= gpu_written_max) {
+        m.erase(m.begin());
+        InterlockedIncrement(&rt_written_evicted);
+    }
+    m.emplace(begin, end);
 }
 bool gpu_written_overlaps(u64 address, u64 bytes)
 {
-    for (const auto& r : gpu_written())
-        if (address < r.end && address + bytes > r.begin) return true;
-    return false;
+    const auto& m = gpu_written();
+    auto it = m.lower_bound(address + bytes);
+    if (it == m.begin()) return false;
+    return (--it)->second > address;
 }
+std::size_t gpu_written_count() { return gpu_written().size(); }
 
 void null_uav(D3D12_CPU_DESCRIPTOR_HANDLE dest, int kind)
 {
@@ -1757,7 +1792,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             continue;
         }
         if (address && bytes && !gpu_written().empty() && gpu_written_overlaps(address, bytes)) {
-            // LOCAL draw-rt: a translated draw stores into this range: read it in place, not from a record-time copy.
+            // LOCAL draw-rt: a translated draw or a GPU copy stores into this range: read it in place, not from a record-time copy.
             ID3D12Resource* window = nullptr;
             u64 at = 0;
             if (desktop_range(address, bytes, &window, &at) && at % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0) {
@@ -1766,7 +1801,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 InterlockedIncrement(&rt_srv_in_place);
                 static LONG shown;
                 if (first_calls(shown, 4))
-                    log("x2w-draw-rt   %016llx srv %u: 0x%llx (%zu bytes) is written by a translated draw; bound in place at window %p +0x%llx",
+                    log("x2w-draw-rt   %016llx srv %u: 0x%llx (%zu bytes) is written on the GPU (draw uav or copy); bound in place at window %p +0x%llx",
                         tr->key, i, address, bytes, static_cast<void*>(window), at);
                 continue;
             }
@@ -1980,4 +2015,143 @@ void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const 
 void __stdcall list_draw_indexed(Wrapper* self, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
     InterlockedIncrement(draw_translated(self, true, count, instances, start, base_vertex, start_instance) ? &translated_draws : &untranslated_draws);
+}
+
+// LOCAL draw-rt: command-list slot 15, CopyBufferRegion, on the GPU at its place in the list
+// (X2W_D3D12_COPY_BUFFER=gpu; installed by d3d12_copy_buffer.inl, which keeps the record-time copy as fallback).
+// Source and destination are resolved to the in-place windows (desktop_range), so the copy reads what earlier GPU
+// work in the submission stored and later GPU work sees the copied bytes in the title's own pages. The copy is a
+// small compute pass with both windows as raw root UAVs, not ID3D12GraphicsCommandList::CopyBufferRegion:
+// - windows are not state-tracked; every other user (translated compute, draw UAVs, indirect) promotes them
+//   implicitly to UNORDERED_ACCESS, so a UAV use is the one state that agrees with what came before in the list;
+// - source and destination often sit in the same 256 MiB window, which cannot be COPY_SOURCE and COPY_DEST at once.
+// Order: null UAV barrier (earlier stores complete), copy, null UAV barrier, then both windows UAV -> COMMON, so
+// later implicit promotions (in-place srv reads of the destination, compute UAVs) start from COMMON again.
+// The destination range is registered as GPU-written: translated draws read it in place from then on, not from
+// a record-time snapshot (which is stale by construction).
+void __stdcall list_copy_buffer(Wrapper* self, Wrapper* dest, u64 dest_offset, Wrapper* source, u64 source_offset, u64 bytes);
+constexpr char copy_gpu_source[] = R"(
+RWByteAddressBuffer from : register(u0);
+RWByteAddressBuffer to : register(u1);
+cbuffer c : register(b0) { uint from_at; uint to_at; uint words; uint step; };
+[numthreads(64, 1, 1)] void cs(uint3 id : SV_DispatchThreadID)
+{
+    for (uint i = id.x; i < words; i += step) to.Store(to_at + i * 4, from.Load(from_at + i * 4));
+}
+)";
+ID3D12RootSignature* copy_gpu_root;
+ID3D12PipelineState* copy_gpu_pso;
+bool ensure_copy_gpu()
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static bool failed;
+    if (copy_gpu_pso) return true;
+    AcquireSRWLockExclusive(&lock);
+    if (!copy_gpu_pso && !failed) {
+        ID3D12Device* device = device_of(the_device);
+        ID3DBlob *code = nullptr, *errors = nullptr, *serialized = nullptr;
+        HRESULT hr = D3DCompile(copy_gpu_source, sizeof(copy_gpu_source) - 1, "copy_gpu", nullptr, nullptr, "cs", "cs_5_0",
+                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+        if (FAILED(hr) && errors) log("x2w-copy-gpu compile: %.400s", static_cast<const char*>(errors->GetBufferPointer()));
+        D3D12_ROOT_PARAMETER params[3]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[1].Descriptor.ShaderRegister = 1;
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[2].Constants.Num32BitValues = 4;
+        for (auto& p : params) p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        const D3D12_ROOT_SIGNATURE_DESC root_desc{3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        if (SUCCEEDED(hr)) hr = D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr);
+        ID3D12RootSignature* root = nullptr;
+        if (SUCCEEDED(hr)) hr = device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&root));
+        ID3D12PipelineState* pso = nullptr;
+        if (SUCCEEDED(hr)) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+            desc.pRootSignature = root;
+            desc.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+            hr = device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso));
+        }
+        if (code) code->Release();
+        if (errors) errors->Release();
+        if (serialized) serialized->Release();
+        if (SUCCEEDED(hr)) {
+            copy_gpu_root = root;
+            copy_gpu_pso = pso;
+        } else {
+            if (root) root->Release();
+            failed = true;
+        }
+        log("x2w-copy-gpu copy pipeline: 0x%08lx", static_cast<unsigned long>(hr));
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return copy_gpu_pso != nullptr;
+}
+
+void __stdcall list_copy_buffer_gpu(Wrapper* self, Wrapper* dest, u64 dest_offset, Wrapper* source, u64 source_offset, u64 bytes)
+{
+    auto* const to = dest && dest->own().kind == resource_kind ? static_cast<unsigned char*>(dest->own().title_memory) : nullptr;
+    auto* const from = source && source->own().kind == resource_kind ? static_cast<const unsigned char*>(source->own().title_memory) : nullptr;
+    ID3D12GraphicsCommandList* list = recording(self);
+    const u64 to_address = to ? reinterpret_cast<u64>(to) + dest_offset : 0;
+    const u64 from_address = from ? reinterpret_cast<u64>(from) + source_offset : 0;
+    ID3D12Resource *to_window = nullptr, *from_window = nullptr;
+    u64 to_at = 0, from_at = 0;
+    int reason = -1;
+    if (!list) reason = cf_no_list;
+    else if (!to || !from) reason = cf_no_title_memory;
+    else if (!bytes || bytes > (u64{256} << 20) || dest_offset > (u64{1} << 40) || source_offset > (u64{1} << 40)) reason = cf_range;
+    else if ((to_address | from_address | bytes) & 3) reason = cf_unaligned;
+    else if (!desktop_range(to_address, bytes, &to_window, &to_at)) reason = cf_dest_unresolved;
+    else if (!desktop_range(from_address, bytes, &from_window, &from_at)) reason = cf_source_unresolved;
+    else if (to_window == from_window && to_at < from_at + bytes && from_at < to_at + bytes) reason = cf_overlap;
+    else if (!ensure_copy_gpu()) reason = cf_no_pipeline;
+    static LONG shown;
+    if (reason >= 0) {
+        InterlockedIncrement(&cg_fallback[reason]);
+        if (first_calls(shown, 16))
+            log("x2w-copy-gpu CopyBufferRegion title %p <- %p bytes 0x%llx: record-time fallback: %s", static_cast<void*>(to ? to + dest_offset : nullptr),
+                static_cast<const void*>(from ? from + source_offset : nullptr), bytes, copy_fallback_names[reason]);
+        list_copy_buffer(self, dest, dest_offset, source, source_offset, bytes);
+        return;
+    }
+    // Root UAVs at 256-byte steps inside the windows; the remainder goes to the shader as byte offsets.
+    const u64 to_base = to_at & ~u64{255}, from_base = from_at & ~u64{255};
+    const std::uint32_t words = static_cast<std::uint32_t>(bytes / 4);
+    const UINT groups = words / 64 + 1 > 4096 ? 4096 : words / 64 + 1;
+    const std::uint32_t values[4] = {static_cast<std::uint32_t>(from_at - from_base), static_cast<std::uint32_t>(to_at - to_base), words, groups * 64};
+    D3D12_RESOURCE_BARRIER uav{};
+    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    list->ResourceBarrier(1, &uav);
+    list->SetPipelineState(copy_gpu_pso);
+    list->SetComputeRootSignature(copy_gpu_root);
+    list->SetComputeRootUnorderedAccessView(0, from_window->GetGPUVirtualAddress() + from_base);
+    list->SetComputeRootUnorderedAccessView(1, to_window->GetGPUVirtualAddress() + to_base);
+    list->SetComputeRoot32BitConstants(2, 4, values, 0);
+    list->Dispatch(groups, 1, 1);
+    D3D12_RESOURCE_BARRIER after[3]{};
+    after[0] = uav;
+    for (int k = 0; k < 2; ++k) {
+        after[1 + k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        after[1 + k].Transition.pResource = k ? from_window : to_window;
+        after[1 + k].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        after[1 + k].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        after[1 + k].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    }
+    list->ResourceBarrier(to_window == from_window ? 2 : 3, after);
+    // Graphics work after this point: a title pipeline with a desktop pipeline expects its state back (translated
+    // draws and compute set theirs on every call).
+    const Pass& pass = pass_of(self);
+    if (pass.pipeline_real && pass.pipeline) list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
+    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
+    note_gpu_written(to_address, bytes);
+    report_draw_rt();
+    ReleaseSRWLockExclusive(&draw_lock);
+    InterlockedIncrement(&cg_gpu);
+    if (to_window == from_window) InterlockedIncrement(&cg_same_window);
+    InterlockedAdd64(&cg_bytes, static_cast<LONG64>(bytes));
+    if (first_calls(shown, 16))
+        log("x2w-copy-gpu CopyBufferRegion title %p <- %p bytes 0x%llx: on the GPU, window %p +0x%llx <- window %p +0x%llx",
+            static_cast<void*>(to + dest_offset), static_cast<const void*>(from + source_offset), bytes, static_cast<void*>(to_window), to_at,
+            static_cast<void*>(from_window), from_at);
 }
