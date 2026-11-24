@@ -901,6 +901,10 @@ class MeshStage(G.Stage):
             return 'x2w_hword(h%d, %du)' % (s[1][1], s[3])
         return super().S(n)
 
+    def heap_sampler(self, tok):
+        # run-time offset (base) or a constant entry of the sampler heap (const_heap_sampler)
+        return super().heap_sampler(tok) or const_heap_sampler(self, tok)
+
     def set_exec_static(self, mask):
         """exec = a constant lane mask (s_mov_b64 exec, <constant> or a copy of one)."""
         mask &= ALL_LANES
@@ -1547,6 +1551,41 @@ for _op in ('add', 'sub', 'subrev'):
         setattr(MeshStage, 'op_' + _name, lambda self, ops, mods, _n=_name: self.carry_op(_n, ops, mods))
 
 
+def const_heap_sampler(stage, tok):
+    """'qh[<entry>]' for a sampler operand whose four words are one sampler-heap entry loaded at a constant byte
+    offset (`s_load_dwordx4 s[..], s[<sampler heap>], 0x410`: a fixed entry of the title's bound sampler heap, as
+    the run programs read it), else None.
+
+    The same table and manifest contract as the run-time offset form (gfx2hlsl heap_sampler; `smpheap 2048 1
+    fallback 2047`: entry n = the title's heap entry at byte 16 * n, an unaligned or out-of-range offset takes the
+    fallback entry), so the stand-in binds it as for a draw. Opt-in with X2W_SAMPLER_HEAP=1 as that form is.
+    Refused: words edited in place after the load, or words from different loads."""
+    r = reg_range(tok)
+    if not r or r[0] != 's' or r[2] - r[1] != 3:
+        return None
+    first = stage.sym.get(r[1])
+    if not first or first[0] != 'desc' or first[1] != ('smpheap',) or first[2] is None:
+        return None
+    if not stage.pipe.sampler_heap:
+        raise Unsupported('sampler from the sampler heap at constant offset %#x (X2W_SAMPLER_HEAP=1 binds the heap)'
+                          % (first[2] + 4 * first[3]))
+    if any(stage.sym.get(r[1] + i) != ('desc', first[1], first[2], first[3] + i) for i in range(4)):
+        raise Unsupported('sampler operand %s mixes sampler heap words' % tok)
+    if (first[1], first[2]) in stage.pipe.modified:
+        raise Unsupported('sampler heap entry at %#x edited in the shader' % (first[2] + 4 * first[3]))
+    offset = first[2] + 4 * first[3]
+    entry = offset >> 4 if offset % 16 == 0 and offset < 16 * G.SAMPLER_HEAP_FALLBACK else G.SAMPLER_HEAP_FALLBACK
+    stage.pipe.uses_sampler_heap = True
+    return 'qh[%du]' % entry
+
+
+class MeshPixelStage(G.Stage):
+    """The pixel stage of a mesh pipeline: the base pixel stage plus constant sampler-heap entries."""
+
+    def heap_sampler(self, tok):
+        return super().heap_sampler(tok) or const_heap_sampler(self, tok)
+
+
 class MeshPipeline(G.Pipeline):
     """Mesh + pixel pipeline. ps_code None: the mesh stage alone (coverage runs; params = what it exports)."""
 
@@ -1593,7 +1632,7 @@ class MeshPipeline(G.Pipeline):
         self.helper_text = None
         self.rect = self.ud(('rect',))
         self.vs = MeshStage(self, ms_code)
-        self.ps = G.Stage(self, 'ps', ps_code) if ps_code is not None else None
+        self.ps = MeshPixelStage(self, 'ps', ps_code) if ps_code is not None else None
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         if self.ps is not None:
             self.spi_reads()
