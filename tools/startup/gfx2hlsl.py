@@ -1504,8 +1504,8 @@ class Stage:
             lines.append('    uint %s;' % ', '.join('s%d = 0' % n for n in sorted(self.used_s)))
         if self.used_v:
             lines.append('    uint %s;' % ', '.join('v%d = 0' % n for n in sorted(self.used_v)))
-        packed = self.pipe.packed_position_vgpr
-        if self.kind == 'ps' and packed in self.used_v:
+        packed = getattr(self.pipe, 'packed_position_vgpr', None)  # the tests' bare pipelines have none
+        if self.kind == 'ps' and packed is not None and packed in self.used_v:
             lines.append('    v%d = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);' % packed)
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
         if self.uses_q:
@@ -1718,19 +1718,50 @@ SINT_RTVS = frozenset((4, 8, 14, 18, 32, 38, 43, 52, 59, 64))
 FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 
 
+# SPI pixel-stage inputs in SPI_PS_INPUT_ENA/ADDR bit order and the VGPRs each takes (Mesa
+# src/amd/common/ac_shader_util.c ac_get_fs_input_vgpr_cnt): the IJ pairs, the pull model's three, then
+# one VGPR each for line stipple, POS_X/Y/Z/W_FLOAT, FRONT_FACE, ANCILLARY, SAMPLE_COVERAGE, POS_FIXED_PT.
+PS_INPUTS = (('persp_sample', 2), ('persp_center', 2), ('persp_centroid', 2), ('persp_pull_model', 3),
+             ('linear_sample', 2), ('linear_center', 2), ('linear_centroid', 2), ('line_stipple', 1),
+             ('pos_x_float', 1), ('pos_y_float', 1), ('pos_z_float', 1), ('pos_w_float', 1),
+             ('front_face', 1), ('ancillary', 1), ('sample_coverage', 1), ('pos_fixed_pt', 1))
+POS_FIXED_PT = 15
+
+
+def ps_input_layout(ena, addr):
+    """VGPR -> SPI input bit for the given SPI_PS_INPUT_ENA/ADDR, or Unsupported.
+
+    The VGPRs follow ADDR, the inputs the code was compiled for; ENA names the ones the hardware initializes
+    and must lie inside ADDR (Mesa ac_print_spi_ps_input_vgpr_list walks the ADDR bits to number v0, v1, ... and
+    marks an input "initialized" only when its ENA bit is also set). Both are 16-bit masks.
+    """
+    if not 0 <= ena <= 0xffff or not 0 <= addr <= 0xffff or ena & ~addr:
+        raise Unsupported('unverified pixel input enable/address combination %#x/%#x' % (ena, addr))
+    layout, vgpr = {}, 0
+    for bit, (_, width) in enumerate(PS_INPUTS):
+        if addr >> bit & 1:
+            for _ in range(width):
+                layout[vgpr] = bit
+                vgpr += 1
+    return layout
+
+
 class Pipeline:
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None):
         self.root = parse_root(root_blob)
+        # With the pixel stage's SPI_PS_INPUT_ENA/ADDR (ps_hw_inputs), entry VGPRs map to SPI inputs. Only
+        # POS_FIXED_PT is lowered: the integer pixel X in [15:0] and Y in [31:16] (Mesa nir_intrinsics.py
+        # pixel_coord, "16-bit integer vec2 of the pixel X/Y in the framebuffer", which
+        # ac_nir_lower_intrinsics_to_args.c builds as unpack_32_2x16 of the pos_fixed_pt argument). D3D
+        # SV_Position.xy is the pixel centre, so its integer part is that pixel.
         self.packed_position_vgpr = None
+        self.ps_input_layout = None
         if ps_hw_inputs is not None:
             ena, addr = ps_hw_inputs
-            if ena != addr or not 0 <= ena <= 0xffff:
-                raise Unsupported('unverified pixel input enable/address combination')
-            if ena & (1 << 15):
-                # SPI PS inputs 0..6 supply IJ pairs (the pull model supplies three);
-                # line stipple through sample coverage each occupy one VGPR.
-                widths = (2, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1)
-                self.packed_position_vgpr = sum(w for bit, w in enumerate(widths) if addr & (1 << bit))
+            self.ps_input_layout = layout = ps_input_layout(ena, addr)
+            self.ps_input_ena = ena
+            if ena >> POS_FIXED_PT & 1:
+                self.packed_position_vgpr = [v for v, bit in layout.items() if bit == POS_FIXED_PT][0]
         self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
@@ -1749,6 +1780,19 @@ class Pipeline:
         # SPI_PS_INPUT_ENA/ADDR state, which a request does not carry, so this is reported, not refused (existing
         # fixtures read entry VGPRs as zero): VGPR -> offset of the first read.
         self.ps_entry_reads = dict(self.ps.entry_reads)
+        if self.ps_input_layout is not None:
+            for reg, off in sorted(self.ps_entry_reads.items(), key=lambda item: item[1]):
+                bit = self.ps_input_layout.get(reg)
+                if bit is None:
+                    raise Unsupported('pixel stage reads entry VGPR v%d at %#x, past the SPI inputs (ADDR allocates %d)'
+                                      % (reg, off, len(self.ps_input_layout)))
+                if not self.ps_input_ena >> bit & 1:
+                    raise Unsupported('pixel stage reads SPI input %s (v%d) at %#x, allocated but not enabled'
+                                      % (PS_INPUTS[bit][0], reg, off))
+                if bit != POS_FIXED_PT:
+                    raise Unsupported('pixel stage reads SPI input %s (v%d) at %#x: not lowered'
+                                      % (PS_INPUTS[bit][0], reg, off))
+            self.ps_entry_reads = {}  # every entry read is the lowered packed position
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         missing = [a for a in self.ps.attrs if a not in self.params]
@@ -1920,14 +1964,15 @@ def find_fxc():
     return shutil.which('fxc.exe')
 
 
-def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request=''):
+def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='',
+                 ps_hw_inputs=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, ps_hw_inputs=ps_hw_inputs)
         if pipe.ps_entry_reads:
             # A request does not carry the SPI input layout, so the HLSL would read that input as 0 (for example
             # the packed pixel position a dither or a full-screen copy addresses with). Not written as a result.
@@ -1988,6 +2033,7 @@ def translate_request(out_dir, key):
         a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
         if request and pipeline_key(a, b, root) != base:
             raise Unsupported('RTV variant source key mismatch')
+        ps_hw_inputs = read_ps_inputs(name + '.psin')
         if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
             # Slot 86 records complete containers in canonical (VS, PS) order.
             # Keep the container bytes in the cache key; translate only the bounded native code.
@@ -2010,7 +2056,24 @@ def translate_request(out_dir, key):
     if set(kinds) != {'vs', 'ps'}:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
-    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request)
+    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
+                        ps_hw_inputs=ps_hw_inputs)
+
+
+def read_ps_inputs(path):
+    """(ENA, ADDR) from a request's optional .psin file, 'spi_ps_input 1 <ENA hex8> <ADDR hex8>', or None.
+
+    The runtime writes it beside the request (it is not part of the key); without one the pixel stage's SPI
+    input layout is unknown and a read of an input VGPR is refused.
+    """
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding='ascii') as file:
+        text = file.read(256)
+    m = re.fullmatch(r'spi_ps_input 1 ([0-9a-f]{8}) ([0-9a-f]{8})\n(?:vs_input 1 [0-3] [0-9a-f]{8}\n)?', text)
+    if not m:
+        raise Unsupported('invalid SPI input file')
+    return int(m.group(1), 16), int(m.group(2), 16)
 
 
 def main():
