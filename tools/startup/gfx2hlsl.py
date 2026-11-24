@@ -333,7 +333,10 @@ class Stage:
         self.set_v(n, 'U(%s)' % expr)
 
     def set_s(self, n, expr, sym=None, scc=None):
-        """Assign scalar register n at run time and/or symbolically."""
+        """Assign scalar register n at run time and/or symbolically.
+
+        Any write ends n's life as a lane mask; a caller that writes a mask marks it again after this call."""
+        getattr(self, 'masks', set()).discard(n)  # (the tests' bare stages have no mask set)
         if sym is not None:
             self.sym[n] = sym
             if sym[0] != 'const':
@@ -676,10 +679,9 @@ class Stage:
             return None
         if is_mask:
             expr = '(%s) & 1' % expr
-            self.masks.add(d)
-        else:
-            self.masks.discard(d)
         self.set_s(d, expr, scc=scc)
+        if is_mask:
+            self.masks.add(d)
         if pair and base != 's_mov_b64':
             self.set_s(d + 1, '0u')
         elif pair:
@@ -759,6 +761,8 @@ class Stage:
 
     def op_s_load_dwordx4(self, ops, mods, count=4):
         dst, base = reg_range(ops[0]), reg_range(ops[1])
+        for n in range(dst[1], dst[2] + 1):
+            getattr(self, 'masks', set()).discard(n)  # a loaded descriptor or value is not a lane mask (some paths below skip set_s)
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
@@ -870,8 +874,23 @@ class Stage:
         buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
         token = smem_offset(ops[2])
         offset = self.u(token)
-        for i in range(count):
-            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, 4 * i))
+        # An SGPR offset can carry an immediate as well (disasm_rdna2 prints "s4 offset:0x10"): the byte offset is
+        # the sum. glc/dlc are cache policy. Anything else is refused.
+        extra = 0
+        for m in mods:
+            if m.startswith('offset:'):
+                extra += int(m[7:], 0)
+            elif m not in ('glc', 'dlc'):
+                raise Unsupported('s_buffer_load modifier %s' % m)
+        # Every word's address uses the offset register as it was before the load, so when the destination range
+        # holds that register it is written last (s_buffer_load_dwordx2 s[4:5], s[16:19], s4).
+        order = list(range(count))
+        r = reg_range(token)
+        if r and r[0] == 's' and dst[1] <= r[1] < dst[1] + count:
+            order.remove(r[1] - dst[1])
+            order.append(r[1] - dst[1])
+        for i in order:
+            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i))
             if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', token):
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
 
