@@ -4444,6 +4444,7 @@ void build_tables()
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
+        list_typed[46] = reinterpret_cast<ListTyped>(&list_root_uav);  // LOCAL draw-rt (d3d12_draw.inl)
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
