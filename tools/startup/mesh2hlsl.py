@@ -1694,7 +1694,10 @@ class MeshStage(G.Stage):
             self.exported_prim = True
             self.emit('if (exec & 1) { x2w_prim = %s; }' % self.u(vals[0]))
             return None
-        if target != 'pos0' and not target.startswith('param'):
+        if target == 'pos1' and self.pipe.vs_out_cntl is None:
+            # what pos1 carries (misc vector or clip/cull distances, and which channels) is pipeline state
+            raise Unsupported('mesh export target pos1 without PA_CL_VS_OUT_CNTL (request .vsout)')
+        if target not in ('pos0', 'pos1') and not target.startswith('param'):
             raise Unsupported('mesh export target %s' % target)
         before = len(self.lines)
         self.kind = 'vs'  # the base export only accepts pos/param outside a pixel stage
@@ -1754,11 +1757,14 @@ class MeshPipeline(G.Pipeline):
     """Mesh + pixel pipeline. ps_code None: the mesh stage alone (coverage runs; params = what it exports)."""
 
     def __init__(self, ms_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), user_sgpr=MESH_USER_SGPR,
-                 ps_hw_inputs=None):
+                 ps_hw_inputs=None, vs_out_cntl=None):
         self.root = G.parse_root(root_blob)
         # First user SGPR: s16 for the run programs (measured, real roots). Archive programs (offline, synthesized
         # root) may start at s8: callers pass entry_sgpr(code) together with synth_root(code).
         self.user_sgpr = user_sgpr
+        # PA_CL_VS_OUT_CNTL of the pipeline (request .vsout; regblob .vsregs u32 at +0x98, +0x54 in mesh blocks),
+        # or None: what a pos1 export carries (G.clip_vector_width). None refuses pos1.
+        self.vs_out_cntl = vs_out_cntl
         # Lane-mask SCCs to publish per wave: found by translating, refusing at the branch with the offsets of the
         # mask instructions the SCC comes from (LaneScc), and translating again with those published.
         self.scc_publish = frozenset()
@@ -1783,7 +1789,6 @@ class MeshPipeline(G.Pipeline):
         self.heapvars = []
         self.heapwords = False   # x2w_hword used (manifest `heapwords 1`)
         self.rw_keys = frozenset()
-        self.vs_out_cntl = None
         # the pixel stage's SPI inputs (SPI_PS_INPUT_ENA/ADDR, request .psin), as for draws
         self.spi_inputs(ps_hw_inputs)
         self.quad_ops = True  # the pixel stage compiles with dxc ps_6_0: DPP quad reads (gfx2hlsl Stage.quad_dpp)
@@ -1925,13 +1930,14 @@ def compile_hlsl(path, profile, out):
 
 
 def translate_to(out_dir, key, ms_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='',
-                 user_sgpr=MESH_USER_SGPR, ps_hw_inputs=None):
+                 user_sgpr=MESH_USER_SGPR, ps_hw_inputs=None, vs_out_cntl=None):
     """Writes <key>.ms.hlsl, <key>.ps.hlsl, the .cso files and <key>.txt (last), or <key>.fail.
-    ps_hw_inputs: the pixel stage's (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR), or None (entry-VGPR reads refused)."""
+    ps_hw_inputs: the pixel stage's (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR), or None (entry-VGPR reads refused).
+    vs_out_cntl: the pipeline's PA_CL_VS_OUT_CNTL (what a pos1 export carries), or None (pos1 refused)."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
         pipe = MeshPipeline(ms_code, ps_code, root_blob, rtv_formats=rtv_formats, user_sgpr=user_sgpr,
-                            ps_hw_inputs=ps_hw_inputs if ps_code is not None else None)
+                            ps_hw_inputs=ps_hw_inputs if ps_code is not None else None, vs_out_cntl=vs_out_cntl)
         if pipe.ps_entry_reads:
             reg, off = min(pipe.ps_entry_reads.items(), key=lambda item: item[1])
             raise Unsupported('pixel stage reads entry VGPR v%d (an SPI input; layout not in the request) at %#x' % (reg, off))
@@ -1973,17 +1979,22 @@ def translate_request(out_dir, key):
         a, b, root = (open(base + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
     except OSError as error:
         return 'unreadable: %s' % error
+    # optional req_<key>.vsout `pa_cl_vs_out_cntl 1 <hex8>` (not part of the key): what a pos1 export carries
+    try:
+        cntl = G.read_vs_out(base + '.vsout')
+    except Unsupported as reason:
+        return 'unsupported: %s' % reason
     if not a and b and is_mesh(b):
-        return translate_to(out_dir, key, b, None, root)   # depth-only mesh pipeline (no pixel stage)
+        return translate_to(out_dir, key, b, None, root, vs_out_cntl=cntl)   # depth-only mesh pipeline (no pixel stage)
     try:
         # the pixel stage's SPI inputs: req_<key>.psin (gfx2hlsl.read_ps_inputs format), else none
         ps_hw_inputs = G.read_ps_inputs(base + '.psin')
     except Unsupported as reason:
         return 'unsupported: %s' % reason
     if a and b and is_mesh(b) and not is_mesh(a):
-        return translate_to(out_dir, key, b, a, root, ps_hw_inputs=ps_hw_inputs)
+        return translate_to(out_dir, key, b, a, root, ps_hw_inputs=ps_hw_inputs, vs_out_cntl=cntl)
     if a and b and is_mesh(a) and not is_mesh(b):
-        return translate_to(out_dir, key, a, b, root, ps_hw_inputs=ps_hw_inputs)
+        return translate_to(out_dir, key, a, b, root, ps_hw_inputs=ps_hw_inputs, vs_out_cntl=cntl)
     return 'not a mesh pipeline'
 
 
