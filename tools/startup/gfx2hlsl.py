@@ -274,10 +274,37 @@ class Stage:
     def emit(self, text):
         self.lines.append(text)
 
+    def lane_invariant(self, expr):
+        """True when the HLSL expression has the same value in every lane of the wave.
+
+        It may name only entry constants (udN), resources (rN, read at any address the expression itself
+        computes), pure functions and literals, SGPR variables that hold a scalar number (not a lane mask: the
+        one-lane model keeps only the lane's bit of a mask) and VGPRs proven lane-invariant. vcc, exec, scc, m0,
+        the temporaries (a, w, t, q) and the interpolants (i.) depend on the lane or on state not tracked here.
+        """
+        for m in re.finditer(r'\b[A-Za-z_]\w*', expr):
+            name = m.group(0)
+            if name in LANE_INVARIANT_NAMES or name.startswith('x2w_'):
+                continue
+            reg = re.fullmatch(r'(ud|r|s|v)(\d+)', name)
+            if reg and reg.group(1) in ('ud', 'r'):
+                continue
+            if reg and reg.group(1) == 's' and int(reg.group(2)) not in self.lane_s and int(reg.group(2)) not in self.masks:
+                continue
+            if reg and reg.group(1) == 'v' and int(reg.group(2)) in self.uniform_v:
+                continue
+            return False
+        return True
+
     def set_v(self, n, expr):
         if hasattr(self, 'written_v'):
             self.written_v.add(n)
+        # A VGPR written in every lane (exec still the entry mask) from lane-invariant values holds one value in
+        # all of them, so a later v_readfirstlane_b32 reads that value whatever exec is then.
+        invariant = self.exec_known and hasattr(self, 'lane_s') and self.lane_invariant(expr)
         self.uniform_v.discard(n)
+        if invariant:
+            self.uniform_v.add(n)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
@@ -312,6 +339,12 @@ class Stage:
                 return
         else:
             self.sym.pop(n, None)
+        if hasattr(self, 'lane_s'):
+            if self.lane_invariant(expr):
+                self.lane_s.discard(n)
+            else:
+                self.lane_s.add(n)
+            self.s_written_at.setdefault(self.pc, set()).add(n)
         self.used_s.add(n)
         self.emit('s%d = %s;' % (n, expr))
         if scc:
@@ -355,7 +388,7 @@ class Stage:
     RUNTIME_BACKED = ('const', 'fixed_buffer_word', 'execcopy')
 
     def snapshot(self):
-        return dict(self.sym), set(self.masks), self.exec_known
+        return dict(self.sym), set(self.masks), self.exec_known, set(self.lane_s)
 
     def merge(self, states):
         """The symbolic state at a join of forward edges: what every incoming path agrees on.
@@ -375,6 +408,7 @@ class Stage:
         self.sym = sym
         self.masks = set().union(*(s[1] for s in states))
         self.exec_known = all(s[2] for s in states)
+        self.lane_s = set().union(*(s[3] for s in states))  # lane-dependent on any incoming path
 
     def translate(self):
         targets, sources = set(), {}
@@ -384,7 +418,9 @@ class Stage:
                 targets.add(target)
                 sources.setdefault(target, []).append(off)
         self.blocks = []          # (offset, [lines], terminator)
-        self.uniform_v = set()
+        self.uniform_v = set()    # VGPRs proven to hold one value in every lane (see set_v)
+        self.lane_s = set()       # SGPR variables that may differ between lanes in the one-lane model (see set_s)
+        self.s_written_at = {}    # instruction offset -> SGPRs it assigns at run time
         self.has_branches = bool(targets)
         start = 0
         incoming = {}             # branch target -> symbolic states of the forward branches seen so far
@@ -403,6 +439,19 @@ class Stage:
                     states.append(self.snapshot())
                 if states:
                     self.merge(states)
+            if off in targets:
+                # Lane invariance is not merged across edges for VGPRs; at a loop head the linear state misses the
+                # back edges, so every SGPR becomes suspect until it is written again.
+                self.uniform_v.clear()
+                if not all(src < off for src in sources[off]):
+                    self.lane_s = set(range(128))
+                else:
+                    # In the one-lane model a branch condition (scc, vccz, execz) may differ between lanes, so an
+                    # SGPR assigned on only some paths into this join may too, however invariant each value is.
+                    first = min(sources[off])
+                    for at, regs in self.s_written_at.items():
+                        if first <= at < off:
+                            self.lane_s |= regs
             self.pc = off
             before = len(self.lines)
             term = self.one(name, asm)
@@ -1116,8 +1165,11 @@ class Stage:
             self.uniform_v.add(dst)
 
     def op_v_readfirstlane_b32(self, ops, mods):
+        # D = S0 of the first active lane (AMD RDNA 2 ISA; LLVM selects it for a VGPR-to-SGPR copy of a value the
+        # divergence analysis found uniform, SIFixSGPRCopies). With a lane-invariant source (see set_v) every
+        # lane's own value is that value. Branches are allowed: invariance is cleared at every branch target.
         src, dst = reg_range(ops[1]), reg_range(ops[0])
-        if (mods or self.has_branches or not self.exec_known or not dst or dst[0] != 's' or
+        if (mods or not self.exec_known or not dst or dst[0] != 's' or
                 not src or src[0] != 'v' or src[1] not in self.uniform_v):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
         self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
@@ -1513,6 +1565,13 @@ class Stage:
         return lines
 
 
+# Identifiers Stage.lane_invariant accepts in an expression besides registers: pure HLSL functions and the
+# translation's own pure helpers (x2w_* are accepted by prefix), the buffer Load method and literals.
+LANE_INVARIANT_NAMES = frozenset((
+    'F', 'U', 'asuint', 'asfloat', 'asint', 'uint', 'int', 'float', 'uint2', 'float2', 'float3', 'float4',
+    'min', 'max', 'abs', 'saturate', 'sqrt', 'rsqrt', 'exp2', 'log2', 'floor', 'ceil', 'trunc', 'frac', 'round',
+    'sin', 'cos', 'countbits', 'firstbitlow', 'firstbithigh', 'reversebits', 'f16tof32', 'f32tof16',
+    'mul_legacy', 'med3', 'clamp', 'Load', 'true', 'false'))
 # name -> (source operand count, expression); operands are floats
 VEC_F = {
     'v_add_f32': (2, '{0} + {1}'), 'v_sub_f32': (2, '{0} - {1}'), 'v_subrev_f32': (2, '{1} - {0}'),
