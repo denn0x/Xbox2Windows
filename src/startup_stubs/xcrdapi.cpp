@@ -114,6 +114,8 @@ struct QueueWork {
     u64 next_submission_id = 0;
     static constexpr std::size_t max_cached_streams = 16;
     std::deque<CachedStream> cached_streams;
+    unsigned char last_served[0x48] = {};  // LOCAL: the latest request this queue served (worker only), for FAIL lines
+    bool served_any = false;
 
     void put_stream(u64 source, u64 base_offset, unsigned compressed_size, unsigned chunk_size,
                     std::vector<u64> continuation_ids, std::vector<unsigned char> data)
@@ -962,14 +964,29 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     if (failed) {
         // LOCAL: every failure, one line, with the source file's path, for offline analysis.
         wchar_t path[300] = L"memory";
+        LARGE_INTEGER file_size{};
+        file_size.QuadPart = -1;
         auto* file_object = reinterpret_cast<Object*>(source);
         if (!(options & 0x400000) && file_object && x2w_local::readable(file_object, sizeof(Object)) && file_object->kind == file &&
             file_object->handle != INVALID_HANDLE_VALUE) {
             if (!GetFinalPathNameByHandleW(file_object->handle, path, 300, FILE_NAME_NORMALIZED)) std::wcscpy(path, L"?");
+            if (!GetFileSizeEx(file_object->handle, &file_size)) file_size.QuadPart = -1;
         }
         const u64* words = reinterpret_cast<const u64*>(request);
-        log("x2w-dstorage FAIL options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x outcome=\"%s\" file=\"%ls\" +10=0x%llx +38=0x%llx +40=0x%llx", options,
-            destination_size, offset, source_size, outcome, path, words[2], words[7], words[8]);
+        // The whole 0x48-byte request as enqueued, so a refused request can be compared field by field
+        // with served ones of the same options (the two garbage-size requests of every run).
+        char bytes[3 * 0x48 + 1] = "";
+        for (int i = 0; i < 0x48; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
+        log("x2w-dstorage FAIL options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x outcome=\"%s\" file=\"%ls\" file_size=0x%llx +10=0x%llx +38=0x%llx +40=0x%llx bytes=[%s]", options,
+            destination_size, offset, source_size, outcome, path, static_cast<unsigned long long>(file_size.QuadPart), words[2], words[7], words[8], bytes);
+        if (self && self->work && self->work->served_any &&
+            *reinterpret_cast<const u64*>(self->work->last_served) == options) {
+            for (int i = 0; i < 0x48; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", self->work->last_served[i]);
+            log("x2w-dstorage   the queue's latest served request with the same options: [%s]", bytes);
+        }
+    } else if (self && self->work && std::strcmp(outcome, "empty") != 0) {
+        std::memcpy(self->work->last_served, request, sizeof self->work->last_served);
+        self->work->served_any = true;
     }
     static LONG slices_logged;
     if (interval_request && slice.at && x2w_local::first_calls(slices_logged, 32))
