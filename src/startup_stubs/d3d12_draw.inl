@@ -11,7 +11,7 @@
 
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
-    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits };
+    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, buf_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
@@ -155,6 +155,18 @@ std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { 
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
 LONG null_by_cause[x2w_local::null_cause_count];  // null_bindings split by cause; the parts add up to it
+// LOCAL draw-rt: counters of the manifest features the pipeline translator asks for (RUNTIME_NEEDS 2-5).
+// Reported every 300 frames as "x2w-draw-rt totals:" once any translation using them was loaded.
+LONG rt_loaded_word3;
+LONG rt_word3_set, rt_word3_zero;
+LONG rt_report_frame = -1;
+void report_draw_rt()  // draw_lock held
+{
+    if (frame_number % 300 || frame_number == rt_report_frame || !rt_loaded_word3) return;
+    rt_report_frame = frame_number;
+    log("x2w-draw-rt totals: frame %ld; loaded bufword3 %ld; bufword3 values set %ld zero %ld", frame_number, rt_loaded_word3,
+        rt_word3_set, rt_word3_zero);
+}
 
 void count_null_binding(x2w_local::NullCause cause)
 {
@@ -272,6 +284,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             else if (!std::strcmp(source, "rootconst")) ud.kind = Translation::root_constant;
             else if (!std::strcmp(source, "stride")) ud.kind = Translation::stride;
             else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
+            else if (!std::strcmp(source, "bufword3")) ud.kind = Translation::buf_word3;  // word 3 of srv a's descriptor
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
@@ -297,6 +310,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     tr.state = 1;
+    if (std::any_of(tr.uds.begin(), tr.uds.end(), [](const Translation::Ud& ud) { return ud.kind == Translation::buf_word3; }))
+        InterlockedIncrement(&rt_loaded_word3);
     if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu static samplers, sampler_heap=%u",
@@ -970,6 +985,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (list && pass.pipeline && !pass.targets_bound) InterlockedIncrement(&draws_without_targets);
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
     AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
+    report_draw_rt();
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass) : nullptr;
@@ -983,7 +999,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         first = 0;
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
     }
-    std::uint32_t strides[32] = {};
+    std::uint32_t strides[32] = {}, word3[32] = {};
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
     // The shader adds the "base vertex" entry value to the vertex index, so that value is biased by
     // -vertex_first and each stream's view starts at vertex_first.
@@ -1033,6 +1049,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         std::uint32_t words[8] = {};
         const bool entry_ok = entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32);
         if (entry_ok) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+        if (entry_ok && words[0] != view_token_magic) word3[i] = words[3];  // run-time buffer format (udsrc bufword3)
         bool buffer_token_known = false;
         if (srv.kind >= 1 && srv.kind <= 4) {
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
@@ -1213,7 +1230,14 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::base_vertex ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
             : ud.kind == Translation::start_instance ? start_instance
             : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
-            : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a] : 0;
+            : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a]
+            : ud.kind == Translation::buf_word3 && ud.a >= 0 && ud.a < 32 ? word3[ud.a] : 0;
+        if (ud.kind == Translation::buf_word3) {
+            InterlockedIncrement(values[i] ? &rt_word3_set : &rt_word3_zero);
+            static LONG shown;
+            if (first_calls(shown, 1))
+                log("x2w-draw-rt bufword3 first use: pipeline %016llx entry value %zu = word 3 of srv %d = 0x%08x", tr->key, i, ud.a, values[i]);
+        }
     }
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
     if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
