@@ -172,19 +172,26 @@ int main(int argc, char** argv) {
     bool stats_ok = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &o9, sizeof(o9))) &&
                     o9.MeshShaderPipelineStatsSupported;
 
-    // root signature: b0 constants, t0..tN-1 root SRVs, u0 dump, u1 hits
+    // root signature: b0 constants, t0..tN-1 as ONE descriptor table of raw buffer views (bounded: a load past
+    // the end reads 0, as the console's V# range check; root SRVs have no bounds check and an out-of-range load
+    // there is undefined, which hung a GPU), u0 dump, u1 hits
     std::vector<D3D12_ROOT_PARAMETER1> params;
     D3D12_ROOT_PARAMETER1 p{};
     p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p.Constants.Num32BitValues = (UINT)consts.size();
     params.push_back(p);
-    for (UINT i = 0; i < srvs.size(); ++i) {
+    D3D12_DESCRIPTOR_RANGE1 srv_range{};
+    srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srv_range.NumDescriptors = (UINT)srvs.size();
+    srv_range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC;
+    if (!srvs.empty()) {
         D3D12_ROOT_PARAMETER1 q{};
-        q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        q.Descriptor.ShaderRegister = i;
-        q.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC;
+        q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        q.DescriptorTable.NumDescriptorRanges = 1;
+        q.DescriptorTable.pDescriptorRanges = &srv_range;
         params.push_back(q);
     }
+    const UINT uav_param = (UINT)params.size();
     for (UINT i = 0; i < 2; ++i) {
         D3D12_ROOT_PARAMETER1 q{};
         q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -231,6 +238,22 @@ int main(int argc, char** argv) {
         std::memset(m, 0, (size_t)d.Width);
         std::memcpy(m, data.data(), data.size());
         srv_res[i]->Unmap(0, nullptr);
+    }
+    Ref<ID3D12DescriptorHeap> srv_heap;
+    D3D12_DESCRIPTOR_HEAP_DESC shd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, srvs.empty() ? 1u : (UINT)srvs.size(),
+                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    CHECK(device->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&srv_heap)));
+    UINT srv_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    for (size_t i = 0; i < srvs.size(); ++i) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = DXGI_FORMAT_R32_TYPELESS;
+        v.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Buffer.NumElements = (UINT)(read_file(srvs[i]).size() / 4);
+        v.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += i * srv_step;
+        device->CreateShaderResourceView(srv_res[i], &v, h);
     }
     Ref<ID3D12Resource> uav[2], back[2], zero;
     UINT64 sizes[2] = {dump_bytes, hits_bytes};
@@ -305,8 +328,10 @@ int main(int argc, char** argv) {
     list->SetGraphicsRootSignature(root);
     list->SetPipelineState(pso);
     list->SetGraphicsRoot32BitConstants(0, (UINT)consts.size(), consts.data(), 0);
-    for (UINT i = 0; i < srvs.size(); ++i) list->SetGraphicsRootShaderResourceView(1 + i, srv_res[i]->GetGPUVirtualAddress());
-    for (UINT i = 0; i < 2; ++i) list->SetGraphicsRootUnorderedAccessView(1 + (UINT)srvs.size() + i, uav[i]->GetGPUVirtualAddress());
+    ID3D12DescriptorHeap* heaps[] = {srv_heap};
+    list->SetDescriptorHeaps(1, heaps);
+    if (!srvs.empty()) list->SetGraphicsRootDescriptorTable(1, srv_heap->GetGPUDescriptorHandleForHeapStart());
+    for (UINT i = 0; i < 2; ++i) list->SetGraphicsRootUnorderedAccessView(uav_param + i, uav[i]->GetGPUVirtualAddress());
     if (stats_ok) list->BeginQuery(qheap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 0);
     list->DispatchMesh(groups, 1, 1);
     if (stats_ok) {
@@ -324,8 +349,15 @@ int main(int argc, char** argv) {
     CHECK(queue->Signal(fence, 1));
     HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     CHECK(fence->SetEventOnCompletion(1, ev));
-    WaitForSingleObject(ev, 60000);
+    DWORD t0 = GetTickCount();
+    DWORD waited = WaitForSingleObject(ev, 60000);
+    printf("gpu wait: %s after %lu ms, fence %llu\n", waited == WAIT_OBJECT_0 ? "done" : "TIMEOUT",
+           (unsigned long)(GetTickCount() - t0), (unsigned long long)fence->GetCompletedValue());
     CHECK(device->GetDeviceRemovedReason());
+    if (waited != WAIT_OBJECT_0) {
+        fprintf(stderr, "the GPU did not finish within 60 s\n");
+        return 3;
+    }
 
     const char* ext[2] = {".dump", ".hits"};
     for (int i = 0; i < 2; ++i) {

@@ -166,6 +166,16 @@ class MeshStage(G.Stage):
                 return off + n
         return None
 
+    def loop_heads(self):
+        if getattr(self, '_heads', None) is None:
+            self._heads = set()
+            for off, _, name, asm in self.ins:
+                if name.startswith('s_cbranch') or name == 's_branch':
+                    t = int(parse(asm)[1][0].split('_')[1], 16)
+                    if t <= off:
+                        self._heads.add(t)
+        return self._heads
+
     def branch_targets(self):
         if getattr(self, '_targets', None) is None:
             self._targets = {int(parse(asm)[1][0].split('_')[1], 16) for _, _, name, asm in self.ins
@@ -340,6 +350,11 @@ class MeshStage(G.Stage):
             self.pending = []
         if self.pc in self.branch_targets():
             self.shadow.clear()      # another path may arrive here without the shadow assignments
+        if self.pc in self.loop_heads():
+            # the linear scan reaches a loop head with the state from before the loop; a later iteration can
+            # arrive with any exec
+            self.exec_static = None
+            self.static_copies.clear()
         if base in ('s_waitcnt_depctr',):
             return None
         if base.startswith('s_cbranch_exec') and self.exec_static is not None:
@@ -406,8 +421,12 @@ class MeshStage(G.Stage):
         self._static_set = False
         for r in writes:
             self.static_copies.pop(r, None)
+            if isinstance(r, int):
+                self.static_copies.pop(r - 1, None)   # the high half of a 64-bit copy
+        before = len(self.lines)
         term = super().one(name, asm)
-        if not self._static_set and self.exec_written(name, ops):
+        if not self._static_set and (self.exec_written(name, ops) or
+                                     any(re.search(r'\bexec = ', l) for l in self.lines[before:])):
             self.exec_static = None   # exec changed in a way not modelled as a constant mask
         if term and term[0] == 'branch':
             cond = term[1]
@@ -431,7 +450,7 @@ class MeshStage(G.Stage):
     @staticmethod
     def exec_written(name, ops):
         base = re.sub(r'_e(32|64)$', '', name)
-        return ('saveexec' in base or base.startswith('v_cmpx') or
+        return ('saveexec' in base or 'wrexec' in base or base.startswith('v_cmpx') or
                 (base.startswith('s_') and ops and ops[0] in ('exec', 'exec_lo')))
 
     def exec_mask_expr(self, mask):
@@ -1031,6 +1050,15 @@ class MeshPipeline(G.Pipeline):
             # attributes the pixel stage reads only interpolated: drop the flat copy (as hlsl_vs)
             line = re.sub(r'o\.fparam(\d+) = [^;]*;', lambda mm: mm.group(0) if int(mm.group(1)) in self.flat else '', line)
             body.append(line)
+        if dump:
+            # progress markers (tests only): header word 1 = 1 at entry, word 2 = phases completed
+            marked, phase = [], 0
+            for line in body:
+                marked.append(line)
+                if line.strip() == 'GroupMemoryBarrierWithGroupSync();' and line.startswith('    G'):
+                    phase += 1
+                    marked.append('    if (tid == 0) x2w_dump.Store(gid * %du + 8u, %du);' % (16 + GROUP * stride, phase))
+            body = ['    if (tid == 0) x2w_dump.Store(gid * %du + 4u, 1u);' % (16 + GROUP * stride)] + marked
         out += s.declarations() + ['    v5 = gid * %du + tid;  // inferred fast-launch vertex id' % GROUP] + body
         out += ['    GroupMemoryBarrierWithGroupSync();',
                 '    uint nv = min(x2w_alloc & 0x7ffu, %du), np = min((x2w_alloc >> 12) & 0x7ffu, %du);' % (MAX_VERTICES, MAX_PRIMITIVES),
