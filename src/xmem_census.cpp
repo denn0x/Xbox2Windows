@@ -85,6 +85,54 @@ int heap_text(char* out, int at, int capacity) noexcept
     return append(out, at, capacity, " heaps %lu committed=%llu MiB (largest %llu)", counted, committed / mib, largest / mib);
 }
 
+// LOCAL memcut: resident (working-set) MiB of each startup block of 16 MiB or more, a lower bound of
+// the pages the title has touched (untouched committed pages are never resident; touched ones can be
+// trimmed). Ranks the "commit startup blocks on first touch" cut (memcut_work/PLAN.md).
+// The walk (~1.2 M pages in run 82) runs at most every 9 s; the lines in between repeat its text.
+int block_resident_walk(char* out, int at, int capacity);
+int block_resident_text(char* out, int at, int capacity) noexcept
+{
+    static char cached[384];
+    static ULONGLONG last;
+    const ULONGLONG now = GetTickCount64();
+    if (!cached[0] || now - last >= 9000) {
+        last = now;
+        cached[0] = 0;
+        try {
+            block_resident_walk(cached, 0, sizeof(cached));
+        } catch (...) {
+            cached[0] = 0;  // out of memory: no residency text this time
+        }
+    }
+    return cached[0] ? append(out, at, capacity, "%s", cached) : at;
+}
+int block_resident_walk(char* out, int at, int capacity)
+{
+    std::vector<std::pair<ULONG_PTR, SIZE_T>> known;
+    AcquireSRWLockShared(&block_lock);
+    if (blocks) known = *blocks;
+    ReleaseSRWLockShared(&block_lock);
+    if (known.empty()) return at;
+    std::sort(known.begin(), known.end());
+    constexpr SIZE_T page = 4096, chunk = 65536;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(chunk);
+    at = append(out, at, capacity, "; block resident MiB");
+    for (const auto& [base, bytes] : known) {
+        if (bytes < (16ull << 20)) continue;
+        ULONGLONG resident = 0;
+        for (SIZE_T done = 0; done < bytes / page;) {
+            const SIZE_T n = std::min(chunk, bytes / page - done);
+            for (SIZE_T i = 0; i < n; ++i) info[i].VirtualAddress = reinterpret_cast<void*>(base + (done + i) * page);
+            if (!QueryWorkingSetEx(GetCurrentProcess(), info.data(), static_cast<DWORD>(n * sizeof(info[0])))) break;
+            for (SIZE_T i = 0; i < n; ++i) resident += info[i].VirtualAttributes.Valid;
+            done += n;
+        }
+        at = append(out, at, capacity, " %llx:%llu/%llu", static_cast<unsigned long long>(base), resident * page / mib,
+                    static_cast<unsigned long long>(bytes / mib));
+    }
+    return at;
+}
+
 // Counters of other stand-ins (x2w_memory_counters exports).
 int stand_in_text(char* out, int at, int capacity) noexcept
 {
@@ -106,7 +154,7 @@ int stand_in_text(char* out, int at, int capacity) noexcept
 
 void report(ULONGLONG second) noexcept
 {
-    char line[1400];
+    char line[1536];  // LOCAL memcut: was 1400; logf's own limit is 1536
     ULONGLONG limit = 0;
     const ULONGLONG committed = system_commit(&limit);
     PROCESS_MEMORY_COUNTERS_EX counters{};
@@ -130,6 +178,7 @@ void report(ULONGLONG second) noexcept
     if (at < 0) return;
     at = heap_text(line, at, sizeof(line));
     at = gpu_text(line, at, sizeof(line));
+    at = block_resident_text(line, at, sizeof(line));  // LOCAL memcut
     at = stand_in_text(line, at, sizeof(line));
     x2w_local::logf("%s", line);
 }
