@@ -544,6 +544,16 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
 endforeach()
 
+# OMSetRenderTargets with a single descriptor range and handles that hold no view, through the outcome counters.
+add_executable(startup_rtv_bind tests/startup_rtv_bind.cpp)
+target_compile_features(startup_rtv_bind PRIVATE cxx_std_17)
+target_link_libraries(startup_rtv_bind PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_rtv_bind_${backend} COMMAND startup_rtv_bind ${backend})
+    set_tests_properties(startup_rtv_bind_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
+
 add_executable(startup_nv12_draw tests/startup_nv12_draw.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_nv12_draw PRIVATE cxx_std_17)
 target_include_directories(startup_nv12_draw PRIVATE src)

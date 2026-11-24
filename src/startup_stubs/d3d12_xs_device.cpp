@@ -2214,6 +2214,15 @@ bool format_has_stencil(DXGI_FORMAT format)
     return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
            format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R32G8X24_TYPELESS;
 }
+// Outcome of every slot 50 call (exactly one each), reported and reset every 300 presented frames.
+enum TargetBind {
+    bind_bound, bind_single_range_bound, bind_not_recording, bind_count_over_8, bind_handles_unreadable,
+    bind_range_past_heap, bind_wrong_kind, bind_unresolved, bind_empty, bind_depth_wrong_kind, bind_depth_unknown,
+    bind_depth_one_plane, bind_outcomes
+};
+LONG target_binds[bind_outcomes], target_unresolved_at[8];
+LONG target_depth_unreadable, target_depth_unmapped;  // bound without the depth the title passed
+LONG draws_without_targets;  // translated draws refused because no bind succeeded on the list (d3d12_draw.inl)
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
 // With single_range the title passes only the first handle; target i is at handle + i * the title's RTV
 // stride (title_descriptor_stride: for RTV heaps the same desktop increment the title reads from the
@@ -2232,13 +2241,14 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target0 = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
     static LONG refused;
-    if (!list) return;
+    const auto refuse = [](TargetBind why) { InterlockedIncrement(&target_binds[why]); };
+    if (!list) return refuse(bind_not_recording);
     if (count > 8) {
         if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: %u render targets (at most 8)", count);
-        return;
+        return refuse(bind_count_over_8);
     }
     const UINT listed = single_range ? (count ? 1 : 0) : count;
-    if (listed && !x2w_local::readable(handles, listed * sizeof(*handles))) return;
+    if (listed && !x2w_local::readable(handles, listed * sizeof(*handles))) return refuse(bind_handles_unreadable);
     u64 stride = 0;
     if (single_range && count) {
         const UINT increment = the_device ? device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) : 0;
@@ -2249,7 +2259,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             if (first_calls(refused, 6))
                 log("x2w-d3d12 OMSetRenderTargets refused: single range of %u at 0x%llx has %u descriptors left in its heap",
                     count, static_cast<unsigned long long>(handles[0].ptr), available);
-            return;
+            return refuse(bind_range_past_heap);
         }
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop[8];
@@ -2262,11 +2272,12 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         if (view.wrong_kind && first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: render target %u is not a render target view", i);
         targets[i] = view.resource;
         if (!targets[i]) {
-            if (view.wrong_kind) return;
+            if (view.wrong_kind) return refuse(bind_wrong_kind);
             if (first_calls(refused, 6))
                 log("x2w-d3d12 OMSetRenderTargets refused: render target %u of %u (title 0x%llx, %s) holds no known view", i, count,
                     static_cast<unsigned long long>(title), single_range ? "single range" : "array");
-            return;
+            InterlockedIncrement(&target_unresolved_at[i]);
+            return refuse(bind_unresolved);
         }
         formats[i] = view_format_of(desktop[i].ptr, targets[i]);
     }
@@ -2275,15 +2286,17 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     ID3D12Resource* dsv_target = nullptr;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     D3D12_RESOURCE_STATES dsv_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    if (depth && !x2w_local::readable(depth, sizeof(*depth))) InterlockedIncrement(&target_depth_unreadable);
     if (depth && x2w_local::readable(depth, sizeof(*depth))) {
         const u64 resolved = desktop_cpu_handle(depth->ptr);
+        if (!resolved && depth->ptr) InterlockedIncrement(&target_depth_unmapped);
         if (resolved) {
             const ResolvedView view = resolve_view(resolved, 21);
             dsv_target = view.resource;
             if (!dsv_target) {
                 if (first_calls(refused, 6))
                     log("x2w-d3d12 OMSetRenderTargets refused: depth handle is %s", view.wrong_kind ? "not a depth stencil view" : "not a known depth stencil view");
-                return;
+                return refuse(view.wrong_kind ? bind_depth_wrong_kind : bind_depth_unknown);
             }
             dsv_format = view_format_of(resolved, dsv_target);
             const bool read_depth = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0;
@@ -2291,14 +2304,14 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
             if (read_depth != read_stencil) {
                 if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: depth stencil view with one read-only plane (flags 0x%x)", view.dsv_flags);
-                return;
+                return refuse(bind_depth_one_plane);
             }
             if (read_depth) dsv_state = D3D12_RESOURCE_STATE_DEPTH_READ;
             desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
             dsv_ptr = &desktop_dsv;
         }
     }
-    if (!count && !dsv_ptr) return;
+    if (!count && !dsv_ptr) return refuse(bind_empty);
     for (UINT i = 0; i < count; ++i) {
         use_as_target(self, targets[i]);
         pass.target_formats[i] = formats[i];
@@ -2309,6 +2322,33 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.dsv_format = dsv_format;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
+    InterlockedIncrement(&target_binds[single_range && count ? bind_single_range_bound : bind_bound]);
+}
+// One line per 300 presented frames: slot 50 outcomes since the last line (counters reset here).
+void report_target_binds()
+{
+    LONG n[bind_outcomes], at[8];
+    LONG calls = 0;
+    for (int i = 0; i < bind_outcomes; ++i) calls += n[i] = InterlockedExchange(&target_binds[i], 0);
+    for (int i = 0; i < 8; ++i) at[i] = InterlockedExchange(&target_unresolved_at[i], 0);
+    log("x2w-targets 300 frames: binds %ld bound %ld single-range %ld refused by reason (not recording %ld, count over 8 %ld, "
+        "handles unreadable %ld, range past heap %ld, wrong kind %ld, unresolved target %ld [at %ld %ld %ld %ld %ld %ld %ld %ld], "
+        "empty %ld, depth wrong kind %ld, depth unknown %ld, depth one read-only plane %ld), bound without depth (unreadable %ld, "
+        "unmapped %ld), draws without targets %ld",
+        calls, n[bind_bound] + n[bind_single_range_bound], n[bind_single_range_bound], n[bind_not_recording],
+        n[bind_count_over_8], n[bind_handles_unreadable], n[bind_range_past_heap], n[bind_wrong_kind], n[bind_unresolved],
+        at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7], n[bind_empty], n[bind_depth_wrong_kind],
+        n[bind_depth_unknown], n[bind_depth_one_plane], InterlockedExchange(&target_depth_unreadable, 0),
+        InterlockedExchange(&target_depth_unmapped, 0), InterlockedExchange(&draws_without_targets, 0));
+}
+// Fixtures: slot 50 outcome counts since the last report, in TargetBind order (bound, single-range bound,
+// then the refusal reasons). Returns how many outcomes exist.
+extern "C" __declspec(dllexport) unsigned x2w_d3d12_target_bind_stats(unsigned* counts, unsigned capacity)
+{
+    for (unsigned i = 0; counts && i < capacity && i < bind_outcomes; ++i)
+        counts[i] = static_cast<unsigned>(InterlockedCompareExchange(&target_binds[i], 0, 0));
+    return bind_outcomes;
+}
 // List slots 21 / 22 / 23, RSSetViewports / RSSetScissorRects / OMSetBlendFactor.
 void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* viewports)
 {
@@ -4177,6 +4217,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
             texture_bytes_uploaded, textures_unreadable);
+    if (render_mode() && frame % 300 == 0) report_target_binds();
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];

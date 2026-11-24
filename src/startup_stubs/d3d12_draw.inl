@@ -936,6 +936,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     const bool rect = pass.topology == 0x11;
+    if (list && pass.pipeline && !pass.targets_bound) InterlockedIncrement(&draws_without_targets);
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
     AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
     BoundPipeline* bound = translation_for(pass.pipeline);
