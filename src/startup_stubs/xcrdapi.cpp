@@ -354,9 +354,10 @@ void __stdcall file_close(Object* self)
 long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 {
     const BOOL ok = info && GetFileInformationByHandle(self->handle, info);
+    const DWORD error = ok ? 0 : GetLastError();  // before log(), whose Win32 calls overwrite it
     log("x2w-dstorage File::GetFileInformation -> %s size=0x%llx", ok ? "ok" : "fail",
         ok ? (static_cast<unsigned long long>(info->nFileSizeHigh) << 32) | info->nFileSizeLow : 0ull);
-    return ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    return ok ? S_OK : HRESULT_FROM_WIN32(error);
 }
 
 // Queue slot 3, EnqueueRequest(request*) by the PC numbering. Request layout from the title's builder

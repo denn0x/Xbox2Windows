@@ -1622,6 +1622,68 @@ bool dstorage_directory_batches()
     return readback.good();
 }
 
+using FileInformationFn = long(__stdcall*)(void*, BY_HANDLE_FILE_INFORMATION*);
+
+// File::GetFileInformation must return the Win32 error of its own failed call, not the error left by the
+// logging that follows. Runs the same sequence with the trap-log variable unset and set, because the stand-in's
+// logger calls GetEnvironmentVariableW (and CreateFileW when the variable is set), and both overwrite the
+// thread's last error. A closed file object keeps its vtable and holds INVALID_HANDLE_VALUE, so the call is
+// well defined and must fail with ERROR_INVALID_HANDLE.
+bool dstorage_file_information_checks()
+{
+    HMODULE library = LoadLibraryW(L"XCRDAPI.dll");
+    if (!library) return false;
+    auto get_factory = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(library, "DStorageGetFactory"));
+    void* factory_ptr = nullptr;
+    if (!get_factory || get_factory(nullptr, &factory_ptr) != 0 || !factory_ptr) return false;
+    auto* factory = static_cast<Object*>(factory_ptr);
+
+    wchar_t temp_dir[MAX_PATH], temp_file[MAX_PATH], log_file[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, temp_dir) || !GetTempFileNameW(temp_dir, L"x2w", 0, temp_file) ||
+        !GetTempFileNameW(temp_dir, L"x2w", 0, log_file))
+        return false;
+    constexpr DWORD size = 1234;
+    HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    std::vector<unsigned char> bytes(size, 0x5a);
+    DWORD written = 0;
+    const bool wrote = WriteFile(h, bytes.data(), size, &written, nullptr) && written == size;
+    CloseHandle(h);
+    if (!wrote) {
+        DeleteFileW(temp_file);
+        return false;
+    }
+
+    bool ok = true;
+    for (const bool log_set : {false, true}) {
+        SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_set ? log_file : nullptr);
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            ok = false;
+            break;
+        }
+        auto* file = static_cast<Object*>(file_ptr);
+        auto information = reinterpret_cast<FileInformationFn>(file->vtable[4]);
+        BY_HANDLE_FILE_INFORMATION info{};
+        const long open_hr = information(file, &info);
+        const bool open_ok = open_hr == S_OK && info.nFileSizeHigh == 0 && info.nFileSizeLow == size;
+        reinterpret_cast<CloseFileFn>(file->vtable[3])(file);
+        SetLastError(0);
+        const long closed_hr = information(file, &info);
+        const long expected = HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE);
+        const bool closed_ok = closed_hr == expected;
+        std::printf("file-information log=%s open: hr=0x%08lx size=%lu %s; closed: hr=0x%08lx expected=0x%08lx %s\n",
+                    log_set ? "set" : "unset", static_cast<unsigned long>(open_hr), info.nFileSizeLow,
+                    open_ok ? "ok" : "MISMATCH", static_cast<unsigned long>(closed_hr),
+                    static_cast<unsigned long>(expected), closed_ok ? "ok" : "MISMATCH");
+        ok = ok && open_ok && closed_ok;
+    }
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", nullptr);
+    DeleteFileW(temp_file);
+    DeleteFileW(log_file);
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1646,6 +1708,11 @@ int main(int argc, char** argv)
     if (!std::strcmp(which, "dstorage-pages")) {
         if (!dstorage_page_array_checks()) return 9;
         std::puts("dstorage-pages ok");
+        return 0;
+    }
+    if (!std::strcmp(which, "dstorage-file-information")) {
+        if (!dstorage_file_information_checks()) return 10;
+        std::puts("dstorage-file-information ok");
         return 0;
     }
     if (!std::strcmp(which, "dstorage")) {
