@@ -382,6 +382,62 @@ u64 archive_read_offset(HANDLE handle, u64 offset, unsigned size)
     return offset;
 }
 
+// LOCAL: multi-piece zlib streams across queues and submissions (measured on one executable). One
+// stream that inflates to several destination-sized pieces is enqueued as one request per piece;
+// every piece names the same compressed size and piece k's offset is the stream's offset plus k
+// times the destination size. The continuation cache above only covers pieces queued in the same
+// submission on the same queue. Pieces that miss it are served from a shared cache of recently
+// inflated streams, or by finding the stream start on disk (offset - k * piece, a zlib header, and a
+// full Adler-checked inflate past piece k).
+LONG requests_stream_pieces, requests_pieces_found_on_disk;
+struct InflatedStream { u64 source, base; unsigned compressed; std::shared_ptr<const std::vector<unsigned char>> data; };
+std::mutex streams_lock;
+std::deque<InflatedStream> streams;
+void remember_stream(u64 source, u64 base, unsigned compressed, std::shared_ptr<const std::vector<unsigned char>> data)
+{
+    const std::lock_guard guard(streams_lock);
+    streams.push_front({source, base, compressed, std::move(data)});
+    if (streams.size() > 16) streams.pop_back();
+}
+bool find_stream(u64 source, u64 offset, unsigned compressed, unsigned piece, std::shared_ptr<const std::vector<unsigned char>>& data, u64& base)
+{
+    const std::lock_guard guard(streams_lock);
+    for (const InflatedStream& s : streams) {
+        if (s.source != source || s.compressed != compressed || offset <= s.base || !piece) continue;
+        const u64 at = offset - s.base;
+        if (at % piece || at >= s.data->size()) continue;
+        data = s.data;
+        base = s.base;
+        return true;
+    }
+    return false;
+}
+std::shared_ptr<const std::vector<unsigned char>> stream_on_disk(HANDLE handle, u64 offset, unsigned compressed, unsigned piece, u64& base)
+{
+    if (!piece || compressed > (64u << 20)) return nullptr;
+    const auto read_at = [handle](u64 at, unsigned char* out, unsigned size) {
+        OVERLAPPED overlapped{};
+        overlapped.Offset = static_cast<DWORD>(at);
+        overlapped.OffsetHigh = static_cast<DWORD>(at >> 32);
+        DWORD read = 0;
+        return ReadFile(handle, out, size, &read, &overlapped) && read == size;
+    };
+    std::vector<unsigned char> packed;
+    for (u64 k = 1; k <= 64 && k * piece <= offset; ++k) {
+        const u64 at = offset - k * piece;
+        unsigned char head[2];
+        if (!read_at(at, head, 2) || head[0] != 0x78 || ((head[0] << 8) | head[1]) % 31) continue;
+        packed.resize(compressed);
+        if (!read_at(at, packed.data(), compressed)) continue;
+        std::vector<unsigned char> big(std::min<std::size_t>(std::size_t{32} << 20, std::max<std::size_t>(std::size_t{4} << 20, std::size_t{piece} * (k + 64))));
+        std::size_t produced = 0;
+        if (!x2w_inflate::inflate_zlib(packed.data(), compressed, big.data(), big.size(), &produced) || produced <= k * piece) continue;
+        base = at;
+        return std::make_shared<const std::vector<unsigned char>>(big.begin(), big.begin() + produced);
+    }
+    return nullptr;
+}
+
 void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
     if (!request) return;
@@ -476,6 +532,16 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                             cached_chunked = true;
                         }
                     }
+                    if (!cached_chunked && !memory_source && !bcpack && produced > destination_size) {
+                        // LOCAL: piece 0 of a multi-piece stream whose other pieces are not in this
+                        // submission: keep the whole stream for them and serve this piece's slice.
+                        remember_stream(source, offset, source_size, std::make_shared<const std::vector<unsigned char>>(output));
+                        decode_length = destination_size;
+                        data = output.data();
+                        outcome = "inflated (stream piece 0, shared cache)";
+                        InterlockedIncrement(&requests_stream_pieces);
+                        cached_chunked = true;
+                    }
                     if (!cached_chunked) {
                         decode_length = produced;
                         data = output.data();
@@ -525,6 +591,28 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
 
+            if (!direct_decoded && !memory_source && !bcpack) {
+                // LOCAL: a later piece that missed the submission's cache (see remember_stream).
+                std::shared_ptr<const std::vector<unsigned char>> whole;
+                u64 base = 0;
+                auto* file_object = reinterpret_cast<Object*>(source);
+                const bool from_file = file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE;
+                if (find_stream(source, offset, source_size, destination_size, whole, base)) {
+                } else if (from_file && (whole = stream_on_disk(file_object->handle, offset, source_size, destination_size, base))) {
+                    remember_stream(source, base, source_size, whole);
+                    InterlockedIncrement(&requests_pieces_found_on_disk);
+                }
+                if (whole) {
+                    const std::size_t at = static_cast<std::size_t>(offset - base);
+                    const std::size_t take = std::min<std::size_t>(destination_size, whole->size() - at);
+                    output.assign(whole->begin() + at, whole->begin() + at + take);
+                    data = output.data();
+                    decode_length = take;
+                    outcome = "inflated (stream piece)";
+                    InterlockedIncrement(&requests_stream_pieces);
+                    direct_decoded = true;
+                }
+            }
             if (!direct_decoded) {
                 outcome = "zlib failed";
                 data = nullptr;
@@ -934,9 +1022,9 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                     std::snprintf(section_text, sizeof(section_text), "unknown");
                 // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
-                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld archive-shifted=%ld past-end=%ld; page tokens 0 at enqueue=%ld, "
+                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld archive-shifted=%ld past-end=%ld stream-pieces=%ld found-on-disk=%ld; page tokens 0 at enqueue=%ld, "
                     "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
-                    requests_failed, requests_bcpack_blank, requests_archive_shifted, requests_archive_past_end, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
+                    requests_failed, requests_bcpack_blank, requests_archive_shifted, requests_archive_past_end, requests_stream_pieces, requests_pieces_found_on_disk, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
                     section_text);
                 last = total2;
                 last_memory = sample;
