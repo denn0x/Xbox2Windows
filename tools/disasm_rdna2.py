@@ -2695,12 +2695,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             sbase_str = f"s[{sbase}:{sbase + base_width - 1}]"
         soffset = (w1 >> 25) & 0x7f
         imm_offset = w1 & 0x1fffff
+        if imm_offset & 0x100000:
+            # GFX9+ SMEM OFFSET[20:0] is a signed 21-bit byte offset (LLVM sign-extends it)
+            imm_offset -= 0x200000
+        imm_str = f"-0x{-imm_offset:x}" if imm_offset < 0 else f"0x{imm_offset:x}"
         if soffset == 125:
-            off_str = f"0x{imm_offset:x}"
+            off_str = imm_str
         else:
             off_str = decode_s_reg(soffset)
             if imm_offset:
-                off_str += f" offset:0x{imm_offset:x}"
+                off_str += f" offset:{imm_str}"
         mods = []
         if (w0 >> 16) & 1:
             mods.append("glc")
