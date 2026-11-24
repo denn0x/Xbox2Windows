@@ -519,7 +519,9 @@ HRESULT create_draw_root(Translation& tr)
     const UINT n = static_cast<UINT>(tr.srvs.size()), m = static_cast<UINT>(tr.uavs.size());
     if (!m && !tr.heap)
         return x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()), n, tr.samplers, &tr.root);
-    D3D12_ROOT_PARAMETER parameters[8]{};
+    // At most 9: constants, srv table, sampler table (smpheap), uav table, heapmem, vinfo, region table, vdesc
+    // (heapwords) = 2 + 1 + 1 + 3 + 1; root cost <= 32 + 4 tables + 3 root SRVs x 2 = 42 of 64 DWORDs.
+    D3D12_ROOT_PARAMETER parameters[9]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = static_cast<UINT>(tr.uds.size());
     const D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, n, 0, 0, 0};
