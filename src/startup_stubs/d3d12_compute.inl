@@ -716,8 +716,9 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
                     bytes = static_cast<std::size_t>(l.bytes);
                     strides[i] = l.index_stride;
                     note_typed_view(l, record, false);
-                    if (!typed_views_off()) {
-                        // word 3 of the V# the console holds for this view (format, swizzle), for bufword3 entry values
+                    if (!typed_views_off() && l.kind == x2w_startup::BufferViewKind::typed) {
+                        // word 3 of the V# the console holds for this typed view (format, swizzle), for bufword3 entry
+                        // values; raw and structured views keep 0 (the translator's raw-words fallback)
                         std::uint32_t v[8];
                         x2w_startup::gfx10_buffer_words(l, v);
                         word3[i] = v[3];
