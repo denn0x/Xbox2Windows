@@ -87,11 +87,18 @@ MESH_HELPERS = {
     'x2w_madp': 'float x2w_madp(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }',
     'x2w_mbcnt_lo':'uint x2w_mbcnt_lo(uint m, uint lane) { return countbits(m & (lane >= 32u ? 0xffffffffu : ((1u << lane) - 1u))); }',
     'x2w_mbcnt_hi': 'uint x2w_mbcnt_hi(uint m, uint lane) { return lane < 32u ? 0u : countbits(m & ((1u << (lane - 32u)) - 1u)); }',
-    # word 3 of a resource-heap buffer view: vinfo dword 2 of its view id (PROPOSED runtime field, RUNTIME_NEEDS.md
-    # section 8: the same synthesized SQ_BUF_RSRC_WORD3 that `udsrc bufword3` hands a table view; 0 = raw)
-    'x2w_vword3': 'uint x2w_vword3(uint h) { uint i = x2w_vid(h); return i < %du ? vinfo.Load(i * 16u + 8u) : 0u; }'
-                  % getattr(G, 'HEAP_IDS', 90000),
+    # word i of a resource-heap descriptor: the runtime's synthesized gfx10 V#/T# words of the view (PROPOSED
+    # runtime buffer, manifest `heapwords 1`, RUNTIME_NEEDS.md 6.3: 32 bytes per view id, root SRV t2 space1;
+    # 0 for an unknown slot or view id, so a null descriptor reads as all zero words)
+    'x2w_hword': ('ByteAddressBuffer x2w_vdesc : register(t2, space1);\n'
+                  'uint x2w_hword(uint h, uint i) { uint id = x2w_vid(h); return id < %du ? x2w_vdesc.Load(id * 32u + 4u * i) : 0u; }'
+                  % getattr(G, 'HEAP_IDS', 90000)),
 }
+# Mesh-only lowerings whose manifest lines need runtime support not in the draw path yet (comma list):
+# heapwords = numeric reads of resource-heap descriptor words (x2w_hword, manifest `heapwords 1`).
+MESH_FEATURES = frozenset(f for f in os.environ.get('X2W_MESH_FEATURES', '').replace(' ', '').split(',') if f)
+if MESH_FEATURES - {'heapwords'}:
+    raise SystemExit('X2W_MESH_FEATURES: unknown %s' % ', '.join(sorted(MESH_FEATURES - {'heapwords'})))
 
 
 def scalar_regs(text):
@@ -370,8 +377,9 @@ class MeshStage(G.Stage):
                 self.tainted.discard(target)
                 self.au.pop(target, None)
                 continue
-            self.tainted.add(target)
+            # (the sources as they were before this statement: `s12 = scc ? s12 : s24` reads the old, untainted s12)
             lane = {d for d in deps & self.tainted if d != 'exec' and self.au.get(d) != self.epoch}
+            self.tainted.add(target)
             if lane or target == 'exec':
                 self.au.pop(target, None)
             else:
@@ -509,11 +517,10 @@ class MeshStage(G.Stage):
             raise Unsupported('group-uniform execz at %#x inside a per-lane range' % off)
         hits = self.skipped_scalars(off, target)
         restore = []
-        if hits:
-            for o, n, name, asm in self.ins:
-                if (name.startswith('s_cbranch') or name == 's_branch') and not off <= o < target and \
-                        int(parse(asm)[1][0].split('_')[1], 16) == target:
-                    raise Unsupported('execz range %#x-%#x: its end is also reached from %#x' % (off, target, o))
+        # the end may also be reached by other branches: only a lane that came through this branch restores
+        # (x2w_u<seen> = 1 here, cleared at the end)
+        seen = 'x2w_u%d' % len(self.shadow_vars)
+        self.shadow_vars.append(seen)
         k = len(self.wave_any)
         self.wave_any.append(off)
         for r in sorted(hits):
@@ -535,7 +542,10 @@ class MeshStage(G.Stage):
             self.emit('%s = %s;' % (var, value))
             if r != -1:
                 self.used_s.add(r)
-            restore.append('if (x2w_any[%d][wave] == 0u) %s = %s;' % (k, reg, var))
+            restore.append('if (%s != 0u && x2w_any[%d][wave] == 0u) %s = %s;' % (seen, k, reg, var))
+        if restore:
+            self.emit('%s = 1u;' % seen)
+            restore.append('%s = 0u;' % seen)
         self.emit('if (exec & 1) x2w_any[%d][wave] = 1u;' % k)
         self.group_restore.setdefault(target, []).extend(restore)
         return ('barrier', 'wave-branch', k, target)
@@ -591,10 +601,14 @@ class MeshStage(G.Stage):
 
     def format_load(self, ops, mods, count, name):
         """buffer_load_format_* through a resource-heap descriptor (X2W_DRAW_FEATURES heap + bufword3): the format
-        and swizzle come from x2w_vword3 (vinfo dword 2 of the view id); table descriptors take the base path."""
+        and swizzle come from the view's word 3 (x2w_hword, X2W_MESH_FEATURES=heapwords); table descriptors take
+        the base path."""
         key = self.descriptor(ops[2])
-        if key[0][0] != 'heapdyn' or not {'heap', 'bufword3'} <= set(getattr(self.pipe, 'features', ())):
+        if key[0][0] != 'heapdyn':
             return super().format_load(ops, mods, count, name)
+        if not {'heap', 'bufword3'} <= set(getattr(self.pipe, 'features', ())) or 'heapwords' not in MESH_FEATURES:
+            raise Unsupported('%s through heapdyn' % name)
+        self.pipe.heapwords = True
         for m in mods:
             if not (m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:')):
                 raise Unsupported('%s modifier %s' % (name, m))
@@ -602,7 +616,19 @@ class MeshStage(G.Stage):
         buf, address = self.buffer_address(ops, mods)
         self.emit('a = %s;' % address)
         for i in range(count):
-            self.set_v(dst[1] + i, 'x2w_fmt_load(%s, a, x2w_vword3(h%d), %du)' % (buf, key[0][1], i))
+            self.set_v(dst[1] + i, 'x2w_fmt_load(%s, a, x2w_hword(h%d, 3u), %du)' % (buf, key[0][1], i))
+
+    def S(self, n):
+        """A word of a resource-heap descriptor read as a number (an image's width bits, a null test): the
+        runtime's synthesized word (x2w_hword), with X2W_MESH_FEATURES=heapwords; otherwise as the base."""
+        s = self.sym.get(n)
+        if s and s[0] == 'hword':
+            return 'x2w_hword(h%d, %du)' % (s[1], s[2])
+        if (s and s[0] == 'desc' and isinstance(s[1], tuple) and s[1][0] == 'heapdyn' and s[2] == 0
+                and 'heapwords' in MESH_FEATURES and 'heap' in getattr(self.pipe, 'features', ())):
+            self.pipe.heapwords = True
+            return 'x2w_hword(h%d, %du)' % (s[1][1], s[3])
+        return super().S(n)
 
     def set_exec_static(self, mask):
         """exec = a constant lane mask (s_mov_b64 exec, <constant> or a copy of one)."""
@@ -784,6 +810,34 @@ class MeshStage(G.Stage):
         return written & self.liveness().get(target, frozenset())
 
     def scalar(self, base, ops):
+        """With X2W_MESH_FEATURES=heapwords, words of a resource-heap descriptor that a scalar op reads as numbers
+        (not an in-place edit of the descriptor) are the runtime's synthesized words (x2w_hword): they are
+        swapped for a numeric symbol for this instruction, so the base computes the result at run time
+        instead of keeping a symbolic `descnum`."""
+        swapped = {}
+        if 'heapwords' in MESH_FEATURES and 'heap' in getattr(self.pipe, 'features', ()):
+            d = reg_range(ops[0])
+            own = self.sym.get(d[1]) if d and d[0] == 's' else None
+            for t in ops[1:]:
+                r = reg_range(t)
+                if not r or r[0] != 's':
+                    continue
+                for n in range(r[1], r[2] + 1):
+                    s = self.sym.get(n)
+                    if (s and s[0] == 'desc' and isinstance(s[1], tuple) and s[1][0] == 'heapdyn' and s[2] == 0
+                            and s != own):
+                        swapped[n] = s
+                        self.sym[n] = ('hword', s[1][1], s[3])
+        if swapped:
+            self.pipe.heapwords = True
+        try:
+            return self.scalar_inner(base, ops)
+        finally:
+            for n, s in swapped.items():
+                if self.sym.get(n) == ('hword', s[1][1], s[3]):
+                    self.sym[n] = s
+
+    def scalar_inner(self, base, ops):
         dname = ops[0]
         r0 = reg_range(dname)
         if dname == 'm0':
@@ -975,6 +1029,24 @@ class MeshStage(G.Stage):
         else:
             x, y = ('(%s & 0xffffu)' % self.u(t) for t in (a, b))
         return self.compare_result(base.replace(typ, 'i32' if typ == 'i16' else 'u32'), cond, writes_exec, dst, x, y)
+
+    def image(self, ops, mods, how):
+        """d16 image results: the channels the base computes as binary32 are packed two per VGPR as binary16,
+        the first in the low half, the unused half of an odd last register 0 (gfx10 packed D16). Only for the
+        float views the base binds (Texture*<float4>); the base refuses the other result modifiers."""
+        if 'd16' not in mods:
+            return super().image(ops, mods, how)
+        dmask = int([m for m in mods if m.startswith('dmask:')][0][6:], 0)
+        n = bin(dmask & 15).count('1')
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[2] - dst[1] + 1 != (n + 1) // 2:
+            raise Unsupported('d16 image result %s for dmask %#x' % (ops[0], dmask))
+        tmp = 1000                                           # HLSL-only scratch VGPRs (the console has 256)
+        super().image([('v[%d:%d]' % (tmp, tmp + n - 1)) if n > 1 else 'v%d' % tmp] + list(ops[1:]), [m for m in mods if m != 'd16'], how)
+        for j in range((n + 1) // 2):
+            lo = 'f32tof16(asfloat(v%d))' % (tmp + 2 * j)
+            hi = '(f32tof16(asfloat(v%d)) << 16)' % (tmp + 2 * j + 1) if 2 * j + 1 < n else '0u'
+            self.set_v(dst[1] + j, '(%s | %s)' % (lo, hi))
 
     def op_v_bfm_b32(self, ops, mods):
         """V_BFM_B32: D = ((1 << S0[4:0]) - 1) << S1[4:0] (RDNA 2 ISA)."""
@@ -1190,6 +1262,7 @@ class MeshPipeline(G.Pipeline):
         # X2W_DRAW_FEATURES as for draws (pstrans gfx2hlsl.draw_features); a base without them keeps refusing.
         self.features = G.draw_features() if hasattr(G, 'draw_features') else frozenset()
         self.heapvars = []
+        self.heapwords = False   # x2w_hword used (manifest `heapwords 1`)
         self.rw_keys = frozenset()
         self.vs_out_cntl = None
         self.packed_position_vgpr = None
@@ -1232,6 +1305,11 @@ class MeshPipeline(G.Pipeline):
         stride = 4 * (4 + 4 * nparams + 1)
         out = self.common()
         body_text = self.helper_text
+        if self.heapwords and not any(self.heapvars):
+            # descriptor words read, but no heap view used as a resource: the base emitted no heap declarations
+            out += ['ByteAddressBuffer heapmem : register(t0, space1);',
+                    'uint x2w_vid(uint h) { return heapmem.Load(h) == 0x%08xu ? heapmem.Load(h + 4) : 0xffffffffu; }'
+                    % G.HEAP_TOKEN]
         out += [text for name, text in MESH_HELPERS.items() if re.search(r'\b%s\(' % name, body_text)]
         out += ['struct MSOut {'] + self.interface(False) + ['};',
                 'struct MSPrim { bool cull : SV_CullPrimitive;%s };' % (' uint pid : SV_PrimitiveID;' if dump else '')] + (
@@ -1293,6 +1371,10 @@ class MeshPipeline(G.Pipeline):
 
     def manifest(self):
         text = super().manifest() if self.ps else self.manifest_ms_only()
+        if self.heapwords:
+            if not re.search(r'^heap 1$', text, re.M):
+                text += 'heap 1\n'
+            text += 'heapwords 1\n'
         return text + 'stage mesh\nms %d %d %d\n' % (GROUP, MAX_VERTICES, MAX_PRIMITIVES)
 
     def manifest_ms_only(self):
