@@ -99,6 +99,8 @@ MESH_HELPERS = {
 }
 # Mesh-only lowerings whose manifest lines need runtime support not in the draw path yet (comma list):
 # heapwords = numeric reads of resource-heap descriptor words (x2w_hword, manifest `heapwords 1`).
+# Exec-off conflicts (MeshStage.merge_exec_off): on by default; X2W_MESH_EXECOFF=0 restores the earlier refusals.
+EXEC_OFF = os.environ.get('X2W_MESH_EXECOFF', '1') != '0'
 MESH_FEATURES = frozenset(f for f in os.environ.get('X2W_MESH_FEATURES', '').replace(' ', '').split(',') if f)
 if MESH_FEATURES - {'heapwords'}:
     raise SystemExit('X2W_MESH_FEATURES: unknown %s' % ', '.join(sorted(MESH_FEATURES - {'heapwords'})))
@@ -208,6 +210,9 @@ class MeshStage(G.Stage):
         self.scc_confined = set()    # lane-mask SCC offsets whose mask result is inside the active lanes (`x & exec`)
         self.lds_used = False
         self.lds_written_in_phase = False
+        self.exec_off = set()        # conflict SGPRs whose conflicting paths all came with this lane's exec bit 0
+        self._execz_edge = False
+        self._execz_snaps = []       # snapshots of taken s_cbranch_execz edges (compared by identity)
         super().__init__(pipe, 'ms', code)
         if not self.alloc_seen:
             raise Unsupported('no GS_ALLOC_REQ (s_sendmsg 0x9): not an NGG mesh stage')
@@ -507,8 +512,14 @@ class MeshStage(G.Stage):
         if self.pending:
             self.lines.extend(self.pending)
             self.pending = []
+        if base == 's_cbranch_execz':
+            self._execz_edge = True   # the snapshot of this branch's taken edge (base translate) is an execz edge
+        if self.pc in self.loop_heads():
+            self.exec_off = set()
         for r, before, at in self.group_checks.get(self.pc, ()):
-            if self.sym.get(r) != before:
+            # A merge that left ('conflict',) is refused by any later use (exec_off_use: an exec-masked mask op
+            # excepted), so only another change is refused here.
+            if self.sym.get(r) != before and not (EXEC_OFF and self.sym.get(r) == ('conflict',)):
                 raise Unsupported('execz range %#x-%#x changes s%d from %s to %s' % (at, self.pc, r, before[0], self.sym.get(r)))
         if self.pc in self.branch_targets():
             self.shadow.clear()      # another path may arrive here without the shadow assignments
@@ -589,6 +600,8 @@ class MeshStage(G.Stage):
                 self.static_copies.pop(r - 1, None)   # the high half of a 64-bit copy
         before = len(self.lines)
         term = super().one(name, asm)
+        if self.exec_written(name, ops) or any(re.search(r'\bexec = ', l) for l in self.lines[before:]):
+            self.exec_off = set()     # lanes may have been turned on: an exec-off register is plain conflict again
         if not self._static_set and (self.exec_written(name, ops) or
                                      any(re.search(r'\bexec = ', l) for l in self.lines[before:])):
             self.exec_static = None   # exec changed in a way not modelled as a constant mask
@@ -787,6 +800,9 @@ class MeshStage(G.Stage):
         snap = super().snapshot() + (self.exec_static, dict(self.static_copies))
         if JOIN_TAINT:
             snap += (frozenset(self.tainted), dict(self.au), self.epoch)
+        if self._execz_edge:
+            self._execz_edge = False
+            self._execz_snaps.append(snap)
         return snap
 
     def merge(self, states):
@@ -808,6 +824,51 @@ class MeshStage(G.Stage):
                 if all(r not in s[-3] or (s[-2].get(r) == s[-1] == self.epoch) for s in states):
                     au[r] = self.epoch
             self.au = au
+        self.merge_exec_off(states)
+
+    def merge_exec_off(self, states):
+        """Registers that the merge made ('conflict',) only because of taken s_cbranch_execz edges.
+
+        A lane takes an execz edge only with its exec bit 0 (per lane: `(exec & 1) == 0`; group-uniform: no lane of
+        the group active), so on those paths the lane's bit is 0 at the join; every other path assigned the
+        register at run time. The run programs use this for a lane mask merged after a divergent if (v_cmp_e64
+        into a reused SGPR inside the range, then `s_nand_b64 / s_orn2_b64 sX, sX, exec` after it; INFERRED to be the
+        compiler's i1 phi, whose skipped side is undefined). Until exec is written again
+        (exec_off_use), a mask op whose lane bit does not depend on the register when exec is 0 may read its HLSL
+        variable."""
+        self.exec_off = set()
+        if not EXEC_OFF:
+            return
+        backed = self.RUNTIME_BACKED
+        for reg, value in self.sym.items():
+            if value != ('conflict',):
+                continue
+            bad = [s for s in states if s[0].get(reg) is not None and s[0].get(reg)[0] not in backed]
+            if bad and len(bad) < len(states) and all(any(s is e for e in self._execz_snaps) for s in bad):
+                self.exec_off.add(reg)
+
+    def exec_off_use(self, base, ops):
+        """Exec-off conflict registers (merge_exec_off) a 64-bit mask op may read: the op takes exec as the other
+        operand and its lane bit is the same for both values of the register's bit when the lane's exec bit is 0
+        (s_and X, exec = 0; s_nand = 1; s_andn2 exec, X = 0; s_orn2 X, exec = 1). Empty when it does not apply."""
+        if not self.exec_off or base not in G.SCA or len(ops) != 3 or not base.endswith('_b64'):
+            return set()
+        srcs = ops[1:]
+        if 'exec' not in srcs:
+            return set()
+        k = 1 - srcs.index('exec')
+        r = reg_range(srcs[k])
+        if not r or r[0] != 's' or r[1] not in self.exec_off or self.sym.get(r[1]) != ('conflict',):
+            return set()
+        text = G.SCA[base][0]
+        if '{2}' in text or not re.fullmatch(r'[~(){}01&|^ ]+', text):
+            return set()
+        bits = set()
+        for x in (0, 1):
+            args = ['0', '0']
+            args[k] = str(x)
+            bits.add(eval(text.format(*args)) & 1)   # noqa: S307 (a fixed SCA formula over two constant bits)
+        return {r[1]} if len(bits) == 1 else set()
 
     def format_load(self, ops, mods, count, name):
         """buffer_load_format_* through a resource-heap descriptor (X2W_DRAW_FEATURES heap + bufword3): the format
@@ -1033,6 +1094,11 @@ class MeshStage(G.Stage):
         swapped for a numeric symbol for this instruction, so the base computes the result at run time
         instead of keeping a symbolic `descnum`."""
         swapped = {}
+        off_regs = self.exec_off_use(base, ops)
+        for n in off_regs:
+            # (merge_exec_off) the register's run-time variable: right on the paths that assigned it, and the
+            # result does not depend on it in a lane that came with exec 0
+            self.sym.pop(n)
         if 'heapwords' in MESH_FEATURES and 'heap' in getattr(self.pipe, 'features', ()):
             d = reg_range(ops[0])
             own = self.sym.get(d[1]) if d and d[0] == 's' else None
@@ -1054,6 +1120,9 @@ class MeshStage(G.Stage):
             for n, s in swapped.items():
                 if self.sym.get(n) == ('hword', s[1][1], s[3]):
                     self.sym[n] = s
+            for n in off_regs:
+                if n not in scalar_regs(ops[0]):
+                    self.sym[n] = ('conflict',)
 
     def scalar_inner(self, base, ops):
         dname = ops[0]
