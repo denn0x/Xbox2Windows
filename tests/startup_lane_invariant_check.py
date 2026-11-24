@@ -162,3 +162,4 @@ def carries():
 
 if __name__ == '__main__':
     readfirstlane()
+    carries()

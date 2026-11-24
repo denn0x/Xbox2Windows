@@ -1209,6 +1209,61 @@ class Stage:
         self.set_v(d[1], 'q.x')
         self.set_v(d[1] + 1, 'q.y')
 
+    def carry_op(self, ops, mods, kind, carry_in):
+        """v_{add,sub,subrev}_co[_ci]_u32 D, SDST, S0, S1[, CI]: 32-bit add or subtract with a carry or borrow out.
+
+        AMD RDNA 2 ISA: V_ADD_CO_CI_U32 D = S0 + S1 + CI, carry = the 33rd bit; V_SUB_CO_CI_U32 D = S0 - S1 - CI,
+        borrow = S1 + CI > S0 (as 33-bit values); SUBREV swaps S0 and S1; the _co forms have no carry-in. LLVM
+        VOP2Instructions.td defines V_ADD_CO_CI_U32 as gfx10's name for v_addc_u32 (VOP2b, carry-out an SGPR mask).
+        The carry is the lane's bit of SDST, as v_cmp writes it; CI must be a lane mask (vcc, exec or an SGPR the
+        translation holds as a mask). Both results go through q, so D or SDST may overlap a source.
+        """
+        if mods:
+            raise Unsupported('v_%s_co%s_u32 with %s' % (kind, '_ci' if carry_in else '', ' '.join(mods)))
+        if len(ops) != (5 if carry_in else 4):
+            raise Unsupported('v_%s_co%s_u32 with %d operands' % (kind, '_ci' if carry_in else '', len(ops)))
+        d = reg_range(ops[0])
+        if not d or d[0] != 'v' or d[1] != d[2]:
+            raise Unsupported('carry operation destination %s' % ops[0])
+        a, b = self.u(ops[2]), self.u(ops[3])
+        if kind == 'subrev':
+            a, b = b, a
+        c = '0u'
+        if carry_in:
+            r = reg_range(ops[4])
+            if not (ops[4] in ('vcc', 'vcc_lo', 'exec', 'exec_lo') or (r and r[0] == 's' and r[1] in self.masks)):
+                raise Unsupported('carry-in %s is not a lane mask' % ops[4])
+            c = '(%s & 1u)' % self.u(ops[4] if not r else 's%d' % r[1])
+        if kind == 'add':
+            value, carry = '%s + %s + %s' % (a, b, c), '((%s + %s) < %s || (%s + %s + %s) < (%s + %s))' % (
+                a, b, a, a, b, c, a, b)
+        else:
+            value, carry = '%s - %s - %s' % (a, b, c), '(%s > %s || (%s - %s) < %s)' % (b, a, a, b, c)
+        self.uses_q = True
+        self.emit('q = uint2(%s, %s ? 1u : 0u);' % (value, carry))
+        self.set_v(d[1], 'q.x')
+        sdst = ops[1]
+        r = reg_range(sdst)
+        self.write_compare(False, sdst if not r else 's%d' % r[1], 'q.y')
+
+    def op_v_add_co_ci_u32(self, ops, mods):
+        self.carry_op(ops, mods, 'add', True)
+
+    def op_v_sub_co_ci_u32(self, ops, mods):
+        self.carry_op(ops, mods, 'sub', True)
+
+    def op_v_subrev_co_ci_u32(self, ops, mods):
+        self.carry_op(ops, mods, 'subrev', True)
+
+    def op_v_add_co_u32(self, ops, mods):
+        self.carry_op(ops, mods, 'add', False)
+
+    def op_v_sub_co_u32(self, ops, mods):
+        self.carry_op(ops, mods, 'sub', False)
+
+    def op_v_subrev_co_u32(self, ops, mods):
+        self.carry_op(ops, mods, 'subrev', False)
+
     def op_v_lshrrev_b64(self, ops, mods):
         self.shift64(ops, mods, 'x2w_lshr64')
 
