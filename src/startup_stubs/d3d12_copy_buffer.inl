@@ -62,16 +62,18 @@ void __stdcall list_copy_buffer(Wrapper* self, Wrapper* dest, u64 dest_offset, W
         done = true;
     }
     InterlockedIncrement(done ? &buffer_copies_done : &buffer_copies_skipped);
-    // The first copy to each destination title address (at most 256 lines); copies of up to 0x100
-    // bytes show the whole source, longer ones its first 16 bytes.
+    // The first copy to each destination title address; copies of up to 0x100 bytes (constant
+    // blocks) show the whole source, longer ones its first 16 bytes. Small and long copies have
+    // separate budgets of 256 lines each: in run 84, world-streaming copies of 0x404 and 0x1000 bytes
+    // spent a single budget within 37 s of setup.
     static SRWLOCK seen_lock = SRWLOCK_INIT;
     static std::unordered_set<u64>* seen = new std::unordered_set<u64>;
     const u64 where = to ? reinterpret_cast<u64>(to) + dest_offset : reinterpret_cast<u64>(dest) ^ (dest_offset << 1);
     AcquireSRWLockExclusive(&seen_lock);
     const bool fresh = seen->size() < 4096 && seen->insert(where).second;
     ReleaseSRWLockExclusive(&seen_lock);
-    static LONG shown;
-    if (fresh && first_calls(shown, 256)) {
+    static LONG shown_small, shown_long;
+    if (fresh && first_calls(bytes && bytes <= 0x100 ? shown_small : shown_long, 256)) {
         const std::size_t dumped = bytes && bytes <= 0x100 ? static_cast<std::size_t>(bytes) : 16;
         char head[3 * 0x100 + 1] = "";
         if (from && x2w_local::readable(from + source_offset, dumped)) hex_text(from + source_offset, dumped, head, sizeof(head));
@@ -81,7 +83,7 @@ void __stdcall list_copy_buffer(Wrapper* self, Wrapper* dest, u64 dest_offset, W
     }
     static LONG reports;
     const LONG total = buffer_copies_done + buffer_copies_skipped;
-    if (total % 5000 == 0 && first_calls(reports, 40))
+    if (total % 1000 == 0 && first_calls(reports, 40))
         log("x2w-copy CopyBufferRegion totals: copied %ld, skipped %ld", buffer_copies_done, buffer_copies_skipped);
 }
 
