@@ -908,6 +908,18 @@ bool area_call(const GUID& provider_id, int slot, u64* args, u64* result)
         *result = 0;
         return true;
     }
+    if (slot > 3 && IsEqualGUID(provider_id, store_provider_id)) {
+        // LOCAL: every other store method that receives the offline context must not reach the
+        // runtime, which dereferences the handle. Refused with E_FAIL, as an offline store would.
+        for (int i = 0; i < 6; ++i) {
+            if (args[i] != store_context_handle) continue;
+            static LONG refused;
+            if (InterlockedIncrement(&refused) <= 16)
+                x2w_local::logf("x2w-runtime store slot %d with the offline context -> E_FAIL", slot);
+            *result = 0x80004005;
+            return true;
+        }
+    }
     return false;
 }
 
