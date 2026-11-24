@@ -272,6 +272,14 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, const Pass& pass)
         target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
                   D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
     if (bound.has_blend) desc.BlendState = bound.blend;
+    // LOCAL EXPERIMENT (X2W_DRAW_DEFAULT_BLEND=1): when no blend description was found, blend
+    // source alpha over the target. Draws that output alpha 1 look the same; coverage-alpha draws
+    // (atlas glyphs) need it. The real fix decodes the console blend registers.
+    static const bool default_blend = x2w_local::env_on("X2W_DRAW_DEFAULT_BLEND");
+    if (!bound.has_blend && default_blend)
+        for (auto& target : desc.BlendState.RenderTarget)
+            target = {TRUE, FALSE, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE,
+                      D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
     desc.SampleMask = ~0u;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -396,7 +404,10 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end()) generation = found->second;
     ReleaseSRWLockShared(&written_lock);
     const bool announced = state.generation != generation;
-    const bool recheck = state.done && !announced && total <= (u64{32} << 20) && frame_number - state.checked_frame >= 15;
+    // Glyph atlases (A8) are written by the CPU just before the draws that use them, and the UI caches
+    // the result in its own target: they are checked on every frame, other textures every 15.
+    const LONG recheck_frames = desc.Format == DXGI_FORMAT_A8_UNORM && total <= (u64{8} << 20) ? 1 : 15;
+    const bool recheck = state.done && !announced && total <= (u64{32} << 20) && frame_number - state.checked_frame >= recheck_frames;
     if (state.done && !announced && !recheck) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
