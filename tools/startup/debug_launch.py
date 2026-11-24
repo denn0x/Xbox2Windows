@@ -428,6 +428,11 @@ def main():
                     "\\device\\rawip", "\\device\\ws2ifsl")
     denied = {}
 
+    # X2W_BINK_PER_HANDLE=1: per movie handle, every NextFrame count 1-3 and each 100th, only pause
+    # changes (not the per-frame repeats), and a frame count on close and in the exit report.
+    bink_per_handle = os.environ.get("X2W_BINK_PER_HANDLE") == "1"
+    bink_handles = {}  # handle -> {"frames", "paused", "opened"}
+
     def bink_call(name, regs, ret):
         """Counts the call, remembers the movie handle and frame buffers; returns a log line or None."""
         bink_counts[name] = bink_counts.get(name, 0) + 1
@@ -435,6 +440,24 @@ def main():
             bink_state["bink"], bink_state["buffers"] = regs["Rcx"], regs["Rdx"]
         if name == "BinkNextFrame":
             bink_state["bink"] = regs["Rcx"]
+        if bink_per_handle and name != "BinkOpenWithOptions":
+            movie = bink_handles.setdefault(regs["Rcx"], {"frames": 0, "paused": None, "opened": False})
+            if name == "BinkNextFrame":
+                movie["frames"] += 1
+                if movie["frames"] > 3 and movie["frames"] % 100:
+                    return None
+                return f"BinkNextFrame rcx={regs['Rcx']:#x} handle frame call {movie['frames']} from {where(ret)}"
+            if name == "BinkPause":
+                paused = regs["Rdx"] != 0
+                if movie["paused"] == paused:
+                    return None
+                movie["paused"] = paused
+                return (f"BinkPause rcx={regs['Rcx']:#x} -> {'paused' if paused else 'playing'} after "
+                        f"{movie['frames']} NextFrame calls from {where(ret)}")
+            if name == "BinkClose":
+                frames = movie["frames"]
+                bink_handles.pop(regs["Rcx"], None)
+                return f"BinkClose rcx={regs['Rcx']:#x} after {frames} NextFrame calls from {where(ret)}"
         if name in ("BinkNextFrame", "BinkShouldSkip") and bink_counts[name] > 3:
             return None
         text = ""
@@ -447,6 +470,8 @@ def main():
         if not bink_counts:
             return
         print("  bink calls: " + ", ".join(f"{k} x{v}" for k, v in sorted(bink_counts.items())))
+        for handle, movie in sorted(bink_handles.items()):
+            print(f"  bink handle {handle:#x} still open: {movie['frames']} NextFrame calls, paused={movie['paused']}")
         header = read(bink_state["bink"], 32) if bink_state.get("bink") else None
         if header:
             print("  bink header (width, height, frames, frame, ...): " + " ".join(str(v) for v in struct.unpack("<8I", header)))
