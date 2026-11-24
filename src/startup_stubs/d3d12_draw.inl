@@ -2168,6 +2168,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
+    gpu_time::mark(self, list, gpu_time::c_draw, tr->key, false);  // LOCAL: X2W_GPU_TIME_CLASSES
     if (indirect_pending(self)) { drawn = indirect_draw_issue(self, list, indexed); } else if (indexed) {  // LOCAL: d3d12_indirect.inl
         u64 offset = 0;
         const u64 address = index_address;
@@ -2183,6 +2184,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         drawn = true;
     }
+    gpu_time::mark(self, list, gpu_time::c_draw, tr->key, true, !drawn);
     if (drawn && m) {
         // LOCAL draw-rt: the stores complete before later work reads or writes the same memory.
         D3D12_RESOURCE_BARRIER barrier{};
@@ -2474,7 +2476,9 @@ void __stdcall list_copy_buffer_gpu(Wrapper* self, Wrapper* dest, u64 dest_offse
         note_issued_dispatch(list, groups, 1, 1, false);
         cx_issue_key = issue_key;
         cx_issue_path = issue_path;
+        gpu_time::mark(self, list, gpu_time::c_copy, bytes, false);  // LOCAL: X2W_GPU_TIME_CLASSES (key: byte count)
         list->Dispatch(groups, 1, 1);
+        gpu_time::mark(self, list, gpu_time::c_copy, bytes, true);
         list->ResourceBarrier(1, &uav);
         // Graphics work after this point: a title pipeline with a desktop pipeline expects its state back (translated
         // draws and compute set theirs on every call).

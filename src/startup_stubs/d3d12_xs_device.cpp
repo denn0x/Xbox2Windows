@@ -1726,6 +1726,10 @@ void close(Wrapper* self, ID3D12GraphicsCommandList* list);
 void submitted(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& wrappers);
 void reset(Wrapper* self);
 void report();
+// LOCAL stall: X2W_GPU_TIME_CLASSES=1, more classes and the recording span
+enum Class { c_cx = 0, c_draw, c_c62, c_copy, c_list, c_count };
+void mark(Wrapper* self, ID3D12GraphicsCommandList* list, int cls, u64 key, bool after, bool drop = false);
+void list_begin(Wrapper* self, ID3D12GraphicsCommandList* list);
 }  // namespace gpu_time
 // List slot 139 (Xbox order): (allocator, 0, 0), the per-frame reset.
 HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
@@ -1749,6 +1753,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     if (SUCCEEDED(hr)) {
         forget_list_dispatches(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
         gpu_time::reset(self);
+        gpu_time::list_begin(self, static_cast<ID3D12GraphicsCommandList*>(self->own().real));  // LOCAL: X2W_GPU_TIME_CLASSES
         self->own().list_ready = false;
         reset_viewport_state(self);
         discard_draw_sampler_heaps(self);
@@ -3291,7 +3296,9 @@ bool execute_dispatch_inner(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
         default: break;
         }
     }
+    gpu_time::mark(self, list, gpu_time::c_c62, key, false);  // LOCAL: X2W_GPU_TIME_CLASSES
     indirect_dispatch(self, list, x, y, z);  // LOCAL: Dispatch, or the pending ExecuteIndirect (d3d12_indirect.inl)
+    gpu_time::mark(self, list, gpu_time::c_c62, key, true);
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
