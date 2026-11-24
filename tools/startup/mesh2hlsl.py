@@ -101,6 +101,9 @@ MESH_HELPERS = {
 # heapwords = numeric reads of resource-heap descriptor words (x2w_hword, manifest `heapwords 1`).
 # Exec-off conflicts (MeshStage.merge_exec_off): on by default; X2W_MESH_EXECOFF=0 restores the earlier refusals.
 EXEC_OFF = os.environ.get('X2W_MESH_EXECOFF', '1') != '0'
+# X2W_MESH_EXEC_COPIES=0: per-lane skipped ranges accept only exec copies taken inside the range (the f37ad9f8 rule);
+# default on: also a pair proven equal to exec at the branch, and copies of copies (MeshStage.exec_copies_at).
+EXEC_COPIES = os.environ.get('X2W_MESH_EXEC_COPIES', '1') != '0'
 MESH_FEATURES = frozenset(f for f in os.environ.get('X2W_MESH_FEATURES', '').replace(' ', '').split(',') if f)
 if MESH_FEATURES - {'heapwords'}:
     raise SystemExit('X2W_MESH_FEATURES: unknown %s' % ', '.join(sorted(MESH_FEATURES - {'heapwords'})))
@@ -1054,11 +1057,72 @@ class MeshStage(G.Stage):
             self._group = {o: t for o, t in ranges if o in need}
         return self._group
 
+    @staticmethod
+    def pair_writes(name, asm):
+        """SGPRs an instruction writes, with the high half of a wave64 lane mask that a compare names by its low
+        register only (v_cmp / v_cmp_class SDST: the disassembler prints one SGPR; carry-outs are already pairs in
+        reads_writes; readlane / readfirstlane write one SGPR)."""
+        w = set(reads_writes(name, asm)[1])
+        if name.startswith('v_cmp'):
+            w |= {x + 1 for x in w}
+        return w
+
+    def exec_copies_at(self):
+        """Offset -> SGPR pairs (low register numbers) that hold exactly the wave's exec on entry to that
+        instruction on EVERY path from the entry: `s_mov_b64 sX, exec`, `s_mov_b64 exec, sX` and moves of such a
+        pair. Forward dataflow over fall-through and branch edges (loops included), intersected at joins; any other
+        exec write, or a write to the pair, ends the fact. Static (no translation state), so the pre-pass of
+        group_branches sees the same facts as the translation."""
+        if not EXEC_COPIES:
+            return {}
+        if getattr(self, '_exec_copies', None) is None:
+            order = [x[0] for x in self.ins]
+            info = {x[0]: (x[2], x[3]) for x in self.ins}
+            following = dict(zip(order, order[1:]))
+            succ = {}
+            for off in order:
+                name, asm = info[off]
+                nxt = [] if name in ('s_endpgm', 's_branch') else ([following[off]] if off in following else [])
+                if name.startswith('s_cbranch') or name == 's_branch':
+                    nxt.append(int(parse(asm)[1][0].split('_')[1], 16))
+                succ[off] = [o for o in nxt if o in info]
+
+            def transfer(off, eq):
+                name, asm = info[off]
+                ops = parse(asm)[1]
+                w = self.pair_writes(name, asm)
+                src = reg_range(ops[1]) if len(ops) == 2 else None
+                if ops and ops[0] in ('exec', 'exec_lo', 'exec_hi') or self.exec_written(name, ops):
+                    return frozenset({src[1]}) if (name == 's_mov_b64' and ops[0] == 'exec' and src and src[0] == 's') else frozenset()
+                dst = reg_range(ops[0]) if ops else None
+                copy = (name == 's_mov_b64' and len(ops) == 2 and dst and dst[0] == 's' and
+                        (ops[1] == 'exec' or (src and src[0] == 's' and src[1] in eq)))
+                out = {x for x in eq if x not in w and x + 1 not in w}
+                if copy:
+                    out.add(dst[1])
+                return frozenset(out)
+            facts = {order[0]: frozenset()} if order else {}   # None (absent) = not reached yet
+            work = list(order[:1])
+            while work:
+                off = work.pop()
+                out = transfer(off, facts[off])
+                for s in succ[off]:
+                    new = out if s not in facts else facts[s] & out
+                    if facts.get(s) != new:
+                        facts[s] = new
+                        work.append(s)
+            self._exec_copies = facts
+        return self._exec_copies
+
     def skipped_scalars(self, off, target):
         """Scalar registers (-1 = vcc) written in (off, target) and live at target; Unsupported for exec writes
         the per-lane model cannot follow."""
         written = set()
-        copies = set()   # registers holding exec as it was inside the range (nested if/else masks)
+        # registers holding exec as it was inside the range (nested if/else masks); a pair equal to exec at the
+        # branch itself is such a copy too: restoring it inside the range gives back exactly the lanes that were
+        # active at the branch, which are the lanes that entered the range (the others skipped it per lane and are
+        # off in the wave as well)
+        copies = set(self.exec_copies_at().get(off, ()))
         for o, n, name, asm in self.ins:
             if off < o < target:
                 r, w, wv, _ = reads_writes(name, asm)
@@ -1070,6 +1134,11 @@ class MeshStage(G.Stage):
                     continue
                 if name in ('s_mov_b64', 's_mov_b32') and len(ops) == 2 and ops[1] in ('exec', 'exec_lo'):
                     copies.add(low[0])
+                    continue
+                if (EXEC_COPIES and name == 's_mov_b64' and len(ops) == 2 and ops[0] not in ('exec', 'vcc')
+                        and low[1] in copies):
+                    copies -= {t for t in copies if t in w or (isinstance(t, int) and t + 1 in w)}   # the pair written
+                    copies.add(low[0])   # a copy of a copy (register shuffles of the saved mask)
                     continue
                 if (re.match(r's_(and|andn2)_b(32|64)$', name) and len(ops) == 3 and ops[0] not in ('exec', 'exec_lo')
                         and low[1] in copies):
@@ -1088,8 +1157,8 @@ class MeshStage(G.Stage):
                     else:
                         raise Unsupported('exec written by %s inside the per-lane skipped range %#x-%#x'
                                           % (name, off, target))
-                for t in w:
-                    copies.discard(t)
+                pw = self.pair_writes(name, asm)
+                copies -= {t for t in copies if t in pw or (isinstance(t, int) and t + 1 in pw)}
         return written & self.liveness().get(target, frozenset())
 
     def scalar(self, base, ops):
