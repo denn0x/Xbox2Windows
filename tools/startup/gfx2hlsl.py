@@ -284,6 +284,13 @@ class Stage:
         return s[1] if s and s[0] == 'const' else None
 
     def emit(self, text):
+        # The address temporary `a` is lane-invariant while its last assignment was an unconditional one from a
+        # lane-invariant expression (a buffer load with no VGPR address, or one computed from uniform values).
+        if hasattr(self, 'lane_s') and re.search(r'\ba = ', text):
+            m = re.fullmatch(r'a = (.*);', text)
+            self.a_invariant = bool(m) and self.lane_invariant(m.group(1))
+        if re.search(r'\bexec = ', text):
+            self.exec_writes = getattr(self, 'exec_writes', 0) + 1
         self.lines.append(text)
 
     def lane_invariant(self, expr):
@@ -297,6 +304,10 @@ class Stage:
         for m in re.finditer(r'\b[A-Za-z_]\w*', expr):
             name = m.group(0)
             if name in LANE_INVARIANT_NAMES or name.startswith('x2w_'):
+                continue
+            if name == 'a' and getattr(self, 'a_invariant', False):
+                continue
+            if re.fullmatch(r'xv\d+', name):  # assigned in every lane from a lane-invariant value (readfirstlane)
                 continue
             reg = re.fullmatch(r'(ud|r|s|v)(\d+)', name)
             if reg and reg.group(1) in ('ud', 'r'):
@@ -317,8 +328,16 @@ class Stage:
         self.uniform_v.discard(n)
         if invariant:
             self.uniform_v.add(n)
+        partial = getattr(self, 'partial_uniform', None)
+        if partial is not None:
+            partial.pop(n, None)
+            partial_ok = not self.exec_known and self.lane_invariant(expr)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
+        if partial is not None and partial_ok:
+            # Written in the active lanes only, from a lane-invariant value: every lane active now holds that value.
+            # Kept with the emitted line so v_readfirstlane_b32 can take the value for every lane (see there).
+            partial[n] = (self.lines, len(self.lines) - 1, expr, getattr(self, 'exec_writes', 0))
 
     def set_vf(self, n, expr, mods=()):
         # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
@@ -434,6 +453,8 @@ class Stage:
                 sources.setdefault(target, []).append(off)
         self.blocks = []          # (offset, [lines], terminator)
         self.uniform_v = set()    # VGPRs proven to hold one value in every lane (see set_v)
+        self.partial_uniform = {}  # VGPRs holding one value in every lane active at their write (see set_v)
+        self.shadow_v = set()     # shadow variables xvN that v_readfirstlane_b32 introduced
         self.lane_s = set()       # SGPR variables that may differ between lanes in the one-lane model (see set_s)
         self.s_written_at = {}    # instruction offset -> SGPRs it assigns at run time
         self.has_branches = bool(targets)
@@ -458,6 +479,8 @@ class Stage:
                 # Lane invariance is not merged across edges for VGPRs; at a loop head the linear state misses the
                 # back edges, so every SGPR becomes suspect until it is written again.
                 self.uniform_v.clear()
+                self.partial_uniform.clear()
+                self.a_invariant = False
                 if not all(src < off for src in sources[off]):
                     self.lane_s = set(range(128))
                 else:
@@ -1459,6 +1482,19 @@ class Stage:
         # divergence analysis found uniform, SIFixSGPRCopies). With a lane-invariant source (see set_v) every
         # lane's own value is that value. Branches are allowed: invariance is cleared at every branch target.
         src, dst = reg_range(ops[1]), reg_range(ops[0])
+        partial = getattr(self, 'partial_uniform', {}).get(src[1]) if src and src[0] == 'v' else None
+        if (not mods and dst and dst[0] == 's' and partial is not None and
+                partial[3] == getattr(self, 'exec_writes', 0)):
+            # The source was written, in the lanes active then, from a lane-invariant value, and exec has not been
+            # written since: the first active lane holds that value. Lanes inactive now kept an older VGPR value,
+            # but the SGPR is the wave's, so every lane takes the value itself, from a shadow assigned in all lanes
+            # at the write. (With no active lane the hardware reads lane 0; that case is not modelled.)
+            lines, at, expr, _ = partial
+            n = src[1]
+            lines[at] = 'xv%d = %s; if (exec & 1) v%d = xv%d;' % (n, expr, n, n)
+            self.shadow_v.add(n)
+            self.set_s(dst[1], 'xv%d' % n)
+            return
         if (mods or not self.exec_known or not dst or dst[0] != 's' or
                 not src or src[0] != 'v' or src[1] not in self.uniform_v):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
@@ -2013,6 +2049,8 @@ class Stage:
             lines.append('    uint %s;' % ', '.join('s%d = 0' % n for n in sorted(self.used_s)))
         if self.used_v:
             lines.append('    uint %s;' % ', '.join('v%d = 0' % n for n in sorted(self.used_v)))
+        if getattr(self, 'shadow_v', None):
+            lines.append('    uint %s;' % ', '.join('xv%d = 0' % n for n in sorted(self.shadow_v)))
         packed = getattr(self.pipe, 'packed_position_vgpr', None)  # the tests' bare pipelines have none
         if self.kind == 'ps' and packed is not None and packed in self.used_v:
             lines.append('    v%d = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);' % packed)
