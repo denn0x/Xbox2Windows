@@ -2459,6 +2459,10 @@ std::unordered_map<Wrapper*, ID3D12PipelineState*>& compute_psos()
     return m;
 }
 LONG compute_executed, compute_skipped_args;
+// LOCAL: dispatch outcomes since the last 300-frame report, by path and reason (report_dispatches).
+enum ComputeOutcome { co_c62_run, co_c62_table_arg, co_c62_unmapped, co_c67_run, co_c67_off, co_c67_other_key, co_c67_untranslated,
+                      co_c67_heap, co_not_run, co_count };
+LONG compute_outcomes[co_count];
 // slot 33, SetComputeRootSignature(root)
 void __stdcall list_compute_root(Wrapper* self, Wrapper* root)
 {
@@ -2515,7 +2519,10 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
     static const bool enabled = !x2w_local::env_on("X2W_COMPUTE_OFF");
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    if (!enabled || !list || !pass.pipeline) return false;
+    if (!enabled || !list || !pass.pipeline) {
+        InterlockedIncrement(&compute_outcomes[co_not_run]);
+        return false;
+    }
     if (!pass.compute_root || !pass.compute_root->own().real) return execute_translated(self, list, key, x, y, z);
     AcquireSRWLockShared(&compute_pso_lock);
     const auto found = compute_psos().find(pass.pipeline);
@@ -2527,12 +2534,14 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
         const int kind = pass.compute_kind[i];
         if (kind == 5) {
             InterlockedIncrement(&compute_skipped_args);
+            InterlockedIncrement(&compute_outcomes[co_c62_table_arg]);
             return false;
         }
         if (kind >= 2 && kind <= 4) {
             addresses[i] = desktop_va(pass.compute_address[i]);
             if (!addresses[i] && pass.compute_address[i]) {
                 InterlockedIncrement(&compute_skipped_args);
+                InterlockedIncrement(&compute_outcomes[co_c62_unmapped]);
                 return false;
             }
         }
@@ -2553,6 +2562,7 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
     const LONG n = InterlockedIncrement(&compute_executed);
+    InterlockedIncrement(&compute_outcomes[co_c62_run]);
     if (n <= 4 || n % 5000 == 0) log("x2w-compute dispatch %ld executed (%u, %u, %u)", n, x, y, z);
     return true;
 }
@@ -2630,16 +2640,34 @@ void report_dispatches()
     dispatch_counts().clear();
     ReleaseSRWLockExclusive(&compute_lock);
     std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.second.calls > b.second.calls; });
+    // LOCAL: every key is listed; a full line continues on another line with the same prefix, and a closing
+    // line gives the key and line counts so a reader can tell the list is complete.
+    static const char prefix[] = "x2w-render dispatches per compute key (300 frames):";
     char line[2048];
-    int n = std::snprintf(line, sizeof(line), "x2w-render dispatches per compute key (300 frames):");
+    int n = std::snprintf(line, sizeof(line), "%s", prefix), lines = 0;
     for (const auto& entry : all) {
-        if (n > static_cast<int>(sizeof(line)) - 80) break;
+        if (n > static_cast<int>(sizeof(line)) - 80) {
+            log("%s", line);
+            ++lines;
+            n = std::snprintf(line, sizeof(line), "%s", prefix);
+        }
         wchar_t path[MAX_PATH];
         const bool signed_ready = cache_path(path, L"", entry.first, L".cs.dxbc") && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
         n += std::snprintf(line + n, sizeof(line) - n, " %016llx%s:%lld(%u,%u,%u)", entry.first, signed_ready ? "*" : "",
                            entry.second.calls, entry.second.x, entry.second.y, entry.second.z);
     }
     log("%s", line);
+    ++lines;
+    log("x2w-render dispatch keys (300 frames): %zu keys in %d lines", all.size(), lines);
+    LONG o[co_count];
+    for (int i = 0; i < co_count; ++i) o[i] = InterlockedExchange(&compute_outcomes[i], 0);
+    log("x2w-compute dispatches (300 frames): executed %ld skipped %ld; slot-62 desktop pipeline executed %ld skipped %ld "
+        "(table argument %ld, unmapped root address %ld); translated executed %ld skipped %ld (X2W_CX_OFF %ld, not a slot-67 key %ld, "
+        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF)",
+        o[co_c62_run] + o[co_c67_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap],
+        o[co_c62_run], o[co_c62_table_arg] + o[co_c62_unmapped], o[co_c62_table_arg], o[co_c62_unmapped], o[co_c67_run],
+        o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap], o[co_c67_off], o[co_c67_other_key], o[co_c67_untranslated],
+        o[co_c67_heap], o[co_not_run]);
 }
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).

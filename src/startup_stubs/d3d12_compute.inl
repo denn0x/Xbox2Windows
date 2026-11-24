@@ -482,13 +482,17 @@ bool title_view_heap(const Pass& pass, u64* address, u64* bytes)
 bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT x, UINT y, UINT z)
 {
     static const bool enabled = !x2w_local::env_on("X2W_CX_OFF");
-    if (!enabled || !list || (key >> 56) != 0x67) return false;
+    if (!enabled || !list || (key >> 56) != 0x67) {
+        InterlockedIncrement(&compute_outcomes[!enabled ? co_c67_off : list ? co_c67_other_key : co_not_run]);
+        return false;
+    }
     Timed timed(time_cx_execute);
     Pass& pass = pass_of(self);
     AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(200000 + __LINE__);
     ComputeTranslation& tr = compute_translations()[key];
     if (!tr.state) load_compute(key, tr);
     if (tr.state != 1 || !ensure_draw_heap(the_device)) {
+        InterlockedIncrement(&compute_outcomes[tr.state != 1 ? co_c67_untranslated : co_c67_heap]);
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -498,11 +502,13 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
         static LONG logged_heap;
         if (draw_heap_increment != 32 || !title_view_heap(pass, &heap_address, &heap_bytes) || !(heap_va = desktop_va(heap_address))) {
             if (first_calls(logged_heap, 4)) log("x2w-cx %016llx: title view heap not reachable (increment %u)", key, draw_heap_increment);
+            InterlockedIncrement(&compute_outcomes[co_c67_heap]);
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
         fill_views(self);
         if (!vinfo_buffer) {
+            InterlockedIncrement(&compute_outcomes[co_c67_heap]);
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
@@ -635,6 +641,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
     const LONG done = InterlockedIncrement(&cx_dispatched);
+    InterlockedIncrement(&compute_outcomes[co_c67_run]);
     if (done <= 8 || done % 5000 == 0)
         log("x2w-cx dispatch %ld: %016llx (%u, %u, %u); ready %ld missing %ld null %ld bad-uav %ld; ranges ok %ld split %ld unmapped %ld", done, key, x, y, z,
             cx_ready, cx_missing, cx_null_res, cx_bad_uav, range_ok, range_split, range_unmapped);
