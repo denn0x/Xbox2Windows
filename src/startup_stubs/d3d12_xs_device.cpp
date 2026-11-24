@@ -2205,6 +2205,24 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
         log("x2w-d3d12 Device::slot62(CreateComputePipelineState?) root=%p cs=%p len=0x%llx node=0x%x flags=0x%x extra=0x%llx,0x%llx "
             "riid=%s -> placeholder [%s]", static_cast<void*>(desc->pRootSignature), desc->CS.pShaderBytecode,
             static_cast<unsigned long long>(desc->CS.BytecodeLength), desc->NodeMask, desc->Flags, extra0, extra1, text, bytes);
+    // LOCAL: write the compute code and its root signature to the shader cache as req_cs_<key>.{cs,root}
+    // for the offline compute translator (nothing executes dispatches yet).
+    if (Wrapper* root = as_wrapper(desc->pRootSignature); root && desc->CS.BytecodeLength &&
+        desc->CS.BytecodeLength <= (1u << 20) && x2w_local::readable(desc->CS.pShaderBytecode, desc->CS.BytecodeLength)) {
+        std::vector<unsigned char> root_blob;
+        AcquireSRWLockShared(&note_lock);
+        const auto found = root_blobs().find(root);
+        if (found != root_blobs().end()) root_blob = found->second;
+        ReleaseSRWLockShared(&note_lock);
+        const u64 key = fnv_bytes(root_blob.data(), root_blob.size(),
+                                  fnv_bytes(desc->CS.pShaderBytecode, desc->CS.BytecodeLength));
+        wchar_t path[MAX_PATH];
+        if (!root_blob.empty() && cache_path(path, L"req_cs_", key, L".cs") && GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+            write_file(path, desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
+            cache_path(path, L"req_cs_", key, L".root");
+            write_file(path, root_blob.data(), root_blob.size());
+        }
+    }
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), 62, nullptr, desc, sizeof(*desc));

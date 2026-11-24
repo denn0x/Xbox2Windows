@@ -148,7 +148,7 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
             else if (!std::strcmp(source, "stride")) ud.kind = 4;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
-            Translation::Srv srv{!std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex3d") ? 3 : 0, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
+            Translation::Srv srv{!std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 : !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
         } else if (std::sscanf(line.c_str(), "smp %d %x %x %x %x", &i, &w[0], &w[1], &w[2], &w[3]) == 5) {
             tr.samplers.push_back({w[0], w[1], w[2], w[3]});
@@ -663,7 +663,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const u64 entry = srv.source == 0 && srv.a < 16 && pass.table_address[srv.a] ? pass.table_address[srv.a] + static_cast<u64>(srv.b) : 0;
         std::uint32_t words[8] = {};
         if (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
-        if (srv.kind == 1 || srv.kind == 3) {
+        if (srv.kind >= 1 && srv.kind <= 4) {
+            // kind 1 Texture2D, 2 Texture2DArray (upstream #1381), 3 Texture3D, 4 Texture1D
+            const D3D12_SRV_DIMENSION want = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D
+                : srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D
+                : srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;
@@ -676,9 +680,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             Wrapper* resource = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
             D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
             desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            desc.ViewDimension = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.ViewDimension = want;
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            desc.Texture2D.MipLevels = 1;  // same offset as Texture3D.MipLevels
+            desc.Texture2D.MipLevels = 1;  // same offset as Texture3D.MipLevels and Texture2DArray.MipLevels
+            if (want == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) desc.Texture2DArray.ArraySize = 1;
             ID3D12Resource* texture = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
@@ -699,14 +704,26 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture),
                     static_cast<unsigned long long>(rd.Width), rd.Height, rd.Format, desc.Format);
             }
-            if (texture && desc.ViewDimension != (srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D) && record.desc_bytes >= 40) {
+            if (texture && want == D3D12_SRV_DIMENSION_TEXTURE2DARRAY && desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+                // The shader declares an array; a plain 2D view is the same data as a one-slice array.
+                const D3D12_TEX2D_SRV plain = desc.Texture2D;
+                desc.ViewDimension = want;
+                desc.Texture2DArray = {};
+                desc.Texture2DArray.MostDetailedMip = plain.MostDetailedMip;
+                desc.Texture2DArray.MipLevels = plain.MipLevels;
+                desc.Texture2DArray.ArraySize = 1;
+                desc.Texture2DArray.PlaneSlice = plain.PlaneSlice;
+                desc.Texture2DArray.ResourceMinLODClamp = plain.ResourceMinLODClamp;
+            }
+            if (texture && desc.ViewDimension != want && record.desc_bytes >= 40) {
                 static LONG mismatch;
                 if (first_calls(mismatch, 6)) log("x2w-draw   %016llx srv %u: view dimension %d does not match the shader; binding null", tr->key, i, desc.ViewDimension);
                 texture = nullptr;
-                desc.ViewDimension = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
+                desc.ViewDimension = want;
                 desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                desc.Texture2D = {};
+                desc.Texture2DArray = {};
                 desc.Texture2D.MipLevels = 1;
+                if (want == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) desc.Texture2DArray.ArraySize = 1;
             }
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
