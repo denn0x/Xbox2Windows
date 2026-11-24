@@ -328,7 +328,7 @@ class MeshStage(G.Stage):
     # ---- entry ---------------------------------------------------------------------------------
     def setup_entry(self):
         root = self.pipe.root
-        reg = MESH_USER_SGPR
+        reg = self.pipe.user_sgpr
         for index, p in enumerate(root['params']):
             if p['type'] == 0:
                 self.sym[reg] = ('ptr', ('table', index))
@@ -1255,8 +1255,11 @@ for _op in ('add', 'sub', 'subrev'):
 class MeshPipeline(G.Pipeline):
     """Mesh + pixel pipeline. ps_code None: the mesh stage alone (coverage runs; params = what it exports)."""
 
-    def __init__(self, ms_code, ps_code, root_blob, sampler_heap=None, rtv_formats=()):
+    def __init__(self, ms_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), user_sgpr=MESH_USER_SGPR):
         self.root = G.parse_root(root_blob)
+        # First user SGPR: s16 for the run programs (measured, real roots). Archive programs (offline, synthesized
+        # root) may start at s8: callers pass entry_sgpr(code) together with synth_root(code).
+        self.user_sgpr = user_sgpr
         # Fields of G.Pipeline.__init__ (which this does not call: it builds a vertex stage) that newer base
         # translators read. The draw lowerings (manifest `heap 1`, `udsrc bufword3`, `uav`) are named in
         # X2W_DRAW_FEATURES as for draws (pstrans gfx2hlsl.draw_features); a base without them keeps refusing.
@@ -1395,11 +1398,12 @@ def compile_hlsl(path, profile, out):
     return r.returncode, r.stderr
 
 
-def translate_to(out_dir, key, ms_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request=''):
+def translate_to(out_dir, key, ms_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='',
+                 user_sgpr=MESH_USER_SGPR):
     """Writes <key>.ms.hlsl, <key>.ps.hlsl, the .cso files and <key>.txt (last), or <key>.fail."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = MeshPipeline(ms_code, ps_code, root_blob, rtv_formats=rtv_formats)
+        pipe = MeshPipeline(ms_code, ps_code, root_blob, rtv_formats=rtv_formats, user_sgpr=user_sgpr)
         if pipe.ps_entry_reads:
             reg, off = min(pipe.ps_entry_reads.items(), key=lambda item: item[1])
             raise Unsupported('pixel stage reads entry VGPR v%d (an SPI input; layout not in the request) at %#x' % (reg, off))
@@ -1460,7 +1464,26 @@ def synth_root(*codes):
     for code in codes:
         if code:
             synth_scan(code, tables, pairs, used)
-    return synth_layout(tables, pairs, used)
+    return synth_layout(tables, pairs, used, min(entry_sgpr(c) for c in codes if c))
+
+
+def entry_sgpr(code):
+    """First user SGPR for a program without a real root: 8 if it reads any of s8..s15 before writing it (the
+    archive programs), else MESH_USER_SGPR (16, the run programs: s8..s15 are written first). Straight-line scan
+    up to the first branch; COVERAGE ONLY."""
+    written = set()
+    for off, n, name, asm in G.decode(G.strip_header(code)):
+        _, ops, mods = parse(asm)
+        base = re.sub(r'_e(32|64)$', '', name)
+        for t in ops[1:]:
+            if any(8 <= r < MESH_USER_SGPR and r not in written for r in scalar_regs(t)):
+                return 8
+        if base.startswith(('s_branch', 's_cbranch', 's_endpgm')):
+            break
+        dst = reg_range(ops[0]) if ops else None
+        if dst and dst[0] == 's' and not base.startswith(NO_DEST):
+            written.update(range(dst[1], dst[2] + 1))
+    return MESH_USER_SGPR
 
 
 def synth_scan(code, tables, pairs, used):
@@ -1501,9 +1524,14 @@ def synth_scan(code, tables, pairs, used):
                 zero.add(dst[1])
 
 
-def synth_layout(tables, pairs, used):
-    params, r = [], MESH_USER_SGPR
-    top = max(used | {MESH_USER_SGPR - 1}) + 1
+def synth_layout(tables, pairs, used, start=MESH_USER_SGPR):
+    params, r = [], start
+    used = {u for u in used if u >= start}
+    if start == MESH_USER_SGPR and used & {23, 24}:
+        # s23/s24 are the resource and sampler heaps after the dominant real layout (sampled real roots: 3 tables,
+        # a root SRV, 2 constants, heap flags 0xc00 in ~87%); such a program cannot be expressed by the scan below
+        return root_blob([(0, None), (0, None), (0, None), (3, None), (1, 2)], 0xc00)
+    top = max(used | {start - 1}) + 1
     while r < top:
         if r in tables:
             params.append((0, None))
@@ -1561,7 +1589,8 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         for i, path in enumerate(sys.argv[3:]):
             code = open(path, 'rb').read()
-            print('%s: %s' % (os.path.basename(path), translate_to(out_dir, i, code, None, synth_root(code))))
+            print('%s: %s' % (os.path.basename(path), translate_to(out_dir, i, code, None, synth_root(code),
+                                                                        user_sgpr=entry_sgpr(code))))
         return
     print(__doc__)
 
