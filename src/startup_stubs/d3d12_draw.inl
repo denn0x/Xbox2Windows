@@ -260,6 +260,47 @@ void note_null_texture(u64 key, UINT srv, u64 entry, const std::uint32_t* words,
 }
 LONG frame_number;
 
+// LOCAL (video), X2W_DRAW_TEXTURE_HEAP_INDEX=1 (default off): when a texture's table entry holds a
+// nonzero integer followed by seven zero words, and the heap that contains the entry holds a view token
+// at that index, use that token instead. Untested HYPOTHESIS. Run 84: loading-screen pipeline 961191d9
+// srv 2 held 0x2f16 at index 0xdcf0a of the count-1245184 heap and drew nothing (alpha 0). Only bindings
+// that are null today change. Each resolved key+srv logs once (at most 32 lines).
+void resolve_heap_index(u64 key, UINT srv, u64 entry, std::uint32_t* words)
+{
+    static const bool on = [] {
+        const bool value = x2w_local::env_on("X2W_DRAW_TEXTURE_HEAP_INDEX");
+        if (value) log("x2w-draw X2W_DRAW_TEXTURE_HEAP_INDEX=1: integer texture descriptors are read as indices into their heap");
+        return value;
+    }();
+    if (!on || !words[0]) return;
+    for (int i = 1; i < 8; ++i)
+        if (words[i]) return;
+    u64 at = 0;
+    AcquireSRWLockShared(&note_lock);
+    for (const HeapInfo& heap : heap_infos()) {
+        if (!heap.title_cpu || words[0] >= heap.count) continue;
+        const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
+        if (entry < heap.title_cpu || entry >= heap.title_cpu + u64{heap.count} * stride) continue;
+        at = heap.title_cpu + u64{words[0]} * stride;
+        break;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    std::uint32_t there[8]{};
+    if (!at || !x2w_local::readable(reinterpret_cast<const void*>(at), sizeof(there))) return;
+    std::memcpy(there, reinterpret_cast<const void*>(at), sizeof(there));
+    if (there[0] != view_token_magic) return;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::unordered_set<u64>* seen = new std::unordered_set<u64>;
+    AcquireSRWLockExclusive(&lock);
+    const bool fresh = seen->size() < 4096 && seen->insert(key * 31 + srv).second;
+    ReleaseSRWLockExclusive(&lock);
+    static LONG lines;
+    if (fresh && first_calls(lines, 32))
+        log("x2w-draw texture heap index %016llx srv %u frame %ld: entry 0x%llx index 0x%x -> 0x%llx token id %u slot %u", key, srv, frame_number,
+            entry, words[0], at, there[1], there[2]);
+    std::memcpy(words, there, sizeof(there));
+}
+
 u64 fnv_bytes(const void* data, std::size_t bytes, u64 hash = 1469598103934665603ull)
 {
     for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
@@ -1491,6 +1532,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                    srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
                                    srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+            // LOCAL (video): X2W_DRAW_TEXTURE_HEAP_INDEX=1 reads an "integer + 7 zero words" entry as an
+            // index into the heap that holds the entry (HYPOTHESIS from run 84, see note_null_texture).
+            if (entry_ok && words[0] != view_token_magic) resolve_heap_index(tr->key, i, entry, words);
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;
