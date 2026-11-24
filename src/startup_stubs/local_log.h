@@ -2,6 +2,7 @@
 // permissive startup paths. Lines go to stderr and are appended to %X2W_TRAP_LOG% when set.
 #pragma once
 
+#include "startup_stubs/log_cap.h"
 #include "startup_stubs/trap.h"
 
 #include <cstdarg>
@@ -37,7 +38,7 @@ inline void logf(const char* format, ...) noexcept
     SetLastError(error);
 }
 
-inline bool first_calls(LONG& counter, LONG limit) noexcept { return InterlockedIncrement(&counter) <= limit; }
+// first_calls (a saturating log cap) is in startup_stubs/log_cap.h.
 
 // Number of contiguous readable bytes at start, up to bytes, found by touching one byte per page.
 // VirtualQuery is not used for this: on the title's multi-gigabyte regions one query takes about a

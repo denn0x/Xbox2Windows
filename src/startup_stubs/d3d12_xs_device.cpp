@@ -455,7 +455,7 @@ void hex_text(const void* data, std::size_t bytes, char* out, std::size_t size)
     for (std::size_t i = 0; i < bytes && used + 4 < size; ++i) used += std::snprintf(out + used, size - used, "%02x ", p[i]);
 }
 
-bool first_calls(LONG& counter, LONG limit = 3) { return InterlockedIncrement(&counter) <= limit; }
+bool first_calls(LONG& counter, LONG limit = 3) { return x2w_local::first_calls(counter, limit); }
 
 // X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
 // calls, tagged with the call that preceded them, and a device removal is reported once with its reason.

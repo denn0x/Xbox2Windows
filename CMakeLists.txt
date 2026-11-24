@@ -368,6 +368,13 @@ add_executable(startup_placement_alloc tests/startup_placement_alloc.cpp)
 target_compile_features(startup_placement_alloc PRIVATE cxx_std_17)
 target_include_directories(startup_placement_alloc PRIVATE src)
 add_test(NAME startup_placement_alloc COMMAND startup_placement_alloc)
+# Log caps that never wrap (src/startup_stubs/log_cap.h); the old wrapping pattern is the negative control.
+add_executable(startup_log_cap_check tests/startup_log_cap_check.cpp)
+target_compile_features(startup_log_cap_check PRIVATE cxx_std_17)
+target_include_directories(startup_log_cap_check PRIVATE src)
+add_test(NAME startup_log_cap COMMAND startup_log_cap_check)
+add_test(NAME startup_log_cap_wrap_control COMMAND startup_log_cap_check --mutate wrap)
+set_tests_properties(startup_log_cap_wrap_control PROPERTIES WILL_FAIL TRUE)
 # The same registration under the lock held exclusively, and max_width kept at the widest record
 # (src/startup_stubs/placement_publish.h). The mutated run is the negative control.
 add_executable(startup_placement_publish_check tests/startup_placement_publish_check.cpp)
