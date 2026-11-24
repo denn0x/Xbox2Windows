@@ -2215,8 +2215,13 @@ bool format_has_stencil(DXGI_FORMAT format)
            format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R32G8X24_TYPELESS;
 }
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
-// A descriptor of the wrong kind, a DSV with only one plane read-only (needs per-plane states), or a
-// depth view that resolves to nothing refuses the whole bind: nothing is set and draws are skipped.
+// With single_range the title passes only the first handle; target i is at handle + i * the title's RTV
+// stride (title_descriptor_stride: for RTV heaps the same desktop increment the title reads from the
+// forwarded GetDescriptorHandleIncrementSize), and each is mapped to its desktop descriptor on its own.
+// A descriptor of the wrong kind, a colour handle that holds no view, a DSV with only one plane
+// read-only (needs per-plane states), or a depth view that resolves to nothing refuses the whole bind:
+// nothing is set and draws are skipped. Binding fewer or null targets is not done: the title's own
+// pipelines expect its count and formats, and an unresolved view has no known format.
 void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL single_range,
                             const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
 {
@@ -2226,18 +2231,43 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target_count = 0;
     pass.target0 = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
-    if (!list || count > 8 || single_range) return;
-    if (count && !x2w_local::readable(handles, count * sizeof(*handles))) return;
     static LONG refused;
+    if (!list) return;
+    if (count > 8) {
+        if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: %u render targets (at most 8)", count);
+        return;
+    }
+    const UINT listed = single_range ? (count ? 1 : 0) : count;
+    if (listed && !x2w_local::readable(handles, listed * sizeof(*handles))) return;
+    u64 stride = 0;
+    if (single_range && count) {
+        const UINT increment = the_device ? device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) : 0;
+        stride = title_descriptor_stride(handles[0].ptr, increment);
+        UINT available = 0;
+        desktop_cpu_handle(handles[0].ptr, nullptr, &available);
+        if (!stride || available < count) {
+            if (first_calls(refused, 6))
+                log("x2w-d3d12 OMSetRenderTargets refused: single range of %u at 0x%llx has %u descriptors left in its heap",
+                    count, static_cast<unsigned long long>(handles[0].ptr), available);
+            return;
+        }
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop[8];
     ID3D12Resource* targets[8]{};
     DXGI_FORMAT formats[8]{};
     for (UINT i = 0; i < count; ++i) {
-        desktop[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(handles[i].ptr));
+        const u64 title = single_range ? handles[0].ptr + i * stride : handles[i].ptr;
+        desktop[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(title));
         const ResolvedView view = resolve_view(desktop[i].ptr, 20);
         if (view.wrong_kind && first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: render target %u is not a render target view", i);
         targets[i] = view.resource;
-        if (!targets[i]) return;
+        if (!targets[i]) {
+            if (view.wrong_kind) return;
+            if (first_calls(refused, 6))
+                log("x2w-d3d12 OMSetRenderTargets refused: render target %u of %u (title 0x%llx, %s) holds no known view", i, count,
+                    static_cast<unsigned long long>(title), single_range ? "single range" : "array");
+            return;
+        }
         formats[i] = view_format_of(desktop[i].ptr, targets[i]);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop_dsv{};
@@ -2279,7 +2309,6 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.dsv_format = dsv_format;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
-}
 // List slots 21 / 22 / 23, RSSetViewports / RSSetScissorRects / OMSetBlendFactor.
 void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* viewports)
 {
