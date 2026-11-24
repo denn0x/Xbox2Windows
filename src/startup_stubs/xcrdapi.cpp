@@ -619,7 +619,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const bool memory_source = (options & 0x400000) != 0;
     const unsigned compression = static_cast<unsigned>(options & 0xFF);
     static LONG logged;
-    if (InterlockedIncrement(&logged) <= 12) {
+    if (x2w_local::first_calls(logged, 12)) {
         char bytes[3 * 0x40 + 1] = "";
         for (int i = 0; i < 0x40; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
         log("x2w-dstorage Queue::EnqueueRequest [%s]", bytes);
@@ -821,7 +821,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 outcome = "zlib failed";
                 data = nullptr;
                 static LONG diagnosed;
-                if (InterlockedIncrement(&diagnosed) <= 12) {
+                if (x2w_local::first_calls(diagnosed, 12)) {
                     unsigned h[4] = {};
                     for (unsigned i = 0; i < 4 && i < source_size; ++i) h[i] = input[i];
                     log("x2w-dstorage zlib failure: header %02x %02x %02x %02x (dest 0x%x, source 0x%x)",
@@ -854,7 +854,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             } else {
                 if (bcn_fallback) {
                     static LONG bcn_failed;
-                    if (InterlockedIncrement(&bcn_failed) <= 16)
+                    if (x2w_local::first_calls(bcn_failed, 16))
                         log("x2w-dstorage BCPack format %u decode failed: zero-filled as before (dest_size=0x%x offset=0x%llx size=0x%x)",
                             bcpack, destination_size, offset, source_size);
                 }
@@ -865,7 +865,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 decode_length = destination_size;
                 outcome = "BCPack not decoded: zero-filled";
                 static LONG blank_logged;
-                if (InterlockedIncrement(&blank_logged) <= 16)
+                if (x2w_local::first_calls(blank_logged, 16))
                     log("x2w-dstorage BCPack format %u not decoded: zero-filled (options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x)",
                         bcpack, options, destination_size, offset, source_size);
             }
@@ -940,7 +940,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     if (failed) tally_failure(outcome);
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries;
-    if (InterlockedIncrement(&summaries) <= 12)
+    if (x2w_local::first_calls(summaries, 12))
         log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
             static_cast<void*>(destination), destination_size, source, offset, source_size, outcome);
     if (failed) {
@@ -956,7 +956,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             destination_size, offset, source_size, outcome, path, words[2], words[7], words[8]);
     }
     static LONG slices_logged;
-    if (interval_request && slice.at && InterlockedIncrement(&slices_logged) <= 32)
+    if (interval_request && slice.at && x2w_local::first_calls(slices_logged, 32))
         log("x2w-dstorage RDS5 slice options=0x%llx dest_size=0x%x offset=0x%llx size=0x%x: interval 0x%llx decoded 0x%zx at 0x%zx +10=0x%llx -> %s",
             options, destination_size, offset, source_size, slice.stored, slice.decoded_size, slice.at,
             *reinterpret_cast<const u64*>(request + 0x10), outcome);
@@ -981,7 +981,7 @@ void run_entry(Object* self, Entry& entry)
                 tally_failure("page array unreadable");
                 if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                 static LONG unreadable;
-                if (InterlockedIncrement(&unreadable) <= 12)
+                if (x2w_local::first_calls(unreadable, 12))
                     log("x2w-dstorage   options=0x%llx page array %p (%zu entries) unreadable when the request runs -> failed", options,
                         static_cast<const void*>(title), entry.token_count);
                 return;
@@ -1025,7 +1025,7 @@ void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
     tally_failure("exception");  // LOCAL: heartbeat tally (a literal: the tally keeps the pointer)
     InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG reported;
-    if (InterlockedIncrement(&reported) <= 12)
+    if (x2w_local::first_calls(reported, 12))
         log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), reason,
             entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
 }
@@ -1426,7 +1426,7 @@ void __stdcall queue_enqueue_status(Object* self, Object* array, unsigned index)
 {
     const bool valid = array && array->kind == status && index < array->capacity;
     static LONG calls;
-    if (!valid || InterlockedIncrement(&calls) <= 8)
+    if (!valid || x2w_local::first_calls(calls, 8))
         log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests done=%ld inflated=%ld failed=%ld)",
             static_cast<void*>(array), index, valid ? "" : " INVALID ARRAY", requests_done, requests_compressed, requests_failed);
     if (!valid) return;
@@ -1458,26 +1458,26 @@ void signal_fence(void* fence, u64 value)
         hr = reinterpret_cast<Signal>((*static_cast<void***>(fence))[10])(fence, value);
     }
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4)
+    if (x2w_local::first_calls(calls, 4))
         log("x2w-dstorage Queue::EnqueueSignal fence=%p value=0x%llx -> 0x%08lx", fence, value, static_cast<unsigned long>(hr));
 }
 void __stdcall queue_submit(Object* self, u64 rdx, u64 r8)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
     submit(self);
 }
 void __stdcall queue_cancel(Object*, u64 mask, u64 value)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
 }
 void __stdcall queue_close(Object*) { log("x2w-dstorage Queue::Close"); }
 HANDLE __stdcall queue_error_event(Object*)
 {
     static HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::GetErrorEvent -> %p (never signaled)", event);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::GetErrorEvent -> %p (never signaled)", event);
     return event;
 }
 // Status array slot 3 IsComplete(index), slot 4 GetHResult(index).
@@ -1485,14 +1485,14 @@ bool __stdcall status_is_complete(Object* self, unsigned index)
 {
     const bool complete = index < self->capacity && self->results[index] != static_cast<LONG>(0x8000000A);
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage StatusArray::IsComplete index=%u -> %d", index, complete);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage StatusArray::IsComplete index=%u -> %d", index, complete);
     return complete;
 }
 long __stdcall status_hresult(Object* self, unsigned index)
 {
     const long hr = index < self->capacity ? self->results[index] : E_INVALIDARG;
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage StatusArray::GetHResult index=%u -> 0x%08lx", index, static_cast<unsigned long>(hr));
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage StatusArray::GetHResult index=%u -> 0x%08lx", index, static_cast<unsigned long>(hr));
     return hr;
 }
 
