@@ -383,6 +383,13 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32) return;
+    // LOCAL draw-rt off switch (X2W_DRAW_RT_OFF=1): translations that use these features stay unavailable.
+    static const bool rt_off = x2w_local::env_on("X2W_DRAW_RT_OFF");
+    if (rt_off && (!tr.uavs.empty() || tr.heap || std::any_of(tr.uds.begin(), tr.uds.end(), [](const Translation::Ud& ud) {
+            return ud.kind == Translation::buf_word3 || ud.kind == Translation::uav_word3 || ud.kind == Translation::uav_base; }))) {
+        log("x2w-draw-rt %016llx: not used (X2W_DRAW_RT_OFF)", tr.key);
+        return;
+    }
     if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
     if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
     const HRESULT hr = create_draw_root(tr);
