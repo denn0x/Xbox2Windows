@@ -144,6 +144,7 @@ def smem_offset(tok):
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
     uses_q = False
+    uses_swap = False
 
     def __init__(self, pipe, kind, code):
         self.pipe, self.kind = pipe, kind
@@ -1754,6 +1755,20 @@ class Stage:
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
+    def op_v_swap_b32(self, ops, mods):
+        # RDNA 2 ISA V_SWAP_B32 (VOP1 0x65, LLVM VOP1Instructions.td: outs $vdst, $vdst1 tied to $src0):
+        # tmp = D; D = S0; S0 = tmp, in the active lanes. Both operands are single VGPRs; there is no VOP3,
+        # DPP or SDWA form (the decoder reports those as unsupported).
+        d, s = reg_range(ops[0]) if ops else None, reg_range(ops[1]) if len(ops) == 2 else None
+        if mods or len(ops) != 2 or not d or not s or d[0] != 'v' or s[0] != 'v' or d[1] != d[2] or s[1] != s[2]:
+            raise Unsupported('v_swap_b32 form %s %s' % (ops, mods))
+        if d[1] == s[1]:
+            return  # a register swapped with itself keeps its value
+        self.uses_swap = True
+        self.lines.append('xswap = %s;' % self.u(ops[0]))  # every lane: a temporary read only below
+        self.set_v(d[1], self.u(ops[1]))
+        self.set_v(s[1], 'xswap')
+
     def op_v_cndmask_b32(self, ops, mods):
         # The VOP3 form takes neg/abs on its two data operands; the select moves bits, so they are sign-bit
         # operations on the selected word.
@@ -2152,6 +2167,8 @@ class Stage:
             lines.append('    uint %s;' % ', '.join('h%d = 0' % k for k in sorted(self.used_h)))
         if self.uses_q:
             lines.append('    uint2 q = 0;')
+        if self.uses_swap:
+            lines.append('    uint xswap = 0;')
         return lines
 
 
