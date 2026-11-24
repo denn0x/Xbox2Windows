@@ -511,7 +511,30 @@ const char* execute_request(Object* self, const unsigned char* request, const UL
                 written = write_physical && tokens && write_physical(tokens, pages, page_offset, data, size);
                 if (!written) outcome = "page destination write failed";
             } else if (data != destination) {
-                std::memcpy(destination, data, size);
+                // LOCAL: a destination that is not committed and writable over its whole span (seen
+                // under memory pressure, after the title's allocator failed) fails this request
+                // instead of ending the process in memcpy.
+                const auto span_writable = [](unsigned char* at, std::size_t bytes) {
+                    while (bytes) {
+                        MEMORY_BASIC_INFORMATION mbi{};
+                        if (!VirtualQuery(at, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
+                        const DWORD p = mbi.Protect & 0xFF;
+                        if (p != PAGE_READWRITE && p != PAGE_EXECUTE_READWRITE && p != PAGE_WRITECOPY && p != PAGE_EXECUTE_WRITECOPY)
+                            return false;
+                        const std::size_t left = static_cast<unsigned char*>(mbi.BaseAddress) + mbi.RegionSize - at;
+                        const std::size_t step = left < bytes ? left : bytes;
+                        at += step;
+                        bytes -= step;
+                    }
+                    return true;
+                };
+                if (span_writable(static_cast<unsigned char*>(destination), size)) {
+                    std::memcpy(destination, data, size);
+                } else {
+                    written = false;
+                    outcome = "destination not writable";
+                    InterlockedIncrement(&requests_failed);
+                }
             }
             if (written && !zlib && !bcpack) InterlockedIncrement(&requests_done);
         }
