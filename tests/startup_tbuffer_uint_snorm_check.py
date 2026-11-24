@@ -1,9 +1,11 @@
-"""tbuffer_load_format_* with BUF_FMT_8_8_8_8_UINT and BUF_FMT_16_16_SNORM (gfx10 unified formats 60 and 24).
+"""tbuffer_load_format_* with BUF_FMT_8_8_8_8_UINT, 16_16_SNORM, 16_16_UINT, 2_10_10_10_UNORM (gfx10 60, 24, 27, 50).
 
 Synthetic gfx1013 words (the vertex stage of startup_vertex_fetch_formats_check: s_load_dwordx4 of vertex buffer 1,
 tbuffer_load_format_xyzw v[4:7], v0, ... idxen offset:<o> format:<code>, exp pos0). References from the format
 definitions, little-endian fields from the lowest byte:
 - 8_8_8_8_UINT: four unsigned bytes, x first; the integer value itself (no conversion).
+- 16_16_UINT: two unsigned 16-bit fields, missing z = 0, w = 1 (integer).
+- 2_10_10_10_UNORM: x bits [9:0], y [19:10], z [29:20], w [31:30]; c / 1023 and w / 3.
 - 16_16_SNORM: two signed 16-bit fields; float = max(c / 32767, -1.0) (D3D11.3 SNORM -> FLOAT, both -32768 and
   -32767 give -1.0); missing z = 0, missing w = 1.0. That the console fetch clamps the same way is ASSUMED.
 The emitted lines are run in Python (ldu = the unaligned little-endian dword at a) on 16 vertices of a byte
@@ -23,7 +25,8 @@ from startup_sampler_heap_check import root_blob  # noqa: E402
 from startup_stream_check import gfx2hlsl  # noqa: E402
 
 DATA = bytearray(b''.join(struct.pack('<I', (0x8b02a7f1 + i * 0x413b1) & 0xffffffff) for i in range(64)))
-FORMATS = {'BUF_FMT_8_8_8_8_UINT': (60, 5, 3), 'BUF_FMT_16_16_SNORM': (24, 6, 2)}  # code, stride, offset
+FORMATS = {'BUF_FMT_8_8_8_8_UINT': (60, 5, 3), 'BUF_FMT_16_16_SNORM': (24, 6, 2), 'BUF_FMT_16_16_UINT': (27, 6, 2),
+           'BUF_FMT_2_10_10_10_UNORM': (50, 7, 1)}  # code, stride, offset
 
 
 def f32(x):
@@ -86,6 +89,15 @@ def reference(name, vertex, swap=False):
         if swap:
             f[0], f[1] = f[1], f[0]
         return f
+    if name == 'BUF_FMT_16_16_UINT':
+        f = [struct.unpack('<H', DATA[a + 2 * i:a + 2 * i + 2])[0] for i in range(2)]
+        return (f[::-1] if swap else f) + [0, 1]
+    if name == 'BUF_FMT_2_10_10_10_UNORM':
+        d = int.from_bytes(DATA[a:a + 4], 'little')
+        f = [(d >> s) & m for s, m in ((0, 1023), (10, 1023), (20, 1023), (30, 3))]
+        if swap:
+            f[0], f[1] = f[1], f[0]
+        return [bits(f32(c / float(m))) for c, m in zip(f, (1023, 1023, 1023, 3))]
     f = [struct.unpack('<h', DATA[a + 2 * i:a + 2 * i + 2])[0] for i in range(2)]
     if swap:
         f.reverse()
@@ -112,7 +124,7 @@ def main():
     assert run(body, 0, 6)[:2] == [bits(-1.0)] * 2
     unclamped = [l.replace('max(', '(').replace(', -1.0))', '))') for l in body]
     assert run(unclamped, 0, 6)[0] != bits(-1.0) and math.isfinite(struct.unpack('<f', struct.pack('<I', run(unclamped, 0, 6)[0]))[0])
-    print('tbuffer_uint_snorm: 8_8_8_8_UINT and 16_16_SNORM match the format definitions on %d vertices at odd '
+    print('tbuffer_uint_snorm: 4 formats match the format definitions on %d vertices at odd '
           'strides and 5 SNORM edge pairs; swapped-reference and unclamped-translation controls caught' % checked)
 
 

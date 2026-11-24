@@ -1157,6 +1157,11 @@ class Stage:
                  'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
                  # integer fields as unsigned values; a missing component of an integer format reads 1
                  'BUF_FMT_8_8_8_8_UINT': ('ldu({0}, a)', ['w & 255u', '(w >> 8) & 255u', '(w >> 16) & 255u', 'w >> 24']),
+                 'BUF_FMT_16_16_UINT': ('ldu({0}, a)', ['w & 65535u', 'w >> 16', '0u', '1u']),
+                 # x in bits [9:0], y [19:10], z [29:20], w [31:30] (the R10G10B10A2 layout, x lowest). ASSUMED from
+                 # the GCN data-format naming; not checked against a source or a console readback.
+                 'BUF_FMT_2_10_10_10_UNORM': ('ldu({0}, a)', ['U((w & 1023) / 1023.0)', 'U(((w >> 10) & 1023) / 1023.0)',
+                                                             'U(((w >> 20) & 1023) / 1023.0)', 'U((w >> 30) / 3.0)']),
                  'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
                  # SNORM n: max(c / (2^(n-1) - 1), -1.0), so both -32768 and -32767 read -1.0 (the D3D11.3 functional
                  # spec's SNORM -> FLOAT rule; that the console's buffer fetch clamps the same way is ASSUMED)
