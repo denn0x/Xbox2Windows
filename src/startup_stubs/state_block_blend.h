@@ -2,11 +2,11 @@
 // slot 57, read from its state block A (#1216).
 //
 // State block A holds the eight CB_BLENDn_CONTROL words at +0xD0, one per render target (measured
-// on #1216). They are decoded with cb_blend.h. CB_TARGET_MASK has not been located, so every
-// target keeps all four channels.
+// on #1216). They are decoded with cb_blend.h. Every target keeps all four channels here; the
+// write masks (CB_TARGET_MASK & CB_SHADER_MASK) are pipeline_state_decode.h's, behind a switch.
 #pragma once
 
-#include "cb_blend.h"
+#include "pipeline_state_decode.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -30,22 +30,16 @@ inline bool state_block_blend(const unsigned char* block, std::size_t bytes, boo
         why = "state block A shorter than the blend words";
         return false;
     }
-    D3D12_BLEND_DESC blend{};
-    blend.IndependentBlendEnable = TRUE;
-    unsigned refused = 0;
-    for (unsigned target = 0; target < 8; ++target) {
-        std::uint32_t word;
-        std::memcpy(&word, block + state_block_blend_offset + 4 * target, sizeof(word));
-        const x2w_cb_blend::Decoded decoded = x2w_cb_blend::decode(word, 0xF, alpha_factor_supported);
-        if (decoded.ok) {
-            blend.RenderTarget[target] = decoded.desc;
-            continue;
-        }
-        if (!refused) why = decoded.reason;
-        refused |= 1u << target;
+    // One decoder for the eight words (pipeline_state_decode.h), with every target writing RGBA.
+    std::uint32_t words[8];
+    std::memcpy(words, block + state_block_blend_offset, sizeof(words));
+    const x2w_pipeline_state::Blend decoded = x2w_pipeline_state::decode_blend(words, 0, 0, false, alpha_factor_supported);
+    if (refused_targets) *refused_targets = decoded.refused_targets;
+    if (!decoded.ok) {
+        why = decoded.reason;
+        return false;
     }
-    if (refused_targets) *refused_targets = refused;
-    if (refused) return false;
+    const D3D12_BLEND_DESC& blend = decoded.desc;
     *out = blend;
     return true;
 }
