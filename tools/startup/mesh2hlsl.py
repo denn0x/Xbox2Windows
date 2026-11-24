@@ -104,6 +104,9 @@ EXEC_OFF = os.environ.get('X2W_MESH_EXECOFF', '1') != '0'
 # X2W_MESH_EXEC_COPIES=0: per-lane skipped ranges accept only exec copies taken inside the range (the f37ad9f8 rule);
 # default on: also a pair proven equal to exec at the branch, and copies of copies (MeshStage.exec_copies_at).
 EXEC_COPIES = os.environ.get('X2W_MESH_EXEC_COPIES', '1') != '0'
+# X2W_MESH_BARRIER_RANGES=0: a group-uniform execz range is skipped when no lane of the group is active even when it
+# holds a phase barrier (the f37ad9f8 form; barrier_count then refuses "paths cross different numbers of barriers").
+BARRIER_RANGES = os.environ.get('X2W_MESH_BARRIER_RANGES', '1') != '0'
 MESH_FEATURES = frozenset(f for f in os.environ.get('X2W_MESH_FEATURES', '').replace(' ', '').split(',') if f)
 if MESH_FEATURES - {'heapwords'}:
     raise SystemExit('X2W_MESH_FEATURES: unknown %s' % ', '.join(sorted(MESH_FEATURES - {'heapwords'})))
@@ -235,13 +238,20 @@ class MeshStage(G.Stage):
         result = super().translate()
         # A group-uniform branch block ends in a barrier (the lanes publish their exec bit); the block after it
         # skips the range when no lane of the group was active (group_branch).
+        # A range with a phase barrier inside (a console s_barrier, a broadcast or a nested group branch) is never
+        # skipped: the skip is group-uniform, but a block after the range would then start in two different phases
+        # (body() gives each block one). Running it with every lane off is what skipping does: vector writes,
+        # exports, LDS writes and stores stay guarded by exec, and the restore gives each wave with no active lane
+        # its scalars from before the range back.
+        barrier_at = [b[0] for b in self.blocks if b[2] and b[2][0] == 'barrier']
         blocks = []
         for b in self.blocks:
             if b[2] and b[2][0] == 'barrier' and len(b[2]) > 1 and b[2][1] == 'wave-branch':
                 k = b[2][2]
                 blocks.append((b[0], self.group_restore.get(b[0], []) + b[1], ('barrier',)))
-                blocks.append((b[0] + 0.5, [], ('branch', '(x2w_any[%d][0] | x2w_any[%d][1]) == 0u' % (k, k), b[2][3])))
-                self.uniform_skips.add(b[0] + 0.5)
+                if not (BARRIER_RANGES and any(b[0] < o < b[2][3] for o in barrier_at)):
+                    blocks.append((b[0] + 0.5, [], ('branch', '(x2w_any[%d][0] | x2w_any[%d][1]) == 0u' % (k, k), b[2][3])))
+                    self.uniform_skips.add(b[0] + 0.5)
             elif b[0] in self.group_restore:
                 blocks.append((b[0], self.group_restore[b[0]] + b[1], b[2]))
             else:
