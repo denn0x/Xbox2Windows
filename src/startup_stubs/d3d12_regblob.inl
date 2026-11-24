@@ -20,7 +20,8 @@
 //   req_<key>.desc    0x300 bytes from the record (what note_pipeline copies; may run past the record)
 //   req_<key>.rec     the 0x160-byte record (pointers as the title passed them); last of the blob files
 //   req_<key>.b, .root, .a   the pipeline request, as cached_translation writes it (kept if present)
-//   req_<key>.d55_<8 hex>    slot 55 derived from this key: its patch records, once per distinct set
+//   req_<key>.d55_<8 hex>    slot 55 derived from this key: its raw patch records, once per distinct set
+//                            (hash ignores the blend write-mask padding and the rasterizer record's tail)
 // <key> is the request key (pipeline_key over [5]/[6], [9]/[10] and the root blob), unchanged, so these
 // pipelines get requests also when they are only ever bound at ExecuteIndirect (list slot 61).
 // Every distinct content of the blobs [1], [3], [7], [11] of a key (the first one too) is also written
@@ -313,7 +314,25 @@ void dump55(const void* base, const void* patches, std::size_t bytes)
         w = info && info->path == 55 ? info->base : nullptr;
     }
     if (!found.second) return;
-    const u64 hash = fnv_bytes(patches, bytes);
+    // Hash a canonical copy: the title leaves garbage in the padding after each write mask (run84), and a
+    // rasterizer record uses only sizeof(D3D12_RASTERIZER_DESC) of its 0x148 bytes. The raw bytes are written.
+    std::vector<unsigned char> canonical = bytes_of(patches, bytes);
+    constexpr std::size_t record = x2w_derived_blend::record_size;
+    for (std::size_t at = 0; at + record <= canonical.size(); at += record) {
+        std::uint32_t kind;
+        std::memcpy(&kind, canonical.data() + at, sizeof(kind));
+        unsigned char* body = canonical.data() + at + sizeof(kind);
+        if (kind == 2) {
+            for (int t = 0; t < 8; ++t)
+                std::memset(body + offsetof(D3D12_BLEND_DESC, RenderTarget) + t * sizeof(D3D12_RENDER_TARGET_BLEND_DESC) +
+                            offsetof(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1, 0, 3);
+        } else if (kind == 1) {
+            std::memset(body + sizeof(D3D12_RASTERIZER_DESC), 0, record - sizeof(kind) - sizeof(D3D12_RASTERIZER_DESC));
+        }
+    }
+    static_assert(sizeof(D3D12_RENDER_TARGET_BLEND_DESC) == offsetof(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 4);
+    static_assert(sizeof(D3D12_RASTERIZER_DESC) + sizeof(std::uint32_t) <= x2w_derived_blend::record_size);
+    const u64 hash = fnv_bytes(canonical.data(), canonical.size());
     AcquireSRWLockExclusive(&lock);
     const bool fresh = seen.size() < 16384 && seen.insert(fnv_bytes(&hash, sizeof(hash), found.first)).second;
     ReleaseSRWLockExclusive(&lock);
