@@ -350,12 +350,42 @@ bool texture_view(Wrapper* self, const ComputeTranslation::Res& r, const ViewRec
 // The view-id region of the shader-visible heap: 8 views per title view id i at
 // draw_heap_size + 8 + 8 * i (0 Texture2D, 1 Texture2DArray, 2 Texture3D, 3 Texture1D, 4 raw buffer SRV,
 // 5 RWTexture2D, 6 RWTexture2DArray, 7 raw buffer UAV), empty views of each kind at draw_heap_size.
-// vinfo (an upload buffer, 16 bytes per id) holds the buffer stride. Filled up to the newest record.
+// vinfo (an upload buffer, 16 bytes per id): word 0 the index stride in bytes (structured: the structure stride,
+// typed: the element size, raw: 0), word 1 the GFX10_FORMAT code of a typed view (0: raw, structured or unmapped).
+// Filled up to the newest record.
 constexpr UINT view_ids_max = 90000;
 UINT views_filled;
 ID3D12Resource* vinfo_buffer;
 std::uint32_t* vinfo_words;
 LONG views_bound, views_null;
+// LOCAL: typed buffer views (FirstElement x element size, index stride = element size). X2W_CX_TYPED_OFF=1 restores
+// the old layout (element 4 bytes, stride 0, no format) for heap views, table views and bufword3.
+bool typed_views_off()
+{
+    static const bool off = x2w_local::env_on("X2W_CX_TYPED_OFF");
+    return off;
+}
+LONG cxv_typed_heap, cxv_typed_table, cxv_misaligned, cxv_word3;  // heap: views filled; table: bindings
+void note_typed_view(const x2w_startup::BufferViewLayout& l, const ViewRecord& record, bool heap)
+{
+    if (l.kind != x2w_startup::BufferViewKind::typed) return;
+    InterlockedIncrement(heap ? &cxv_typed_heap : &cxv_typed_table);
+    static LONG logged;
+    if (first_calls(logged, 6)) {
+        std::uint32_t format = 0;
+        std::memcpy(&format, record.desc, 4);
+        log("x2w-cx typed buffer view %u (%s): format %u -> gfx10 format %u, %u-byte elements from byte %llu, %llu bytes%s", record.id, heap ? "heap" : "table", format,
+            l.format.code, l.index_stride, static_cast<unsigned long long>(l.offset), static_cast<unsigned long long>(l.bytes),
+            typed_views_off() ? " (X2W_CX_TYPED_OFF)" : "");
+    }
+}
+// Called every 300 frames (render mode): view facts handed to translated programs since the last report.
+void report_cx_views()
+{
+    log("x2w-cx view facts (300 frames): typed buffer views heap %ld table %ld (heap misaligned %ld), bufword3 synthesized %ld%s",
+        InterlockedExchange(&cxv_typed_heap, 0), InterlockedExchange(&cxv_typed_table, 0), InterlockedExchange(&cxv_misaligned, 0),
+        InterlockedExchange(&cxv_word3, 0), typed_views_off() ? " (X2W_CX_TYPED_OFF)" : "");
+}
 void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
 {
     const SIZE_T inc = draw_heap_increment;
@@ -372,27 +402,30 @@ void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
         } else if (buffer_view) {
             u64 address = 0;
             std::size_t bytes = 0;
-            std::uint32_t stride = 0;
+            std::uint32_t stride = 0, format_code = 0;
+            bool typed = false;
             if (record->slot == 17 && record->desc_bytes >= 12) {
                 std::uint32_t size = 0;
                 std::memcpy(&address, record->desc, 8);
                 std::memcpy(&size, record->desc + 8, 4);
                 bytes = size;
             } else if ((record->slot == 18 || record->slot == 19) && record->desc_bytes >= 24 && resource && resource->own().title_memory) {
-                u64 first_element = 0;
-                std::uint32_t count = 0;
-                const std::size_t off = record->slot == 18 ? 16 : 8;
-                std::memcpy(&first_element, record->desc + off, 8);
-                std::memcpy(&count, record->desc + off + 8, 4);
-                std::memcpy(&stride, record->desc + off + 12, 4);
-                const UINT element = stride ? stride : 4;
-                address = reinterpret_cast<u64>(resource->own().title_memory) + first_element * element;
-                bytes = std::size_t{count} * element;
+                x2w_startup::BufferViewLayout l;
+                if (x2w_startup::buffer_view_layout_from_desc(record->slot == 19, record->desc, record->desc_bytes, l, typed_views_off())) {
+                    address = reinterpret_cast<u64>(resource->own().title_memory) + l.offset;
+                    bytes = static_cast<std::size_t>(l.bytes);
+                    stride = l.index_stride;
+                    format_code = l.format.code;
+                    note_typed_view(l, *record, true);
+                    typed = l.kind == x2w_startup::BufferViewKind::typed;
+                }
             }
             if (bytes > (256u << 20)) bytes = 256u << 20;
             ID3D12Resource* window = nullptr;
             u64 offset = 0;
-            if (address && bytes && desktop_range(address, bytes, &window, &offset) && (offset & 15) == 0) {
+            const bool in_window = address && bytes && desktop_range(address, bytes, &window, &offset);
+            if (in_window && (offset & 15) && typed) InterlockedIncrement(&cxv_misaligned);  // raw views must start 16-aligned
+            if (in_window && (offset & 15) == 0) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
                 sd.Format = DXGI_FORMAT_R32_TYPELESS;
                 sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -410,7 +443,10 @@ void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
                 device_of(the_device)->CreateUnorderedAccessView(window, nullptr, &ud, at(7));
                 done[4] = done[7] = true;
             }
-            if (vinfo_words && record->id < view_ids_max) vinfo_words[record->id * 4] = stride;
+            if (vinfo_words && record->id < view_ids_max) {
+                vinfo_words[record->id * 4] = stride;
+                vinfo_words[record->id * 4 + 1] = format_code;
+            }
         }
     }
     for (UINT k = 0; k < 8; ++k) {
@@ -562,17 +598,20 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
                 Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
                 D3D12_SRV_DIMENSION dim{};
                 std::memcpy(&dim, record.desc + 4, 4);
-                if (dim == 1 /* BUFFER in both SRV and UAV enums */ && resource && resource->own().title_memory) {
-                    u64 first_element = 0;
-                    std::uint32_t count = 0, stride = 0;
-                    const std::size_t at = record.slot == 18 ? 16 : 8;
-                    std::memcpy(&first_element, record.desc + at, 8);
-                    std::memcpy(&count, record.desc + at + 8, 4);
-                    std::memcpy(&stride, record.desc + at + 12, 4);
-                    const UINT element = stride ? stride : 4;
-                    address = reinterpret_cast<u64>(resource->own().title_memory) + first_element * element;
-                    bytes = std::size_t{count} * element;
-                    strides[i] = stride;
+                x2w_startup::BufferViewLayout l;
+                if (dim == 1 /* BUFFER in both SRV and UAV enums */ && resource && resource->own().title_memory &&
+                    x2w_startup::buffer_view_layout_from_desc(record.slot == 19, record.desc, record.desc_bytes, l, typed_views_off())) {
+                    address = reinterpret_cast<u64>(resource->own().title_memory) + l.offset;
+                    bytes = static_cast<std::size_t>(l.bytes);
+                    strides[i] = l.index_stride;
+                    note_typed_view(l, record, false);
+                    if (!typed_views_off()) {
+                        // word 3 of the V# the console holds for this view (format, swizzle), for bufword3 entry values
+                        std::uint32_t v[8];
+                        x2w_startup::gfx10_buffer_words(l, v);
+                        word3[i] = v[3];
+                        InterlockedIncrement(&cxv_word3);
+                    }
                 }
             } else if (entry && words[0] != view_token_magic) {
                 address = words[0] | (static_cast<u64>(words[1] & 0xffff) << 32);

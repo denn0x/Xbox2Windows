@@ -43,6 +43,7 @@
 #include "present_view_format.h"
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
+#include "gfx10_view_words.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
@@ -4230,6 +4231,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         report_dispatches();
         report_indirect(300);  // LOCAL: d3d12_indirect.inl
         regblob::report();
+        report_cx_views();
     }
     if (now - last_report >= 5000) {
         last_report = now;
