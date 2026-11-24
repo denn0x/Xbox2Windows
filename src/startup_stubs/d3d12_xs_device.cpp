@@ -4011,6 +4011,7 @@ void draw_overlay(LONG frame, double seconds)
 #include "startup_stubs/d3d12_compute.inl"
 #include "startup_stubs/d3d12_indirect.inl"
 #include "startup_stubs/d3d12_present.inl"
+#include "startup_stubs/d3d12_copy_buffer.inl"
 
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
@@ -4274,6 +4275,7 @@ void build_tables()
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
+        install_copy_buffer(list_typed);
     }
     tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
 
