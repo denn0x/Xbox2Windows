@@ -2532,6 +2532,10 @@ void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
     pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
 }
 extern LONG translated_draws, untranslated_draws, frame_number;
+// LOCAL: d3d12_indirect.inl, the indirect call at the issue points of the dispatch and draw paths.
+bool indirect_pending(Wrapper* self);
+bool indirect_draw_issue(Wrapper* self, ID3D12GraphicsCommandList* list, bool indexed);
+void indirect_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z);
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
 extern thread_local u64 last_draw_key;
 extern thread_local const char* last_draw_why;
@@ -2685,7 +2689,7 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
         default: break;
         }
     }
-    list->Dispatch(x, y, z);
+    indirect_dispatch(self, list, x, y, z);  // LOCAL: Dispatch, or the pending ExecuteIndirect (d3d12_indirect.inl)
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
