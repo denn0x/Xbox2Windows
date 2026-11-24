@@ -250,10 +250,16 @@ Wrapper* the_device;
 // Time spent inside the stand-in per entry-point family, reported with the heartbeat.
 enum { time_list, time_device_noop, time_forward, time_create, time_view, time_queue, time_present, time_wait,
        time_pipeline, time_heap, time_copy, time_cx_fill_views, time_cx_desktop_range, time_cx_readable, time_cx_texture,
-       time_cx_execute, time_vquery, time_count };
+       time_cx_execute, time_vquery, time_placed, time_placed_query, time_placed_create, time_placed_log, time_placed_gap,
+       time_count };
+// LOCAL (perf_work/STARTUP.md): "placed" is all of Device slot 133 (CreatePlacedResourceX); its parts are
+// the memory queries, the desktop heap/resource creation and the log line; "placed-gap" is the time on
+// the same thread from the end of one slot 133 call to the start of the next (the title's own work
+// between two calls; gaps over 1 s are not counted).
 const char* const time_names[time_count] = {"list", "device-noop", "forward", "create", "view", "queue", "present", "wait",
                                             "pipeline", "heap", "copy", "cx-fill-views", "cx-desktop-range", "cx-readable",
-                                            "cx-texture-view", "cx-execute", "vquery"};
+                                            "cx-texture-view", "cx-execute", "vquery", "placed", "placed-query",
+                                            "placed-create", "placed-log", "placed-gap"};
 volatile LONG64 time_ticks[time_count], time_calls[time_count];
 struct Timed;
 SIZE_T timed_query(const void* address, MEMORY_BASIC_INFORMATION* info);  // VirtualQuery, timed as "vquery"
@@ -271,6 +277,25 @@ struct Timed {
         InterlockedIncrement64(&time_calls[category]);
     }
 };
+
+// LOCAL: a part of a call timed into one category (Timed covers a whole scope).
+struct TimedPart {
+    int category;
+    LARGE_INTEGER start;
+    explicit TimedPart(int c) : category(c) { QueryPerformanceCounter(&start); }
+    void stop()
+    {
+        if (category < 0) return;
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        InterlockedAdd64(&time_ticks[category], end.QuadPart - start.QuadPart);
+        InterlockedIncrement64(&time_calls[category]);
+        category = -1;
+    }
+    ~TimedPart() { stop(); }
+};
+// Slot 133 totals since the start, never reset (the per-report times above are).
+volatile LONG64 placed_calls_total, placed_ticks_total;
 
 SIZE_T timed_query(const void* address, MEMORY_BASIC_INFORMATION* info)
 {
@@ -3580,6 +3605,35 @@ D3D12_GPU_VIRTUAL_ADDRESS desktop_va(u64 address)
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
 {
+    // LOCAL timers: the whole call ("placed") and the gap since this thread's previous call ("placed-gap").
+    static thread_local LONG64 placed_last_end = 0;
+    struct PlacedEnd {
+        LARGE_INTEGER start;
+        LONG64* last_end;
+        ~PlacedEnd()
+        {
+            LARGE_INTEGER end;
+            QueryPerformanceCounter(&end);
+            InterlockedAdd64(&time_ticks[time_placed], end.QuadPart - start.QuadPart);
+            InterlockedIncrement64(&time_calls[time_placed]);
+            InterlockedAdd64(&placed_ticks_total, end.QuadPart - start.QuadPart);
+            InterlockedIncrement64(&placed_calls_total);
+            *last_end = end.QuadPart;
+        }
+    } placed_end{{}, &placed_last_end};
+    QueryPerformanceCounter(&placed_end.start);
+    {
+        static const LONG64 frequency = [] {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            return f.QuadPart;
+        }();
+        const LONG64 gap = placed_end.start.QuadPart - placed_last_end;
+        if (placed_last_end && gap >= 0 && gap < frequency) {
+            InterlockedAdd64(&time_ticks[time_placed_gap], gap);
+            InterlockedIncrement64(&time_calls[time_placed_gap]);
+        }
+    }
     char text[48];
     guid_text(iid, text, sizeof(text));
     if (!out || !desc || !iid) return E_POINTER;
@@ -3625,8 +3679,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         *out = w;
         return S_OK;
     }
+    TimedPart query_time(time_placed_query);
     MEMORY_BASIC_INFORMATION info{};
     if (!address || VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT) {
+        query_time.stop();
         log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) address=%p not committed -> E_INVALIDARG", address);
         return E_INVALIDARG;
     }
@@ -3649,6 +3705,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         allocation_bytes += region.RegionSize;
     if ((offset & 0xFFFF) || offset > allocation_bytes || desc->Width > allocation_bytes - offset || info.Type != MEM_PRIVATE ||
         initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) hr = E_INVALIDARG;
+    query_time.stop();
+    TimedPart create_time(time_placed_create);
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
         for (auto& [known, h] : existing_heaps)
@@ -3684,9 +3742,12 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                                                       nullptr, IID_PPV_ARGS(&resource));
         placement = "not aliased";
     }
+    create_time.stop();
+    TimedPart log_time(time_placed_log);
     log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) address=%p base=%p offset=0x%llx width=0x%llx flags=0x%x "
         "state=0x%x clear=%p riid=%s -> 0x%08lx %s gpuva=0x%llx", address, base, offset, desc->Width, desc->Flags, state,
         clear, text, static_cast<unsigned long>(hr), placement, resource ? resource->GetGPUVirtualAddress() : 0ull);
+    log_time.stop();
     if (FAILED(hr)) return hr;
     Wrapper* w = wrap(resource, resource_kind);
     w->own().title_memory = address;
@@ -4310,6 +4371,13 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
                                           static_cast<long long>(ticks * 1000 / frequency.QuadPart), static_cast<long long>(calls));
             }
             log("x2w-d3d12 time inside the stand-in since the last report (ms/calls):%s", text);
+            static LONG64 placed_reported = 0;  // LOCAL: slot 133 totals, when they changed
+            const LONG64 placed_calls = placed_calls_total;
+            if (placed_calls != placed_reported) {
+                placed_reported = placed_calls;
+                log("x2w-d3d12 placed resources (slot 133) since the start: %lld calls, %lld ms inside", static_cast<long long>(placed_calls),
+                    static_cast<long long>(placed_ticks_total * 1000 / frequency.QuadPart));
+            }
             used = 0;
             text[0] = 0;
             for (int i = 0; i < 256; ++i) {
