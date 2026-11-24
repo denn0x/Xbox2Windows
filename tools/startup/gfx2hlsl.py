@@ -1559,6 +1559,15 @@ class Stage:
             self.exports['depth'] = True
             self.emit('o.depth = F(%s);' % self.u(vals[0]))
             return None
+        if target == 'pos1' and self.kind == 'vs' and getattr(self.pipe, 'vs_out_cntl', None) is not None \
+                and 'compr' not in flags:
+            # With VS_OUT_MISC_VEC_ENA clear and VS_OUT_CCDIST0_VEC_ENA set, the export after pos0 is the first
+            # clip/cull distance vector (see clip_vector_width); D3D: SV_ClipDistance0.
+            n = clip_vector_width(self.pipe.vs_out_cntl, vals)
+            self.exports['clip'] = n
+            parts = ', '.join('F(%s)' % self.u(v) for v in vals[:n])
+            self.emit('o.clip0 = %s;' % (parts if n == 1 else 'float%d(%s)' % (n, parts)))
+            return None
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
@@ -1924,8 +1933,10 @@ def ps_input_layout(ena, addr):
 
 class Pipeline:
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None,
-                 features=None):
+                 features=None, vs_out_cntl=None):
         self.root = parse_root(root_blob)
+        # PA_CL_VS_OUT_CNTL of the vertex stage (request .vsout), or None: says what a pos1 export carries.
+        self.vs_out_cntl = vs_out_cntl
         # Lowerings whose manifest lines need draw-runtime support (DRAW_FEATURES); off unless named, so a
         # --requests pass never publishes a result the runtime cannot bind yet.
         self.features = draw_features() if features is None else frozenset(features)
@@ -2061,6 +2072,9 @@ class Pipeline:
         for p in self.flat:
             fields.append('    nointerpolation uint4 fparam%d : FPARAM%d;' % (p, p))
         fields.append('    float4 pos : SV_Position;')
+        clip = self.vs.exports.get('clip')
+        if clip:
+            fields.append('    float%s clip0 : SV_ClipDistance0;' % ('' if clip == 1 else clip))
         return fields
 
     def hlsl_vs(self):
@@ -2081,6 +2095,8 @@ class Pipeline:
         for p in range(max(self.params) + 1 if self.params else 0):
             out.append('    o.param%d = p.param%d + r.param%d - q.param%d;' % (p, p, p, p))
         out += ['    o.fparam%d = p.fparam%d;' % (p, p) for p in self.flat]
+        if self.vs.exports.get('clip'):
+            out.append('    o.clip0 = p.clip0 + r.clip0 - q.clip0;')  # linear in the corner, like the params
         out += ['    o.pos = p.pos + r.pos - q.pos;', '    return o;', '}']
         return '\n'.join(out) + '\n'
 
@@ -2167,14 +2183,15 @@ def find_fxc():
 
 
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='',
-                 ps_hw_inputs=None):
+                 ps_hw_inputs=None, vs_out_cntl=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, ps_hw_inputs=ps_hw_inputs)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, ps_hw_inputs=ps_hw_inputs,
+                        vs_out_cntl=vs_out_cntl)
         if pipe.ps_entry_reads:
             # A request does not carry the SPI input layout, so the HLSL would read that input as 0 (for example
             # the packed pixel position a dither or a full-screen copy addresses with). Not written as a result.
@@ -2236,6 +2253,7 @@ def translate_request(out_dir, key):
         if request and pipeline_key(a, b, root) != base:
             raise Unsupported('RTV variant source key mismatch')
         ps_hw_inputs = read_ps_inputs(name + '.psin')
+        vs_out_cntl = read_vs_out(name + '.vsout')
         if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
             # Slot 86 records complete containers in canonical (VS, PS) order.
             # Keep the container bytes in the cache key; translate only the bounded native code.
@@ -2259,7 +2277,45 @@ def translate_request(out_dir, key):
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
     return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
-                        ps_hw_inputs=ps_hw_inputs)
+                        ps_hw_inputs=ps_hw_inputs, vs_out_cntl=vs_out_cntl)
+
+
+def read_vs_out(path):
+    """PA_CL_VS_OUT_CNTL from a request's optional .vsout file, 'pa_cl_vs_out_cntl 1 <hex8>', or None."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding='ascii') as file:
+        text = file.read(64)
+    m = re.fullmatch(r'pa_cl_vs_out_cntl 1 ([0-9a-f]{8})\n', text)
+    if not m:
+        raise Unsupported('invalid vertex output control file')
+    return int(m.group(1), 16)
+
+
+# PA_CL_VS_OUT_CNTL fields (Mesa src/amd/registers/gfx10.json): CLIP_DIST_ENA_0..7 [7:0], CULL_DIST_ENA_0..7 [15:8],
+# USE_VTX_POINT_SIZE 16, _EDGE_FLAG 17, _RENDER_TARGET_INDX 18, _VIEWPORT_INDX 19, _KILL_FLAG 20,
+# VS_OUT_MISC_VEC_ENA 21, VS_OUT_CCDIST0_VEC_ENA 22, VS_OUT_CCDIST1_VEC_ENA 23, VS_OUT_MISC_SIDE_BUS_ENA 24,
+# USE_VTX_GS_CUT_FLAG 25, USE_VTX_SHD_OBJPRIM_ID 26, USE_VTX_LINE_WIDTH 27.
+VS_OUT_CCDIST0 = 1 << 22
+VS_OUT_SIDE_BUS = 1 << 24
+
+
+def clip_vector_width(cntl, vals):
+    """Channels of a pos1 export that are clip distances 0..n-1; refuses every other PA_CL_VS_OUT_CNTL use.
+
+    Accepted only when pos1 is the first clip/cull distance vector (no misc vector, CCDIST0 on, CCDIST1 off,
+    no per-vertex misc values), the written channels are x.. contiguously, each is a clip distance, and the
+    cull enables are either none or the same channels. A distance that is both clip and cull distance is
+    lowered as SV_ClipDistance alone: the cull removes a primitive only when every vertex is below 0, which the
+    clip at 0 removes already. VS_OUT_MISC_SIDE_BUS_ENA (a transport choice) is allowed.
+    """
+    written = [i for i, v in enumerate(vals) if v != 'off']
+    n = len(written)
+    clip, cull = cntl & 0xff, cntl >> 8 & 0xff
+    if (cntl & ~(0xffff | VS_OUT_CCDIST0 | VS_OUT_SIDE_BUS) or not cntl & VS_OUT_CCDIST0 or not n
+            or written != list(range(n)) or clip != (1 << n) - 1 or cull not in (0, clip)):
+        raise Unsupported('pos1 export with PA_CL_VS_OUT_CNTL %#010x (channels %s)' % (cntl, written))
+    return n
 
 
 def read_ps_inputs(path):
