@@ -523,6 +523,16 @@ bool rds5_slice(HANDLE handle, u64 offset, unsigned compressed, unsigned destina
 // inflated streams, or by finding the stream start on disk (offset - k * piece, a zlib header, and a
 // full Adler-checked inflate past piece k).
 LONG requests_stream_pieces, requests_pieces_found_on_disk;
+// Off unless X2W_DSTORAGE_STREAM_PIECES=1. Upstream's controls (startup_stub_check: a separate submission at
+// a cached stream's continuation offset, an undersized whole-stream request) fail these requests, and
+// these paths serve them: they cannot tell such a request from a real later piece or piece 0. Since the
+// RDS5 interval slices (rds5_slice) these paths served no request in runs 85-87 (heartbeat
+// stream-pieces=0 found-on-disk=0), so they stay as an opt-in.
+bool stream_pieces_enabled()
+{
+    static const bool on = x2w_local::env_on("X2W_DSTORAGE_STREAM_PIECES");
+    return on;
+}
 struct InflatedStream { u64 source, base; unsigned compressed; std::shared_ptr<const std::vector<unsigned char>> data; };
 std::mutex streams_lock;
 std::deque<InflatedStream> streams;
@@ -740,7 +750,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                             cached_chunked = true;
                         }
                     }
-                    if (!cached_chunked && !memory_source && !bcpack && produced > destination_size) {
+                    if (!cached_chunked && !memory_source && !bcpack && produced > destination_size && stream_pieces_enabled()) {
                         // LOCAL: piece 0 of a multi-piece stream whose other pieces are not in this
                         // submission: keep the whole stream for them and serve this piece's slice.
                         remember_stream(source, offset, source_size, std::make_shared<const std::vector<unsigned char>>(output));
@@ -799,7 +809,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
 
-            if (!direct_decoded && !decode_error && !memory_source && !bcpack) {
+            if (!direct_decoded && !decode_error && !memory_source && !bcpack && stream_pieces_enabled()) {
                 // LOCAL: a later piece that missed the submission's cache (see remember_stream). Not for a
                 // request whose own bytes start a zlib stream that failed to decode: that is a damaged
                 // stream, and it fails like on the queue-cache path above.
