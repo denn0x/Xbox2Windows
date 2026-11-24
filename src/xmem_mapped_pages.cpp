@@ -20,7 +20,26 @@ namespace {
 struct Backing {
     HANDLE section;
     ULONG_PTR views = 0;
+    ULONG64 offset = 0;    // byte offset of the page in its section
+    bool shared = false;   // the section is a chunk shared by many pages (not closed per page)
 };
+
+// LOCAL EXPERIMENT (X2W_XMEM_CHUNKS=1): pages live in 1 GiB committed sections (16384 pages each,
+// page p at (p % 16384) * 64 KiB of chunk p / 16384) instead of one section per page. A desktop GPU
+// heap can be opened over a whole chunk (OpenExistingHeapFromFileMapping accepts 1 GiB, not 4 GiB),
+// so the GPU reads and writes the same pages the title maps. x2w_xmem_gpu_location() names the
+// chunk and offset behind a mapped address.
+constexpr ULONG_PTR chunk_pages = 16384;
+bool chunks_on()
+{
+    static const bool on = [] {
+        char value[8];
+        const DWORD n = GetEnvironmentVariableA("X2W_XMEM_CHUNKS", value, sizeof value);
+        return n && n < sizeof value && value[0] == '1';
+    }();
+    return on;
+}
+HANDLE chunk_sections[(std::uint64_t{1} << 18) / chunk_pages];
 
 // Keep grant transitions and section views serialized. A grant can outlive all its
 // views so its bytes survive unmapping. Its backing is released before reuse.
@@ -42,7 +61,7 @@ struct PhysicalMemory {
         for (const auto& view : views)
             UnmapViewOfFile(reinterpret_cast<void*>(view.first));
         for (const auto& backing : backings)
-            CloseHandle(backing.second.section);
+            if (!backing.second.shared) CloseHandle(backing.second.section);
     }
 };
 
@@ -85,6 +104,22 @@ HANDLE section_for(ULONG_PTR page)
     const auto existing = memory.backings.find(page);
     if (existing != memory.backings.end())
         return existing->second.section;
+    if (chunks_on()) {
+        const ULONG_PTR chunk = page / chunk_pages;
+        if (chunk >= std::size(chunk_sections)) return nullptr;
+        if (!chunk_sections[chunk]) {
+            const ULONG64 bytes = ULONG64{chunk_pages} * page_bytes;
+            chunk_sections[chunk] = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+                                                       static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
+            x2w_local::logf("x2w-xmem chunk %llu section %p", static_cast<unsigned long long>(chunk), chunk_sections[chunk]);
+            if (!chunk_sections[chunk]) return nullptr;
+        }
+        Backing backing{chunk_sections[chunk]};
+        backing.offset = ULONG64{page % chunk_pages} * page_bytes;
+        backing.shared = true;
+        memory.backings.emplace(page, backing);
+        return chunk_sections[chunk];
+    }
     const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | (lazy_commit() ? SEC_RESERVE : 0),
                                               0, page_bytes, nullptr);
     if (section) {
@@ -106,11 +141,11 @@ auto owned_reservation(ULONG_PTR address)
     return address - it->first < it->second ? it : memory.reservations.end();
 }
 
-bool map_view(ULONG_PTR address, HANDLE section)
+bool map_view(ULONG_PTR address, HANDLE section, ULONG64 offset = 0)
 {
     auto* target = reinterpret_cast<void*>(address);
     auto map = [&] {
-        return MapViewOfFile3(section, GetCurrentProcess(), target, 0,
+        return MapViewOfFile3(section, GetCurrentProcess(), target, offset,
                               page_bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
     };
     if (map()) return true;
@@ -164,7 +199,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
             }
             auto next = batch.begin();
             for (; next != batch.end(); ++next) {
-                if (!map_view(next->first, memory.backings.at(next->second).section)) {
+                if (!map_view(next->first, memory.backings.at(next->second).section, memory.backings.at(next->second).offset)) {
                     const DWORD error = GetLastError();
                     while (next != batch.begin()) {
                         const auto previous = --next;
@@ -190,7 +225,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                     const DWORD error = GetLastError();
                     while (next != batch.begin()) {
                         const auto& [address, page] = *--next;
-                        if (!map_view(address, memory.backings.at(page).section)) {
+                        if (!map_view(address, memory.backings.at(page).section, memory.backings.at(page).offset)) {
                             --memory.backings.at(page).views;
                             memory.views.erase(address);
                         }
@@ -449,7 +484,7 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto backing = memory.backings.find(pages[i]);
             if (backing != memory.backings.end()) {
-                CloseHandle(backing->second.section);
+                if (!backing->second.shared) CloseHandle(backing->second.section);
                 memory.backings.erase(backing);
             }
         }
@@ -469,12 +504,15 @@ extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PT
     while (bytes) {
         if (index >= count || (tokens[index] & 0xF)) return FALSE;
         HANDLE section = nullptr;
+        ULONG64 section_offset = 0;
         {
             const std::lock_guard guard(memory.mutex);
             section = section_for(tokens[index] >> 4);
+            if (section) section_offset = memory.backings.at(tokens[index] >> 4).offset;
         }
         if (!section) return FALSE;
-        void* view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, page_bytes);
+        void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(section_offset >> 32), static_cast<DWORD>(section_offset),
+                                   page_bytes);
         if (!view) return FALSE;
         if (lazy_commit() && !VirtualAlloc(view, page_bytes, MEM_COMMIT, PAGE_READWRITE)) {
             UnmapViewOfFile(view);
@@ -658,4 +696,20 @@ extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allo
         return nullptr;
     }
     return reservation;
+}
+
+// Local experiment export: the section (a 1 GiB chunk, X2W_XMEM_CHUNKS=1) and byte offset behind a
+// mapped title address. FALSE when the address is not in a mapped page or chunks are off.
+extern "C" BOOL WINAPI x2w_xmem_gpu_location(const void* address, HANDLE* section, ULONG64* offset)
+{
+    if (!chunks_on() || !section || !offset) return FALSE;
+    const auto at = reinterpret_cast<ULONG_PTR>(address);
+    const std::lock_guard guard(memory.mutex);
+    const auto view = memory.views.find(at - at % page_bytes);
+    if (view == memory.views.end()) return FALSE;
+    const auto backing = memory.backings.find(view->second);
+    if (backing == memory.backings.end() || !backing->second.shared) return FALSE;
+    *section = backing->second.section;
+    *offset = backing->second.offset + at % page_bytes;
+    return TRUE;
 }

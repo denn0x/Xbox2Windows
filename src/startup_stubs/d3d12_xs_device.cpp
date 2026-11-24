@@ -16,6 +16,9 @@
 #include "startup_stubs/local_log.h"
 #include "xmem_low.h"
 
+#include <algorithm>
+#include <map>
+#include <tuple>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -185,24 +188,62 @@ ID3D12Device* removal_device;
 LONG removal_reported, debug_lines;
 SRWLOCK debug_lock = SRWLOCK_INIT;
 
+// LOCAL: logs DRED breadcrumbs (the operations around the last completed one, per list) and the page fault.
+void report_dred(ID3D12Device* device)
+{
+    ID3D12DeviceRemovedExtendedData* dred = nullptr;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
+        log("x2w-dred not available");
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs{};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&crumbs))) {
+        int lists = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE* node = crumbs.pHeadAutoBreadcrumbNode; node && lists < 24; node = node->pNext) {
+            const UINT done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+            if (done >= node->BreadcrumbCount) continue;  // completed list
+            ++lists;
+            log("x2w-dred list %p: %u of %u operations completed", static_cast<const void*>(node->pCommandList), done, node->BreadcrumbCount);
+            const UINT from = done > 6 ? done - 6 : 0, to = done + 4 < node->BreadcrumbCount ? done + 4 : node->BreadcrumbCount;
+            for (UINT i = from; i < to; ++i)
+                log("x2w-dred   %s op %u: %d", i == done ? ">>" : "  ", i, static_cast<int>(node->pCommandHistory[i]));
+        }
+        if (!lists) log("x2w-dred no incomplete list in the breadcrumbs");
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault))) {
+        log("x2w-dred page fault va 0x%llx", static_cast<unsigned long long>(fault.PageFaultVA));
+        int n = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE* a = fault.pHeadExistingAllocationNode; a && n < 8; a = a->pNext, ++n)
+            log("x2w-dred   existing allocation type %d", static_cast<int>(a->AllocationType));
+        n = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE* a = fault.pHeadRecentFreedAllocationNode; a && n < 8; a = a->pNext, ++n)
+            log("x2w-dred   recently freed allocation type %d", static_cast<int>(a->AllocationType));
+    }
+    dred->Release();
+}
+
 void check_device(const char* context, int slot)
 {
     if (removal_device && !removal_reported) {
         const HRESULT reason = removal_device->GetDeviceRemovedReason();
-        if (reason != S_OK && InterlockedExchange(&removal_reported, 1) == 0)
+        if (reason != S_OK && InterlockedExchange(&removal_reported, 1) == 0) {
             log("x2w-d3d12 DEVICE REMOVED, reason 0x%08lx, first noticed after %s %d", static_cast<unsigned long>(reason),
                 context, slot);
+            report_dred(removal_device);
+        }
     }
     if (!info_queue) return;
     AcquireSRWLockExclusive(&debug_lock);
     const UINT64 count = info_queue->GetNumStoredMessages();
-    for (UINT64 i = 0; i < count && debug_lines < 400; ++i) {
+    static std::unordered_map<int, int> per_id;  // LOCAL: at most 4 lines per message id
+    for (UINT64 i = 0; i < count && debug_lines < 4000; ++i) {
         SIZE_T size = 0;
         info_queue->GetMessage(i, nullptr, &size);
         if (!size || size > 8192) continue;
         alignas(16) char storage[8192];
         auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage);
-        if (SUCCEEDED(info_queue->GetMessage(i, message, &size))) {
+        if (SUCCEEDED(info_queue->GetMessage(i, message, &size)) && ++per_id[message->ID] <= 4) {
             ++debug_lines;
             log("x2w-d3d12-debug [%s %d] sev=%d id=%d %.900s", context, slot, message->Severity, message->ID,
                 message->pDescription);
@@ -510,6 +551,19 @@ DXGI_FORMAT desktop_format(DXGI_FORMAT format)
     return mapped;
 }
 
+// Depth-stencil formats are planar on desktop: a stencil view format reads plane 1, a depth one
+// plane 0. A view with the wrong plane removes the device (DXGI_ERROR_INVALID_CALL).
+void fix_srv_plane(D3D12_SHADER_RESOURCE_VIEW_DESC& d)
+{
+    const bool stencil = d.Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT || d.Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    const bool depth = d.Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || d.Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                       d.Format == DXGI_FORMAT_R32_FLOAT || d.Format == DXGI_FORMAT_R16_UNORM;
+    if (!stencil && !depth) return;
+    const UINT plane = stencil ? 1 : 0;
+    if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) d.Texture2D.PlaneSlice = plane;
+    else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) d.Texture2DArray.PlaneSlice = plane;
+}
+
 constexpr UINT desktop_resource_flags = 0x3f;
 D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
 {
@@ -716,6 +770,17 @@ void __stdcall device_copyable_footprints(Wrapper* self, const D3D12_RESOURCE_DE
     device_of(self)->GetCopyableFootprints(&copy, first, count, base, layouts, rows, row_bytes, total);
 }
 
+// LOCAL: command signatures by wrapper: stride and the argument descriptors, for ExecuteIndirect.
+struct SignatureInfo {
+    UINT stride = 0;
+    std::vector<D3D12_INDIRECT_ARGUMENT_DESC> args;
+};
+SRWLOCK signature_lock = SRWLOCK_INIT;
+std::unordered_map<const void*, SignatureInfo>& signature_infos()
+{
+    static std::unordered_map<const void*, SignatureInfo> infos;
+    return infos;
+}
 // Device slot 41, desktop CreateCommandSignature(desc, root, riid, ppv); on failure the descriptor and
 // its argument descriptors are logged.
 u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND_SIGNATURE_DESC* desc, u64 root,
@@ -740,8 +805,27 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
     if (FAILED(static_cast<HRESULT>(result)) && console_type && out) {
         log("x2w-d3d12   CreateCommandSignature: console argument type -> placeholder");
         *reinterpret_cast<void**>(out) = wrap(nullptr, command_signature_kind);
-        return S_OK;
     }
+    if (out && desc && x2w_local::readable(desc, sizeof(*desc)) && *reinterpret_cast<void**>(out) &&
+        (SUCCEEDED(static_cast<HRESULT>(result)) || console_type)) {
+        SignatureInfo info;
+        info.stride = desc->ByteStride;
+        if (desc->NumArgumentDescs <= 16 && x2w_local::readable(desc->pArgumentDescs, desc->NumArgumentDescs * sizeof(D3D12_INDIRECT_ARGUMENT_DESC)))
+            info.args.assign(desc->pArgumentDescs, desc->pArgumentDescs + desc->NumArgumentDescs);
+        static LONG logged;
+        if (first_calls(logged, 40)) {
+            char text[256] = "";
+            int at = 0;
+            for (const auto& a : info.args)
+                at += std::snprintf(text + at, sizeof(text) - at > 0 ? sizeof(text) - at : 0, " %u(%u,%u)", static_cast<UINT>(a.Type),
+                                    a.Constant.RootParameterIndex, a.Constant.Num32BitValuesToSet);
+            log("x2w-d3d12   command signature %p: stride %u, args%s", *reinterpret_cast<void**>(out), info.stride, text);
+        }
+        AcquireSRWLockExclusive(&signature_lock);
+        signature_infos()[*reinterpret_cast<void**>(out)] = std::move(info);
+        ReleaseSRWLockExclusive(&signature_lock);
+    }
+    if (FAILED(static_cast<HRESULT>(result)) && console_type && out) return S_OK;
     return result;
 }
 
@@ -1098,6 +1182,148 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     if (count <= 3 || count % 5 == 0) log("x2w-render presented %s (frame %ld)", shown_note, frame_number);
 }
 
+// LOCAL: render targets drawn into during a traced frame, in first-use order. At the end of the
+// traced frame each is copied back on the presenting queue (after the title's work) and summarised:
+// the share of texels that are not all zero and the mean byte value, to find the first empty pass.
+SRWLOCK traced_lock = SRWLOCK_INIT;
+struct TracedTarget {
+    ID3D12Resource* first;  // the target
+    int second;             // drawn draws
+    ID3D12Resource* snap;   // copy taken right after its last drawn draw (COPY_DEST), or null
+};
+std::vector<TracedTarget>& traced_targets()
+{
+    static std::vector<TracedTarget> targets;
+    return targets;
+}
+void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state);
+void note_traced_target(Wrapper* self, ID3D12Resource* target, bool drawn)
+{
+    if (!target) return;
+    AcquireSRWLockExclusive(&traced_lock);
+    auto& all = traced_targets();
+    auto found = std::find_if(all.begin(), all.end(), [&](const auto& e) { return e.first == target; });
+    if (found == all.end()) {
+        target->AddRef();
+        all.push_back({target, 0, nullptr});
+        found = all.end() - 1;
+    }
+    static const bool snapshots = x2w_local::env_on("X2W_D3D12_TRACE_TARGETS");
+    if (drawn) ++found->second;
+    if (drawn && snapshots) {
+        D3D12_RESOURCE_DESC desc = target->GetDesc();
+        if (!found->snap && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1) {
+            desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+            if (FAILED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                                       nullptr, IID_PPV_ARGS(&found->snap))))
+                found->snap = nullptr;
+        }
+        if (found->snap && self->own().list_open) {
+            auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+            require_state(self, target, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyResource(found->snap, target);
+            require_state(self, target, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+    }
+    ReleaseSRWLockExclusive(&traced_lock);
+}
+void summarise_traced_targets(ID3D12CommandQueue* queue)
+{
+    AcquireSRWLockExclusive(&traced_lock);
+    std::vector<TracedTarget> all;
+    all.swap(traced_targets());
+    ReleaseSRWLockExclusive(&traced_lock);
+    ID3D12Device* device = device_of(the_device);
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HRESULT hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+    if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&list));
+    if (SUCCEEDED(hr)) hr = list->Close();
+    if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    UINT64 fence_value = 0;
+    for (std::size_t n = 0; n < all.size() && SUCCEEDED(hr); ++n) {
+        ID3D12Resource* target = all[n].snap ? all[n].snap : all[n].first;
+        const D3D12_RESOURCE_STATES rest = all[n].snap ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON;
+        const D3D12_RESOURCE_DESC desc = target->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT rows = 0;
+        UINT64 row_bytes = 0, total = 0;
+        device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total);
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || total == 0 || total == ~0ull || total > (512ull << 20)) {
+            log("x2w-frame target %zu %p fmt %d: not summarised", n, static_cast<void*>(target), desc.Format);
+            continue;
+        }
+        ID3D12Resource* readback = nullptr;
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = total;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                   IID_PPV_ARGS(&readback)))) continue;
+        allocator->Reset();
+        list->Reset(allocator, nullptr);
+        transition(list, target, rest, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+        from.pResource = target;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource = readback;
+        to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint = footprint;
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        transition(list, target, D3D12_RESOURCE_STATE_COPY_SOURCE, rest);
+        list->Close();
+        ID3D12CommandList* lists[] = {list};
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, ++fence_value);
+        fence->SetEventOnCompletion(fence_value, event);
+        if (WaitForSingleObject(event, 5000) != WAIT_OBJECT_0) {
+            log("x2w-frame target %zu: read-back timed out", n);
+            readback->Release();
+            break;
+        }
+        void* mapped = nullptr;
+        const D3D12_RANGE range{0, static_cast<SIZE_T>(total)};
+        if (SUCCEEDED(readback->Map(0, &range, &mapped))) {
+            const UINT texel = desc.Width ? static_cast<UINT>(row_bytes / desc.Width) : 0;
+            std::uint64_t nonzero = 0, sum = 0, texels = 0;
+            for (UINT y = 0; y < rows; y += 2) {
+                const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset + UINT64{y} * footprint.Footprint.RowPitch;
+                for (UINT64 x = 0; x < desc.Width && texel; x += 2) {
+                    bool any = false;
+                    for (UINT b = 0; b < texel; ++b) {
+                        any |= row[x * texel + b] != 0;
+                        sum += row[x * texel + b];
+                    }
+                    nonzero += any;
+                    ++texels;
+                }
+            }
+            log("x2w-frame target %zu %s %p %llux%u fmt %d draws %d: non-zero texels %.4f, mean byte %.2f", n, all[n].snap ? "snapshot" : "end", static_cast<void*>(all[n].first),
+                static_cast<unsigned long long>(desc.Width), desc.Height, desc.Format, all[n].second,
+                texels ? double(nonzero) / texels : 0.0, texels && texel ? double(sum) / (texels * texel) : 0.0);
+            const D3D12_RANGE none{0, 0};
+            readback->Unmap(0, &none);
+        }
+        readback->Release();
+    }
+    for (auto& e : all) {
+        e.first->Release();
+        if (e.snap) e.snap->Release();
+    }
+    if (list) list->Release();
+    if (allocator) allocator->Release();
+    if (fence) fence->Release();
+    CloseHandle(event);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Render stage 2: real pipelines and draws for the shaders that have a translation.
 //
@@ -1374,6 +1600,12 @@ struct Pass {
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     bool heap_set = false;
+    // LOCAL: compute root state (kind 1 constants, 2 CBV, 3 SRV, 4 UAV, 5 table)
+    Wrapper* compute_root = nullptr;
+    int compute_kind[16] = {};
+    u64 compute_address[16] = {};
+    std::uint32_t compute_constants[16][16] = {};
+    UINT compute_count[16] = {};
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 
@@ -1499,31 +1731,332 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
     list->SetGraphicsRootShaderResourceView(parameter, desktop);
     pass.srv_bound |= 1u << parameter;
 }
+// LOCAL: list slot 61, ExecuteIndirect(signature, max count, argument resource, offset, count resource,
+// count offset). Not executed yet. During a traced frame every call is recorded (signature, the bound
+// pipeline's creation path, argument address) with whether its record was non-zero when the list was
+// recorded; at the end of the frame the records are read again and summarised per group. Words that
+// only the console GPU would write stay as they were, so "non-zero at end" means the CPU wrote them.
+LONG indirect_calls;
+struct IndirectCall {
+    const void* signature;
+    int path;
+    const void* base;
+    const unsigned char* record;
+    UINT stride;
+    UINT type;
+    bool nonzero_at_record;
+};
+SRWLOCK indirect_lock = SRWLOCK_INIT;
+std::vector<IndirectCall>& indirect_trace()
+{
+    static std::vector<IndirectCall> calls;
+    return calls;
+}
+void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT max_count, Wrapper* arguments, u64 offset,
+                                     Wrapper* count_resource, u64 count_offset)
+{
+    InterlockedIncrement(&indirect_calls);
+    if (!trace_frame_active) return;
+    SignatureInfo info;
+    AcquireSRWLockShared(&signature_lock);
+    const auto found = signature_infos().find(signature);
+    if (found != signature_infos().end()) info = found->second;
+    ReleaseSRWLockShared(&signature_lock);
+    IndirectCall call{};
+    call.signature = signature;
+    call.stride = info.stride;
+    call.type = info.args.empty() ? ~0u : static_cast<UINT>(info.args.back().Type);
+    const PipelineInfo* pipeline = pass_of(self).pipeline ? pipeline_info(pass_of(self).pipeline) : nullptr;
+    call.path = pipeline ? pipeline->path : -1;
+    call.base = arguments && arguments->own().kind == resource_kind ? arguments->own().title_memory : nullptr;
+    call.record = call.base ? static_cast<const unsigned char*>(call.base) + offset : nullptr;
+    const UINT bytes = info.stride && info.stride <= 64 ? info.stride : 12;
+    if (call.record && x2w_local::readable(call.record, bytes))
+        for (UINT i = 0; i < bytes; ++i) call.nonzero_at_record |= call.record[i] != 0;
+    else
+        call.record = nullptr;
+    (void)max_count;
+    (void)count_resource;
+    (void)count_offset;
+    AcquireSRWLockExclusive(&indirect_lock);
+    indirect_trace().push_back(call);
+    ReleaseSRWLockExclusive(&indirect_lock);
+}
+void summarise_indirect_calls()
+{
+    AcquireSRWLockExclusive(&indirect_lock);
+    std::vector<IndirectCall> calls;
+    calls.swap(indirect_trace());
+    ReleaseSRWLockExclusive(&indirect_lock);
+    struct Group {
+        int calls = 0, unreadable = 0, nonzero_at_record = 0, nonzero_at_end = 0;
+        UINT stride = 0, type = 0;
+        std::uint32_t sample[4] = {};
+    };
+    std::map<std::tuple<const void*, int, const void*>, Group> groups;
+    for (const auto& c : calls) {
+        Group& g = groups[{c.signature, c.path, c.base}];
+        ++g.calls;
+        g.stride = c.stride;
+        g.type = c.type;
+        if (!c.record) {
+            ++g.unreadable;
+            continue;
+        }
+        const UINT bytes = c.stride && c.stride <= 64 ? c.stride : 12;
+        bool nonzero = false;
+        if (x2w_local::readable(c.record, bytes))
+            for (UINT i = 0; i < bytes; ++i) nonzero |= c.record[i] != 0;
+        g.nonzero_at_record += c.nonzero_at_record;
+        if (nonzero) {
+            if (!g.nonzero_at_end) std::memcpy(g.sample, c.record, bytes < 16 ? bytes : 16);
+            ++g.nonzero_at_end;
+        }
+    }
+    log("x2w-frame indirect summary: %zu calls, %zu groups (signature, pipeline creation path, argument resource)", calls.size(), groups.size());
+    for (const auto& [key, g] : groups)
+        log("x2w-frame indirect group sig %p type %u stride %u path %d args %p: calls %d, unreadable %d, non-zero at record %d, at end %d, sample %08x %08x %08x %08x",
+            std::get<0>(key), g.type, g.stride, std::get<1>(key), std::get<2>(key), g.calls, g.unreadable, g.nonzero_at_record,
+            g.nonzero_at_end, g.sample[0], g.sample[1], g.sample[2], g.sample[3]);
+}
 extern LONG translated_draws, untranslated_draws, frame_number;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
+extern thread_local u64 last_draw_key;
+extern thread_local const char* last_draw_why;
 // List slot 12, DrawInstanced.
 void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     if (list && !pass.pipeline_real) {
-        InterlockedIncrement(draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance) ? &translated_draws
-                                                                                                                : &untranslated_draws);
+        const bool done = draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance);
+        InterlockedIncrement(done ? &translated_draws : &untranslated_draws);
+        if (trace_frame_active) {
+            note_traced_target(self, pass.target0, done);
+            const D3D12_RESOURCE_DESC rd = pass.target0 ? pass.target0->GetDesc() : D3D12_RESOURCE_DESC{};
+            log("x2w-frame draw %u %s target %p %llux%u fmt %d topology 0x%x key %016llx %s", vertices, done ? "drawn" : "NOT drawn",
+                static_cast<void*>(pass.target0), static_cast<unsigned long long>(rd.Width), rd.Height, rd.Format, pass.topology,
+                last_draw_key, done ? "" : (last_draw_why ? last_draw_why : "draw failed"));
+        }
         return;
     }
     // The translated vertex shaders read their fetch table through root parameter 0.
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
+        if (trace_frame_active) log("x2w-frame draw %u drawn (real pipeline)", vertices);
         const LONG n = InterlockedIncrement(&render_draws);
         if (n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
         InterlockedIncrement(&render_draws_skipped);
+        if (trace_frame_active) log("x2w-frame draw %u NOT drawn (real pipeline %d, targets %d, topology 0x%x, srv %x)", vertices,
+                                    pass.pipeline_real, pass.targets_bound, pass.topology, pass.srv_bound);
     }
 }
 
 extern SRWLOCK written_lock;
 std::unordered_map<u64, u64>& written_textures();
 #include "startup_stubs/d3d12_draw.inl"
+
+LONG frame_dispatches;  // dispatches since the last present (LOCAL instrumentation)
+// LOCAL: slot 67 register blobs ([1]/[2] and [3]/[4] of the description), copied at creation because the
+// title frees them; written next to the code as req_c67_<key>.regs (length-prefixed pair).
+std::unordered_map<Wrapper*, std::vector<unsigned char>>& compute_regs() { static std::unordered_map<Wrapper*, std::vector<unsigned char>> m; return m; }
+// LOCAL: compute pipeline wrapper -> req_cs key, and dispatch counts per key (instrumentation).
+SRWLOCK compute_lock = SRWLOCK_INIT;
+std::unordered_map<Wrapper*, u64>& compute_keys() { static std::unordered_map<Wrapper*, u64> m; return m; }
+// LOCAL: compute root state the title sets (list slots = desktop + 4), replayed on a real dispatch.
+D3D12_GPU_VIRTUAL_ADDRESS desktop_va(u64 address);
+void note_window(ID3D12Resource* buffer);
+bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT x, UINT y, UINT z);
+SRWLOCK compute_pso_lock = SRWLOCK_INIT;
+std::unordered_map<Wrapper*, ID3D12PipelineState*>& compute_psos()
+{
+    static std::unordered_map<Wrapper*, ID3D12PipelineState*> m;
+    return m;
+}
+LONG compute_executed, compute_skipped_args;
+// slot 33, SetComputeRootSignature(root)
+void __stdcall list_compute_root(Wrapper* self, Wrapper* root)
+{
+    Pass& pass = pass_of(self);
+    pass.compute_root = root;
+    for (auto& k : pass.compute_kind) k = 0;
+}
+// slot 35, SetComputeRootDescriptorTable(parameter, handle): not replayed (the executed shaders use none).
+void __stdcall list_compute_table(Wrapper* self, UINT parameter, u64 gpu_handle)
+{
+    if (parameter >= 16) return;
+    u64 address = 0;  // the table's address in the title's descriptor memory (as list_table)
+    AcquireSRWLockShared(&note_lock);
+    for (const HeapInfo& heap : heap_infos())
+        if (heap.desktop_gpu && heap.title_cpu && gpu_handle >= heap.desktop_gpu && gpu_handle < heap.desktop_gpu + u64{heap.count} * heap.increment)
+            address = heap.title_cpu + (gpu_handle - heap.desktop_gpu);
+    ReleaseSRWLockShared(&note_lock);
+    pass_of(self).compute_kind[parameter] = 5;
+    pass_of(self).compute_address[parameter] = address;
+}
+// slot 37, SetComputeRoot32BitConstant(parameter, value, offset)
+void __stdcall list_compute_constant(Wrapper* self, UINT parameter, UINT value, UINT offset)
+{
+    Pass& pass = pass_of(self);
+    if (parameter >= 16 || offset >= 16) return;
+    pass.compute_kind[parameter] = 1;
+    pass.compute_constants[parameter][offset] = value;
+    if (offset + 1 > pass.compute_count[parameter]) pass.compute_count[parameter] = offset + 1;
+}
+// slot 39, SetComputeRoot32BitConstants(parameter, count, data, offset)
+void __stdcall list_compute_constants(Wrapper* self, UINT parameter, UINT count, const void* data, UINT offset)
+{
+    Pass& pass = pass_of(self);
+    if (parameter >= 16 || offset >= 16 || !data || !x2w_local::readable(data, std::size_t{count} * 4)) return;
+    if (offset + count > 16) count = 16 - offset;
+    pass.compute_kind[parameter] = 1;
+    std::memcpy(&pass.compute_constants[parameter][offset], data, std::size_t{count} * 4);
+    if (offset + count > pass.compute_count[parameter]) pass.compute_count[parameter] = offset + count;
+}
+void compute_root_descriptor(Wrapper* self, UINT parameter, u64 address, int kind)
+{
+    Pass& pass = pass_of(self);
+    if (parameter >= 16) return;
+    pass.compute_kind[parameter] = kind;
+    pass.compute_address[parameter] = address;
+}
+void __stdcall list_compute_cbv(Wrapper* self, UINT parameter, u64 address) { compute_root_descriptor(self, parameter, address, 2); }
+void __stdcall list_compute_srv(Wrapper* self, UINT parameter, u64 address) { compute_root_descriptor(self, parameter, address, 3); }
+void __stdcall list_compute_uav(Wrapper* self, UINT parameter, u64 address) { compute_root_descriptor(self, parameter, address, 4); }
+
+// Runs a dispatch through a desktop compute pipeline when one exists for the bound pipeline.
+bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
+{
+    static const bool enabled = !x2w_local::env_on("X2W_COMPUTE_OFF");
+    auto* list = recording(self);
+    Pass& pass = pass_of(self);
+    if (!enabled || !list || !pass.pipeline) return false;
+    if (!pass.compute_root || !pass.compute_root->own().real) return execute_translated(self, list, key, x, y, z);
+    AcquireSRWLockShared(&compute_pso_lock);
+    const auto found = compute_psos().find(pass.pipeline);
+    ID3D12PipelineState* pso = found != compute_psos().end() ? found->second : nullptr;
+    ReleaseSRWLockShared(&compute_pso_lock);
+    if (!pso) return execute_translated(self, list, key, x, y, z);
+    D3D12_GPU_VIRTUAL_ADDRESS addresses[16] = {};
+    for (UINT i = 0; i < 16; ++i) {
+        const int kind = pass.compute_kind[i];
+        if (kind == 5) {
+            InterlockedIncrement(&compute_skipped_args);
+            return false;
+        }
+        if (kind >= 2 && kind <= 4) {
+            addresses[i] = desktop_va(pass.compute_address[i]);
+            if (!addresses[i] && pass.compute_address[i]) {
+                InterlockedIncrement(&compute_skipped_args);
+                return false;
+            }
+        }
+    }
+    list->SetPipelineState(pso);
+    list->SetComputeRootSignature(static_cast<ID3D12RootSignature*>(pass.compute_root->own().real));
+    for (UINT i = 0; i < 16; ++i) {
+        switch (pass.compute_kind[i]) {
+        case 1: list->SetComputeRoot32BitConstants(i, pass.compute_count[i], pass.compute_constants[i], 0); break;
+        case 2: list->SetComputeRootConstantBufferView(i, addresses[i]); break;
+        case 3: list->SetComputeRootShaderResourceView(i, addresses[i]); break;
+        case 4: list->SetComputeRootUnorderedAccessView(i, addresses[i]); break;
+        default: break;
+        }
+    }
+    list->Dispatch(x, y, z);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    list->ResourceBarrier(1, &barrier);
+    const LONG n = InterlockedIncrement(&compute_executed);
+    if (n <= 4 || n % 5000 == 0) log("x2w-compute dispatch %ld executed (%u, %u, %u)", n, x, y, z);
+    return true;
+}
+struct DispatchCount { LONG64 calls = 0; LONG64 groups = 0; UINT x = 0, y = 0, z = 0; };
+std::unordered_map<u64, DispatchCount>& dispatch_counts() { static std::unordered_map<u64, DispatchCount> m; return m; }
+// List slot 14, Dispatch(x, y, z). LOCAL instrumentation: counts dispatches per compute pipeline key.
+void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
+{
+    Pass& pass = pass_of(self);
+    u64 key = ~0ull;  // no compute pipeline bound
+    AcquireSRWLockExclusive(&compute_lock);
+    if (pass.pipeline) {
+        const auto found = compute_keys().find(pass.pipeline);
+        key = found != compute_keys().end() ? found->second : ~1ull;  // ~1: no compute key known for it
+    }
+    ReleaseSRWLockExclusive(&compute_lock);
+    if (key == ~1ull) {
+        // Device slot 67: a console compute pipeline. Its description has the layout of slot 57:
+        // [0] root signature, [5]/[6] machine code address and length, [7]/[8] the stage's metadata.
+        // The key is fnv(root blob, fnv(code)), tagged with 0x67 in the top byte; the code, metadata
+        // and root blob are written to the shader cache as req_c67_<key>.{cs,meta,root}.
+        const PipelineInfo* info = pipeline_info(pass.pipeline);
+        if (info && info->path == 67 && info->desc.size() >= 0x48) {
+            u64 words[9];
+            std::memcpy(words, info->desc.data(), sizeof(words));
+            std::vector<unsigned char> root_blob;
+            if (Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]))) {
+                AcquireSRWLockShared(&note_lock);
+                const auto found = root_blobs().find(root);
+                if (found != root_blobs().end()) root_blob = found->second;
+                ReleaseSRWLockShared(&note_lock);
+            }
+            const auto* code = reinterpret_cast<const void*>(words[5]);
+            const auto* meta = reinterpret_cast<const void*>(words[7]);
+            if (words[6] && words[6] <= (1u << 20) && x2w_local::readable(code, words[6])) {
+                key = (fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(code, words[6])) & 0x00ffffffffffffffull) | (0x67ull << 56);
+                wchar_t path[MAX_PATH];
+                if (cache_path(path, L"req_c67_", key, L".cs") && GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+                    write_file(path, code, words[6]);
+                    if (words[8] && words[8] <= 0x10000 && x2w_local::readable(meta, words[8]) && cache_path(path, L"req_c67_", key, L".meta"))
+                        write_file(path, meta, words[8]);
+                    if (cache_path(path, L"req_c67_", key, L".root")) write_file(path, root_blob.data(), root_blob.size());
+                    if (cache_path(path, L"req_c67_", key, L".desc")) write_file(path, info->desc.data(), info->desc.size());
+                    std::vector<unsigned char> regs;
+                    AcquireSRWLockShared(&compute_lock);
+                    if (const auto found = compute_regs().find(pass.pipeline); found != compute_regs().end()) regs = found->second;
+                    ReleaseSRWLockShared(&compute_lock);
+                    if (!regs.empty() && cache_path(path, L"req_c67_", key, L".regs")) write_file(path, regs.data(), regs.size());
+                }
+            } else {
+                key = 0x67ull << 56;  // code unreadable
+            }
+        } else if (info) {
+            key = (0xeeull << 56) | static_cast<u64>(info->path);  // another creation path
+        }
+        AcquireSRWLockExclusive(&compute_lock);
+        compute_keys()[pass.pipeline] = key;
+        ReleaseSRWLockExclusive(&compute_lock);
+    }
+    AcquireSRWLockExclusive(&compute_lock);
+    DispatchCount& count = dispatch_counts()[key];
+    ++count.calls;
+    count.groups += LONG64{x} * y * z;
+    count.x = x, count.y = y, count.z = z;
+    ReleaseSRWLockExclusive(&compute_lock);
+    InterlockedIncrement(&frame_dispatches);
+    const bool executed = execute_dispatch(self, x, y, z, key);
+    if (trace_frame_active) log("x2w-frame dispatch %016llx (%u, %u, %u)%s", key, x, y, z, executed ? " executed" : "");
+}
+void report_dispatches()
+{
+    std::vector<std::pair<u64, DispatchCount>> all;
+    AcquireSRWLockExclusive(&compute_lock);
+    for (const auto& entry : dispatch_counts()) all.push_back(entry);
+    dispatch_counts().clear();
+    ReleaseSRWLockExclusive(&compute_lock);
+    std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.second.calls > b.second.calls; });
+    char line[2048];
+    int n = std::snprintf(line, sizeof(line), "x2w-render dispatches per compute key (300 frames):");
+    for (const auto& entry : all) {
+        if (n > static_cast<int>(sizeof(line)) - 80) break;
+        wchar_t path[MAX_PATH];
+        const bool signed_ready = cache_path(path, L"", entry.first, L".cs.dxbc") && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+        n += std::snprintf(line + n, sizeof(line) - n, " %016llx%s:%lld(%u,%u,%u)", entry.first, signed_ready ? "*" : "",
+                           entry.second.calls, entry.second.x, entry.second.y, entry.second.z);
+    }
+    log("%s", line);
+}
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
 void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
@@ -1830,6 +2363,18 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             std::memcpy(desc_copy, &mapped, sizeof(mapped));
             args[desc_index] = reinterpret_cast<u64>(desc_copy);
         }
+        if (N == 18) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC view;
+            std::memcpy(&view, desc_copy, sizeof(view));
+            const D3D12_SHADER_RESOURCE_VIEW_DESC before = view;
+            fix_srv_plane(view);
+            if (std::memcmp(&view, &before, sizeof(view)) != 0) {
+                std::memcpy(desc_copy, &view, sizeof(view));
+                args[desc_index] = reinterpret_cast<u64>(desc_copy);
+                static LONG planes;
+                if (first_calls(planes, 4)) log("x2w-d3d12 Device::slot18 view format %d: plane slice set for the depth-stencil plane", view.Format);
+            }
+        }
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
     if (N == 20 && args[0]) note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]));
@@ -1950,6 +2495,156 @@ HRESULT __stdcall device_frame_event(Wrapper*, UINT type, UINT offset_us, void* 
 // title address; nothing translates title GPU addresses yet. Textures trap.
 std::mutex placed_mutex;
 std::vector<std::pair<void*, ID3D12Heap*>> existing_heaps;
+ID3D12Heap* existing_heap(void* base)
+{
+    std::lock_guard lock(placed_mutex);
+    for (auto& [known, h] : existing_heaps)
+        if (known == base) return h;
+    ID3D12Device3* device3 = nullptr;
+    ID3D12Heap* heap = nullptr;
+    HRESULT hr = device_of(the_device)->QueryInterface(IID_PPV_ARGS(&device3));
+    if (SUCCEEDED(hr)) {
+        hr = device3->OpenExistingHeapFromAddress(base, IID_PPV_ARGS(&heap));
+        device3->Release();
+    }
+    if (FAILED(hr)) {
+        log("x2w-va OpenExistingHeapFromAddress(%p) -> 0x%08lx", base, static_cast<unsigned long>(hr));
+        return nullptr;
+    }
+    existing_heaps.emplace_back(base, heap);
+    return heap;
+}
+// LOCAL: title GPU address -> desktop GPU address. Title GPU memory is the title's own (CPU) memory.
+// A private (VirtualAlloc) allocation can be opened as a desktop heap; buffers placed on that heap
+// in 256 MiB steps, each 512 MiB long (or up to the heap's end), let any range below 256 MiB be
+// addressed by one buffer. The desktop GPU then reads and writes the same pages as the title's CPU.
+struct VaWindow {
+    void* base;
+    UINT64 start;
+    ID3D12Resource* buffer;
+};
+SRWLOCK va_lock = SRWLOCK_INIT;
+std::vector<VaWindow>& va_windows()
+{
+    static std::vector<VaWindow> windows;
+    return windows;
+}
+LONG va_mapped, va_failed;
+ID3D12Heap* existing_heap(void* base);  // opens (once) the desktop heap over a private allocation
+// A chunk section opened once as a desktop heap; buffers placed on it in 256 MiB steps (512 MiB long).
+D3D12_GPU_VIRTUAL_ADDRESS section_va(HANDLE section, ULONG64 offset)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::vector<std::pair<HANDLE, ID3D12Heap*>> heaps;
+    static std::vector<std::tuple<HANDLE, ULONG64, ID3D12Resource*>> windows;
+    const ULONG64 start = offset & ~((1ull << 28) - 1);
+    AcquireSRWLockExclusive(&lock);
+    for (const auto& [h, s, b] : windows)
+        if (h == section && s == start) {
+            const D3D12_GPU_VIRTUAL_ADDRESS va = b ? b->GetGPUVirtualAddress() + (offset - start) : 0;
+            ReleaseSRWLockExclusive(&lock);
+            return va;
+        }
+    ID3D12Heap* heap = nullptr;
+    for (const auto& [h, hp] : heaps)
+        if (h == section) heap = hp;
+    HRESULT hr = S_OK;
+    if (!heap) {
+        ID3D12Device3* device3 = nullptr;
+        hr = device_of(the_device)->QueryInterface(IID_PPV_ARGS(&device3));
+        if (SUCCEEDED(hr)) {
+            hr = device3->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&heap));
+            device3->Release();
+        }
+        log("x2w-va heap over chunk section %p -> 0x%08lx size 0x%llx", section, static_cast<unsigned long>(hr),
+            SUCCEEDED(hr) ? heap->GetDesc().SizeInBytes : 0ull);
+        heaps.emplace_back(section, SUCCEEDED(hr) ? heap : nullptr);
+        if (FAILED(hr)) heap = nullptr;
+    }
+    ID3D12Resource* buffer = nullptr;
+    if (heap) {
+        const UINT64 size = heap->GetDesc().SizeInBytes;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = size - start < (2ull << 28) ? size - start : (2ull << 28);
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        hr = device_of(the_device)->CreatePlacedResource(heap, start, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&buffer));
+        if (FAILED(hr)) buffer = nullptr;
+        log("x2w-va chunk window %p+0x%llx -> 0x%08lx va 0x%llx", section, start, static_cast<unsigned long>(hr),
+            buffer ? buffer->GetGPUVirtualAddress() : 0ull);
+    }
+    windows.emplace_back(section, start, buffer);
+    ReleaseSRWLockExclusive(&lock);
+    note_window(buffer);
+    return buffer ? buffer->GetGPUVirtualAddress() + (offset - start) : 0;
+}
+D3D12_GPU_VIRTUAL_ADDRESS desktop_va(u64 address)
+{
+    if (!address) return 0;
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info) && info.Type == MEM_MAPPED) {
+        // Physical pages in 1 GiB chunk sections (xmem X2W_XMEM_CHUNKS=1): a heap over the chunk.
+        using Location = BOOL(WINAPI*)(const void*, HANDLE*, ULONG64*);
+        static const Location location = [] {
+            const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+            return xmem ? reinterpret_cast<Location>(GetProcAddress(xmem, "x2w_xmem_gpu_location")) : nullptr;
+        }();
+        HANDLE section = nullptr;
+        ULONG64 at = 0;
+        if (location && location(reinterpret_cast<const void*>(address), &section, &at))
+            return section_va(section, at);
+        if (InterlockedIncrement(&va_failed) <= 8) log("x2w-va 0x%llx: mapped page without a chunk location", address);
+        return 0;
+    }
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) != sizeof(info) || info.Type != MEM_PRIVATE ||
+        info.State != MEM_COMMIT) {
+        if (InterlockedIncrement(&va_failed) <= 8)
+            log("x2w-va 0x%llx: not a committed private allocation (type 0x%lx state 0x%lx)", address, info.Type, info.State);
+        return 0;
+    }
+    void* base = info.AllocationBase;
+    const UINT64 offset = address - reinterpret_cast<u64>(base);
+    const UINT64 start = offset & ~((1ull << 28) - 1);
+    AcquireSRWLockShared(&va_lock);
+    for (const auto& w : va_windows())
+        if (w.base == base && w.start == start) {
+            const D3D12_GPU_VIRTUAL_ADDRESS va = w.buffer ? w.buffer->GetGPUVirtualAddress() + (offset - start) : 0;
+            ReleaseSRWLockShared(&va_lock);
+            return va;
+        }
+    ReleaseSRWLockShared(&va_lock);
+    ID3D12Heap* heap = existing_heap(base);
+    ID3D12Resource* buffer = nullptr;
+    HRESULT hr = E_FAIL;
+    if (heap) {
+        const UINT64 size = heap->GetDesc().SizeInBytes;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = size - start < (2ull << 28) ? size - start : (2ull << 28);
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        hr = device_of(the_device)->CreatePlacedResource(heap, start, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&buffer));
+    }
+    AcquireSRWLockExclusive(&va_lock);
+    va_windows().push_back({base, start, SUCCEEDED(hr) ? buffer : nullptr});
+    ReleaseSRWLockExclusive(&va_lock);
+    if (SUCCEEDED(hr)) note_window(buffer);
+    const LONG n = SUCCEEDED(hr) ? InterlockedIncrement(&va_mapped) : InterlockedIncrement(&va_failed);
+    if (n <= 16)
+        log("x2w-va window base=%p start=0x%llx heap=%p -> 0x%08lx desktop va 0x%llx", base, start, static_cast<void*>(heap),
+            static_cast<unsigned long>(hr), SUCCEEDED(hr) ? buffer->GetGPUVirtualAddress() : 0ull);
+    return SUCCEEDED(hr) ? buffer->GetGPUVirtualAddress() + (offset - start) : 0;
+}
+
 
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
@@ -1965,7 +2660,9 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         // stands in, not aliased with the title address. The clear value is dropped if refused.
         const D3D12_RESOURCE_DESC texture = sanitized(*desc);
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
-        const auto* clear_value = static_cast<const D3D12_CLEAR_VALUE*>(clear);
+        D3D12_CLEAR_VALUE mapped_clear{};
+        if (clear) { mapped_clear = *static_cast<const D3D12_CLEAR_VALUE*>(clear); mapped_clear.Format = desktop_format(mapped_clear.Format); }
+        const D3D12_CLEAR_VALUE* clear_value = clear ? &mapped_clear : nullptr;
         ID3D12Resource* created = nullptr;
         HRESULT texture_hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &texture,
                                                                       D3D12_RESOURCE_STATE_COMMON, clear_value,
@@ -2207,6 +2904,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
             static_cast<unsigned long long>(desc->CS.BytecodeLength), desc->NodeMask, desc->Flags, extra0, extra1, text, bytes);
     // LOCAL: write the compute code and its root signature to the shader cache as req_cs_<key>.{cs,root}
     // for the offline compute translator (nothing executes dispatches yet).
+    u64 compute_key = 0;
     if (Wrapper* root = as_wrapper(desc->pRootSignature); root && desc->CS.BytecodeLength &&
         desc->CS.BytecodeLength <= (1u << 20) && x2w_local::readable(desc->CS.pShaderBytecode, desc->CS.BytecodeLength)) {
         std::vector<unsigned char> root_blob;
@@ -2216,6 +2914,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
         ReleaseSRWLockShared(&note_lock);
         const u64 key = fnv_bytes(root_blob.data(), root_blob.size(),
                                   fnv_bytes(desc->CS.pShaderBytecode, desc->CS.BytecodeLength));
+        if (!root_blob.empty()) compute_key = key;
         wchar_t path[MAX_PATH];
         if (!root_blob.empty() && cache_path(path, L"req_cs_", key, L".cs") && GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
             write_file(path, desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
@@ -2226,6 +2925,29 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), 62, nullptr, desc, sizeof(*desc));
+    // LOCAL: a retargeted and signed container <key>.cs.dxbc becomes a desktop compute pipeline.
+    if (compute_key) {
+        wchar_t path[MAX_PATH];
+        ID3DBlob* code = nullptr;
+        Wrapper* root = as_wrapper(desc->pRootSignature);
+        if (root && root->own().real && cache_path(path, L"", compute_key, L".cs.dxbc") && SUCCEEDED(D3DReadFileToBlob(path, &code))) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC real{};
+            real.pRootSignature = static_cast<ID3D12RootSignature*>(root->own().real);
+            real.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+            ID3D12PipelineState* pso = nullptr;
+            const HRESULT hr = device_of(the_device)->CreateComputePipelineState(&real, IID_PPV_ARGS(&pso));
+            log("x2w-compute pipeline %016llx from signed container -> 0x%08lx", compute_key, static_cast<unsigned long>(hr));
+            if (SUCCEEDED(hr)) {
+                AcquireSRWLockExclusive(&compute_pso_lock);
+                compute_psos()[static_cast<Wrapper*>(*out)] = pso;
+                ReleaseSRWLockExclusive(&compute_pso_lock);
+            }
+            code->Release();
+        }
+    }
+    AcquireSRWLockExclusive(&compute_lock);
+    compute_keys()[static_cast<Wrapper*>(*out)] = compute_key;
+    ReleaseSRWLockExclusive(&compute_lock);
     return S_OK;
 }
 
@@ -2279,6 +3001,20 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
+    if (N == 67 && x2w_local::readable(desc, 0x28)) {
+        u64 words[5];
+        std::memcpy(words, desc, sizeof(words));
+        std::vector<unsigned char> regs;
+        for (int i : {1, 3}) {
+            const std::uint32_t bytes = words[i + 1] <= 0x1000 && x2w_local::readable(reinterpret_cast<const void*>(words[i]), words[i + 1])
+                                            ? static_cast<std::uint32_t>(words[i + 1]) : 0u;
+            regs.insert(regs.end(), reinterpret_cast<const unsigned char*>(&bytes), reinterpret_cast<const unsigned char*>(&bytes) + 4);
+            if (bytes) regs.insert(regs.end(), reinterpret_cast<const unsigned char*>(words[i]), reinterpret_cast<const unsigned char*>(words[i]) + bytes);
+        }
+        AcquireSRWLockExclusive(&compute_lock);
+        compute_regs()[static_cast<Wrapper*>(*out)] = std::move(regs);
+        ReleaseSRWLockExclusive(&compute_lock);
+    }
     return S_OK;
 }
 
@@ -2326,6 +3062,8 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(0, 1, &copy);
     check_device("Device before slot", 127);
     void* const title_memory = info.SizeInBytes != ~0ull ? title_resource_memory(info.SizeInBytes, info.Alignment) : nullptr;
+    D3D12_CLEAR_VALUE mapped_clear{};
+    if (clear) { mapped_clear = *clear; mapped_clear.Format = desktop_format(mapped_clear.Format); clear = &mapped_clear; }
     ID3D12Resource* resource = nullptr;
     HRESULT hr = kind_for(*iid) == resource_kind
         ? device_of(self)->CreateCommittedResource(props, flags, &copy, D3D12_RESOURCE_STATE_COMMON, clear,
@@ -2370,7 +3108,14 @@ HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, voi
         QueryPerformanceFrequency(&frequency);
         QueryPerformanceCounter(&origin);
     }
-    const LONGLONG interval = frequency.QuadPart * (frame_interval_us ? frame_interval_us : 33333) / 1000000;
+    // LOCAL: X2W_FRAME_US overrides the title's interval (for example 8333 for 120 Hz, 1 for no pacing)
+    // so boot, menus and loading run faster in test runs.
+    static const UINT override_us = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_FRAME_US", value, sizeof(value)) ? static_cast<UINT>(std::atol(value)) : 0u;
+    }();
+    const UINT interval_us = override_us ? override_us : frame_interval_us ? frame_interval_us : 33333;
+    const LONGLONG interval = frequency.QuadPart * interval_us / 1000000;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     LONGLONG target;
@@ -2379,7 +3124,8 @@ HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, voi
         if (target < now.QuadPart) target = now.QuadPart;  // running late: start a new timeline here
         origin.QuadPart = target;
     } else {
-        target = origin.QuadPart + frequency.QuadPart * frame_event_offset_us[type < 4 ? type : 3] / 1000000;
+        const UINT offset_us = frame_event_offset_us[type < 4 ? type : 3];
+        target = origin.QuadPart + frequency.QuadPart * (override_us && offset_us > override_us ? override_us : offset_us) / 1000000;
     }
     const LONGLONG wait_ticks = target > now.QuadPart ? target - now.QuadPart : 0;
     ReleaseSRWLockExclusive(&lock);
@@ -2486,6 +3232,7 @@ void draw_overlay(LONG frame, double seconds)
     ReleaseDC(window, dc);
 }
 
+#include "startup_stubs/d3d12_compute.inl"
 #include "startup_stubs/d3d12_present.inl"
 
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
@@ -2510,6 +3257,28 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         } else if (wanted && frame == wanted) {
             InterlockedExchange(&trace_frame_active, 0);
             log("x2w-frame ---- end frame %ld", wanted);
+        }
+        // LOCAL: X2W_D3D12_TRACE_BUSY=n traces one frame after the first frame with at least n dispatches
+        // (the first busy frame after loading), then one more every 3000 frames.
+        static const LONG busy = [] {
+            char value[16]{};
+            return GetEnvironmentVariableA("X2W_D3D12_TRACE_BUSY", value, sizeof(value)) ? std::atol(value) : 0L;
+        }();
+        static LONG busy_end, busy_next;
+        const LONG dispatched = InterlockedExchange(&frame_dispatches, 0);
+        if (busy && busy_end && frame == busy_end) {
+            InterlockedExchange(&trace_frame_active, 0);
+            log("x2w-frame ---- end busy frame %ld", frame);
+            // The target read-back stalls Present for about a second: only with X2W_D3D12_TRACE_TARGETS=1.
+            static const bool targets = x2w_local::env_on("X2W_D3D12_TRACE_TARGETS");
+            if (targets) summarise_traced_targets(static_cast<ID3D12CommandQueue*>(self->own().real));
+            summarise_indirect_calls();
+            busy_end = 0;
+        } else if (busy && !busy_end && dispatched >= busy && frame >= busy_next) {
+            log("x2w-frame ---- begin busy frame %ld (previous frame: %ld dispatches)", frame + 1, dispatched);
+            InterlockedExchange(&trace_frame_active, 1);
+            busy_end = frame + 1;
+            busy_next = frame + 3000;
         }
     }
     bool shown_in_window = false;
@@ -2569,6 +3338,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             if (calls) n += std::snprintf(line + n, sizeof(line) - n, " %d:%.1f", i, calls / 300.0);
         }
         log("%s", line);
+        report_dispatches();
     }
     if (now - last_report >= 5000) {
         last_report = now;
@@ -2693,6 +3463,15 @@ void build_tables()
         list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
+        list_typed[14] = reinterpret_cast<ListTyped>(&list_dispatch);
+        list_typed[61] = reinterpret_cast<ListTyped>(&list_execute_indirect);
+        list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
+        list_typed[35] = reinterpret_cast<ListTyped>(&list_compute_table);
+        list_typed[37] = reinterpret_cast<ListTyped>(&list_compute_constant);
+        list_typed[39] = reinterpret_cast<ListTyped>(&list_compute_constants);
+        list_typed[41] = reinterpret_cast<ListTyped>(&list_compute_cbv);
+        list_typed[43] = reinterpret_cast<ListTyped>(&list_compute_srv);
+        list_typed[45] = reinterpret_cast<ListTyped>(&list_compute_uav);
         list_typed[20] = reinterpret_cast<ListTyped>(&list_topology);
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
@@ -2776,6 +3555,16 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
         if (SUCCEEDED(debug_hr)) layer->EnableDebugLayer();
         log("x2w-d3d12 debug layer: 0x%08lx%s", static_cast<unsigned long>(debug_hr),
             SUCCEEDED(debug_hr) ? " enabled" : " (not installed?)");
+    }
+    if (x2w_local::env_on("X2W_D3D12_DRED")) {
+        // LOCAL: device-removed extended data (breadcrumbs and page fault), reported by check_device.
+        ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->Release();
+            log("x2w-d3d12 DRED enabled");
+        }
     }
     ID3D12Device* device = nullptr;
     const HRESULT hr = kind_for(iid) == device_kind || iid == __uuidof(IUnknown)

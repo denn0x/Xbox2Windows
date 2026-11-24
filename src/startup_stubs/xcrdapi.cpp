@@ -268,7 +268,7 @@ bool find_stream(u64 source, u64 offset, unsigned compressed, unsigned piece, st
 //   failing requests, all with k = 14, each matching the archive's own boundary table). Why the
 //   executable adds the shift is not known; LOCAL SHORTCUT until its offset arithmetic is understood.
 // A candidate needs a zlib header and must inflate in full from `compressed` bytes (Adler-32 checked).
-LONG requests_pieces_found_on_disk, requests_shifted_streams, requests_shift_unconfirmed;
+LONG requests_pieces_found_on_disk, requests_shifted_streams, requests_shift_unconfirmed, requests_shifted_past_end;
 // RDS5 boundary table of an archive (cached per handle): stored offset, logical offset, codec.
 struct Rds5Boundary { u64 stored, logical; unsigned codec; };
 const std::vector<Rds5Boundary>* rds5_table(HANDLE handle)
@@ -407,7 +407,7 @@ const char* execute_request(Object* self, const unsigned char* request, const UL
     auto* const destination = *reinterpret_cast<unsigned char* const*>(request + 0x08);
     const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
     const u64 source = *reinterpret_cast<const u64*>(request + 0x20);
-    const u64 offset = *reinterpret_cast<const u64*>(request + 0x28);
+    u64 offset = *reinterpret_cast<const u64*>(request + 0x28);
     const unsigned source_size = *reinterpret_cast<const unsigned*>(request + 0x30);
     const bool memory_source = (options & 0x400000) != 0;
     const unsigned compression = static_cast<unsigned>(options & 0xFF);
@@ -438,10 +438,27 @@ const char* execute_request(Object* self, const unsigned char* request, const UL
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
         LARGE_INTEGER file_size{};
+        // The archives whose streams sit 14 x 64 KiB before the title's offsets (stream_on_disk) also
+        // have pieces in their last 14 x 64 KiB: those offsets point past the file's end. When the
+        // shifted range fits in the file, the read is taken from there.
+        constexpr u64 archive_shift = 14 * 0x10000;
+        if (file_object && x2w_local::readable(file_object, sizeof(Object)) && file_object->kind == file && source_size <= (64u << 20) &&
+            GetFileSizeEx(file_object->handle, &file_size) && offset + source_size > static_cast<u64>(file_size.QuadPart) &&
+            offset >= archive_shift && offset - archive_shift + source_size <= static_cast<u64>(file_size.QuadPart)) {
+            offset -= archive_shift;
+            InterlockedIncrement(&requests_shifted_past_end);
+        }
         if (!file_object || !x2w_local::readable(file_object, sizeof(Object)) || file_object->kind != file ||
             !GetFileSizeEx(file_object->handle, &file_size) || offset + source_size > static_cast<u64>(file_size.QuadPart)) {
             // Checked before the buffer is sized from the request (one request named 0xd508a3ec bytes).
             outcome = "read failed (no file, or past its end)";
+            static LONG why;
+            if (InterlockedIncrement(&why) <= 24) {
+                const bool object_ok = file_object && x2w_local::readable(file_object, sizeof(Object));
+                log("x2w-dstorage   read refused: object %s, kind %d (file %d), size 0x%llx, end 0x%llx",
+                    object_ok ? "readable" : "unreadable", object_ok ? static_cast<int>(file_object->kind) : -1, static_cast<int>(file),
+                    static_cast<unsigned long long>(file_size.QuadPart), static_cast<unsigned long long>(offset + source_size));
+            }
             log_request(self, options, destination, destination_size, source, offset, source_size, outcome);
             return outcome;
         }
@@ -817,8 +834,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
             const LONG total = requests_done + requests_compressed + requests_failed;
             const LONG total2 = total + requests_bcpack_blank;
             if (total2 != last)
-                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld (stream pieces %ld, starts found on disk %ld, shifted streams %ld, shifts other than 14 %ld) failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld, replaced after enqueue=%ld", second, requests_done, requests_compressed, requests_stream_pieces, requests_pieces_found_on_disk, requests_shifted_streams, requests_shift_unconfirmed, requests_failed, requests_bcpack_blank,
+                log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld (stream pieces %ld, starts found on disk %ld, shifted streams %ld, shifts other than 14 %ld, past-end pieces shifted %ld) failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
+                    "still 0 at run=%ld, replaced after enqueue=%ld", second, requests_done, requests_compressed, requests_stream_pieces, requests_pieces_found_on_disk, requests_shifted_streams, requests_shift_unconfirmed, requests_shifted_past_end, requests_failed, requests_bcpack_blank,
                     zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue);
             last = total2;
         }

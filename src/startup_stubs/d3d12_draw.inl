@@ -16,6 +16,7 @@ struct Translation {
     std::vector<Srv> srvs;
     std::vector<Ud> uds;
     std::vector<std::array<std::uint32_t, 4>> samplers;
+    std::uint32_t compare_samplers = 0;  // LOCAL: bit i set when sampler i is a SamplerComparisonState
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3D12RootSignature* root = nullptr;
@@ -88,7 +89,7 @@ bool read_text(const wchar_t* path, std::string& out)
     return true;
 }
 
-D3D12_STATIC_SAMPLER_DESC decode_sampler(const std::array<std::uint32_t, 4>& words, UINT shader_register)
+D3D12_STATIC_SAMPLER_DESC decode_sampler(const std::array<std::uint32_t, 4>& words, UINT shader_register, bool compare = false)
 {
     static const D3D12_TEXTURE_ADDRESS_MODE modes[8] = {
         D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -104,6 +105,11 @@ D3D12_STATIC_SAMPLER_DESC decode_sampler(const std::array<std::uint32_t, 4>& wor
     s.MaxAnisotropy = 1u << ((words[0] >> 9) & 7);
     if (s.MaxAnisotropy > 16) s.MaxAnisotropy = 16;
     s.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    if (compare) {
+        // S# word 0 bits 14:12 hold the depth compare function (never, less, ..., always); D3D12's enum is that + 1.
+        s.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(((words[0] >> 12) & 7) + 1);
+        s.Filter = D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_COMPARISON);
+    }
     s.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     s.MaxLOD = D3D12_FLOAT32_MAX;
     s.ShaderRegister = shader_register;
@@ -146,12 +152,15 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
             else if (!std::strcmp(source, "startinstance")) ud.kind = 2;
             else if (!std::strcmp(source, "rootconst")) ud.kind = 3;
             else if (!std::strcmp(source, "stride")) ud.kind = 4;
+            else if (!std::strcmp(source, "bufword3")) ud.kind = 5;  // LOCAL: word 3 of srv a's buffer descriptor
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             Translation::Srv srv{!std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 : !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
         } else if (std::sscanf(line.c_str(), "smp %d %x %x %x %x", &i, &w[0], &w[1], &w[2], &w[3]) == 5) {
             tr.samplers.push_back({w[0], w[1], w[2], w[3]});
+        } else if (std::sscanf(line.c_str(), "smpcmp %d", &i) == 1 && i >= 0 && i < 32) {
+            tr.compare_samplers |= 1u << i;
         }
     }
     if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32) return;
@@ -164,7 +173,7 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[1].DescriptorTable = {1, &range};
     std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
-    for (std::size_t i = 0; i < tr.samplers.size(); ++i) samplers.push_back(decode_sampler(tr.samplers[i], static_cast<UINT>(i)));
+    for (std::size_t i = 0; i < tr.samplers.size(); ++i) samplers.push_back(decode_sampler(tr.samplers[i], static_cast<UINT>(i), (tr.compare_samplers >> i) & 1));
     D3D12_ROOT_SIGNATURE_DESC desc{tr.srvs.empty() ? 1u : 2u, parameters, static_cast<UINT>(samplers.size()), samplers.data(),
                                    D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ID3DBlob* blob = nullptr;
@@ -306,7 +315,8 @@ volatile LONG draw_heap_cursor;
 bool ensure_draw_heap()
 {
     if (draw_heap) return true;
-    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, draw_heap_size, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    // LOCAL: the ring is [0, draw_heap_size); after it, the view-id region of translated compute (d3d12_compute.inl).
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, draw_heap_size + 8 + 8 * 90000, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(device_of(the_device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&draw_heap)))) return false;
     draw_heap_increment = device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return true;
@@ -597,16 +607,22 @@ void draw_dump_flush(LONG frame)
     ReleaseSRWLockExclusive(&draw_lock);
 }
 
+thread_local u64 last_draw_key;          // LOCAL: translation key of the last draw (trace)
+thread_local const char* last_draw_why;  // LOCAL: why the last draw was not drawn (trace)
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     const bool rect = pass.topology == 0x11;
+    last_draw_key = 0;
+    last_draw_why = !list ? "no list" : !pass.pipeline ? "no pipeline" : !pass.targets_bound ? "targets not bound" : "topology";
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
     AcquireSRWLockExclusive(&draw_lock);
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? bound->translation : nullptr;
     ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap() ? pipeline_for(*bound, pass) : nullptr;
+    last_draw_key = tr ? tr->key : 0;
+    last_draw_why = !tr ? "no translation (creation path)" : tr->state != 1 ? "translation missing or failed" : "desktop pipeline not created";
     if (!pipeline) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
@@ -618,6 +634,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n));
     }
     std::uint32_t strides[32] = {};
+    std::uint32_t word3[32] = {};  // LOCAL: word 3 of each table buffer descriptor (format for buffer_load_format)
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
     // The shader adds the "base vertex" entry value to the vertex index, so that value is biased by
     // -vertex_first and each stream's view starts at vertex_first.
@@ -663,6 +680,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const u64 entry = srv.source == 0 && srv.a < 16 && pass.table_address[srv.a] ? pass.table_address[srv.a] + static_cast<u64>(srv.b) : 0;
         std::uint32_t words[8] = {};
         if (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+        if (i < 32 && words[0] != view_token_magic) word3[i] = words[3];
         if (srv.kind >= 1 && srv.kind <= 4) {
             // kind 1 Texture2D, 2 Texture2DArray (upstream #1381), 3 Texture3D, 4 Texture1D
             const D3D12_SRV_DIMENSION want = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D
@@ -725,6 +743,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 desc.Texture2D.MipLevels = 1;
                 if (want == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) desc.Texture2DArray.ArraySize = 1;
             }
+            if (texture) fix_srv_plane(desc);
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
         }
@@ -787,6 +806,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const Translation::Ud& ud = tr->uds[i];
         values[i] = ud.kind == 0 ? (rect ? 1u : 0u) : ud.kind == 1 ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
             : ud.kind == 2 ? start_instance : ud.kind == 3 ? ((ud.a < 16 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
+            : ud.kind == 5 ? (ud.a >= 0 && ud.a < 32 ? word3[ud.a] : 0)
             : (ud.a >= 0 && ud.a < 32 ? strides[ud.a] : 0);
     }
     list->SetPipelineState(pipeline);
@@ -861,5 +881,14 @@ void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const 
 // List slot 13, DrawIndexedInstanced(index count, instances, start index, base vertex, start instance).
 void __stdcall list_draw_indexed(Wrapper* self, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
-    InterlockedIncrement(draw_translated(self, true, count, instances, start, base_vertex, start_instance) ? &translated_draws : &untranslated_draws);
+    const bool done = draw_translated(self, true, count, instances, start, base_vertex, start_instance);
+    InterlockedIncrement(done ? &translated_draws : &untranslated_draws);
+    if (trace_frame_active) {
+        const Pass& pass = pass_of(self);
+        note_traced_target(self, pass.target0, done);
+        const D3D12_RESOURCE_DESC rd = pass.target0 ? pass.target0->GetDesc() : D3D12_RESOURCE_DESC{};
+        log("x2w-frame draw-indexed %u %s target %p %llux%u fmt %d key %016llx %s", count, done ? "drawn" : "NOT drawn",
+            static_cast<void*>(pass.target0), static_cast<unsigned long long>(rd.Width), rd.Height, rd.Format, last_draw_key,
+            done ? "" : (last_draw_why ? last_draw_why : "draw failed"));
+    }
 }

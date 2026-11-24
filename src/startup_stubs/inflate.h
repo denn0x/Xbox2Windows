@@ -208,6 +208,19 @@ inline std::uint32_t adler32(const unsigned char* data, std::size_t size) noexce
     return (b << 16) | a;
 }
 
+// Raw deflate data without the zlib wrapper; true when the final block ended inside the input.
+inline bool inflate_deflate(const unsigned char* in, std::size_t in_size, unsigned char* out, std::size_t out_size,
+                            std::size_t* produced) noexcept
+{
+    if (produced) *produced = 0;
+    Stream s{in, in_size};
+    s.out = out;
+    s.out_size = out_size;
+    if (!inflate_raw(s)) return false;
+    if (produced) *produced = s.out_pos;
+    return true;
+}
+
 // zlib stream (2-byte header, deflate data, Adler-32). The checksum must match.
 inline bool inflate_zlib(const unsigned char* in, std::size_t in_size, unsigned char* out, std::size_t out_size,
                          std::size_t* produced) noexcept
