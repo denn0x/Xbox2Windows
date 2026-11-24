@@ -11,8 +11,13 @@ struct WindowPresenter {
     ID3D12DescriptorHeap* targets = nullptr;
     ID3D12DescriptorHeap* textures = nullptr;
     ID3D12Resource* buffers[2] = {};
-    ID3D12CommandAllocator* allocator = nullptr;
-    ID3D12GraphicsCommandList* list = nullptr;
+    // LOCAL stall: two copy slots (allocator, list, view), each reused only once the fence value of its
+    // last copy has passed; a present whose slot is still busy skips the window copy instead of waiting.
+    ID3D12CommandAllocator* allocators[2] = {};
+    ID3D12GraphicsCommandList* lists[2] = {};
+    UINT64 slot_values[2] = {};
+    UINT next_slot = 0;
+    LONG skipped = 0;
     ID3D12RootSignature* root = nullptr;
     ID3D12PipelineState* pipeline = nullptr;
     ID3D12Fence* fence = nullptr;
@@ -96,7 +101,7 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
     if (chain1) chain1->Release();
     if (factory) factory->Release();
     const D3D12_DESCRIPTOR_HEAP_DESC target_heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
-    const D3D12_DESCRIPTOR_HEAP_DESC texture_heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const D3D12_DESCRIPTOR_HEAP_DESC texture_heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};  // one view per copy slot
     if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&target_heap, IID_PPV_ARGS(&p.targets));
     if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&texture_heap, IID_PPV_ARGS(&p.textures));
     const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -105,9 +110,11 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
         if (SUCCEEDED(hr))
             device->CreateRenderTargetView(p.buffers[i], nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{p.targets->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{i} * step});
     }
-    if (SUCCEEDED(hr)) hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&p.allocator));
-    if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p.allocator, nullptr, IID_PPV_ARGS(&p.list));
-    if (SUCCEEDED(hr)) hr = p.list->Close();
+    for (int i = 0; i < 2; ++i) {
+        if (SUCCEEDED(hr)) hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&p.allocators[i]));
+        if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p.allocators[i], nullptr, IID_PPV_ARGS(&p.lists[i]));
+        if (SUCCEEDED(hr)) hr = p.lists[i]->Close();
+    }
     if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&p.fence));
     p.reached = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     static const char source[] =
@@ -284,6 +291,16 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
         p.failed = true;
         return false;
     }
+    // LOCAL stall: X2W_PRESENT_WAIT=1 restores the old order (one slot, wait for the queue after each
+    // present). Without it the window copy never waits: run 88 spent ~590 ms per present in that wait
+    // (present.inl:323 in the stop dump), which is the whole queue draining, not the copy.
+    static const bool wait_each = x2w_local::env_on("X2W_PRESENT_WAIT");
+    const UINT slot = wait_each ? 0 : p.next_slot;
+    if (!wait_each && p.fence->GetCompletedValue() < p.slot_values[slot]) {
+        const LONG n = InterlockedIncrement(&p.skipped);
+        if (n <= 4 || n % 500 == 0) log("x2w-present window copy skipped %ld times (previous copies still queued)", n);
+        return true;  // the window keeps its last picture
+    }
     ID3D12Device* device = device_of(the_device);
     const DXGI_FORMAT view_format = x2w_startup::present_view_format(desc.Format);
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
@@ -291,36 +308,44 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(surface, &view, p.textures->GetCPUDescriptorHandleForHeapStart());
+    const UINT view_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    device->CreateShaderResourceView(surface, &view, D3D12_CPU_DESCRIPTOR_HANDLE{p.textures->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{slot} * view_step});
     const UINT index = p.chain->GetCurrentBackBufferIndex();
     const D3D12_CPU_DESCRIPTOR_HANDLE target{p.targets->GetCPUDescriptorHandleForHeapStart().ptr +
                                              SIZE_T{index} * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
-    if (FAILED(p.allocator->Reset()) || FAILED(p.list->Reset(p.allocator, p.pipeline))) return false;
-    transition(p.list, surface, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12GraphicsCommandList* list = p.lists[slot];
+    if (FAILED(p.allocators[slot]->Reset()) || FAILED(list->Reset(p.allocators[slot], p.pipeline))) return false;
+    transition(list, surface, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transition(list, p.buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(p.width), static_cast<float>(p.height), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(p.width), static_cast<LONG>(p.height)};
-    p.list->SetGraphicsRootSignature(p.root);
-    p.list->SetDescriptorHeaps(1, &p.textures);
-    p.list->SetGraphicsRootDescriptorTable(0, p.textures->GetGPUDescriptorHandleForHeapStart());
-    p.list->RSSetViewports(1, &viewport);
-    p.list->RSSetScissorRects(1, &scissor);
-    p.list->OMSetRenderTargets(1, &target, FALSE, nullptr);
-    p.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    p.list->DrawInstanced(3, 1, 0, 0);
-    transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-    transition(p.list, surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (FAILED(p.list->Close())) {
+    list->SetGraphicsRootSignature(p.root);
+    list->SetDescriptorHeaps(1, &p.textures);
+    list->SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE{p.textures->GetGPUDescriptorHandleForHeapStart().ptr + UINT64{slot} * view_step});
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->DrawInstanced(3, 1, 0, 0);
+    transition(list, p.buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    transition(list, surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (FAILED(list->Close())) {
         p.failed = true;
         return false;
     }
-    ID3D12CommandList* lists[] = {p.list};
+    ID3D12CommandList* lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
-    const HRESULT hr = p.chain->Present(0, 0);
-    // The allocator is reused next frame: wait until this frame's commands are done.
-    if (SUCCEEDED(queue->Signal(p.fence, ++p.fence_value)) && p.fence->GetCompletedValue() < p.fence_value &&
-        SUCCEEDED(p.fence->SetEventOnCompletion(p.fence_value, p.reached)))
-        WaitForSingleObject(p.reached, 2000);
+    // Without the wait, DO_NOT_WAIT: a full flip queue drops this window frame instead of blocking.
+    HRESULT hr = p.chain->Present(0, wait_each ? 0 : DXGI_PRESENT_DO_NOT_WAIT);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+        const LONG n = InterlockedIncrement(&p.skipped);
+        if (n <= 4 || n % 500 == 0) log("x2w-present window flip skipped %ld times (flip queue full)", n);
+        hr = S_OK;
+    }
+    if (SUCCEEDED(queue->Signal(p.fence, ++p.fence_value))) p.slot_values[slot] = p.fence_value;
+    p.next_slot = (slot + 1) % 2;
+    if (wait_each && p.fence->GetCompletedValue() < p.fence_value && SUCCEEDED(p.fence->SetEventOnCompletion(p.fence_value, p.reached)))
+        WaitForSingleObject(p.reached, 2000);  // the allocator is reused next frame
     static LONG failures;
     if (FAILED(hr) && first_calls(failures, 4)) log("x2w-present Present failed 0x%08lx", static_cast<unsigned long>(hr));
     check_device("window present", 0);
