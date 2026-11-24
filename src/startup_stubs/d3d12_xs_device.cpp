@@ -4961,8 +4961,7 @@ void build_tables()
     tables[descriptor_heap_kind][9] = reinterpret_cast<void*>(&descriptor_heap_cpu_start);
     tables[descriptor_heap_kind][10] = reinterpret_cast<void*>(&descriptor_heap_gpu_start);
     if (device_noop()) fill_all_remaining_noops(std::make_index_sequence<kind_count>{});
-    // Runs 77-89 log Device::slot70 (memory SRV) and list slots such as 12/44/52 as "x2w-noop" first
-    // calls although this file installs handlers for them. Say what the tables hold after the fill.
+    // Say what the tables hold after the fill, so a census run shows which build it ran.
     if (noop_census_enabled())
         log("x2w-noop-census tables: device slot 70 = %s, list slot 12 typed = %s, list slot 44 typed = %s, render mode %d, device noop %d, list noop %d",
             tables[device_kind][70] == reinterpret_cast<void*>(&device_memory_srv) ? "memory SRV handler"
