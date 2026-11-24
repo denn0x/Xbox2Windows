@@ -371,16 +371,42 @@ struct Timed;
 SIZE_T timed_query(const void* address, MEMORY_BASIC_INFORMATION* info);  // VirtualQuery, timed as "vquery"
 volatile LONG64 list_slot_ticks[256], list_slot_calls[256];  // per command-list slot
 volatile LONG64 list_slot_census[256];  // per command-list slot, reported with the render totals
+// LOCAL stall: per-thread time inside timed stand-in calls (the outermost Timed scope only, so nested
+// categories are not counted twice), for the present split line (present_split).
+struct ThreadInside {
+    volatile LONG tid;
+    volatile LONG64 ticks;
+};
+constexpr LONG thread_inside_max = 256;
+ThreadInside thread_inside[thread_inside_max];
+volatile LONG thread_inside_count;
+thread_local ThreadInside* thread_inside_mine;
+thread_local int timed_depth;
+ThreadInside* inside_slot()
+{
+    if (!thread_inside_mine) {
+        static ThreadInside overflow;
+        const LONG i = InterlockedIncrement(&thread_inside_count) - 1;
+        thread_inside_mine = i < thread_inside_max ? &thread_inside[i] : &overflow;
+        thread_inside_mine->tid = static_cast<LONG>(GetCurrentThreadId());
+    }
+    return thread_inside_mine;
+}
 struct Timed {
     int category;
     LARGE_INTEGER start;
-    explicit Timed(int c) : category(c) { QueryPerformanceCounter(&start); }
+    explicit Timed(int c) : category(c)
+    {
+        ++timed_depth;
+        QueryPerformanceCounter(&start);
+    }
     ~Timed()
     {
         LARGE_INTEGER end;
         QueryPerformanceCounter(&end);
         InterlockedAdd64(&time_ticks[category], end.QuadPart - start.QuadPart);
         InterlockedIncrement64(&time_calls[category]);
+        if (--timed_depth == 0) InterlockedAdd64(&inside_slot()->ticks, end.QuadPart - start.QuadPart);
     }
 };
 
@@ -4649,6 +4675,70 @@ void draw_overlay(LONG frame, double seconds)
 #include "startup_stubs/d3d12_present.inl"
 #include "startup_stubs/d3d12_copy_buffer.inl"
 
+// LOCAL stall: every 300 presents, one line: the wall time between them on the presenting thread, split
+// into time inside timed stand-in calls and outside, the thread's own CPU time in the same window (wall
+// minus CPU is time it was blocked or not scheduled), and the threads with the most stand-in time in the
+// window. Says whether the frame period is the presenting thread's own work or a wait on something else.
+// X2W_PRESENT_SPLIT=<frames>: another period (default 300); 0: off.
+LONG present_split_period()
+{
+    static const LONG period = [] {
+        char value[16]{};
+        return GetEnvironmentVariableA("X2W_PRESENT_SPLIT", value, sizeof(value)) ? std::atol(value) : 300L;
+    }();
+    return period;
+}
+
+void present_split(LONG frame)
+{
+    static LARGE_INTEGER frequency, last;
+    static LONG last_frame;
+    static LONG64 last_inside, last_ticks[thread_inside_max];
+    static ULONG64 last_cpu;
+    static DWORD last_tid;
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    FILETIME created, exited, kernel, user;
+    GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user);
+    const auto u64_of = [](const FILETIME& t) { return (static_cast<ULONG64>(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+    const ULONG64 cpu = u64_of(kernel) + u64_of(user);  // 100 ns units
+    const DWORD tid = GetCurrentThreadId();
+    const LONG64 inside = inside_slot()->ticks;
+    const LONG count = thread_inside_count < thread_inside_max ? thread_inside_count : thread_inside_max;
+    const auto ms = [](LONG64 ticks) { return static_cast<double>(ticks) * 1000.0 / static_cast<double>(frequency.QuadPart); };
+    if (last.QuadPart && tid == last_tid && frame > last_frame) {
+        const double wall = ms(now.QuadPart - last.QuadPart), in = ms(inside - last_inside);
+        const double cpu_ms = static_cast<double>(cpu - last_cpu) / 1e4;
+        struct Top { LONG tid; LONG64 ticks; } top[4]{};
+        for (LONG i = 0; i < count; ++i) {
+            const LONG64 delta = thread_inside[i].ticks - last_ticks[i];
+            for (int j = 0; j < 4; ++j) {
+                if (delta <= top[j].ticks) continue;
+                for (int m = 3; m > j; --m) top[m] = top[m - 1];
+                top[j] = {thread_inside[i].tid, delta};
+                break;
+            }
+        }
+        char text[160];
+        int used = 0;
+        text[0] = 0;
+        for (const Top& t : top)
+            if (t.ticks) used += std::snprintf(text + used, sizeof(text) - used, " %ld:%.0f", t.tid, ms(t.ticks));
+        const LONG frames = frame - last_frame;
+        log("x2w-present split over %ld frames (%.1f ms/frame): presenting thread %lu inside stand-in calls %.1f ms/frame, "
+            "outside %.1f ms/frame; its CPU %.1f ms/frame, so %.1f ms/frame blocked or not running; stand-in ms by thread "
+            "(tid:ms over the window):%s; %ld threads seen", frames, wall / frames, tid, in / frames, (wall - in) / frames,
+            cpu_ms / frames, (wall - cpu_ms) / frames, text, count);
+    }
+    last = now;
+    last_frame = frame;
+    last_inside = inside;
+    last_cpu = cpu;
+    last_tid = tid;
+    for (LONG i = 0; i < count; ++i) last_ticks[i] = thread_inside[i].ticks;
+}
+
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
@@ -4657,6 +4747,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static LONG frames;
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
+    if (const LONG period = present_split_period(); period > 0 && (frame == 1 || frame % period == 0)) present_split(frame);
     frame_number = frame;
     note_present_planes(frame, planes, plane_parameters, present_parameters);
     note_quiet_frame(frame);
