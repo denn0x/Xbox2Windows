@@ -707,6 +707,10 @@ class Stage:
             if len(ops) != 4 or ops[3] not in ('vcc', 'vcc_lo'):
                 raise Unsupported('SDWA v_cndmask_b32 form %s' % ops)
             arity, text = 2, '(vcc & 1) ? {1} : {0}'
+        elif base == 'v_mov_b32':
+            # VOP1 SDWA move (LLVM VOP1Instructions.td V_MOV_B32 has an SDWA form): the selected source field,
+            # placed by dst_sel / dst_unused like every integer SDWA result.
+            arity, text = 1, '{0}'
         elif base in VEC_U_TO_F:
             # The float-result conversions moved out of VEC_U (#1707) keep their SDWA form: the same expression
             # as the bits, as VEC_U had it ('U(float({0}))' and so on). No output modifier is accepted above.
