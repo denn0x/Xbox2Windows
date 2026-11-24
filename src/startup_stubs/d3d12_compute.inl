@@ -224,15 +224,22 @@ void load_compute(u64 key, ComputeTranslation& tr)
     if (SUCCEEDED(hr)) hr = device_of(the_device)->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&tr.root));
     if (blob) blob->Release();
     if (errors) errors->Release();
+    LARGE_INTEGER compile_start{}, compile_end{}, frequency{};
+    QueryPerformanceCounter(&compile_start);
     if (SUCCEEDED(hr)) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = tr.root;
         pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
         hr = device_of(the_device)->CreateComputePipelineState(&pd, IID_PPV_ARGS(&tr.pso));
     }
+    QueryPerformanceCounter(&compile_end);
+    QueryPerformanceFrequency(&frequency);
+    const SIZE_T code_bytes = code->GetBufferSize();
     code->Release();
-    log("x2w-cx %016llx translated: %zu entry values, %u resources, %zu samplers, group %ux%ux%u -> 0x%08lx", key, tr.uds.size(), n,
-        tr.samplers.size(), tr.threads[0], tr.threads[1], tr.threads[2], static_cast<unsigned long>(hr));
+    // LOCAL: the driver compile time and DXIL size, so a run shows which first uses are slow
+    log("x2w-cx %016llx translated: %zu entry values, %u resources, %zu samplers, group %ux%ux%u -> 0x%08lx (%zu bytes, compiled in %lld ms)",
+        key, tr.uds.size(), n, tr.samplers.size(), tr.threads[0], tr.threads[1], tr.threads[2], static_cast<unsigned long>(hr), code_bytes,
+        static_cast<long long>((compile_end.QuadPart - compile_start.QuadPart) * 1000 / frequency.QuadPart));
     if (FAILED(hr)) return;
     tr.state = 1;
     InterlockedIncrement(&cx_ready);
@@ -625,6 +632,33 @@ std::uint32_t descword_value(const Pass& pass, int param, int offset, u64 key)
     return out[word];
 }
 
+// LOCAL: the translation of `key`, loaded on first use without holding draw_lock. A driver compile of
+// a large translated shader takes seconds (run 85: >= 11 s in amdxc64 for one key); under draw_lock it
+// blocked every other recording thread and ExecuteCommandLists, so the render thread could not finish
+// a frame and the title's frame-loop watchdog stopped it. Different keys now compile in parallel; a
+// thread that needs a key another thread is compiling waits for that key only. State 3 = loading.
+SRWLOCK compute_load_lock = SRWLOCK_INIT;
+CONDITION_VARIABLE compute_loaded = CONDITION_VARIABLE_INIT;
+ComputeTranslation& loaded_compute(u64 key)
+{
+    AcquireSRWLockExclusive(&compute_load_lock);
+    ComputeTranslation& tr = compute_translations()[key];  // element references survive rehashing
+    while (tr.state == 3) SleepConditionVariableSRW(&compute_loaded, &compute_load_lock, INFINITE, 0);
+    if (tr.state != 0) {
+        ReleaseSRWLockExclusive(&compute_load_lock);
+        return tr;
+    }
+    tr.state = 3;
+    ReleaseSRWLockExclusive(&compute_load_lock);
+    ComputeTranslation loaded;
+    load_compute(key, loaded);
+    AcquireSRWLockExclusive(&compute_load_lock);
+    tr = loaded;  // final state (1 ready, 2 unavailable) and the objects; nobody reads tr while it is 3
+    ReleaseSRWLockExclusive(&compute_load_lock);
+    WakeAllConditionVariable(&compute_loaded);
+    return tr;
+}
+
 // Runs a dispatch through the translation of compute key `key`. False: not translated (or no list).
 bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT x, UINT y, UINT z)
 {
@@ -635,9 +669,15 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     }
     Timed timed(time_cx_execute);
     Pass& pass = pass_of(self);
+    // LOCAL: X2W_CX_COMPILE_LOCKED=1 restores the old order (compile while holding draw_lock), for comparison.
+    static const bool compile_locked = x2w_local::env_on("X2W_CX_COMPILE_LOCKED");
+    ComputeTranslation* ready = compile_locked ? nullptr : &loaded_compute(key);
     AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(200000 + __LINE__);
-    ComputeTranslation& tr = compute_translations()[key];
-    if (!tr.state) load_compute(key, tr);
+    if (!ready) {
+        ready = &compute_translations()[key];
+        if (!ready->state) load_compute(key, *ready);
+    }
+    ComputeTranslation& tr = *ready;
     if (tr.state != 1 || !ensure_draw_heap(the_device)) {
         InterlockedIncrement(&compute_outcomes[tr.state != 1 ? co_c67_untranslated : co_c67_heap]);
         ReleaseSRWLockExclusive(&draw_lock);
