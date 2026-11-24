@@ -69,7 +69,7 @@ int main(int argc, char** argv)
     st::on_poll(s, true, nullptr);
     report(10);
     expect(logged(no_stale ? "completions 0" : "completions 1,"), "a completed status is counted");
-    expect(logged("polls pending 3 complete 1"), "IsComplete polls are counted by outcome");
+    expect(logged("polls (approximate) pending 3 complete 1"), "IsComplete polls are counted by outcome");
     expect(logged("reused before complete 0, stale writes 0"), "no reuse in a normal batch");
 
     // Index 0 enqueued again (gen a), then again before a's status was written (gen b): reused. a's write

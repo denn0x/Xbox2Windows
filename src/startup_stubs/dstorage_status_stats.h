@@ -120,10 +120,14 @@ inline void on_complete(StatusStats* s, unsigned index, LONG gen) noexcept
     InterlockedExchange(&s->completed_gen[index], gen);
 }
 
+// IsComplete runs at tens of millions of calls per second while the title waits, so the poll counts are
+// plain (unlocked) increments on the array's own counters: approximate when several threads poll one
+// array or a report resets them mid-increment, but no locked instruction on the title's poll path.
 inline void on_poll(StatusStats* s, bool complete, void* caller) noexcept
 {
     if (!s) return;
-    InterlockedIncrement64(complete ? &s->polls_complete : &s->polls_pending);
+    volatile LONG64& polls = complete ? s->polls_complete : s->polls_pending;
+    polls = polls + 1;
     if (!s->poller) InterlockedCompareExchangePointer(&s->poller, caller, nullptr);
 }
 
@@ -191,7 +195,7 @@ void report(int second, LONG pending_result, Log log, QueueText queue_text)
     }
     if (completions || polls_pending || polls_complete || reused || stale)
         log("x2w-dstorage status %d s: arrays %ld (active %ld), completions %lld, wait mean %.3f ms max %.3f ms (array #%ld); "
-            "IsComplete polls pending %lld complete %lld; reused before complete %ld, stale writes %ld (since start); first pollers:%s",
+            "IsComplete polls (approximate) pending %lld complete %lld; reused before complete %ld, stale writes %ld (since start); first pollers:%s",
             second, static_cast<long>(array_count), static_cast<long>(active), completions,
             completions ? ms(wait_ticks) / static_cast<double>(completions) : 0.0, ms(wait_max), static_cast<long>(max_at),
             polls_pending, polls_complete, static_cast<long>(reused), static_cast<long>(stale), used ? pollers : " none");
