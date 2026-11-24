@@ -4675,7 +4675,7 @@ void draw_overlay(LONG frame, double seconds)
 #include "startup_stubs/d3d12_present.inl"
 #include "startup_stubs/d3d12_copy_buffer.inl"
 
-// LOCAL stall: every 300 presents, one line: the wall time between them on the presenting thread, split
+// LOCAL stall: every 300 presents (or 10 s), one line: the wall time between them on the presenting thread, split
 // into time inside timed stand-in calls and outside, the thread's own CPU time in the same window (wall
 // minus CPU is time it was blocked or not scheduled), and the threads with the most stand-in time in the
 // window. Says whether the frame period is the presenting thread's own work or a wait on something else.
@@ -4726,9 +4726,10 @@ void present_split(LONG frame)
         for (const Top& t : top)
             if (t.ticks) used += std::snprintf(text + used, sizeof(text) - used, " %ld:%.0f", t.tid, ms(t.ticks));
         const LONG frames = frame - last_frame;
-        log("x2w-present split over %ld frames (%.1f ms/frame): presenting thread %lu inside stand-in calls %.1f ms/frame, "
-            "outside %.1f ms/frame; its CPU %.1f ms/frame, so %.1f ms/frame blocked or not running; stand-in ms by thread "
-            "(tid:ms over the window):%s; %ld threads seen", frames, wall / frames, tid, in / frames, (wall - in) / frames,
+        log("x2w-present split over %ld frames (%.1f ms/frame): presenting thread %lu inside timed d3d12_xs calls %.1f "
+            "ms/frame, outside %.1f ms/frame (xmem/XCRDAPI time counts as outside); its CPU %.1f ms/frame, so %.1f ms/frame "
+            "blocked or not running; timed d3d12_xs ms by thread (tid:ms over the window):%s; %ld threads seen",
+            frames, wall / frames, tid, in / frames, (wall - in) / frames,
             cpu_ms / frames, (wall - cpu_ms) / frames, text, count);
     }
     last = now;
@@ -4747,7 +4748,15 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static LONG frames;
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
-    if (const LONG period = present_split_period(); period > 0 && (frame == 1 || frame % period == 0)) present_split(frame);
+    // Every <period> frames or 10 s, whichever comes first (run 92's crawl: 168 frames in 87 s).
+    if (const LONG period = present_split_period(); period > 0) {
+        static ULONGLONG split_due;
+        const ULONGLONG tick = GetTickCount64();
+        if (frame == 1 || frame % period == 0 || tick >= split_due) {
+            split_due = tick + 10000;
+            present_split(frame);
+        }
+    }
     frame_number = frame;
     note_present_planes(frame, planes, plane_parameters, present_parameters);
     note_quiet_frame(frame);
