@@ -1,6 +1,10 @@
 // DispatchMesh ExecuteIndirect (list slot 61) through a translated mesh pipeline (d3d12_mesh.inl).
 //
-//   startup_mesh_dispatch <warp|hardware> <gpu|derived|zero|huge|off|missing|depth|words16|words32|wordsraw>
+//   startup_mesh_dispatch <warp|hardware> <gpu|derived|zero|huge|off|missing|depth|words16|words32|wordsraw|
+//                                          fmaprecise|fmabad|notargets|rtvuint>
+// fma line: derived has none ("fma unstated"), fmaprecise `fma precise` (drawn), fmabad `fma fused` (refused:
+// translation failed), the other modes `fma exact` (needs DoublePrecisionFloatShaderOps). notargets: no
+// OMSetRenderTargets; rtvuint: an R32_UINT target: both refused once with "call refused (...)", nothing drawn.
 //   (X2W_D3D12_RENDER=1 X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_DEBUG=1; X2W_MESH=1 except mode off;
 //    the test sets X2W_SHADER_CACHE and X2W_TRAP_LOG itself)
 //
@@ -155,7 +159,8 @@ int main(int argc, char** argv)
     if (argc != 3) return 2;
     const std::string mode = argv[2];
     if (mode != "gpu" && mode != "derived" && mode != "zero" && mode != "huge" && mode != "off" && mode != "missing" && mode != "depth" &&
-        mode != "words16" && mode != "words32" && mode != "wordsraw")
+        mode != "words16" && mode != "words32" && mode != "wordsraw" && mode != "fmaprecise" && mode != "fmabad" && mode != "notargets" &&
+        mode != "rtvuint")
         return 2;
     const bool depth = mode == "depth";
     const bool words = mode.compare(0, 5, "words") == 0;  // heap descriptor + vdesc (`heap 1`, `heapwords 1`)
@@ -274,8 +279,10 @@ int main(int argc, char** argv)
     std::printf("mesh key %016llx\n", static_cast<unsigned long long>(key));
     if (mode != "missing") {
         // words modes: no srv line; the vertices are reached through the title heap slot in entry value 2.
-        const std::string manifest = words ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nudsrc 2 rootconst 0 0\nheap 1\nheapwords 1\nstage mesh\nms 3 3 1\n"
-                                           : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\nstage mesh\nms 3 3 1\n";
+        // The fma line (RUNTIME_NEEDS 8): derived has none (unstated), fmaprecise / fmabad name their rule, the rest exact.
+        const std::string fma = mode == "derived" ? "" : mode == "fmaprecise" ? "fma precise\n" : mode == "fmabad" ? "fma fused\n" : "fma exact\n";
+        const std::string manifest = words ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nudsrc 2 rootconst 0 0\nheap 1\nheapwords 1\n" + fma + "stage mesh\nms 3 3 1\n"
+                                           : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\n" + fma + "stage mesh\nms 3 3 1\n";
         const std::wstring base = cache + L"\\" + hex_key(key);
         if (!(words ? write_file(base + L".ms.cso", startup_mesh_heap_ms, sizeof(startup_mesh_heap_ms))
                     : write_file(base + L".ms.cso", startup_mesh_ms, sizeof(startup_mesh_ms))) ||
@@ -376,12 +383,14 @@ int main(int argc, char** argv)
         barrier(observer.list.Get(), target.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON);
         if (!observer.run()) return 12;
     } else {
-        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, size, size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+        // rtvuint: an integer target (R32_UINT, 4 bytes per pixel like RGBA8): the call must be refused ("rtv variant").
+        const DXGI_FORMAT format = mode == "rtvuint" ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, size, size, 1, 1, format, {1, 0},
                                        D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
-        const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 0}};
+        const D3D12_CLEAR_VALUE clear{format, {0, 0, 0, 0}};
         if (FAILED(desktop->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, &clear,
                                                     IID_PPV_ARGS(&target)))) return 12;
-        D3D12_RENDER_TARGET_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
+        D3D12_RENDER_TARGET_VIEW_DESC view{format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
         invoke(device, 20, arg(target.Get()), arg(&view), target_handle);
     }
     // The view heap with one hardware buffer descriptor: base, stride 0, 48 records (bytes), over the vertices.
@@ -441,7 +450,7 @@ int main(int argc, char** argv)
         invoke(list, 50, 0, 0, 0, arg(&target_handle));                    // OMSetRenderTargets(0, null, FALSE, &dsv)
     } else {
         invoke(list, 52, target_handle, arg(clear_colour));                // ClearRenderTargetView
-        invoke(list, 50, 1, arg(&target_handle));                          // OMSetRenderTargets(1, &rtv)
+        if (mode != "notargets") invoke(list, 50, 1, arg(&target_handle)); // OMSetRenderTargets(1, &rtv); notargets: none bound
     }
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(size), static_cast<float>(size), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(size), static_cast<LONG>(size)};
@@ -486,7 +495,7 @@ int main(int argc, char** argv)
         std::printf("the record in title memory is not what the writer stored\n");
         ++failures;
     }
-    const bool drawn_expected = mode == "gpu" || mode == "derived" || (!words_skip && (mode == "words16" || mode == "words32"));
+    const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || (!words_skip && (mode == "words16" || mode == "words32"));
     // RGBA8 little-endian: R c0, G 40, B ff, A ff. words modes: G = the FORMAT code in vdesc word 3 (29 = 0x1d, 64 = 0x40).
     const std::uint32_t drawn = mode == "words16" ? 0xffff1dc0u : 0xffff40c0u;
     if (depth) {
@@ -516,13 +525,32 @@ int main(int argc, char** argv)
     std::string bound_line;
     if (const std::size_t p = log.find(std::string("x2w-mesh key ") + key_text + " first bound frame "); p != std::string::npos)
         bound_line = log.substr(p, log.find('\n', p) - p);
-    const bool bound_ok = bound_line.find(mode == "missing" ? "(cache: missing)" : "(cache: ok)") != std::string::npos;
+    const bool bound_ok = bound_line.find(mode == "missing" ? "(cache: missing)" : mode == "fmabad" ? "(cache: fail)" : "(cache: ok)") != std::string::npos;
+    // Refusal modes: the once-per-key reason line (d3d12_mesh.inl mesh_refusal_line / load_mesh_stages).
+    const std::string pipeline_line = std::string("x2w-mesh pipeline ") + key_text + ": ";
+    const bool refusal_mode = mode == "fmabad" || mode == "notargets" || mode == "rtvuint";
+    const std::string reason = mode == "fmabad"      ? "translation failed (unknown fma rule \"fused\")"
+                               : mode == "notargets" ? "call refused (no targets: "
+                               : mode == "rtvuint"   ? "call refused (rtv variant: target formats 42;"
+                                                     : "";
+    const bool reason_ok = refusal_mode && has(pipeline_line + reason);
+    if (refusal_mode) std::printf("log: refusal line \"%s%s\" %d\n", pipeline_line.c_str(), reason.c_str(), reason_ok);
+    // The fma rule each loaded translation reports, and the capability line for exact / unstated.
+    const char* fma_rule = mode == "derived" ? "fma unstated" : mode == "fmaprecise" ? "fma precise" : "fma exact";
+    const bool fma_checked = mode != "off" && mode != "missing" && mode != "fmabad";
+    const bool fma_ok = !fma_checked || (has(std::string(", ") + fma_rule) && (mode == "fmaprecise" || has("x2w-mesh DoublePrecisionFloatShaderOps 1 ")));
+    if (fma_checked) std::printf("log: mesh stage line ends \"%s\" and capability line as required: %d\n", fma_rule, fma_ok);
+    if (!fma_ok) {
+        std::printf("FAIL: the fma lines do not match mode %s\n", mode.c_str());
+        ++failures;
+    }
     std::printf("log: issued %d, no translation %d, any x2w-mesh line %d, first bound line \"%s\"\n", issued, missing, any_mesh,
                 bound_line.c_str());
     const bool skipped_32 = has(std::string("x2w-draw-rt ") + key_text + ": heap draw skipped: descriptor increment is not 32");
     if (words_skip) std::printf("log: heap draw skipped (increment not 32) %d\n", skipped_32);
     if (mode == "off"       ? any_mesh
         : mode == "missing" ? (!missing || issued || !bound_ok)
+        : refusal_mode      ? (issued || !bound_ok || !reason_ok)
         : words_skip        ? (issued || !bound_ok || !skipped_32)
                             : (!issued || !bound_ok)) {
         std::printf("FAIL: the x2w-mesh lines do not match mode %s\n", mode.c_str());
