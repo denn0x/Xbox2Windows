@@ -1,6 +1,6 @@
 // DispatchMesh ExecuteIndirect (list slot 61) through a translated mesh pipeline (d3d12_mesh.inl).
 //
-//   startup_mesh_dispatch <warp|hardware> <gpu|derived|zero|huge|off|missing|depth>
+//   startup_mesh_dispatch <warp|hardware> <gpu|derived|zero|huge|off|missing|depth|words16|words32|wordsraw>
 //   (X2W_D3D12_RENDER=1 X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_DEBUG=1; X2W_MESH=1 except mode off;
 //    the test sets X2W_SHADER_CACHE and X2W_TRAP_LOG itself)
 //
@@ -18,7 +18,13 @@
 // entry value 0); zero: X = 0, nothing drawn; huge: X = 70000 zeroed by indirect's guard, nothing drawn; off
 // (X2W_MESH unset): nothing drawn, no x2w-mesh line; missing: nothing drawn, "no translation" for the key; depth:
 // the depth-only pipeline (no pixel stage) is created and issued (depth value printed; today's default state has
-// depth off, so it is not checked). Every mode: no debug-layer error or corruption message, device not removed.
+// depth off, so it is not checked). words16 / words32 / wordsraw (`heap 1` + `heapwords 1`, MeshHeap): no srv line;
+// a title buffer view (16_16_FLOAT / 32_32_FLOAT / raw) in heap slot 2, the slot in root constant 0.0; the shader
+// reads the view id from the heap, the FORMAT from vdesc word 3 and decodes the positions by it: words16 drawn with
+// green 0x1d, words32 with green 0x40, wordsraw (FORMAT 32_FLOAT) nothing; with a view increment other than 32
+// (WARP) the call must be skipped ("descriptor increment is not 32", no vdesc buffer) and the mode reports a
+// capability skip after checking that. Every mode: no debug-layer error or
+// corruption message, device not removed.
 // Exit 0 pass, 77 capability skip (no adapter, no existing-heap support, MeshShaderTier 0, depth on WARP), other
 // values name the step.
 #include <d3d12.h>
@@ -34,6 +40,7 @@
 #include <string>
 #include <vector>
 
+#include "startup_mesh_heap_ms.h"
 #include "startup_mesh_ms.h"
 #include "startup_mesh_ps.h"
 #include "startup_mesh_writer.h"
@@ -147,8 +154,12 @@ int main(int argc, char** argv)
 {
     if (argc != 3) return 2;
     const std::string mode = argv[2];
-    if (mode != "gpu" && mode != "derived" && mode != "zero" && mode != "huge" && mode != "off" && mode != "missing" && mode != "depth") return 2;
+    if (mode != "gpu" && mode != "derived" && mode != "zero" && mode != "huge" && mode != "off" && mode != "missing" && mode != "depth" &&
+        mode != "words16" && mode != "words32" && mode != "wordsraw")
+        return 2;
     const bool depth = mode == "depth";
+    const bool words = mode.compare(0, 5, "words") == 0;  // heap descriptor + vdesc (`heap 1`, `heapwords 1`)
+    UINT view_increment = 0;
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
     ComPtr<IDXGIAdapter> adapter;
@@ -201,7 +212,12 @@ int main(int argc, char** argv)
             std::printf("OpenExistingHeapFromAddress -> 0x%08lx: capability skip\n", static_cast<unsigned long>(hr));
             return 77;
         }
+        view_increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        std::printf("view increment %u\n", view_increment);
     }
+    // `heap 1` draws need the console's 32-byte view slots (d3d12_draw.inl draw_translated); with another increment
+    // (WARP) the words modes check that the call is skipped as required and then report a capability skip.
+    const bool words_skip = words && view_increment != 32;
     // Measured on WARP 10.0.26100.9818 (2026-11-24): a mesh PSO without a pixel stage removes the device on its first
     // DispatchMesh (with depth off and with depth test/write on; with the debug layer on and off; no debug-layer
     // message before the removal). The same stream with a pixel stage draws, and hardware draws it without one.
@@ -257,9 +273,12 @@ int main(int argc, char** argv)
     key = fnv(title_blob->GetBufferPointer(), title_blob->GetBufferSize(), key);
     std::printf("mesh key %016llx\n", static_cast<unsigned long long>(key));
     if (mode != "missing") {
-        const std::string manifest = "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\nstage mesh\nms 3 3 1\n";
+        // words modes: no srv line; the vertices are reached through the title heap slot in entry value 2.
+        const std::string manifest = words ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nudsrc 2 rootconst 0 0\nheap 1\nheapwords 1\nstage mesh\nms 3 3 1\n"
+                                           : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\nstage mesh\nms 3 3 1\n";
         const std::wstring base = cache + L"\\" + hex_key(key);
-        if (!write_file(base + L".ms.cso", startup_mesh_ms, sizeof(startup_mesh_ms)) ||
+        if (!(words ? write_file(base + L".ms.cso", startup_mesh_heap_ms, sizeof(startup_mesh_heap_ms))
+                    : write_file(base + L".ms.cso", startup_mesh_ms, sizeof(startup_mesh_ms))) ||
             (!depth && !write_file(base + L".ps.cso", startup_mesh_ps, sizeof(startup_mesh_ps))) ||
             !write_file(base + L".txt", manifest.data(), manifest.size()))
             return 5;
@@ -281,11 +300,11 @@ int main(int argc, char** argv)
     if (!ok(invoke(device, 62, arg(&compute), 0, 0, arg(&__uuidof(ID3D12PipelineState)), arg(&writer)))) return 8;
     // The slot-57 mesh record.
     alignas(8) static unsigned char record[0x300];
-    Word words[16] = {};
-    words[0] = arg(title_root);
-    if (!depth) words[5] = arg(pixel_code), words[6] = sizeof(pixel_code);
-    words[13] = arg(mesh_code), words[14] = sizeof(mesh_code);
-    std::memcpy(record, words, sizeof(words));
+    Word record_words[16] = {};
+    record_words[0] = arg(title_root);
+    if (!depth) record_words[5] = arg(pixel_code), record_words[6] = sizeof(pixel_code);
+    record_words[13] = arg(mesh_code), record_words[14] = sizeof(mesh_code);
+    std::memcpy(record, record_words, sizeof(record_words));
     if (!ok(invoke(device, 57, arg(record), arg(&__uuidof(ID3D12PipelineState)), arg(&pipeline)))) return 8;
     if (mode == "derived") {
         Patch patch{2};
@@ -315,6 +334,16 @@ int main(int argc, char** argv)
     const float vertices[12] = {-0.9f, -0.9f, -0.9f, 0.9f, -0.1f, 0.0f, 0.1f, 0.0f, 0.9f, 0.9f, 0.9f, -0.9f};
     unsigned char* const vertex_memory = memory + 0x30000;
     std::memcpy(vertex_memory, vertices, sizeof(vertices));
+    if (mode == "words16") {  // the same positions as half2 (all exactly representable: +-0.875, +-0.125, 0)
+        const float halves[12] = {-0.875f, -0.875f, -0.875f, 0.875f, -0.125f, 0.0f, 0.125f, 0.0f, 0.875f, 0.875f, 0.875f, -0.875f};
+        std::uint16_t packed[12];
+        for (int i = 0; i < 12; ++i) {
+            std::uint32_t b = 0;
+            std::memcpy(&b, &halves[i], 4);
+            packed[i] = halves[i] == 0.0f ? 0 : static_cast<std::uint16_t>(((b >> 16) & 0x8000) | ((((b >> 23) & 0xff) - 112) << 10) | ((b >> 13) & 0x3ff));
+        }
+        std::memcpy(vertex_memory, packed, sizeof(packed));
+    }
 
     // Targets: a desktop texture with a view made through the stand-in (as the title's views are wrapped).
     constexpr UINT size = 32;
@@ -368,6 +397,26 @@ int main(int argc, char** argv)
     const std::uint32_t descriptor[8] = {static_cast<std::uint32_t>(vertex_address), static_cast<std::uint32_t>(vertex_address >> 32) & 0xffff,
                                          sizeof(vertices), 0};
     std::memcpy(reinterpret_cast<void*>(view_cpu), descriptor, sizeof(descriptor));
+    // words modes: a title buffer view in heap slot 2 (the stand-in writes its view token there), over a placed
+    // buffer on the vertices: 16_16_FLOAT (words16), 32_32_FLOAT (words32) or raw (wordsraw: no typed format).
+    constexpr std::uint32_t heap_slot = 2;
+    void* vertex_buffer = nullptr;
+    if (words) {
+        D3D12_RESOURCE_DESC vb{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                               D3D12_RESOURCE_FLAG_NONE};
+        if (!ok(invoke(device, 133, arg(vertex_memory), arg(&vb), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&vertex_buffer))))
+            return 12;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Format = mode == "words16" ? DXGI_FORMAT_R16G16_FLOAT : mode == "words32" ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R32_TYPELESS;
+        view.Buffer.NumElements = mode == "wordsraw" ? 12 : 6;
+        view.Buffer.Flags = mode == "wordsraw" ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
+        invoke(device, 18, arg(vertex_buffer), arg(&view), view_cpu + 32 * heap_slot);
+        std::uint32_t token[2] = {};
+        std::memcpy(token, reinterpret_cast<const void*>(view_cpu + 32 * heap_slot), 8);
+        std::printf("heap slot %u: %08x %08x (view token X2WV = 56573258 + view id)\n", heap_slot, token[0], token[1]);
+    }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -402,6 +451,7 @@ int main(int argc, char** argv)
     invoke(list, 32, 1, arg(&view_heap));                                  // SetDescriptorHeaps
     invoke(list, 36, 1, view_gpu);                                         // SetGraphicsRootDescriptorTable(1, heap start)
     invoke(list, 40, 2, 1, arg(&colour), 0);                               // SetGraphicsRoot32BitConstants(2, 1, &colour, 0)
+    if (words) invoke(list, 40, 0, 1, arg(&heap_slot), 0);                 // SetGraphicsRoot32BitConstants(0, 1, &slot, 0): entry value 2
     invoke(list, 25, arg(pipeline));                                       // SetPipelineState (the mesh pipeline)
     invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);               // ExecuteIndirect(mesh signature, 1, args, 0)
     invoke(list, 9);                                                       // Close
@@ -436,8 +486,9 @@ int main(int argc, char** argv)
         std::printf("the record in title memory is not what the writer stored\n");
         ++failures;
     }
-    const bool drawn_expected = mode == "gpu" || mode == "derived";
-    const std::uint32_t drawn = 0xffff40c0u;  // RGBA8 little-endian: R c0, G 40, B ff, A ff
+    const bool drawn_expected = mode == "gpu" || mode == "derived" || (!words_skip && (mode == "words16" || mode == "words32"));
+    // RGBA8 little-endian: R c0, G 40, B ff, A ff. words modes: G = the FORMAT code in vdesc word 3 (29 = 0x1d, 64 = 0x40).
+    const std::uint32_t drawn = mode == "words16" ? 0xffff1dc0u : 0xffff40c0u;
     if (depth) {
         float values[3];
         std::memcpy(values, pixels.data(), sizeof(values));
@@ -468,9 +519,26 @@ int main(int argc, char** argv)
     const bool bound_ok = bound_line.find(mode == "missing" ? "(cache: missing)" : "(cache: ok)") != std::string::npos;
     std::printf("log: issued %d, no translation %d, any x2w-mesh line %d, first bound line \"%s\"\n", issued, missing, any_mesh,
                 bound_line.c_str());
-    if (mode == "off" ? any_mesh : mode == "missing" ? (!missing || issued || !bound_ok) : (!issued || !bound_ok)) {
+    const bool skipped_32 = has(std::string("x2w-draw-rt ") + key_text + ": heap draw skipped: descriptor increment is not 32");
+    if (words_skip) std::printf("log: heap draw skipped (increment not 32) %d\n", skipped_32);
+    if (mode == "off"       ? any_mesh
+        : mode == "missing" ? (!missing || issued || !bound_ok)
+        : words_skip        ? (issued || !bound_ok || !skipped_32)
+                            : (!issued || !bound_ok)) {
         std::printf("FAIL: the x2w-mesh lines do not match mode %s\n", mode.c_str());
         ++failures;
+    }
+    if (words) {  // the vdesc root parameter and buffer, and the word the stand-in wrote for the view
+        const bool root = has(std::string("x2w-vdesc pipeline ") + key_text + ": heapwords 1, vdesc in root parameter ");
+        const bool buffer = has("x2w-vdesc buffer 90000 ids x 32 bytes");
+        std::string view_line;
+        if (const std::size_t p = log.find("x2w-vdesc view "); p != std::string::npos) view_line = log.substr(p, log.find('\n', p) - p);
+        std::printf("log: vdesc root parameter %d, vdesc buffer %d, view words \"%s\"\n", root, buffer, view_line.c_str());
+        // Skipped (increment not 32): the root parameter exists, but no buffer is made and no view is filled.
+        if (!root || (words_skip ? buffer || !view_line.empty() : !buffer || view_line.empty())) {
+            std::printf("FAIL: the x2w-vdesc lines do not match mode %s\n", mode.c_str());
+            ++failures;
+        }
     }
     for (std::size_t p = log.find("x2w-d3d12-debug"); p != std::string::npos; p = log.find("x2w-d3d12-debug", p + 1)) {
         const std::size_t end = log.find('\n', p);
@@ -480,6 +548,10 @@ int main(int argc, char** argv)
     }
     std::printf("device removed reason: 0x%08lx\n", static_cast<unsigned long>(desktop->GetDeviceRemovedReason()));
     if (desktop->GetDeviceRemovedReason() != S_OK) ++failures;
+    if (!failures && words_skip) {
+        std::printf("view increment %u is not 32: skipped as required, vdesc not exercised: capability skip\n", view_increment);
+        return 77;
+    }
     std::printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 16 : 0;
 }

@@ -24,6 +24,43 @@ void MeshMain(uint3 group : SV_GroupID, uint thread : SV_GroupThreadID, out vert
     if (thread == 0) tris[0] = uint3(0, 1, 2);
 }
 
+// MeshHeap (modes words16 / words32 / wordsraw): a typed buffer reached through a RESOURCE-HEAP descriptor, read with
+// the format from its descriptor words (manifest `heap 1` + `heapwords 1`; mesh_work/RUNTIME_NEEDS.md 6.1 / 6.3), as
+// mesh2hlsl emits it: heapmem (t0 space1, the title heap: view token X2WV + view id per 32-byte slot), the view-id
+// region (raw buffer views at 8 + 8 * id + 4, t0 space6) and vdesc (t2 space1, 8 gfx10 words per view id). The heap
+// slot comes from entry value 2 (a root constant). Word 3 FORMAT (bits 12-18): 29 = 16_16_FLOAT (positions read as
+// half2), 64 = 32_32_FLOAT (float2); any other format draws nothing. Green = the FORMAT code / 255, so the read-back
+// shows which word the shader saw.
+cbuffer HeapEntry : register(b0) { uint heap_rect; uint heap_colour; uint heap_slot; };
+ByteAddressBuffer heapmem : register(t0, space1);
+ByteAddressBuffer vdesc : register(t2, space1);
+ByteAddressBuffer heapbuf[] : register(t0, space6);
+
+[numthreads(3, 1, 1)]
+[outputtopology("triangle")]
+void MeshHeap(uint3 group : SV_GroupID, uint thread : SV_GroupThreadID, out vertices Vertex verts[3], out indices uint3 tris[1])
+{
+    const uint h = heap_slot * 32;
+    const uint id = heapmem.Load(h) == 0x56573258u ? heapmem.Load(h + 4) : 0xffffffffu;
+    const uint word3 = id < 90000u ? vdesc.Load(id * 32 + 12) : 0u;
+    const uint format = (word3 >> 12) & 127u;
+    const bool known = format == 29u || format == 64u;
+    SetMeshOutputCounts(known ? 3 : 0, known ? 1 : 0);
+    if (!known) return;
+    const uint e = group.x * 3 + thread;
+    const uint k = 8u + 8u * id + 4u;
+    float2 p;
+    if (format == 29u) {
+        const uint v = heapbuf[NonUniformResourceIndex(k)].Load(e * 4);
+        p = f16tof32(uint2(v & 0xffffu, v >> 16));
+    } else {
+        p = asfloat(heapbuf[NonUniformResourceIndex(k)].Load2(e * 8));
+    }
+    verts[thread].pos = float4(p, 0.25, 1.0);
+    verts[thread].param0 = float4((heap_colour & 255) / 255.0, format / 255.0, ((heap_colour >> 16) & 255) / 255.0, heap_rect == 0 ? 1.0 : 0.5);
+    if (thread == 0) tris[0] = uint3(0, 1, 2);
+}
+
 float4 PixelMain(Vertex input) : SV_Target0
 {
     return input.param0;
