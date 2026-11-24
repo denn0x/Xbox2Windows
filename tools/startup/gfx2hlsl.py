@@ -587,6 +587,11 @@ class Stage:
             if len(ops) != 4 or ops[3] not in ('vcc', 'vcc_lo'):
                 raise Unsupported('SDWA v_cndmask_b32 form %s' % ops)
             arity, text = 2, '(vcc & 1) ? {1} : {0}'
+        elif base in VEC_U_TO_F:
+            # The float-result conversions moved out of VEC_U (#1707) keep their SDWA form: the same expression
+            # as the bits, as VEC_U had it ('U(float({0}))' and so on). No output modifier is accepted above.
+            arity, text_f = VEC_U_TO_F[base]
+            text = 'U(%s)' % text_f
         elif base not in VEC_U:
             raise Unsupported('SDWA form of %s' % base)
         else:
