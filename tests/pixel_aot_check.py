@@ -6729,7 +6729,7 @@ def check_int16_ternary_controls():
     # The two-operand forms keep their operand count; the neighbours that stay unsupported are still refused.
     refuse("v_add_nc_u16 v24, v18, v19, v20", "Wrong 16-bit integer operand count for v_add_nc_u16")
     for line in ("v_mad_u32_u16 v24, v18, v19, v20", "v_mad_i32_i16 v24, v18, v19, v20",
-                 "v_sad_u16 v24, v18, v19, v20", "v_med3_f16 v24, v18, v19, v20", "v_mad_f16 v24, v18, v19, v20"):
+                 "v_med3_f16 v24, v18, v19, v20", "v_mad_f16 v24, v18, v19, v20"):
         refuse(line, "Unsupported instruction")
     sample = next(i for i, line in enumerate(with_constants([])) if line.startswith("image_sample"))
     overlap = with_constants([])
@@ -8082,7 +8082,11 @@ def check_mode_register_controls():
     assert translate([HALF_RTZ] + with_constants(HALF_BODY)) == translate(["s_nop 0"] + with_constants(HALF_BODY))
 
 
-HINT_NAMES = ("s_clause", "s_setprio", "s_sleep")
+HINT_NAMES = ("s_clause", "s_setprio", "s_sleep", "s_inst_prefetch", "s_incperflevel", "s_decperflevel",
+              "s_ttracedata_imm", "s_icache_inv", "s_ttracedata", "s_wakeup")
+# Operand limits by hint: the RDNA 2 field each operand fills.
+HINT_OPERAND_LIMITS = (("s_clause", 0x3f), ("s_setprio", 3), ("s_sleep", 0x7f), ("s_incperflevel", 0xf),
+                       ("s_decperflevel", 0xf), ("s_ttracedata_imm", 0xffff))
 
 
 def scheduling_hints():
@@ -8093,6 +8097,14 @@ def scheduling_hints():
     program.insert(1, "s_setprio 2")
     program.insert(program.index("s_waitcnt vmcnt(0)"), "v_nop")
     program.insert(program.index("s_waitcnt vmcnt(0)"), "s_sleep 1")
+    # Instruction prefetch and cache hints, performance levels, trace markers and a wakeup.
+    program.insert(1, "s_inst_prefetch 0x1")
+    program.insert(2, "s_icache_inv")
+    program.insert(3, "s_incperflevel 2")
+    program.insert(program.index("s_waitcnt vmcnt(0)"), "s_ttracedata")
+    program.insert(program.index("s_waitcnt vmcnt(0)"), "s_ttracedata_imm 0x5")
+    program.insert(program.index("s_waitcnt vmcnt(0)"), "s_wakeup")
+    program.insert(program.index("s_waitcnt vmcnt(0)"), "s_decperflevel 2")
     return program
 
 
@@ -8105,12 +8117,21 @@ def check_scheduling_hints():
                for line in hinted]
     assert translate(hinted) == translate(as_nops)
     nop = translate(["s_nop 0"] + plain)
-    for hint, limit in (("s_clause", 0x3f), ("s_setprio", 3), ("s_sleep", 0x7f)):
+    for hint, limit in HINT_OPERAND_LIMITS:
         assert translate([f"{hint} {limit}"] + plain) == nop
         assert translate([f"{hint} {hex(limit)}"] + plain) == nop
+        assert translate([f"{hint} 0"] + plain) == nop
         must_reject(translate, [f"{hint} {limit + 1}"] + plain)
+        must_reject(translate, [hint] + plain)
+    for hint in ("s_icache_inv", "s_ttracedata", "s_wakeup"):
+        assert translate([hint] + plain) == nop
+        must_reject(translate, [f"{hint} 0"] + plain)
+        must_reject(translate, plain[:-1] + [hint, plain[-1]])
     assert translate(["v_nop"] + plain) == nop
     must_reject(translate, ["v_nop 0"] + plain)
+    # s_wait_idle and s_waitcnt_depctr are waits, not hints, and stay refused.
+    must_reject(translate, ["s_wait_idle"] + plain)
+    must_reject(translate, ["s_waitcnt_depctr 0xffe3"] + plain)
     # s_code_end stays unknown, and nothing may follow the program end or sit between the color
     # export and s_endpgm.
     must_reject(translate, ["s_code_end"] + plain)
@@ -10260,6 +10281,70 @@ def cvt_int_f64_wrongs(row, mask, static):
     return [(kind, words) for kind, words in wrongs if words != right]
 
 
+# v_cvt_f32_f64 (issue 1606, mode-independent slice): the narrowing of a binary64 VGPR pair, lowered only for the pair of a
+# v_cvt_f64_f32 of a statically known source and only when the value returns bit for bit after widening and narrowing
+# (LLVM 15 VOP1Instructions.td; not checked against the ISA document here and not measured on a console). The slice does
+# not read either MODE field: which of MODE[1:0]/[5:4] and MODE[3:2]/[7:6] governs binary64 stays open until independent
+# native evidence distinguishes them. Accepted: a normal binary32 and both signed zeros; the result is the original
+# binary32 word. Refused (check_cvt_f32_f64_lowering): both infinities, NaN, subnormals, unknown pairs, integer-origin
+# pairs, a clobbered word, an unequal join, a value that would need rounding (at the helper level) and every modifier.
+# Bodies for uncompressed_export() as in the int and f64 modes: s45 = XOR mask, s46 and s47 the sentinels, the pair is
+# v[16:17], its copy v[20:21], the results are v13 (read from the pair) and v14 (read from the copy), exported as result ^ M.
+CVT_F32_F64_ROWS = (0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x3F800001, 0xBF800001, 0x00800000, 0x80800000,
+                    0x7F7FFFFF, 0xFF7FFFFF)
+CVT_F32_F64_SENTINELS = CVT_F64_INT_SENTINELS
+
+
+def cvt_f32_f64_lines(bits, pair=16, copy=20, dest=("v13", "v14")):
+    """One row: the pair v[pair:pair+1] from a static literal, its narrowing, a copy pair and the copy's narrowing."""
+    spelled = CVT_F64_F32_INLINE_TEXT.get(bits, f"0x{bits:08x}")
+    return [f"v_cvt_f64_f32_e32 v[{pair}:{pair + 1}], {spelled}", f"v_cvt_f32_f64_e32 {dest[0]}, v[{pair}:{pair + 1}]",
+            f"v_mov_b32_e32 v{copy}, v{pair}", f"v_mov_b32_e32 v{copy + 1}, v{pair + 1}",
+            f"v_cvt_f32_f64 {dest[1]}, v[{copy}:{copy + 1}]"]
+
+
+def cvt_f32_f64_program(bits):
+    return uncompressed_export([*CVT_F64_INT_HEAD, *cvt_f32_f64_lines(bits), *CVT_F64_INT_TAIL])
+
+
+def cvt_f32_f64_binary_program():
+    """Every row in one program (pairs v[24:25], v[26:27], ...; results v100 and up): the binary round trip compares the
+    translation of the disassembly with that of the text."""
+    lines = []
+    for k, bits in enumerate(CVT_F32_F64_ROWS):
+        lines += cvt_f32_f64_lines(bits, 24 + 4 * k, 26 + 4 * k, (f"v{100 + 2 * k}", f"v{101 + 2 * k}"))
+    return uncompressed_export(lines)
+
+
+def cvt_f32_f64_mask(bits):
+    """A mask M with the result word, the word of the pair and the sentinels distinct and normal or zero after the xor."""
+    for exponent in range(1, 255):
+        mask = exponent << 23
+        if binary32_normal_or_zero(bits ^ mask) and not set(CVT_F32_F64_SENTINELS) & {bits ^ mask}:
+            return mask
+    raise AssertionError(hex(bits))
+
+
+def cvt_f32_f64_exported(mask, first, second=None):
+    """The four exported words: sentinel, v13 ^ M, v14 ^ M, sentinel; second defaults to first."""
+    second = first if second is None else second
+    return (CVT_F32_F64_SENTINELS[0], first ^ mask, second ^ mask, CVT_F32_F64_SENTINELS[1])
+
+
+def cvt_f32_f64_wrongs(bits, mask):
+    """(kind, exported words) of every wrong reference that must report a mismatch; the controls equal to the right
+    words are dropped. The right reference is the original binary32 pattern, which is independent of the lowering."""
+    right = cvt_f32_f64_exported(mask, bits)
+    low, high = cvt_f64_f32_ref(bits)
+    wrongs = [("sign lost", cvt_f32_f64_exported(mask, bits & 0x7FFFFFFF)),
+              ("mantissa", cvt_f32_f64_exported(mask, bits ^ 1)),
+              ("word", cvt_f32_f64_exported(mask, high)), ("word", cvt_f32_f64_exported(mask, low)),
+              ("copy slot", cvt_f32_f64_exported(mask, bits, bits ^ 1)),
+              ("copy slot", cvt_f32_f64_exported(mask, bits ^ 1, bits)),
+              ("sentinel", (high ^ mask, *right[1:])), ("sentinel", (*right[:3], low ^ mask))]
+    return [(kind, words) for kind, words in wrongs if words != right]
+
+
 # v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32: the carry-out add and subtracts above, plus the carry or
 # borrow of each lane read from a lane mask. Bodies for uncompressed_export(): A, B, C and D are the constants in
 # s44 to s47, v18 = B and v19 = D. The carry-out form of the same operation leaves the carry of op(A, B) in vcc_lo
@@ -10367,16 +10452,21 @@ CARRY_IN_WRONG = {
         (3, 3, lambda a, b, c, d: _SET, "borrow-out of the unreversed subtract"),
     ),
 }
-# Sums of absolute differences (v_sad_hi_u8, v_sad_u32, v_msad_u8). Bodies for uncompressed_export(): s44 = A,
-# s45 = B and s46 = C from the constants, v18 = B, and each channel v12..v15 holds its own result. The second
-# source is the reference of v_msad_u8, here once a register and once a literal whose byte 2 is zero. No
-# instruction uses more than two scalar registers and literals, the gfx10 constant bus limit LLVM 15 enforces.
+# Sums of absolute differences (v_sad_u8, v_sad_hi_u8, v_sad_u16, v_sad_u32, v_msad_u8). Bodies for
+# uncompressed_export(): s44 = A, s45 = B and s46 = C from the constants, v18 = B, and each channel v12..v15 holds
+# its own result. The second source is the reference of v_msad_u8, here once a register and once a literal whose
+# byte 2 is zero. The lanes group gives v_sad_u8 a literal accumulator that is not an inline constant, so its
+# result stays a normal binary32. No instruction uses more than two scalar registers and literals, the gfx10
+# constant bus limit LLVM 15 enforces.
 SAD_LITERAL = 0x7f00ff01
+SAD_ACCUMULATOR = 0x3f800010
 SAD_BODIES = {
     "bytes": ["v_sad_hi_u8 v12, s44, v18, s46", "v_sad_hi_u8 v13, v18, s44, 0",
               "v_msad_u8 v14, s44, v18, s46", "v_msad_u8 v15, v18, s44, s46"],
     "dword": ["v_sad_u32 v12, s44, v18, s46", "v_sad_u32 v13, v18, s44, 64",
               f"v_msad_u8 v14, s44, {SAD_LITERAL:#x}, v18", "v_sad_hi_u8 v15, s45, s44, v18"],
+    "lanes": ["v_sad_u8 v12, s44, v18, s46", f"v_sad_u8 v13, v18, s44, {SAD_ACCUMULATOR:#x}",
+              "v_sad_u16 v14, s44, v18, s46", "v_sad_u16 v15, v18, s44, v18"],
 }
 SAD_OPS = tuple(sorted({line.split()[0] for body in SAD_BODIES.values() for line in body}))
 
@@ -10389,6 +10479,14 @@ def _sad4(a, b, masked=False, lanes=4, signed=False):
     return sum(abs(lane(a, k) - lane(b, k)) for k in range(lanes) if not masked or _byte(b, k))
 
 
+def _sad2(a, b, lanes=2, signed=False):
+    """Sum of |a.half[k] - b.half[k]| over the low halfword lanes."""
+    def lane(word, k):
+        value = (word >> (16 * k)) & 0xffff
+        return value - 0x10000 if signed and value >= 0x8000 else value
+    return sum(abs(lane(a, k) - lane(b, k)) for k in range(lanes))
+
+
 def _signed_absdiff32(a, b):
     return abs((a - (1 << 32) if a & 0x80000000 else a) - (b - (1 << 32) if b & 0x80000000 else b))
 
@@ -10397,6 +10495,7 @@ def _signed_absdiff32(a, b):
 SAD_RESULTS = {
     "bytes": lambda a, b, c: ((_sad4(a, b) << 16) + c, _sad4(b, a) << 16, _sad4(a, b, True) + c, _sad4(b, a, True) + c),
     "dword": lambda a, b, c: (abs(a - b) + c, abs(b - a) + 64, _sad4(a, SAD_LITERAL, True) + b, (_sad4(b, a) << 16) + b),
+    "lanes": lambda a, b, c: (_sad4(a, b) + c, _sad4(b, a) + SAD_ACCUMULATOR, _sad2(a, b) + c, _sad2(b, a) + b),
 }
 # Negative controls by group: (channel, word a wrong lowering would give, what went wrong). Each is drawn on
 # the first row of the group and must report a mismatch.
@@ -10423,6 +10522,19 @@ SAD_WRONG = {
         (2, lambda a, b, c: _sad4(a, SAD_LITERAL, True) + c, "s46 read for the register accumulator"),
         (3, lambda a, b, c: (_sad4(b, a) << 16) + c, "wrong accumulator register"),
     ),
+    "lanes": (
+        (0, lambda a, b, c: (_sad4(a, b) << 16) + c, "v_sad_u8 moved to the high half like v_sad_hi_u8"),
+        (0, lambda a, b, c: _sad4(a, b, True) + c, "v_sad_u8 masked like v_msad_u8"),
+        (0, lambda a, b, c: _sad4(a, b, signed=True) + c, "signed byte lanes"),
+        (0, lambda a, b, c: _sad4(a, b, lanes=3) + c, "top byte lane dropped"),
+        (0, lambda a, b, c: _sad4(a, b), "accumulator dropped"),
+        (1, lambda a, b, c: _sad4(b, a) + c, "s46 read for the literal accumulator"),
+        (2, lambda a, b, c: _sad4(a, b) + c, "byte lanes for the halfword sum"),
+        (2, lambda a, b, c: _sad2(a, b, signed=True) + c, "signed halfword lanes"),
+        (2, lambda a, b, c: _sad2(a, b, lanes=1) + c, "high halfword lane dropped"),
+        (2, lambda a, b, c: abs(a - b) + c, "dword difference for the halfword sum"),
+        (3, lambda a, b, c: _sad2(b, a) + c, "s46 read for the VGPR accumulator"),
+    ),
 }
 # (A, B, C) as binary32 words; the inputs and every right result are normal numbers or zero (asserted at the
 # draw). In the first bytes row A and B each have one zero byte in a different lane and lanes on both sides of
@@ -10430,6 +10542,8 @@ SAD_WRONG = {
 SAD_ROWS = {
     "bytes": ((0xC1007F90, 0x40C30011, 0x3F80FFFF), (0x3E0027FF, 0xBF62FF00, 0x40000000)),
     "dword": ((0xC1700000, 0x3F800024, 0x7F000000), (0x40000023, 0x4C003A00, 0x3F800000)),
+    # The bytes rows again: A and B also have halfword lanes on both sides of 0x8000 (0xC100 and 0x40C3).
+    "lanes": ((0xC1007F90, 0x40C30011, 0x3F80FFFF), (0x3E0027FF, 0xBF62FF00, 0x40000000)),
 }
 
 
@@ -11313,9 +11427,10 @@ def check_cvt_f64_f32_lowering():
     # Arithmetic on the pair and the conversions back are refused, and so is the conversion in a masked region.
     # v_cvt_i32_f64 and v_cvt_u32_f64 of this pair of 1.0 were refused here before the static truncation
     # (check_cvt_int_f64_lowering) was admitted: 1.0 is finite and fits both destinations, so both are that
-    # supported case now and moved there.
+    # supported case now and moved there. v_cvt_f32_f64 of this pair of 1.0 was refused here too and is accepted now
+    # (the exact narrowing of a static normal binary32, check_cvt_f32_f64_lowering).
     for consumer in ("v_add_f64 v[14:15], v[12:13], v[12:13]", "v_mul_f64 v[14:15], v[12:13], v[12:13]",
-                     "v_cvt_f32_f64_e32 v14, v[12:13]", "v_mov_b32_e32 v14, v[12:13]"):
+                     "v_mov_b32_e32 v14, v[12:13]"):
         must_reject(translate_int, program("v_cvt_f64_f32 v[12:13], 1.0", consumer))
     must_reject(translate_int, uncompressed_export([
         *MAD64_PREFIX, "v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc",
@@ -11520,6 +11635,212 @@ def check_cvt_int_f64_lowering():
         assert bits in CVT_INT_F64_STATIC_ROWS[kind], (kind, hex(bits))
 
 
+def check_cvt_f32_f64_lowering():
+    """Static checks for v_cvt_f32_f64: the accepted static pairs (a normal binary32 or a signed zero) and the controls
+    that must be refused (infinities, NaN, subnormals, unknown and integer-origin pairs, clobbers, unequal joins,
+    values needing rounding at the helper level, modifiers and every other spelling)."""
+    def program(*lines):
+        return uncompressed_export([*MAD64_PREFIX, *lines])
+
+    def results(source):
+        return re.findall(r"precise float alu\d+ = asfloat\((\d+)u\);", source.split("uint4 main")[1])
+
+    # Accepted: the result is the original binary32 word, as a constant, with no double and no runtime conversion.
+    for bits in CVT_F32_F64_ROWS:
+        source = translate_int(cvt_f32_f64_program(bits))
+        assert results(source)[-2:] == [str(bits)] * 2, (hex(bits), results(source))
+        assert "double" not in source and "firstbithigh" not in source.split("uint4 main")[1], hex(bits)
+        mask = cvt_f32_f64_mask(bits)
+        assert binary32_normal_or_zero(bits ^ mask) and cvt_f32_f64_wrongs(bits, mask), hex(bits)
+    translate_int(cvt_f32_f64_binary_program())
+    # Both spellings of the unmodified form, the highest pair, an unaligned pair, a destination equal to a pair word and
+    # a pair read twice; the result is a numeric register to later readers.
+    for good in ("v_cvt_f32_f64 v13, v[24:25]", "v_cvt_f32_f64_e32 v13, v[24:25]", "v_cvt_f32_f64 v24, v[24:25]"):
+        translate_int(program("v_cvt_f64_f32 v[24:25], 1.0", good))
+    translate_int(program("v_cvt_f64_f32 v[254:255], 1.0", "v_cvt_f32_f64 v255, v[254:255]"))
+    translate_int(program("v_cvt_f64_f32 v[25:26], 0x3f800001", "v_cvt_f32_f64 v13, v[25:26]", "v_cvt_f32_f64 v14, v[25:26]"))
+    translate_int(program("v_cvt_f64_f32 v[24:25], 1.0", "v_cvt_f32_f64 v13, v[24:25]", "v_add_f32_e32 v14, v13, v13"))
+    # The modifiers of the widening are applied first (abs, then neg): the pair of -|0x80000000| is -0.0, narrowed to -0.
+    source = translate_int(program("v_cvt_f64_f32_e64 v[24:25], neg(0x3f800001)", "v_cvt_f32_f64 v13, v[24:25]"))
+    assert results(source)[-1] == str(0xBF800001), results(source)
+    source = translate_int(program("v_cvt_f64_f32_e64 v[24:25], -|0x80000000|", "v_cvt_f32_f64 v13, v[24:25]"))
+    assert results(source)[-1] == "2147483648", results(source)
+    # A copy of both words, in either order, and of a copy keeps the provenance.
+    translate_int(program("v_cvt_f64_f32 v[24:25], 1.0", "v_mov_b32_e32 v27, v25", "v_mov_b32_e32 v26, v24",
+                          "v_mov_b32_e32 v31, v27", "v_mov_b32_e32 v30, v26", "v_cvt_f32_f64 v13, v[30:31]"))
+    # Independent hand-computed binary32 words of the helper: the largest and smallest normal, both zeros.
+    assert pixel_aot.cvt_f32_f64_exact_bits(0xE0000000, 0x47EFFFFF) == 0x7F7FFFFF
+    assert pixel_aot.cvt_f32_f64_exact_bits(0, 0x38100000) == 0x00800000
+    assert pixel_aot.cvt_f32_f64_exact_bits(0, 0xB8100000) == 0x80800000
+    assert pixel_aot.cvt_f32_f64_exact_bits(0, 0) == 0 and pixel_aot.cvt_f32_f64_exact_bits(0, 0x80000000) == 0x80000000
+    assert pixel_aot.cvt_f32_f64_exact_bits(0x20000000, 0x3FF00000) == 0x3F800001
+    # Helper-level refusals of the translator, whatever the origin of the words: a binary64 value that is not exactly a
+    # normal binary32 requires rounding (1 + 2^-24, 2^24 + 1, 0.1, a value beyond the largest binary32, one that rounds
+    # to the largest binary32, one far below the smallest and one just below it), the infinities and NaNs are not
+    # finite, and an exact subnormal binary32 (2^-140) is a subnormal.
+    def words(value):
+        return struct.unpack("<II", struct.pack("<d", value))
+
+    flt_max = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
+    for value in (1.0 + 2.0 ** -24, 16777217.0, 0.1, -0.1, 1e300, flt_max * 2.0, flt_max + 2.0 ** 102, flt_max + 2.0 ** 103,
+                  1e-50, 2.0 ** -126 - 2.0 ** -150, 2.0 ** -126 * (1.0 + 2.0 ** -30)):
+        try:
+            pixel_aot.cvt_f32_f64_exact_bits(*words(value))
+        except ValueError as error:
+            assert "requires rounding" in str(error), (value, str(error))
+        else:
+            raise AssertionError(f"accepted {value!r}")
+    for low, high in ((0, 0x7FF00000), (0, 0xFFF00000), (1, 0x7FF00000), (0, 0x7FF80000), (0xFFFFFFFF, 0xFFFFFFFF)):
+        try:
+            pixel_aot.cvt_f32_f64_exact_bits(low, high)
+        except ValueError as error:
+            assert "is not finite" in str(error), (hex(high), hex(low), str(error))
+        else:
+            raise AssertionError(f"accepted {hex(high)} {hex(low)}")
+    for value in (2.0 ** -140, -(2.0 ** -149)):
+        try:
+            pixel_aot.cvt_f32_f64_exact_bits(*words(value))
+        except ValueError as error:
+            assert "is a subnormal binary32" in str(error), (value, str(error))
+        else:
+            raise AssertionError(f"accepted {value!r}")
+    # Both infinities are accepted by the widening and refused by the narrowing, in the pair and in a copy of it.
+    for literal in ("0x7f800000", "0xff800000"):
+        translate_int(program(f"v_cvt_f64_f32 v[24:25], {literal}"))
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32 v[24:25], {literal}", "v_cvt_f32_f64 v13, v[24:25]"),
+                           "is not finite")
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32 v[24:25], {literal}", "v_mov_b32_e32 v26, v24",
+                                                  "v_mov_b32_e32 v27, v25", "v_cvt_f32_f64_e32 v13, v[26:27]"),
+                           "is not finite")
+    # A NaN and a subnormal never become a pair, so they are refused before the narrowing.
+    for literal in ("0x7fc00000", "0x7f800001", "0xffc00000"):
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32 v[24:25], {literal}", "v_cvt_f32_f64 v13, v[24:25]"),
+                           "is a NaN")
+    for literal in ("0x00000001", "0x807fffff", "0x007fffff"):
+        expect_value_error(translate_int, program(f"v_cvt_f64_f32 v[24:25], {literal}", "v_cvt_f32_f64 v13, v[24:25]"),
+                           "is a subnormal")
+    # A pair from a runtime source is not static.
+    expect_value_error(translate_int, program("v_cvt_f64_f32 v[24:25], v18", "v_cvt_f32_f64 v13, v[24:25]"),
+                       "Unproven runtime input")
+    # Integer-origin pairs are refused even where the integer is exact in binary32 (1) or not (2^24 + 1, which the
+    # narrowing would have to round), from a constant buffer word and from a known source, with both signednesses.
+    low, high = cvt_f64_int_ref(True, 0x01000001)
+    assert (low, high) == words(16777217.0)
+    try:
+        pixel_aot.cvt_f32_f64_exact_bits(low, high)
+    except ValueError as error:
+        assert "requires rounding" in str(error)
+    else:
+        raise AssertionError("2^24 + 1 narrowed exactly")
+    for kind in ("i32", "u32"):
+        for source_text in ("s44", "v18", "0x01000001", "0x01000000", "1", "0"):
+            expect_value_error(translate_int, program(f"v_cvt_f64_{kind} v[24:25], {source_text}",
+                                                      "v_cvt_f32_f64 v13, v[24:25]"), "integer origin")
+            expect_value_error(translate_int, program(f"v_cvt_f64_{kind} v[24:25], {source_text}", "v_mov_b32_e32 v26, v24",
+                                                      "v_mov_b32_e32 v27, v25", "v_cvt_f32_f64_e32 v13, v[26:27]"),
+                               "integer origin")
+    # Unknown pairs: raw constants, SGPR and VGPR words, an interpolant, a pair never written.
+    for raw in (("v_mov_b32_e32 v24, 0", "v_mov_b32_e32 v25, 0x3ff00000"), ("v_mov_b32_e32 v24, 0", "v_mov_b32_e32 v25, 0"),
+                ("v_mov_b32_e32 v24, s46", "v_mov_b32_e32 v25, s47"), ("v_mov_b32_e32 v24, v18", "v_mov_b32_e32 v25, v21"), ()):
+        expect_value_error(translate_int, program(*raw, "v_cvt_f32_f64 v13, v[24:25]"), "Unproven binary64 source")
+    expect_value_error(translate_int, program("v_cvt_f32_f64 v13, v[0:1]"), "Unproven binary64 source")
+    expect_value_error(translate_int, program("v_cvt_f32_f64 v13, v[12:13]"), "Unproven binary64 source")
+    # One overwritten word ends the provenance, whichever word and whatever writes it, and so does a clobber of both.
+    for clobber in (("v_mov_b32_e32 v24, s46",), ("v_mov_b32_e32 v25, s46",), ("v_mov_b32_e32 v24, 0",),
+                    ("v_mov_b32_e32 v25, 0x3ff00000",), ("v_add_f32_e32 v24, v24, v24",), ("v_add_f32_e32 v25, v25, v25",),
+                    ("v_mov_b32_e32 v25, v24",), ("v_mov_b32_e32 v24, v25",), ("v_swap_b32 v24, v25",), ("v_swap_b32 v25, v20",),
+                    ("v_swap_b32 v24, v20",), ("v_mov_b32_e32 v24, s46", "v_mov_b32_e32 v25, s47"),
+                    ("v_mov_b32_e32 v24, 0", "v_mov_b32_e32 v25, 0x3ff00000")):
+        expect_value_error(translate_int, program("v_cvt_f64_f32 v[24:25], 1.0", *clobber, "v_cvt_f32_f64 v13, v[24:25]"),
+                           "Unproven binary64 source")
+    # A word rewritten by a conversion is not the pair of the conversion.
+    expect_value_error(translate_int, program("v_cvt_f64_f32_e32 v[24:25], 1.0", "v_cvt_f32_i32_e32 v24, v18",
+                                              "v_cvt_f32_f64 v13, v[24:25]"), "Unproven binary64 source")
+    # The clobber of the source pair does not reach a copy made before it, and a clobbered copy does not reach the source.
+    translate_int(program("v_cvt_f64_f32 v[24:25], 1.0", "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25",
+                          "v_mov_b32_e32 v24, s46", "v_cvt_f32_f64 v13, v[26:27]"))
+    translate_int(program("v_cvt_f64_f32 v[24:25], 1.0", "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25",
+                          "v_mov_b32_e32 v26, s46", "v_cvt_f32_f64 v13, v[24:25]"))
+    expect_value_error(translate_int, program("v_cvt_f64_f32 v[24:25], 1.0", "v_mov_b32_e32 v26, v24",
+                                              "v_mov_b32_e32 v27, v25", "v_mov_b32_e32 v26, s46",
+                                              "v_cvt_f32_f64 v13, v[26:27]"), "Unproven binary64 source")
+    # Words that do not belong together: swapped words, words of two pairs (equal and different values), a pair read at
+    # an offset.
+    expect_value_error(translate_int, program("v_cvt_f64_f32 v[24:25], 0x3fc00000", "v_mov_b32_e32 v26, v25",
+                                              "v_mov_b32_e32 v27, v24", "v_cvt_f32_f64 v13, v[26:27]"),
+                       "Unproven binary64 source")
+    expect_value_error(translate_int, program("v_cvt_f64_f32 v[24:25], 0x3fc00000", "v_cvt_f64_f32 v[28:29], 0x40100000",
+                                              "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v29",
+                                              "v_cvt_f32_f64 v13, v[26:27]"), "Unproven binary64 source")
+    # Two conversions of the same static value hold the same binary64 words, so their words are interchangeable (the
+    # record is the value, unlike the record of an integer pair, which names its source variable).
+    assert results(translate_int(program("v_cvt_f64_f32 v[24:25], 0x3fc00000", "v_cvt_f64_f32 v[28:29], 0x3fc00000",
+                                          "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v29",
+                                          "v_cvt_f32_f64 v13, v[26:27]")))[-1] == str(0x3FC00000)
+    expect_value_error(translate_int, program("v_cvt_f64_f32 v[24:25], 1.0", "v_cvt_f32_f64 v13, v[25:26]"),
+                       "Unproven binary64 source")
+    # Not inside a masked region, like the other conversions.
+    must_reject(translate_int, uncompressed_export([
+        *MAD64_PREFIX, "v_cvt_f64_f32 v[24:25], 1.0", "v_cmp_lt_f32_e64 vcc_lo, v12, s44",
+        "s_and_saveexec_b64 s[60:61], vcc", "v_cvt_f32_f64 v13, v[24:25]", MASKED_OR_RESTORE]))
+    # Joins: P = v[24:25] (1.5) and its copy v[26:27], Q = v[28:29] (2.25), R = v[30:31] (the pair of the integer 1).
+    pre = ["v_cvt_f64_f32 v[24:25], 0x3fc00000", "v_cvt_f64_f32 v[28:29], 0x40100000", "v_cvt_f64_i32 v[30:31], s44",
+           "v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25"]
+    opener = ["v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc"]
+    post = ["v_cvt_f32_f64 v13, v[26:27]"]
+    copy_p = ("v_mov_b32_e32 v26, v24", "v_mov_b32_e32 v27, v25")
+    copy_q = ("v_mov_b32_e32 v26, v28", "v_mov_b32_e32 v27, v29")
+    copy_r = ("v_mov_b32_e32 v26, v30", "v_mov_b32_e32 v27, v31")
+
+    def one_arm(*body):
+        return uncompressed_export([*MAD64_PREFIX, *pre, *opener, *body, MASKED_OR_RESTORE, *post])
+
+    def two_arms(then, other):
+        return uncompressed_export([*MAD64_PREFIX, *pre, *opener, *then, ELSE_TRANSITION, *other, MASKED_MOV_RESTORE, *post])
+
+    for accepted in (one_arm(*copy_p), one_arm(copy_p[1]), one_arm(copy_p[0]), two_arms(copy_p, copy_p),
+                     two_arms(copy_p, (copy_p[1], copy_p[0]))):
+        assert results(translate_int(accepted))[-1] == str(0x3FC00000)
+    for refused in (one_arm(*copy_q), one_arm(copy_q[0]), one_arm(copy_q[1]), two_arms(copy_p, copy_q),
+                    two_arms(copy_q, copy_p), two_arms(copy_q, (copy_q[0], copy_p[1])),
+                    two_arms((copy_p[0], copy_q[1]), copy_p),
+                    two_arms(copy_p, ("v_mov_b32_e32 v26, s46", "v_mov_b32_e32 v27, s47")),
+                    one_arm("v_mov_b32_e32 v26, s46"), one_arm("v_add_f32_e32 v27, v27, v27")):
+        expect_value_error(translate_int, refused, "Unproven binary64 source")
+    # A join with the pair of an integer is refused as an unequal join, not as integer origin of one path.
+    for refused in (one_arm(*copy_r), one_arm(copy_r[0]), two_arms(copy_p, copy_r)):
+        expect_value_error(translate_int, refused, "Unproven binary64 source")
+    # The same programs without the region are the plain cases above: a join is what loses the provenance.
+    assert results(translate_int(program(*pre, *copy_p, *post)))[-1] == str(0x3FC00000)
+    expect_value_error(translate_int, program(*pre, *copy_r, *post), "integer origin")
+    # Modifiers and spellings: the _e64 form with and without a modifier, clamp, omod, the source modifiers, DPP, SDWA.
+    for bad in ("v_cvt_f32_f64_e64 v13, v[24:25]", "v_cvt_f32_f64_e64 v13, v[24:25] clamp", "v_cvt_f32_f64 v13, v[24:25] clamp",
+                "v_cvt_f32_f64_e64 v13, -v[24:25]", "v_cvt_f32_f64_e64 v13, |v[24:25]|", "v_cvt_f32_f64_e64 v13, -|v[24:25]|",
+                "v_cvt_f32_f64_e64 v13, v[24:25] mul:2", "v_cvt_f32_f64_e64 v13, v[24:25] div:2",
+                "v_cvt_f32_f64 v13, v[24:25] mul:2", "v_cvt_f32_f64 v13, -v[24:25]", "v_cvt_f32_f64 v13, |v[24:25]|",
+                "v_cvt_f32_f64_dpp v13, v[24:25] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                "v_cvt_f32_f64 v13, v[24:25] row_shl:1", "v_cvt_f32_f64_sdwa v13, v[24:25] src0_sel:WORD_1",
+                "v_cvt_f32_f64 v13, v[24:25] src0_sel:WORD_1"):
+        must_reject(translate_int, program("v_cvt_f64_f32 v[24:25], 1.0", bad))
+    # Operand shapes: a one-register source, an inverted, wide or degenerate range, an out-of-range register, a non-VGPR
+    # destination or source, an extra or missing operand.
+    for bad in ("v_cvt_f32_f64 v13, v24", "v_cvt_f32_f64 v13, v[25:24]", "v_cvt_f32_f64 v13, v[24:26]",
+                "v_cvt_f32_f64 v13, v[24:24]", "v_cvt_f32_f64 v13, v[255:256]", "v_cvt_f32_f64 v13, v[256:257]",
+                "v_cvt_f32_f64 v256, v[24:25]", "v_cvt_f32_f64 v[13:14], v[24:25]", "v_cvt_f32_f64 s13, v[24:25]",
+                "v_cvt_f32_f64 v13, s[44:45]", "v_cvt_f32_f64 v13, 1.0", "v_cvt_f32_f64 v13, v[024:25]",
+                "v_cvt_f32_f64 v13, v[24:25], v[24:25]", "v_cvt_f32_f64 v13", "v_cvt_f32_f64 vcc_lo, v[24:25]"):
+        must_reject(translate_int, program("v_cvt_f64_f32 v[24:25], 1.0", bad))
+    # The binary64 arithmetic and a plain move of a pair stay refused.
+    for consumer in ("v_add_f64 v[14:15], v[24:25], v[24:25]", "v_mul_f64 v[14:15], v[24:25], v[24:25]",
+                     "v_mov_b32_e32 v14, v[24:25]"):
+        must_reject(translate_int, program("v_cvt_f64_f32 v[24:25], 1.0", consumer))
+    # Bookkeeping of the draws: the rows the maintainer named are in the program set, and the controls are not vacuous.
+    assert {0, 0x80000000, 0x00800000, 0x7F7FFFFF, 0x80800000, 0xFF7FFFFF, 0x3F800000, 0x3F800001} <= set(CVT_F32_F64_ROWS)
+    assert 0x80000000 in CVT_F32_F64_ROWS and cvt_f32_f64_wrongs(0x80000000, cvt_f32_f64_mask(0x80000000))
+    assert ("sign lost", cvt_f32_f64_exported(cvt_f32_f64_mask(0x80000000), 0)) in cvt_f32_f64_wrongs(
+        0x80000000, cvt_f32_f64_mask(0x80000000))
+
+
 def check_carry_in_lowering():
     """Static checks for v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32 as written by carry_in_group()."""
     # v18 and v19 are written by the movs at 20 and 21, the carry-out forms at 22 (vcc_lo) and 23 (s60) write the
@@ -11588,7 +11909,7 @@ def check_carry_in_lowering():
 
 
 def check_sad_lowering():
-    """Static checks for v_sad_hi_u8, v_sad_u32 and v_msad_u8 in the programs of sad_group()."""
+    """Static checks for v_sad_u8, v_sad_hi_u8, v_sad_u16, v_sad_u32 and v_msad_u8 in the programs of sad_group()."""
     # v18 is written by the mov at index 20 and the four group instructions follow at 21..24.
     a, b, c, v = "params[0].w", "params[1].x", "params[1].y", "asuint(alu20)"
     expected = {
@@ -11596,6 +11917,8 @@ def check_sad_lowering():
                   f"sad4_u8({a}, {v}, true) + {c}", f"sad4_u8({v}, {a}, true) + {c}"),
         "dword": (f"(max({a}, {v}) - min({a}, {v})) + {c}", f"(max({v}, {a}) - min({v}, {a})) + 64u",
                   f"sad4_u8({a}, {SAD_LITERAL}u, true) + {v}", f"(sad4_u8({b}, {a}, false) << 16u) + {v}"),
+        "lanes": (f"sad4_u8({a}, {v}, false) + {c}", f"sad4_u8({v}, {a}, false) + {SAD_ACCUMULATOR}u",
+                  f"sad2_u16({a}, {v}) + {c}", f"sad2_u16({v}, {a}) + {v}"),
     }
     assert expected.keys() == SAD_BODIES.keys() == SAD_RESULTS.keys() == SAD_WRONG.keys() == SAD_ROWS.keys()
     for group, expressions in expected.items():
@@ -11605,16 +11928,21 @@ def check_sad_lowering():
         for offset, expression in enumerate(expressions, start=21):
             statement = f"    precise float alu{offset} = asfloat({expression});"
             assert statement in source.splitlines(), (group, statement)
-        # The byte-lane helper is emitted once, and only for a program that uses it.
+        # The byte-lane helper is emitted once, and only for a program that uses it; so is the halfword one.
         assert source.count("uint sad4_u8(uint a, uint b, bool masked)") == 1, group
+        assert source.count("uint sad2_u16(uint a, uint b)") == (1 if group == "lanes" else 0), group
     only_dword = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_sad_u32 v12, s44, v18, s46"]))
-    assert "sad4_u8" not in only_dword
+    assert "sad4_u8" not in only_dword and "sad2_u16" not in only_dword
+    only_halves = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_sad_u16 v12, s44, v18, s46"]))
+    assert "sad4_u8" not in only_halves and only_halves.count("uint sad2_u16(uint a, uint b)") == 1
     assert set(SAD_OPS) <= ACCEPTED, set(SAD_OPS) - ACCEPTED
-    assert SAD_OPS == ("v_msad_u8", "v_sad_hi_u8", "v_sad_u32")
+    assert SAD_OPS == ("v_msad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_sad_u8")
     # The Python references agree with the worked values of the first rows.
     assert _sad4(0xC1007F90, 0x40C30011) == 0x242 and _sad4(0xC1007F90, 0x40C30011, True) == 0x1C3
     assert _sad4(0x40C30011, 0xC1007F90, True) == 0x17F
     assert SAD_RESULTS["dword"](*SAD_ROWS["dword"][0])[0] & 0xffffffff == 0x00EFFFDC
+    # |0xC100 - 0x40C3| + |0x7F90 - 0x0011| = 0x803D + 0x7F7F; read as signed halfwords the high lane would be 0x7FC3.
+    assert _sad2(0xC1007F90, 0x40C30011) == 0xFFBC and _sad2(0xC1007F90, 0x40C30011, signed=True) == 0xFF42
     # Three sources in the VOP3 encoding and nothing else: no e32 spelling, no clamp (LLVM 15 assembles the
     # bit, but the ISA text gives it no meaning for an integer result), no float modifier, an in-range
     # destination, written registers and 32-bit literals only.
@@ -11634,13 +11962,18 @@ def check_sad_lowering():
         "v_msad_u8 v256, s44, v18, s46",
         "v_msad_u8 v12, s44, 0x100000000, s46",
         "v_msad_u8 v12, s44, v106, s46",
+        "v_sad_u8_e32 v12, s44, v18, s46",
+        "v_sad_u8 v12, s44, v18, s46 clamp",
+        "v_sad_u8 v12, s44, v18",
+        "v_sad_u16_e32 v12, s44, v18, s46",
+        "v_sad_u16 v12, s44, v18, s46 clamp",
+        "v_sad_u16 v12, s44, -v18, s46",
+        "v_sad_u16 v12, s44, v106, s46",
     ):
         translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
-    # The neighbours stay unsupported: the 8- and 16-bit lane sums without a shift, and the wide packed forms.
+    # The neighbours stay unsupported: the wide packed forms.
     for neighbour in (
-        "v_sad_u8 v12, s44, v18, s46",
-        "v_sad_u16 v12, s44, v18, s46",
         "v_qsad_pk_u16_u8 v[12:13], v[18:19], s44, v[20:21]",
         "v_mqsad_pk_u16_u8 v[12:13], v[18:19], s44, v[20:21]",
         "v_mqsad_u32_u8 v[12:15], v[18:19], s44, v[20:23]",
@@ -16286,6 +16619,7 @@ _CONTROL_SUBCHECKS = (
     "check_cvt_f64_int_lowering",
     "check_cvt_f64_f32_lowering",
     "check_cvt_int_f64_lowering",
+    "check_cvt_f32_f64_lowering",
     "check_sdwa_integer_lowering",
     "check_pack_int16_lowering",
     "check_sat_pack_u8_lowering",
@@ -16544,6 +16878,45 @@ def check_cvt_int_f64_binary(directory, assembler, objcopy, library):
                      f"v_cvt_{kind}_f64_e64 v13, v[20:21] mul:2"):
             must_reject(translate_int, uncompressed_export([*MAD64_PREFIX, f"v_cvt_f64_{kind} v[20:21], s44", text]))
             must_reject(translate_int, uncompressed_export([*MAD64_PREFIX, "v_cvt_f64_f32 v[20:21], 1.0", text]))
+
+
+def check_cvt_f32_f64_binary(directory, assembler, objcopy, library):
+    """LLVM 15 gfx1013 encodings of v_cvt_f32_f64: the VOP1 word, the spellings LLVM prints (the unmodified form as _e32
+    whether or not the source spelled it, every _e64 form with its suffix), the VOP3 modifier bits, and the forms the
+    assembler cannot encode (DPP, SDWA). Only the printed _e32 spelling is lowered."""
+    source, obj, binary = directory / "cvt_f32_f64.s", directory / "cvt_f32_f64.o", directory / "cvt_f32_f64.bin"
+
+    def assemble(line):
+        source.write_text(line + chr(10) + "s_endpgm" + chr(10), encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", source, "-o", obj], check=True,
+                       capture_output=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        code = binary.read_bytes()
+        return code[:-4], disassemble(code, library)[0]
+
+    for line, encoded, text in (
+            ("v_cvt_f32_f64 v13, v[20:21]", "141f1a7e", "v_cvt_f32_f64_e32 v13, v[20:21]"),
+            ("v_cvt_f32_f64_e32 v13, v[20:21]", "141f1a7e", "v_cvt_f32_f64_e32 v13, v[20:21]"),
+            ("v_cvt_f32_f64_e64 v13, v[20:21]", "0d008fd514010000", "v_cvt_f32_f64_e64 v13, v[20:21]"),
+            ("v_cvt_f32_f64 v13, v[20:21] clamp", "0d808fd514010000", "v_cvt_f32_f64_e64 v13, v[20:21] clamp"),
+            ("v_cvt_f32_f64 v13, -v[20:21]", "0d008fd514010020", "v_cvt_f32_f64_e64 v13, -v[20:21]"),
+            ("v_cvt_f32_f64 v13, |v[20:21]|", "0d018fd514010000", "v_cvt_f32_f64_e64 v13, |v[20:21]|"),
+            ("v_cvt_f32_f64 v13, v[20:21] mul:2", "0d008fd514010008", "v_cvt_f32_f64_e64 v13, v[20:21] mul:2")):
+        code, decoded = assemble(line)
+        assert (code.hex(), decoded) == (encoded, text), (line, code.hex(), decoded)
+    # DPP and SDWA do not assemble for this opcode, so neither can reach the translator from LLVM 15 output.
+    for line in ("v_cvt_f32_f64 v13, v[20:21] row_shl:1", "v_cvt_f32_f64_sdwa v13, v[20:21] src0_sel:WORD_1"):
+        try:
+            assemble(line)
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            raise AssertionError(f"LLVM 15 assembled {line}")
+    # The decoded spellings that are not lowered are refused behind a pair that is lowered.
+    for text in ("v_cvt_f32_f64_e64 v13, v[20:21]", "v_cvt_f32_f64_e64 v13, v[20:21] clamp",
+                 "v_cvt_f32_f64_e64 v13, -v[20:21]", "v_cvt_f32_f64_e64 v13, |v[20:21]|",
+                 "v_cvt_f32_f64_e64 v13, v[20:21] mul:2"):
+        must_reject(translate_int, uncompressed_export([*MAD64_PREFIX, "v_cvt_f64_f32 v[20:21], 1.0", text]))
 
 
 def check_f16_round_binary(directory, assembler, objcopy, library):
@@ -16879,6 +17252,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((cvt_f64_f32_binary_program(group), translate_int) for group in CVT_F64_F32_GROUPS)
     fixtures.extend((cvt_int_f64_rt_binary_program(kind), translate_int) for kind in CVT_INT_F64_RT_BODIES)
     fixtures.extend((cvt_int_f64_static_binary_program(kind), translate_int) for kind in CVT_INT_F64_STATIC_ROWS)
+    fixtures.append((cvt_f32_f64_binary_program(), translate_int))
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
     fixtures.append((sat_pack_u8_program(), translate_int))
@@ -16958,6 +17332,7 @@ def check_binary(directory, assembler, objcopy, library):
     check_exp_en_decoding(directory, assembler, objcopy, library)
     check_cvt_f64_f32_binary(directory, assembler, objcopy, library)
     check_cvt_int_f64_binary(directory, assembler, objcopy, library)
+    check_cvt_f32_f64_binary(directory, assembler, objcopy, library)
     check_cli_partial_export(directory, assembler, objcopy, library)
 
 
@@ -17941,6 +18316,51 @@ def check_cvt_int_f64_draws(directory, compiler, renderer, backend):
     return 0
 
 
+def check_cvt_f32_f64_draws(directory, compiler, renderer, backend):
+    """Draw v_cvt_f32_f64 of a static pair through the integer readback target, bit for bit.
+
+    Each row of CVT_F32_F64_ROWS is its own program (a v_cvt_f64_f32 of a literal, the narrowing of the pair into v13 and
+    of a copy of the pair into v14), compiled once and drawn in one renderer batch: the right words, which are the
+    original binary32 bit pattern, then wrong references that must report a mismatch: the sign lost (the sign of -0
+    included), a flipped mantissa bit, a pair word (high or low) in place of the result, one result slot off by a bit and
+    a sentinel replaced by a pair word. The shader uses no double and reads neither MODE field, so the draws need no
+    capability and do not decide which field governs binary64. On a desktop GPU the draws establish that the translated
+    shader computes the stated operation, not what the console does. The words are exported as result ^ M.
+    """
+    source = directory / "cvt_f32_f64.hlsl"
+    shader = directory / "cvt_f32_f64.cso"
+    drawn = {"sign lost": 0, "mantissa": 0, "word": 0, "copy slot": 0, "sentinel": 0}
+
+    def add_case(cases, mask, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, 0, mask, *CVT_F32_F64_SENTINELS)
+        case = directory / f"cvt_f32_f64-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64)
+        cases.append((case, status))
+
+    for bits in CVT_F32_F64_ROWS:
+        source.write_text(translate_int(cvt_f32_f64_program(bits)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        mask = cvt_f32_f64_mask(bits)
+        assert binary32_normal_or_zero(bits ^ mask), hex(bits)
+        cases = []
+        add_case(cases, mask, cvt_f32_f64_exported(mask, bits), "pass")
+        for label, words in cvt_f32_f64_wrongs(bits, mask):
+            add_case(cases, mask, words, "mismatch")
+            drawn[label] += 1
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    # The controls are not vacuous: every kind was drawn, and both signed zeros and the normal endpoints are drawn.
+    assert all(drawn.values()), drawn
+    assert {0, 0x80000000, 0x00800000, 0x7F7FFFFF, 0x80800000, 0xFF7FFFFF, 0x3F800000, 0xBF800000,
+            0x3F800001} <= set(CVT_F32_F64_ROWS)
+    return 0
+
+
 def check_carry_in_draws(directory, compiler, renderer, backend):
     """Draw v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32 through the integer readback target.
 
@@ -17997,7 +18417,8 @@ def check_carry_in_draws(directory, compiler, renderer, backend):
 
 
 def check_sad_draws(directory, compiler, renderer, backend):
-    """Draw v_sad_hi_u8, v_sad_u32 and v_msad_u8 through the integer readback target and compare the words.
+    """Draw v_sad_u8, v_sad_hi_u8, v_sad_u16, v_sad_u32 and v_msad_u8 through the integer readback target and compare
+    the words.
 
     Each group of SAD_BODIES is compiled once and drawn in one renderer batch: every row of SAD_ROWS with the
     right words, and the first row once per SAD_WRONG entry with one channel replaced by the word a wrong
@@ -22138,7 +22559,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-cvt-f64-f32", "draw-cvt-int-f64", "draw-pack-int16", "draw-pack-b32",
+                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-cvt-f64-f32", "draw-cvt-int-f64", "draw-cvt-f32-f64", "draw-pack-int16", "draw-pack-b32",
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
@@ -22161,6 +22582,7 @@ def main():
                         "draw-cvt-f64-int": check_cvt_f64_int_draws,
                         "draw-cvt-f64-f32": check_cvt_f64_f32_draws,
                         "draw-cvt-int-f64": check_cvt_int_f64_draws,
+                        "draw-cvt-f32-f64": check_cvt_f32_f64_draws,
                         "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-brev": check_brev_draw,

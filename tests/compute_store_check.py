@@ -1105,7 +1105,7 @@ def alu_controls():
         (unsupported + "v_max_i32_e32", (("v_min_u32_e32", "v_max_i32_e32"),)),
         (unsupported + "v_mul_hi_u32_e32", (("v_lshrrev_b32_e32", "v_mul_hi_u32_e32"),)),
         (unsupported + "v_xnor_b32_e32", (("v_and_b32_e32", "v_xnor_b32_e32"),)),
-        (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
+        (unsupported + "v_mul_i32_i24_e32", ((mad, "v_mul_i32_i24_e32 v1, v2, v1"),)),
         (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
         # Wrong operand widths: 16-bit, 64-bit and sub-dword (SDWA) forms, and a register range.
         (unsupported + "v_min_u16_e32", (("v_min_u32_e32", "v_min_u16_e32"),)),
