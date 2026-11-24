@@ -2418,6 +2418,10 @@ void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* v
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports))) {
         list->RSSetViewports(count, viewports);
         pass_of(self).viewport_set = true;
+        // LOCAL (video): a traced frame shows each viewport (letterbox questions).
+        if (trace_frame_active)
+            log("x2w-frame viewport list=%p count %u: x %.1f y %.1f w %.1f h %.1f", static_cast<void*>(self), count, viewports[0].TopLeftX,
+                viewports[0].TopLeftY, viewports[0].Width, viewports[0].Height);
     } else if (list) InterlockedIncrement(&state_dropped[0]);
 }
 void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
@@ -2425,6 +2429,9 @@ void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects))) {
         list->RSSetScissorRects(count, rects);
         pass_of(self).scissor_set = true;
+        if (trace_frame_active)
+            log("x2w-frame scissor list=%p count %u: %ld %ld %ld %ld", static_cast<void*>(self), count, rects[0].left, rects[0].top, rects[0].right,
+                rects[0].bottom);
     } else if (list) InterlockedIncrement(&state_dropped[1]);
 }
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
@@ -4467,6 +4474,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     frame_number = frame;
     note_present_planes(frame, planes, plane_parameters, present_parameters);
     note_quiet_frame(frame);
+    note_descriptor_watch(frame);
     draw_dump_flush();
     {
         static const LONG wanted = [] {
