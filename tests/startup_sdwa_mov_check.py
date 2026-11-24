@@ -7,7 +7,7 @@ src0_sel is zero- or sign-extended to 32 bits; dst_sel DWORD writes it; a partia
 that field and the rest of the register is 0 (UNUSED_PAD) or kept (UNUSED_PRESERVE).
 
 The emitted expression is evaluated in Python for every src0_sel x dst_sel x {PAD, PRESERVE} x sext on a value
-grid, against a reference written here from those rules. An SGPR source is accepted. Refused: UNUSED_SEXT (no
+grid, against a reference written here from those rules. An SGPR source is accepted. A PRESERVE destination not yet written is recorded as an entry VGPR read. Refused: UNUSED_SEXT (no
 lowering), the neg bit (not an integer input modifier; the decoder flags it). Negative control: a reference that
 ignores sext (or PRESERVE) is caught.
 """
@@ -85,8 +85,16 @@ def main():
             assert why in str(error), (label, str(error))
         else:
             raise AssertionError('accepted: ' + label)
+    # UNUSED_PRESERVE reads the destination: in a pixel stage a destination not yet written is an entry (SPI
+    # input) VGPR read and must be recorded; PAD does not read it.
+    from startup_scalar_bits_check import TestPipeline
+    import struct
+    for unused, want in ((2, {2: 4}), (0, {})):
+        code = [0x7e000000 | 1 << 17 | 1 << 9 | 128] + words(4, unused, 5) + [0xbf810000]
+        stage = G.Stage(TestPipeline(), 'ps', struct.pack('<%dI' % len(code), *code))
+        assert stage.entry_reads == want, (unused, stage.entry_reads)
     print('sdwa_mov: %d v_mov_b32_sdwa forms match the SDWA rules on %d values (sext caught in %d, PRESERVE in %d); '
-          'SGPR source accepted; UNUSED_SEXT and neg refused' % (forms, len(GRID), caught_sext, caught_preserve))
+          'SGPR source accepted; UNUSED_SEXT and neg refused; PRESERVE records an entry read' % (forms, len(GRID), caught_sext, caught_preserve))
 
 
 if __name__ == '__main__':

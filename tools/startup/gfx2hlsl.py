@@ -743,8 +743,11 @@ class Stage:
         if SDWA_SEL[select][1] < 32:
             result = '(%s)' % result
         destination = reg_range(ops[0])[1]
-        self.set_v(destination, sdwa_dest(result, select, fields.get('dst_unused', 'UNUSED_PAD'),
-                                          'v%d' % destination))
+        unused = fields.get('dst_unused', 'UNUSED_PAD')
+        # UNUSED_PRESERVE reads the destination's other bits: read it as an operand, so a pixel stage's entry
+        # (SPI input) VGPR read is recorded like any other read
+        old = self.u(ops[0]) if unused == 'UNUSED_PRESERVE' and SDWA_SEL[select][1] < 32 else 'v%d' % destination
+        self.set_v(destination, sdwa_dest(result, select, unused, old))
 
     # scalar ALU with descriptor-word bookkeeping
     def scalar(self, base, ops):
