@@ -507,6 +507,16 @@ class MeshStage(G.Stage):
             self.emit('exec = %s;' % self.exec_mask_expr(mask))
             self.exec_known = False
 
+    def op_s_cselect_b32(self, ops, mods):
+        # the base handles register / exec / vcc destinations; the run form also selects into m0
+        if ops[0] == 'm0':
+            low = [('s%d' % reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else t for t in ops[1:3]]
+            self.emit('m0 = scc ? %s : %s;' % (self.u(low[0]), self.u(low[1])))
+            return None
+        if not reg_range(ops[0]) and ops[0] not in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
+            raise Unsupported('s_cselect_b32 to %s' % ops[0])
+        return super().op_s_cselect_b32(ops, mods)
+
     def op_s_and_b32(self, ops, mods):
         # merged_wave_info & mask: the wave index field (bits 27:24) is the only part this translation models
         for i, j in ((1, 2), (2, 1)):
@@ -540,6 +550,12 @@ class MeshStage(G.Stage):
         self.lds_used = True
         if base.startswith('ds_write'):
             addr, data = ops[0], reg_range(ops[1])
+            # Several lanes storing to one address are ordered on the console (the highest lane wins) but race in
+            # HLSL: a uniform address is only taken under a constant single-lane exec.
+            single = self.exec_static is not None and bin(self.exec_static).count('1') == 1
+            ar = reg_range(addr)
+            if not single and not (ar and ar[0] == 'v' and self.lane_dependent('v%d' % ar[1])):
+                raise Unsupported('%s to a wave-uniform address with more than one lane active at %#x' % (base, self.pc))
             self.emit('a = (%s + %du) >> 2;' % (self.u(addr), off))
             for i in range(size):
                 self.emit('if (exec & 1) x2w_lds[min(a + %du, %du)] = v%d;' % (i, LDS_DWORDS - 1, data[1] + i))
