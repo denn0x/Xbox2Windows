@@ -149,6 +149,7 @@ class Stage:
         self.uses_pos = False
         self.masks = set()        # scalar registers currently holding lane masks
         self.uses_q = False       # the uint2 temporary of the 64-bit operations
+        self.used_h = set()       # heap descriptor offsets h<k> this stage assigns (manifest `heap 1`)
         self.written_v = set()    # VGPRs assigned so far in program order
         self.entry_reads = {}     # VGPR read before any write (its entry value) -> offset of the first such read
         self.pc = 0
@@ -757,6 +758,18 @@ class Stage:
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
+        if p[1] == ('resheap',) and 'heap' in getattr(self.pipe, 'features', ()) and count in (4, 8) and not mods:
+            # A descriptor read from the resource heap at a constant or run-time byte offset (manifest `heap 1`).
+            # The title's heap memory holds a view token per 32-byte slot; the HLSL reads the token from heapmem
+            # and indexes the desktop view-id region, as the compute path does (draw layout: draw-rt, board msgs
+            # 180500). The descriptor words themselves are not read as numbers (S() refuses heapdyn).
+            k = len(self.pipe.heapvars)
+            self.pipe.heapvars.append(None)
+            self.used_h.add(k)
+            self.emit('h%d = %s;' % (k, self.u(ops[2]) if reg_range(ops[2]) else '0x%xu' % (int(ops[2], 0) & 0xffffffff)))
+            for i in range(count):
+                self.sym[dst[1] + i] = ('desc', ('heapdyn', k), 0, i)
+            return
         try:
             # 'off' names no offset operand at all, so the byte offset is zero, as for the literal 0.
             off = int(smem_offset(ops[2]), 0)
@@ -880,7 +893,11 @@ class Stage:
         if 'idxen' in mods:
             if key in self.pipe.modified:
                 raise Unsupported('indexed load through a modified descriptor')
-            address = '%s * ud%d + %d' % (self.u(ops[1]), self.pipe.ud(('stride',) + (self.pipe.resources[key]['index'],)), offset)
+            if key[0][0] == 'heapdyn':
+                # a heap buffer view's stride is vinfo dword 0 of its view id (0 for a raw view)
+                address = '%s * x2w_vstride(h%d) + %d' % (self.u(ops[1]), key[0][1], offset)
+            else:
+                address = '%s * ud%d + %d' % (self.u(ops[1]), self.pipe.ud(('stride',) + (self.pipe.resources[key]['index'],)), offset)
         elif 'offen' in mods:
             address = '%s + %d' % (self.u(ops[1]), offset)
         else:
@@ -1623,6 +1640,8 @@ class Stage:
         if self.kind == 'ps' and packed is not None and packed in self.used_v:
             lines.append('    v%d = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);' % packed)
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
+        if self.used_h:
+            lines.append('    uint %s;' % ', '.join('h%d = 0' % k for k in sorted(self.used_h)))
         if self.uses_q:
             lines.append('    uint2 q = 0;')
         return lines
@@ -1834,6 +1853,30 @@ SAMPLER_HEAP_SPACE = 1
 SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
 
 
+# Draw lowerings that need the draw runtime to parse a manifest line, named in X2W_DRAW_FEATURES (comma list):
+# heap (`heap 1`). Off by default until the runtime side is integrated.
+KNOWN_DRAW_FEATURES = frozenset(('heap',))
+
+
+def draw_features():
+    named = frozenset(f for f in os.environ.get('X2W_DRAW_FEATURES', '').replace(' ', '').split(',') if f)
+    unknown = named - KNOWN_DRAW_FEATURES
+    if unknown:
+        raise SystemExit('X2W_DRAW_FEATURES: unknown %s' % ', '.join(sorted(unknown)))
+    return named
+
+
+# Resource-heap views of a draw (manifest `heap 1`, layout agreed with draw-rt): the title heap memory heapmem
+# (t0 space1, a view token per 32-byte slot: HEAP_TOKEN then the view id), vinfo (t1 space1, 16 bytes per view id,
+# dword 0 the buffer stride), and one array per kind over the view-id region, index 8 + 8 * id + kind for ids below
+# HEAP_IDS and kind alone (an empty view) otherwise. Bounded arrays, so FXC needs no unbounded-table flag.
+HEAP_TOKEN = 0x56573258
+HEAP_IDS = 90000
+HEAP_KINDS = {'tex2d': ('heaptex2d', 0, 'Texture2D<float4>'), 'tex2da': ('heaptex2da', 1, 'Texture2DArray<float4>'),
+              'tex3d': ('heaptex3d', 2, 'Texture3D<float4>'), 'tex1d': ('heaptex1d', 3, 'Texture1D<float4>'),
+              'buf': ('heapbuf', 4, 'ByteAddressBuffer')}
+
+
 # DXGI_FORMAT values for integer RTVs and the binary32 float targets.
 UINT_RTVS = frozenset((3, 7, 12, 17, 25, 30, 36, 42, 50, 57, 62))
 SINT_RTVS = frozenset((4, 8, 14, 18, 32, 38, 43, 52, 59, 64))
@@ -1869,8 +1912,13 @@ def ps_input_layout(ena, addr):
 
 
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None,
+                 features=None):
         self.root = parse_root(root_blob)
+        # Lowerings whose manifest lines need draw-runtime support (DRAW_FEATURES); off unless named, so a
+        # --requests pass never publishes a result the runtime cannot bind yet.
+        self.features = draw_features() if features is None else frozenset(features)
+        self.heapvars = []    # heap descriptor k -> resource kind it is used as (None until used)
         # With the pixel stage's SPI_PS_INPUT_ENA/ADDR (ps_hw_inputs), entry VGPRs map to SPI inputs. Only
         # POS_FIXED_PT is lowered: the integer pixel X in [15:0] and Y in [31:16] (Mesa nir_intrinsics.py
         # pixel_coord, "16-bit integer vec2 of the pixel X/Y in the framebuffer", which
@@ -1943,6 +1991,16 @@ class Pipeline:
         return self.uds.index(source)
 
     def resource(self, key, kind):
+        if key[0][0] == 'heapdyn':
+            k = key[0][1]
+            if key[1] not in (0, None):
+                raise Unsupported('heap descriptor at word offset %s' % key[1])
+            if self.heapvars[k] not in (None, kind):
+                raise Unsupported('heap descriptor used as %s and %s' % (self.heapvars[k], kind))
+            if kind not in HEAP_KINDS:
+                raise Unsupported('heap %s' % kind)
+            self.heapvars[k] = kind
+            return '%s[NonUniformResourceIndex(x2w_hix(h%d, %du))]' % (HEAP_KINDS[kind][0], k, HEAP_KINDS[kind][1])
         r = self.resources.setdefault(key, dict(index=len(self.resources), kind=kind))
         if r['kind'] != kind:
             raise Unsupported('resource %s used as %s and %s' % (key, r['kind'], kind))
@@ -1969,6 +2027,15 @@ class Pipeline:
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
+        if any(getattr(self, 'heapvars', ())):  # tests build bare pipelines without __init__
+            out += ['ByteAddressBuffer heapmem : register(t0, space1);', 'ByteAddressBuffer vinfo : register(t1, space1);',
+                    'uint x2w_vid(uint h) { return heapmem.Load(h) == 0x%08xu ? heapmem.Load(h + 4) : 0xffffffffu; }'
+                    % HEAP_TOKEN,
+                    'uint x2w_hix(uint h, uint k) { uint i = x2w_vid(h); return i < %du ? 8u + 8u * i + k : k; }' % HEAP_IDS,
+                    'uint x2w_vstride(uint h) { uint i = x2w_vid(h); return i < %du ? vinfo.Load(i * 16u) : 0u; }' % HEAP_IDS]
+            for kind in sorted(set(k for k in self.heapvars if k), key=lambda k: HEAP_KINDS[k][1]):
+                name, slot, hlsl_type = HEAP_KINDS[kind]
+                out.append('%s %s[%d] : register(t0, space%d);' % (hlsl_type, name, 8 + 8 * HEAP_IDS, 2 + slot))
         if self.uses_sampler_heap:
             out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
             out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
@@ -2035,6 +2102,8 @@ class Pipeline:
             if where is None:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
+        if any(getattr(self, 'heapvars', ())):
+            lines.append('heap 1')
         for key, i in self.samplers.items():
             comparison = key[0] == 'cmp'
             lines.append('%s %d %s' % ('smpc' if comparison else 'smp', i, ' '.join('0x%x' % w for w in key[comparison:])))
