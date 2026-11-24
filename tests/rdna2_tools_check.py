@@ -2764,6 +2764,54 @@ class TestRdna2Disasm(unittest.TestCase):
                 plain = disasm_rdna2(self._vop3_word(op, **kwargs))[0]["assembly"]
                 self.assertEqual(disasm_rdna2(self._vop3_word(op, op_sel=0xf, **kwargs))[0]["assembly"], plain)
 
+    # Issue #1890: the VINTRP (e32) v_interp_mov_f32 vsrc field is the parameter selector, not a VGPR.
+    # Assembled from these lines with LLVM 15.0.7 for gfx1013; llvm-objdump 15.0.7 prints the same text.
+    VINTRP_MOV_E32_VECTORS = (
+        ("000006c8", "v_interp_mov_f32_e32 v1, p10, attr0.x"),
+        ("01050ac8", "v_interp_mov_f32_e32 v2, p20, attr1.y"),
+        ("020a0ec8", "v_interp_mov_f32_e32 v3, p0, attr2.z"),
+        ("02ff1ec8", "v_interp_mov_f32_e32 v7, p0, attr63.w"),
+    )
+
+    def test_vintrp_interp_mov_selector_golden_vectors(self):
+        """Issue #1890: the e32 selector prints as p10, p20 or p0, as LLVM prints it."""
+        for encoding, assembly in self.VINTRP_MOV_E32_VECTORS:
+            with self.subTest(assembly=assembly):
+                record, = disasm_rdna2(bytes.fromhex(encoding))
+                self.assertEqual(record["assembly"], assembly)
+                self.assertEqual(record["opcode"], "v_interp_mov_f32_e32")
+                self.assertEqual(record["length"], 4)
+        # p1 and p2 keep their VGPR operand in the same field.
+        record, = disasm_rdna2(bytes.fromhex("020004c8"))
+        self.assertEqual(record["assembly"], "v_interp_p1_f32_e32 v1, v2, attr0.x")
+
+    def test_vintrp_interp_mov_selector_llvm_round_trip(self):
+        """Issue #1890: the e32 vectors assemble to these bytes and disassemble to these strings on LLVM."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"VINTRP round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        source = [assembly for _, assembly in self.VINTRP_MOV_E32_VECTORS]
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        self.assertEqual(emitted, bytes.fromhex("".join(encoding for encoding, _ in self.VINTRP_MOV_E32_VECTORS)))
+        decoded = [record["assembly"] for record in disasm_rdna2(emitted)]
+        self.assertEqual(decoded, llvm_disassemble(emitted, resolved_lib))
+        self.assertEqual(decoded, source)
+
+    def test_vintrp_interp_mov_selector_out_of_range_is_refused(self):
+        """Issue #1890: a selector LLVM prints as invalid_param_<n> is a four-byte unsupported record."""
+        end = struct.pack("<I", 0xbf810000)
+        for selector in (3, 128, 255):
+            with self.subTest(selector=selector):
+                records = disasm_rdna2(struct.pack("<I", 0xc8060000 | selector) + end)
+                self.assertEqual([r["length"] for r in records], [4, 4])
+                self.assertEqual(records[0]["opcode"], "v_interp_mov_f32_e32_unsupported")
+                self.assertIn("<unsupported VINTRP encoding>", records[0]["assembly"])
+                self.assertEqual(records[1]["opcode"], "s_endpgm")
+
     def test_vop3_mqsad_u32_u8_register_quads_stop_at_v255(self):
         """A destination or accumulator quad that would run past v255 is flagged, not printed as a register."""
         last_quad = disasm_rdna2(self._vop3_word(0x175, vdst=252, src2=0x100 + 252))[0]["assembly"]

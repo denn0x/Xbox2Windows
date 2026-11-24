@@ -1758,6 +1758,10 @@ class Stage:
         self.set_v(reg_range(ops[0])[1], 'U(i.param%d.%s)' % (attr, comp))
 
     def op_v_interp_mov_f32(self, ops, mods):
+        # Only p0 is the flat copy. p10 (P1 - P0) and p20 (P2 - P0) need the per-vertex attribute
+        # values, which the FXC path does not have, so they are refused rather than read as p0.
+        if ops[1] != 'p0':
+            raise Unsupported('v_interp_mov_f32 parameter selector %s: only p0 is lowered' % ops[1])
         attr, comp = self.note_attr(ops[2], 'flat')
         self.set_v(reg_range(ops[0])[1], 'i.fparam%d.%s' % (attr, comp))
 

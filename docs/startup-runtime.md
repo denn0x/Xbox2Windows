@@ -546,7 +546,9 @@ These are measured on one executable; treat them as hypotheses for others.
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
   ([#1259](https://github.com/R0Y00/Xbox2Windows/issues/1259)). Colour exports of constant integer
-  words still go through `float4` and have the same loss. Reproduce with
+  words still go through `float4` and have the same loss. Only the `p0` selector is lowered;
+  `p10` and `p20` are refused in both encodings
+  ([#1890](https://github.com/R0Y00/Xbox2Windows/issues/1890)). Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_flat_param_"`.
 - **Stream-cache identity.** A cached zlib stream is served only to the exact queued
   continuation entries in the same DirectStorage queue. The lookup checks the enqueued request

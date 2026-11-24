@@ -1029,7 +1029,8 @@ VOP3_RESTRICTED_MODIFIERS = {
     "v_interp_mov_f32_e64": (True, True),
 }
 
-# The v_interp_mov_f32_e64 parameter selector (src1 field): p10, p20 and p0.
+# The v_interp_mov_f32 parameter selector (VINTRP vsrc field, VOP3A src1 field): p10, p20 and p0.
+# LLVM prints any other value as invalid_param_<n> and its assembler accepts none of them.
 VINTRP_MOV_PARAMS = ("p10", "p20", "p0")
 
 
@@ -2623,8 +2624,14 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         vsrc = w0 & 0xff
         op_names = {0: "v_interp_p1_f32_e32", 1: "v_interp_p2_f32_e32", 2: "v_interp_mov_f32_e32"}
         op_name = op_names.get(op, f"v_interp_{op}")
-        asm = f"{op_name} v{vdst}, v{vsrc}, attr{attr}.{chan}"
         comment = f"Parameter interpolation stage {op+1} for attribute {attr}.{chan}"
+        if op == 2:
+            # The mov form's vsrc field is the parameter selector, not a VGPR.
+            if vsrc >= len(VINTRP_MOV_PARAMS):
+                return (4, f"{op_name}_unsupported", f"{op_name} <unsupported VINTRP encoding>",
+                        f"v_interp_mov_f32 parameter selector {vsrc} is not p10, p20 or p0")
+            return (4, op_name, f"{op_name} v{vdst}, {VINTRP_MOV_PARAMS[vsrc]}, attr{attr}.{chan}", comment)
+        asm = f"{op_name} v{vdst}, v{vsrc}, attr{attr}.{chan}"
         return (4, op_name, asm, comment)
 
     # 9. EXP: 64-bit [31:26] == 0b111110 (0xf8000000)

@@ -10697,6 +10697,41 @@ Scope: decoding and scanner recognition only. None of these forms is lowered by 
 measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1_f32_e64` and `v_interp_p2_f32_e64`
 (0x200 and 0x201 on gfx1013) are not decoded by this change.
 
+**The VINTRP spelling and the startup translator (#1890).** The 32-bit VINTRP `v_interp_mov_f32_e32` now prints
+its selector the same way (`p10`, `p20`, `p0`) instead of a VGPR; any other value of the field becomes a
+four-byte `v_interp_mov_f32_e32_unsupported` record, where llvm-objdump prints `invalid_param_<n>`.
+`tools/startup/gfx2hlsl.py` lowers only `p0`, the flat copy, in both encodings. `p10` (P1 - P0) and `p20`
+(P2 - P0) need per-vertex attribute values, which the FXC path does not have, so they are refused with the
+selector in the reason instead of being read as `p0`. `tests/startup_flat_param_check.py` replaces the first read
+of its pixel stage with each selector in both encodings; its `binary` mode checks those words with llvm-mc.
+
+## Startup translator: conversion operations
+
+The previous draw fixtures did not run the plain conversion operations in `tools/startup/gfx2hlsl.py` before: `v_cvt_f32_u32`, `v_cvt_f32_i32`, `v_cvt_u32_f32`, `v_cvt_f32_ubyte0` to `3`, `v_cvt_f32_f16` and `v_cvt_f16_f32`. `tests/startup_gfx2hlsl_cvt_alu_check.py` draws them with the shared runner `tests/startup_gfx2hlsl_lane_alu.py`. Each draw applies one operation to each of four pixels' flat inputs, alternating the `_e32` and `_e64` spellings, and compares the four result words exactly.
+
+The references follow the AMD RDNA 2 ISA reference:
+- integer to binary32 rounds to nearest even: `0x80000001` gives 2^31, `0xffffffff` gives 2^32, and `0x01000001` gives 2^24 by ties to even;
+- `v_cvt_u32_f32` truncates toward zero and reads 0 for a negative value, -0 or a NaN;
+- the `ubyte` forms convert byte N;
+- `v_cvt_f32_f16` reads S0[15:0], with other values in the high half;
+- `v_cvt_f16_f32` writes bits 15:0 and clears bits 31:16.
+
+Each operation also has a wrong lowering whose first draw must read its own mutated words:
+- signed and unsigned exchanged;
+- rounding instead of truncation;
+- the wrong byte or a 7-bit mask;
+- the high binary16 half;
+- a negated source.
+
+On WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003), all 34 draws matched and all 17 mutated draws read their mutated words. Eight operations are drawn through FXC `ps_5_1` and DXC `ps_6_0`; `v_cvt_f16_f32` is drawn through DXC only. Its result words are binary32 denormals in the fixture's float target. The FXC `ps_5_1` output of that pixel stage read `00000000` in all four channels on both adapters, even when one channel exported a constant conversion. The same words with `0x3f800000` ORed in at the export read back exactly, so the conversion itself is right, and the zeros come from the FXC output of denormal bit patterns.
+
+Not covered:
+- `v_cvt_u32_f32` at or above 2^32 and of +inf, where the HLSL conversion of an out-of-range value is not pinned;
+- binary16 denormal inputs;
+- binary32 values that `v_cvt_f16_f32` has to round.
+
+Tests: `startup_gfx2hlsl_cvt_alu_controls`, `startup_gfx2hlsl_cvt_alu_warp` and `startup_gfx2hlsl_cvt_alu_hardware`.
+
 ## Startup translator: explicit-LOD image sampling
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
