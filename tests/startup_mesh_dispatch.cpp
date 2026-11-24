@@ -1,7 +1,12 @@
 // DispatchMesh ExecuteIndirect (list slot 61) through a translated mesh pipeline (d3d12_mesh.inl).
 //
 //   startup_mesh_dispatch <warp|hardware> <gpu|derived|zero|huge|off|missing|depth|words16|words32|wordsraw|
-//                                          fmaprecise|fmabad|notargets|rtvuint>
+//                                          fmaprecise|fmabad|notargets|rtvuint|smpheap|smpheapswap>
+// smpheap / smpheapswap (`smpheap 2048 1 fallback 2047`, PixelSampler): a title sampler heap of 128 raw S# entries
+// bound with SetDescriptorHeaps; the pixel stage samples entry 65 over a 2x1 texture (srv 1, placed on title memory:
+// texel 0 red, texel 1 blue) at u = 0.375. smpheap: 65 point, 64 linear -> red ff0000ff; smpheapswap (control): 65
+// linear, 64 point -> 0.75 red + 0.25 blue (ff4000bf +-3). Both: the "x2w-draw sampler heap:" line has no unbound
+// and no unreadable entry.
 // fma line: derived has none ("fma unstated"), fmaprecise `fma precise` (drawn), fmabad `fma fused` (refused:
 // translation failed), the other modes `fma exact` (needs DoublePrecisionFloatShaderOps). notargets: no
 // OMSetRenderTargets; rtvuint: an R32_UINT target: both refused once with "call refused (...)", nothing drawn.
@@ -47,6 +52,7 @@
 #include "startup_mesh_heap_ms.h"
 #include "startup_mesh_ms.h"
 #include "startup_mesh_ps.h"
+#include "startup_mesh_smp_ps.h"
 #include "startup_mesh_writer.h"
 
 using Microsoft::WRL::ComPtr;
@@ -160,8 +166,11 @@ int main(int argc, char** argv)
     const std::string mode = argv[2];
     if (mode != "gpu" && mode != "derived" && mode != "zero" && mode != "huge" && mode != "off" && mode != "missing" && mode != "depth" &&
         mode != "words16" && mode != "words32" && mode != "wordsraw" && mode != "fmaprecise" && mode != "fmabad" && mode != "notargets" &&
-        mode != "rtvuint")
+        mode != "rtvuint" && mode != "smpheap" && mode != "smpheapswap")
         return 2;
+    // smpheap / smpheapswap: the pixel stage samples title sampler-heap entry 65 (`smpheap 2048 1 fallback 2047`);
+    // entry 65 is point and 64 linear (smpheap), or the other way round (smpheapswap, the control).
+    const bool smp = mode.compare(0, 7, "smpheap") == 0;
     const bool depth = mode == "depth";
     const bool words = mode.compare(0, 5, "words") == 0;  // heap descriptor + vdesc (`heap 1`, `heapwords 1`)
     UINT view_increment = 0;
@@ -281,12 +290,17 @@ int main(int argc, char** argv)
         // words modes: no srv line; the vertices are reached through the title heap slot in entry value 2.
         // The fma line (RUNTIME_NEEDS 8): derived has none (unstated), fmaprecise / fmabad name their rule, the rest exact.
         const std::string fma = mode == "derived" ? "" : mode == "fmaprecise" ? "fma precise\n" : mode == "fmabad" ? "fma fused\n" : "fma exact\n";
-        const std::string manifest = words ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nudsrc 2 rootconst 0 0\nheap 1\nheapwords 1\n" + fma + "stage mesh\nms 3 3 1\n"
-                                           : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\n" + fma + "stage mesh\nms 3 3 1\n";
+        const std::string manifest =
+            words ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nudsrc 2 rootconst 0 0\nheap 1\nheapwords 1\n" + fma + "stage mesh\nms 3 3 1\n"
+            // smp: srv 1 is the table's second descriptor (the table offset is in bytes: one view increment).
+            : smp ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\nsrv 1 tex2d table 1 " + std::to_string(view_increment) +
+                        "\nsmpheap 2048 1 fallback 2047\n" + fma + "stage mesh\nms 3 3 1\n"
+                  : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\n" + fma + "stage mesh\nms 3 3 1\n";
         const std::wstring base = cache + L"\\" + hex_key(key);
         if (!(words ? write_file(base + L".ms.cso", startup_mesh_heap_ms, sizeof(startup_mesh_heap_ms))
                     : write_file(base + L".ms.cso", startup_mesh_ms, sizeof(startup_mesh_ms))) ||
-            (!depth && !write_file(base + L".ps.cso", startup_mesh_ps, sizeof(startup_mesh_ps))) ||
+            (!depth && !(smp ? write_file(base + L".ps.cso", startup_mesh_smp_ps, sizeof(startup_mesh_smp_ps))
+                             : write_file(base + L".ps.cso", startup_mesh_ps, sizeof(startup_mesh_ps)))) ||
             !write_file(base + L".txt", manifest.data(), manifest.size()))
             return 5;
     }
@@ -426,6 +440,38 @@ int main(int argc, char** argv)
         std::memcpy(token, reinterpret_cast<const void*>(view_cpu + 32 * heap_slot), 8);
         std::printf("heap slot %u: %08x %08x (view token X2WV = 56573258 + view id)\n", heap_slot, token[0], token[1]);
     }
+    // smp modes: a 2x1 RGBA8 texture placed on title memory (the stand-in backs it with a desktop texture and uploads
+    // it from that memory at the draw; texel 0 red, texel 1 blue), its SRV at the table's second descriptor, and a
+    // shader-visible title sampler heap of 128 raw 16-byte S# entries: 64 and 65 clamp, one point, one linear.
+    void *smp_texture = nullptr, *sampler_heap = nullptr;
+    if (smp) {
+        const std::uint32_t texels[2] = {0xff0000ffu, 0xffff0000u};
+        std::memcpy(memory + 0x40000, texels, sizeof(texels));
+        D3D12_RESOURCE_DESC tex{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 2, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                D3D12_RESOURCE_FLAG_NONE};
+        if (!ok(invoke(device, 133, arg(memory + 0x40000), arg(&tex), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
+                       arg(&smp_texture))))
+            return 12;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        invoke(device, 18, arg(smp_texture), arg(&view), view_cpu + view_increment);
+        constexpr UINT sampler_count = 128;
+        static std::uint32_t sampler_words[sampler_count][4];
+        const std::uint32_t clamp = 2u | (2u << 3) | (2u << 6);
+        const auto filter = [](std::uint32_t f) { return (f << 20) | (f << 22); };  // mag, min; 0 point, 1 linear
+        sampler_words[64][0] = sampler_words[65][0] = clamp;
+        sampler_words[65][2] = filter(mode == "smpheap" ? 0 : 1);
+        sampler_words[64][2] = filter(mode == "smpheap" ? 1 : 0);
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            Word backing, bytes;
+        } sampler_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, sampler_count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+                            arg(sampler_words), sizeof(sampler_words)};
+        if (!ok(invoke(device, 14, arg(&sampler_heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&sampler_heap)))) return 12;
+    }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -457,7 +503,8 @@ int main(int argc, char** argv)
     invoke(list, 21, 1, arg(&viewport));
     invoke(list, 22, 1, arg(&scissor));
     invoke(list, 34, arg(title_root));                                     // SetGraphicsRootSignature
-    invoke(list, 32, 1, arg(&view_heap));                                  // SetDescriptorHeaps
+    void* const heaps[2] = {view_heap, sampler_heap};
+    invoke(list, 32, smp ? 2 : 1, arg(heaps));                             // SetDescriptorHeaps (smp: and the sampler heap)
     invoke(list, 36, 1, view_gpu);                                         // SetGraphicsRootDescriptorTable(1, heap start)
     invoke(list, 40, 2, 1, arg(&colour), 0);                               // SetGraphicsRoot32BitConstants(2, 1, &colour, 0)
     if (words) invoke(list, 40, 0, 1, arg(&heap_slot), 0);                 // SetGraphicsRoot32BitConstants(0, 1, &slot, 0): entry value 2
@@ -495,9 +542,19 @@ int main(int argc, char** argv)
         std::printf("the record in title memory is not what the writer stored\n");
         ++failures;
     }
-    const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || (!words_skip && (mode == "words16" || mode == "words32"));
+    const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || smp || (!words_skip && (mode == "words16" || mode == "words32"));
     // RGBA8 little-endian: R c0, G 40, B ff, A ff. words modes: G = the FORMAT code in vdesc word 3 (29 = 0x1d, 64 = 0x40).
-    const std::uint32_t drawn = mode == "words16" ? 0xffff1dc0u : 0xffff40c0u;
+    // smpheap: entry 65 point -> texel 0 (red ff0000ff); smpheapswap: entry 65 linear at u = 0.375 -> 0.75 red + 0.25
+    // blue (R bf, B 40, A ff; filtering precision allows +-3 per channel).
+    const std::uint32_t drawn = mode == "words16" ? 0xffff1dc0u : mode == "smpheap" ? 0xff0000ffu : mode == "smpheapswap" ? 0xff4000bfu : 0xffff40c0u;
+    const auto matches = [&](std::uint32_t got, std::uint32_t want) {
+        if (mode != "smpheapswap" || !want) return got == want;
+        for (int s = 0; s < 32; s += 8) {
+            const int d = static_cast<int>((got >> s) & 255) - static_cast<int>((want >> s) & 255);
+            if (d < -3 || d > 3) return false;
+        }
+        return true;
+    };
     if (depth) {
         float values[3];
         std::memcpy(values, pixels.data(), sizeof(values));
@@ -506,7 +563,7 @@ int main(int argc, char** argv)
     } else {
         std::printf("pixels: left %08x right %08x outside %08x (drawn = %08x, cleared = 00000000)\n", pixels[0], pixels[1], pixels[2], drawn);
         const std::uint32_t want = drawn_expected ? drawn : 0u;
-        if (pixels[0] != want || pixels[1] != want || pixels[2] != 0) {
+        if (!matches(pixels[0], want) || !matches(pixels[1], want) || pixels[2] != 0) {
             std::printf("FAIL: expected left and right %08x, outside 00000000\n", want);
             ++failures;
         }
@@ -555,6 +612,15 @@ int main(int argc, char** argv)
                             : (!issued || !bound_ok)) {
         std::printf("FAIL: the x2w-mesh lines do not match mode %s\n", mode.c_str());
         ++failures;
+    }
+    if (smp) {  // the translated sampler heap was built from the title's 128 entries (bound: none unbound)
+        std::string sampler_line;
+        if (const std::size_t p = log.find("x2w-draw sampler heap: "); p != std::string::npos) sampler_line = log.substr(p, log.find('\n', p) - p);
+        std::printf("log: sampler heap line \"%s\"\n", sampler_line.c_str());
+        if (sampler_line.find("null_sampler_unbound=0 ") == std::string::npos || sampler_line.find("null_sampler_unreadable=0 ") == std::string::npos) {
+            std::printf("FAIL: the sampler heap was not built from the title's sampler heap\n");
+            ++failures;
+        }
     }
     if (words) {  // the vdesc root parameter and buffer, and the word the stand-in wrote for the view
         const bool root = has(std::string("x2w-vdesc pipeline ") + key_text + ": heapwords 1, vdesc in root parameter ");

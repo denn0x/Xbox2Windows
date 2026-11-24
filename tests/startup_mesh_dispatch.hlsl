@@ -61,6 +61,16 @@ void MeshHeap(uint3 group : SV_GroupID, uint thread : SV_GroupThreadID, out vert
     if (thread == 0) tris[0] = uint3(0, 1, 2);
 }
 
+// PixelSampler (modes smpheap / smpheapswap; manifest `smpheap 2048 1 fallback 2047`, board/msgs/225000_mesh3): a
+// FIXED entry of the title's sampler heap, as mesh3's translation emits it (qh[2048] in space1, entry 65), over a 2x1
+// texture (srv 1, texel 0 red, texel 1 blue) at u = 0.375: point sampling gives red, linear 0.75 red + 0.25 blue.
+Texture2D smp_tex : register(t1);
+SamplerState qh[2048] : register(s0, space1);
+float4 PixelSampler(Vertex input) : SV_Target0
+{
+    return smp_tex.SampleLevel(qh[65u], float2(0.375, 0.5), 0);
+}
+
 float4 PixelMain(Vertex input) : SV_Target0
 {
     return input.param0;
