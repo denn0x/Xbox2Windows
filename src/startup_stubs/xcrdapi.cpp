@@ -13,6 +13,7 @@
 #include "startup_stubs/dstorage_file_read.h"
 #include "startup_stubs/bcpack_decoder.h"
 #include "startup_stubs/bcpack_bc6h.h"
+#include "startup_stubs/dstorage_status_stats.h"
 #include <algorithm>
 #include <memory>
 #include <map>
@@ -61,6 +62,7 @@ struct Object {
     struct QueueWork* work = nullptr;  // Queue: entries waiting for Submit and the worker running them
     struct Unrecorded* unrecorded_head = nullptr;  // Queue: entries no queue storage could hold, see push()
     struct Unrecorded* unrecorded_tail = nullptr;
+    x2w_dstorage_stats::StatusStats* stats = nullptr;  // StatusArray: LOCAL wait diagnostics (dstorage_status_stats.h)
 };
 
 // A queue entry as enqueued: a request (its 0x48 bytes copied, and a snapshot of its destination page
@@ -85,6 +87,7 @@ struct Entry {
     u64 id = 0;
     u64 submission_id = 0;
     u64 after = 0;  // failing: entries the worker must have finished before this one completes
+    LONG status_gen = 0;  // status entry: its EnqueueStatus generation (dstorage_status_stats.h)
 };
 struct CachedStream {
     u64 source = 0;
@@ -305,6 +308,7 @@ long __stdcall factory_create_status_array(Object*, unsigned capacity, const cha
     object->capacity = capacity;
     object->results = new LONG[capacity ? capacity : 1];
     for (unsigned i = 0; i < capacity; ++i) object->results[i] = static_cast<LONG>(0x8000000A);  // E_PENDING
+    object->stats = x2w_dstorage_stats::make(capacity, object->results);
     *out = object;
     return S_OK;
 }
@@ -997,6 +1001,7 @@ void run_entry(Object* self, Entry& entry)
         execute_request(self, entry.bytes, entry.token_count ? entry.tokens.get() : nullptr, entry.id, entry.submission_id);
     } else if (entry.type == Entry::status_entry) {
         const LONG result = InterlockedExchange(&self->pending, S_OK);
+        x2w_dstorage_stats::on_complete(entry.array->stats, entry.index, entry.status_gen);
         InterlockedExchange(&entry.array->results[entry.index], result);
     } else {
         signal_fence(entry.fence, entry.value);
@@ -1139,6 +1144,7 @@ struct Unrecorded {
     unsigned index;
     void* fence;
     u64 value;
+    LONG status_gen;
 };
 
 // True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
@@ -1153,7 +1159,7 @@ bool deferred_pending(const QueueWork& work)
 
 // Fails an entry that will not run: a request counts as failed, a status entry completes with the
 // pending failure (E_OUTOFMEMORY when nothing worse is pending), a fence is signaled.
-void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned index, void* fence, u64 value)
+void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned index, void* fence, u64 value, LONG status_gen)
 {
     if (type == Entry::request) {
         InterlockedIncrement(&requests_failed);
@@ -1161,6 +1167,7 @@ void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned inde
     } else if (type == Entry::status_entry) {
         const LONG pending = InterlockedExchange(&self->pending, S_OK);
         if (array && array->results && index < array->capacity) {
+            x2w_dstorage_stats::on_complete(array->stats, index, status_gen);
             InterlockedExchange(&array->results[index],
                                 pending < 0 ? pending : static_cast<LONG>(E_OUTOFMEMORY));
         }
@@ -1192,9 +1199,9 @@ bool has_unrecorded(Object* self)
 
 void defer_unrecorded(Object* self, const Entry& entry)
 {
-    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value};
+    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.status_gen};
     if (!node) {
-        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.status_gen);
         return;
     }
     const std::lock_guard guard(setup_mutex());
@@ -1212,7 +1219,7 @@ void fail_unrecorded(Object* self)
     }
     while (node) {
         Unrecorded* const next = node->next;
-        fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+        fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->status_gen);
         delete node;
         node = next;
     }
@@ -1229,7 +1236,7 @@ void fail_waiting(Object* self, QueueWork* work)
             entry = std::move(work->waiting.front());
             work->waiting.pop_front();
         }
-        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.status_gen);
     }
 }
 
@@ -1357,10 +1364,10 @@ void complete_deferred(Object* self, QueueWork* work)
             }
         }
         if (node) {
-            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->status_gen);
             delete node;
         } else {
-            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.status_gen);
         }
     }
 }
@@ -1430,9 +1437,11 @@ void __stdcall queue_enqueue_status(Object* self, Object* array, unsigned index)
         log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests done=%ld inflated=%ld failed=%ld)",
             static_cast<void*>(array), index, valid ? "" : " INVALID ARRAY", requests_done, requests_compressed, requests_failed);
     if (!valid) return;
+    const LONG gen = x2w_dstorage_stats::on_enqueue(array->stats, index, self);
     InterlockedExchange(&array->results[index], static_cast<LONG>(0x8000000A));  // E_PENDING until its turn
     Entry entry{};
     entry.type = Entry::status_entry;
+    entry.status_gen = gen;
     entry.array = array;
     entry.index = index;
     push(self, std::move(entry));
@@ -1484,6 +1493,7 @@ HANDLE __stdcall queue_error_event(Object*)
 bool __stdcall status_is_complete(Object* self, unsigned index)
 {
     const bool complete = index < self->capacity && self->results[index] != static_cast<LONG>(0x8000000A);
+    x2w_dstorage_stats::on_poll(self->stats, complete, _ReturnAddress());
     static LONG calls;
     if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage StatusArray::IsComplete index=%u -> %d", index, complete);
     return complete;
@@ -1622,6 +1632,18 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 last = total2;
                 last_memory = sample;
             }
+            x2w_dstorage_stats::report(second, static_cast<LONG>(0x8000000A), [](const char* format, auto... args) { log(format, args...); }, [](void* queue, char* out, std::size_t size) {
+                auto* const q = static_cast<Object*>(queue);
+                QueueWork* const work = q ? q->work : nullptr;
+                if (!work) {
+                    std::snprintf(out, size, "queue %p: no work", queue);
+                    return;
+                }
+                const std::lock_guard guard(work->mutex);
+                std::snprintf(out, size, "queue %p: entries submitted %llu finished %llu, %zu to run, %zu waiting for Submit, %zu failing", queue,
+                              static_cast<unsigned long long>(work->submitted_total), static_cast<unsigned long long>(work->finished_total),
+                              work->submitted.size(), work->waiting.size(), work->failing.size());
+            });
         }
     }, nullptr, 0, nullptr);
     (void)heartbeat;

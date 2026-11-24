@@ -375,6 +375,13 @@ target_include_directories(startup_log_cap_check PRIVATE src)
 add_test(NAME startup_log_cap COMMAND startup_log_cap_check)
 add_test(NAME startup_log_cap_wrap_control COMMAND startup_log_cap_check --mutate wrap)
 set_tests_properties(startup_log_cap_wrap_control PROPERTIES WILL_FAIL TRUE)
+# Status wait diagnostics of the DirectStorage stand-in (src/startup_stubs/dstorage_status_stats.h).
+add_executable(startup_dstorage_status_stats_check tests/startup_dstorage_status_stats_check.cpp)
+target_compile_features(startup_dstorage_status_stats_check PRIVATE cxx_std_17)
+target_include_directories(startup_dstorage_status_stats_check PRIVATE src)
+add_test(NAME startup_dstorage_status_stats COMMAND startup_dstorage_status_stats_check)
+add_test(NAME startup_dstorage_status_stats_stale_control COMMAND startup_dstorage_status_stats_check --mutate no-stale)
+set_tests_properties(startup_dstorage_status_stats_stale_control PROPERTIES WILL_FAIL TRUE)
 # The same registration under the lock held exclusively, and max_width kept at the widest record
 # (src/startup_stubs/placement_publish.h). The mutated run is the negative control.
 add_executable(startup_placement_publish_check tests/startup_placement_publish_check.cpp)
