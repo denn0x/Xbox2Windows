@@ -1673,17 +1673,23 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
 def parse_root(blob):
     if not blob or blob[:4] != b'DXBC':
         raise Unsupported('root signature blob missing')
-    n, = struct.unpack_from('<I', blob, 28)
-    for o in struct.unpack_from('<%dI' % n, blob, 32):
+
+    def read(fmt, data, offset):
+        if offset < 0 or offset + struct.calcsize(fmt) > len(data):
+            raise Unsupported('root signature blob truncated')
+        return struct.unpack_from(fmt, data, offset)
+
+    n, = read('<I', blob, 28)
+    for o in read('<%dI' % n, blob, 32):
         if blob[o:o + 4] == b'RTS0':
             d = blob[o + 8:]
-            ver, nparam, poff, nsamp, soff, flags = struct.unpack_from('<6I', d, 0)
+            ver, nparam, poff, nsamp, soff, flags = read('<6I', d, 0)
             params = []
             for i in range(nparam):
-                ptype, vis, off = struct.unpack_from('<3I', d, poff + 12 * i)
+                ptype, vis, off = read('<3I', d, poff + 12 * i)
                 p = dict(type=ptype, vis=vis)
                 if ptype == 1:
-                    p['reg'], p['space'], p['count'] = struct.unpack_from('<3I', d, off)
+                    p['reg'], p['space'], p['count'] = read('<3I', d, off)
                 params.append(p)
             return dict(flags=flags, params=params)
     raise Unsupported('no RTS0 part')

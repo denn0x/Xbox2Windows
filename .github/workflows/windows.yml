@@ -181,6 +181,7 @@ jobs:
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_inline_sampler_check.py \
             tests/compute_entry_layout_check.py \
+            tests/startup_gfx2hlsl_root_check.py \
             tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows

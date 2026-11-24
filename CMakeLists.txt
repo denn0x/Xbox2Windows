@@ -1735,6 +1735,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_xg_tile64_tiling PROPERTIES TIMEOUT 30 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
     add_test(NAME startup_inline_sampler_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_inline_sampler_check.py")
+    add_test(NAME startup_gfx2hlsl_root COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_root_check.py")
+    set_tests_properties(startup_gfx2hlsl_root PROPERTIES TIMEOUT 60)
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_inline_sampler_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_inline_sampler_check.py" draw "${DXC_EXECUTABLE}"
