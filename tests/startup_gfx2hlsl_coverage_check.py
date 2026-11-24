@@ -214,7 +214,11 @@ def integer_helpers():
           lines(w)[1] == 'q = uint2(x2w_lshl64_lo(v2, v3, v1), x2w_lshl64_hi(v2, v3, v1));\nv2 = q.x;\nv3 = q.y;')
     check('a negative inline 64-bit constant is sign-extended',
           'x2w_lshr64_lo(0xffffffffu, 0xffffffffu, v1)' in lines([0xd4000000 | 0x300 << 16 | 10, 257 | 0xc1 << 9])[1])
-    check('a 64-bit literal operand refused', refused('v_lshrrev_b64 v[10:11], v1, 0x12345678'))
+    # A 32-bit literal in a 64-bit integer operand: only bit 31 decides zero- vs sign-extension, so a literal
+    # with bit 31 set stays refused and one with bit 31 clear reads a zero high dword (startup_lit64_check.py).
+    check('a 64-bit literal operand with bit 31 set refused', refused('v_lshrrev_b64 v[10:11], v1, 0x92345678'))
+    check('a 64-bit literal operand with bit 31 clear has a zero high dword',
+          not refused('v_lshrrev_b64 v[10:11], v1, 0x12345678'))
     w = [0xbf000000 | 0xd << 16 | 0x81 << 8 | 11]
     s, text = lines(w)
     check('s_bitcmp1_b32 s11, 1 sets SCC from bit 1', asm_of(w) == 's_bitcmp1_b32 s11, 1' and

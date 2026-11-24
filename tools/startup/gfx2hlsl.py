@@ -1210,6 +1210,11 @@ class Stage:
             value = int(tok, 0)
         except ValueError:
             raise Unsupported('64-bit operand %r' % tok)
+        if tok.startswith('0x') and 0 <= value <= 0x7fffffff:
+            # A 32-bit literal in a 64-bit integer operand. Whether hardware zero- or sign-extends it is open (LLVM
+            # AMDGPUDisassembler::decodeLiteralConstant zero-extends with a ToDo on signedness; the assembler takes
+            # Lo_32), but with bit 31 clear both readings give the high dword 0.
+            return '0x%08xu' % value, '0x00000000u'
         if not -16 <= value <= 64 or tok.startswith('0x'):
             raise Unsupported('64-bit literal operand %s' % tok)
         value &= 0xffffffffffffffff
