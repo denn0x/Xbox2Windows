@@ -4022,6 +4022,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
     frame_number = frame;
+    note_present_planes(frame, planes, plane_parameters, present_parameters);
     draw_dump_flush();
     {
         static const LONG wanted = [] {

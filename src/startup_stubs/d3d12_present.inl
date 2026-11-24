@@ -158,6 +158,46 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
     return SUCCEEDED(hr);
 }
 
+// LOCAL (video): X2W_PRESENT_PLANES_LOG=1 logs the present call's planes whenever the plane count,
+// the first plane's resource count, its surface or that surface's size and format change (at most
+// 32 lines). Run 77 logged planes=1 for frames 1 and 2 only; this shows whether a later present
+// (a movie, the loading screen) brings more planes, which the window presenter does not draw.
+void note_present_planes(LONG frame, UINT planes, const void* plane_parameters, const void* present_parameters)
+{
+    static const bool on = [] {
+        const bool value = x2w_local::env_on("X2W_PRESENT_PLANES_LOG");
+        if (value) log("x2w-present X2W_PRESENT_PLANES_LOG=1: plane changes are logged");
+        return value;
+    }();
+    if (!on) return;
+    static UINT last_planes = ~0u;
+    static u64 last_count = ~0ull, last_surface = ~0ull, last_shape = ~0ull;
+    static LONG lines;
+    const auto* words = static_cast<const u64*>(plane_parameters);
+    const bool header = planes && words && x2w_local::readable(words, 0x18);
+    const u64 count = header ? words[1] : 0;
+    u64 surface = 0, shape = 0;
+    if (header && count >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8)) {
+        surface = *reinterpret_cast<const u64*>(words[2]);
+        Wrapper* wrapper = as_wrapper(reinterpret_cast<const void*>(surface));
+        if (wrapper && wrapper->own().kind == resource_kind && wrapper->own().real) {
+            const D3D12_RESOURCE_DESC desc = static_cast<ID3D12Resource*>(wrapper->own().real)->GetDesc();
+            shape = (desc.Width & 0xFFFFF) | (u64{desc.Height & 0xFFFFF} << 20) | (u64{static_cast<UINT>(desc.Format) & 0xFFF} << 40);
+        }
+    }
+    if (planes == last_planes && count == last_count && surface == last_surface && shape == last_shape) return;
+    last_planes = planes;
+    last_count = count;
+    last_surface = surface;
+    last_shape = shape;
+    if (!first_calls(lines, 32)) return;
+    char a[3 * 0x60 + 1] = "", b[3 * 0x40 + 1] = "";
+    if (plane_parameters && x2w_local::readable(plane_parameters, 0x60)) hex_text(plane_parameters, 0x60, a, sizeof(a));
+    if (present_parameters && x2w_local::readable(present_parameters, 0x40)) hex_text(present_parameters, 0x40, b, sizeof(b));
+    log("x2w-present planes frame %ld: planes=%u resources=%llu surface=0x%llx %llux%llu format %llu; plane=[%s] present=[%s]", frame, planes,
+        count, surface, shape & 0xFFFFF, (shape >> 20) & 0xFFFFF, (shape >> 40) & 0xFFF, a, b);
+}
+
 // Draws `surface` (resting in COMMON) into the window and flips. Returns false if not shown.
 bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
 {
