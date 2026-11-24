@@ -1281,7 +1281,7 @@ class Stage:
         # binary16 coordinates for a sample. d16, tfe, lwe and r128 change the result or resource layout and are
         # refused, as is any modifier not named here.
         # (image_sample_l and image_load_mip check their own modifier lists below.)
-        allowed = ('dlc', 'glc', 'slc', 'a16') + (('unorm',) if how == 'load' else ())
+        allowed = ('dlc', 'glc', 'slc', 'a16') + (('unorm',) if how == 'load' else ('d16',) if how in ('sample', 'lz') else ())
         for m in mods:
             if how in ('sample', 'lz', 'load', 'b', 'd') and not (m.startswith(('dim:', 'dmask:')) or m in allowed):
                 raise Unsupported('image_%s modifier %s' % (how, m))
@@ -1369,6 +1369,18 @@ class Stage:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
         self.emit('t = %s;' % call)
         n = dst[1]
+        if 'd16' in mods:
+            # Packed D16 (gfx9+, LLVM GCNSubtarget hasPackedD16VMem; SIISelLowering adjustLoadValueType): each enabled
+            # channel of the filtered result is converted to binary16 and two go in one VGPR, the first channel in
+            # the low half; the high half after an odd channel count is written as 0 here (undefined in hardware).
+            # Only the sampling forms take it: their result is a float whatever the texel format.
+            comps = ['f32tof16(t.%s)' % c for bit, c in enumerate('xyzw') if dmask & (1 << bit)]
+            if not comps or dst[2] - dst[1] + 1 != (len(comps) + 1) // 2:
+                raise Unsupported('image_%s d16 with dmask %#x into %s' % (how, dmask, ops[0]))
+            for i in range(0, len(comps), 2):
+                self.set_v(n, comps[i] if i + 1 == len(comps) else '%s | (%s << 16)' % (comps[i], comps[i + 1]))
+                n += 1
+            return
         for bit, comp in enumerate('xyzw'):
             if dmask & (1 << bit):
                 self.set_v(n, 'U(t.%s)' % comp)
