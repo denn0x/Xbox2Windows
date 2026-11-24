@@ -6,6 +6,7 @@
 #include "era_physical.h"
 #include "xmem_low.h"
 #include "xmem_census.h"
+#include "xmem_gpu_pool.h"
 
 #include <cstring>
 #include "startup_stubs/local_log.h"
@@ -147,6 +148,19 @@ HANDLE pagefile_slab() noexcept
     }
     return CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<DWORD>(slab_bytes >> 32),
                               static_cast<DWORD>(slab_bytes), nullptr);
+}
+
+// LOCAL (xmem_gpu_pool.h): a pagefile slab for the GPU, from the long-lived pool when it has one (same budget).
+HANDLE gpu_slab(bool* pooled) noexcept
+{
+    *pooled = false;
+    const ULONG64 budget = slab_budget_bytes();
+    if (!budget || (pagefile_slabs() + 1) * slab_bytes <= budget)
+        if (const HANDLE section = x2w_gpu_pool::take(slab_bytes)) {
+            *pooled = true;
+            return section;
+        }
+    return pagefile_slab();
 }
 
 // A new slab: file-backed when X2W_XMEM_SLAB_DIR allows it, else from the pagefile. *file says which.
@@ -389,7 +403,8 @@ HANDLE migrate_slab(HANDLE old_slab)
         --run;
         if (address - run->first < run->second) broken.insert(*run);
     }
-    const HANDLE moved = pagefile_slab();
+    bool pooled = false;
+    const HANDLE moved = gpu_slab(&pooled);
     if (!moved) {
         ++memory.migration_failures;
         x2w_local::logf("x2w-xmem slab move refused: no pagefile slab (error %lu)", GetLastError());
@@ -415,6 +430,8 @@ HANDLE migrate_slab(HANDLE old_slab)
             // Only the used part of the newest slab holds pages.
             const bool newest = !memory.slabs.empty() && memory.slabs.back() == old_slab;
             std::memcpy(to, from, newest ? memory.slab_used : slab_bytes);
+            // A pool section holds an earlier run's bytes: the unused tail must read as zero, as a fresh one.
+            if (pooled && newest) std::memset(static_cast<char*>(to) + memory.slab_used, 0, slab_bytes - memory.slab_used);
             copied = true;
         } else {
             error = GetLastError();
