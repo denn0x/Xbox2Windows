@@ -224,6 +224,7 @@ void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT incre
 // that copies the title makes there itself can be followed.
 void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_t desc_bytes, u64 dest_title, u64 dest_desktop)
 {
+    if (const Wrapper* r = as_wrapper(reinterpret_cast<const void*>(resource)); r && r->own().refs <= 0) x2w_memcut::note_after_release(false);  // LOCAL memcut
     ViewRecord record{};
     record.slot = static_cast<std::uint32_t>(slot);
     record.resource = resource;

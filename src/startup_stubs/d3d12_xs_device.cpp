@@ -46,6 +46,7 @@
 #include "title_heap_memory.h"
 #include "gfx10_view_words.h"
 #include "startup_stubs/rawaddr_table.h"  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
+#include "startup_stubs/d3d12_mem_counters.h"  // LOCAL memcut counters
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
@@ -2078,8 +2079,9 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset)
         }
         ReleaseSRWLockExclusive(&lock);
     }
-    if (!ring || bytes == 0 || bytes > ring_bytes / 4) return nullptr;
+    if (!ring || bytes == 0 || bytes > ring_bytes / 4) return x2w_memcut::note_ring_refused(), nullptr;
     const u64 rounded = (bytes + 511) & ~u64{511};  // 512: texture footprints are placed in the ring too
+    x2w_memcut::note_ring(frame_number, rounded);  // LOCAL memcut
     u64 start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded))) % ring_bytes;
     if (start + rounded > ring_bytes) start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded) + (ring_bytes - start))) % ring_bytes, start = 0;
     *offset = start;
@@ -4797,6 +4799,7 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
     ReleaseSRWLockExclusive(&written_lock);
 }
 }  // namespace
+#include "startup_stubs/d3d12_mem_counters.inl"  // LOCAL memcut: x2w_memory_counters export
 
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {

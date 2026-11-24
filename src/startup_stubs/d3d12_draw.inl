@@ -1020,6 +1020,7 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
     }
     std::memcpy(ring, source, bytes);
+    x2w_memcut::note_copy(frame_number, bytes);  // LOCAL memcut
     if (known) {
         static LONG refreshed;
         if (first_calls(refreshed, 4))
@@ -1066,6 +1067,7 @@ u64 hash_memory(const unsigned char* data, std::size_t bytes)
 void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 {
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
+    if (InterlockedCompareExchange(&resource->own().refs, 0, 0) <= 0) x2w_memcut::note_after_release(true);  // LOCAL memcut
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
     const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
