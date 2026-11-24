@@ -873,12 +873,14 @@ class Stage:
         dst = reg_range(ops[0])
         dim = [m for m in mods if m.startswith('dim:')][0][4:]
         dmask = int([m for m in mods if m.startswith('dmask:')][0][6:], 0)
-        kinds = {'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        kinds = {'SQ_RSRC_IMG_1D': 'tex1d', 'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d',
+                 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
         if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
         # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
-        # Load on a Texture2DArray take it in the same place, so only the declared type differs.
-        three = dim != 'SQ_RSRC_IMG_2D'
+        # Load on a Texture2DArray take it in the same place, so only the declared type differs. A 1D image has
+        # the one coordinate (x for a load, u for a sample), bound as a Texture1D (manifest kind tex1d).
+        axes = {'SQ_RSRC_IMG_1D': 1, 'SQ_RSRC_IMG_2D': 2}.get(dim, 3)
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -897,7 +899,6 @@ class Stage:
                 raise Unsupported('image_%s modifier %s' % (how, m))
         a16 = 'a16' in mods
         if a16:
-            axes = 3 if three else 2
             if len(cs) < (axes + 1) // 2:
                 raise Unsupported('a16 image address with %d registers' % len(cs))
             # component i is the (i % 2) half of address dword i // 2; unpacked to one 32-bit value each
@@ -914,14 +915,14 @@ class Stage:
                     raise Unsupported('image_sample_l modifier %s' % m)
             if dmask == 0:
                 raise Unsupported('image_sample_l with an empty dmask')
-            if len(cs) != (4 if three else 3):
+            if len(cs) != axes + 1:
                 raise Unsupported('image_sample_l with %d address registers' % len(cs))
             lod, cs = cs[-1], cs[:-1]
         tex = self.pipe.resource(self.descriptor(ops[2]), kinds[dim])
         if how in ('load', 'load_mip'):
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
-            # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
-            axes = 3 if three else 2
+            # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip); a Texture1D
+            # takes int2(x, mip).
             mip = '0'
             if how == 'load_mip':
                 unsupported = [m for m in mods if not m.startswith(('dim:', 'dmask:'))
@@ -929,14 +930,18 @@ class Stage:
                 if unsupported or len(cs) != axes + 1 or not dmask:
                     raise Unsupported('image_load_mip address or modifiers: %s' % ' '.join(mods))
                 mip = self.u(cs[axes])
+            if len(cs) < axes:
+                raise Unsupported('image_%s with %d address registers' % (how, len(cs)))
             address = [self.a16_u(c) if isinstance(c, tuple) else self.u(c) for c in cs[:axes]] + [mip]
             call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address))
         else:
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
-            fs = [self.a16_f(c) if isinstance(c, tuple) else self.f(c) for c in cs[:3 if three else 2]]
-            uv = ('float3(%s, %s, %s)' % tuple(fs) if three else 'float2(%s, %s)' % tuple(fs))
+            if len(cs) < axes:
+                raise Unsupported('image_%s with %d address registers' % (how, len(cs)))
+            fs = [self.a16_f(c) if isinstance(c, tuple) else self.f(c) for c in cs[:axes]]
+            uv = fs[0] if axes == 1 else 'float%d(%s)' % (axes, ', '.join(fs))
             if how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
@@ -1744,7 +1749,7 @@ class Pipeline:
         out += [text for name, text in HELPERS.items() if re.search(r'\b%s\(' % name, self.helper_text)]
         out += ['cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
-            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
+            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:

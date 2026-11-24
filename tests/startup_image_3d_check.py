@@ -101,14 +101,13 @@ def controls():
     assert 'srv 0 tex2d table 0 0' in manifest, manifest
     print('dim 2D (same words, dim field changed): Texture2D r0, float2(F(v0), F(v1)); manifest srv 0 tex2d')
 
-    # Other dimensions are refused rather than sampled as 2D (2D arrays: tests/startup_image_2d_array_check.py).
-    try:
-        translate(WORDS_1D)
-    except G.Unsupported as error:
-        assert 'image dimension SQ_RSRC_IMG_1D' in str(error), error
-    else:
-        raise AssertionError('dim:SQ_RSRC_IMG_1D accepted')
-    print('dim 1D: refused')
+    # dim:SQ_RSRC_IMG_1D is a Texture1D sampled at u alone, never as 2D (2D arrays: startup_image_2d_array_check.py).
+    pipe = translate(WORDS_1D)
+    ps, manifest = pipe.hlsl_ps(), pipe.manifest()
+    assert 'Texture1D<float4> r0 : register(t0);' in ps and 'Texture2D' not in ps and 'Texture3D' not in ps, ps
+    assert 't = r0.Sample(q0, F(v0));' in ps, ps
+    assert 'srv 0 tex1d table 0 0' in manifest, manifest
+    print('dim 1D (same words, dim field changed): Texture1D r0, Sample(q0, F(v0)); manifest srv 0 tex1d')
 
 
 def assemble(llvm_mc, source):

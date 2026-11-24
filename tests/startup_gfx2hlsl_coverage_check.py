@@ -613,6 +613,11 @@ def sdwa_and_misc():
     _, text = lines(sample, setup=gather_setup)
     check('image_sample a16 takes binary16 u and v from the halves of one address dword',
           'f16tof32(v2), f16tof32(v2 >> 16)' in text and 'v3' not in text)
+    load1d = [0xf0000000 | 1 << 8, 2 | 8 << 8 | (24 // 4) << 16]
+    s, text = lines(load1d, setup=gather_setup)
+    check('image_load on a 1D image is Texture1D.Load(int2(x, 0)) with manifest kind tex1d',
+          asm_of(load1d).endswith('dmask:0x1 dim:SQ_RSRC_IMG_1D') and
+          text == 't = r0.Load(int2(v2, 0));\nv8 = U(t.x);' and list(s.pipe.resources.values())[0]['kind'] == 'tex1d')
     check('image_sample d16 refused', refused(None, setup=gather_setup, words=[sample[0], sample[1] | 1 << 31]))
     check('image_sample unorm refused', refused(None, setup=gather_setup, words=[sample[0] | 1 << 12, sample[1]]))
     check('image_load tfe refused', refused(None, setup=gather_setup, words=[load[0] | 1 << 16, load[1]]))

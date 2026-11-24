@@ -225,11 +225,16 @@ def controls():
     refused('d16', 'image_sample_l modifier d16')  # half-precision result layout
     refused('r128', 'image_sample_l modifier r128')  # four-dword resource descriptor
     refused('dmask0', 'empty dmask')
-    for name in ('dim1d', 'msaa'):
-        refused(name, 'image dimension SQ_RSRC_IMG_')
+    refused('msaa', 'image dimension SQ_RSRC_IMG_')
+    # dim:SQ_RSRC_IMG_1D is a Texture1D (manifest kind tex1d, bound as a Texture1D view by the draw path): the
+    # address is u and then the level, never sampled as 2D.
+    one = stage('dim1d')
+    assert 'Texture1D<float4> r0' in one and 'Texture2D' not in one, one
+    assert re.search(r'\w+\.SampleLevel\(\w+, F\(v0\), F\(v1\)\);', one), one
     for name in RESERVED:
         refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
-    print('refused: offset, compare, gather, cube, 1D, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
+    print('refused: offset, compare, gather, cube, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits; '
+          '1D: Texture1D SampleLevel(u, level)')
 
     # Cache-policy bits do not change the sampled value: same lowering as the plain form.
     for name in ('glc', 'slc', 'dlc'):
