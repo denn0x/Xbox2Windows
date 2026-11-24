@@ -40,6 +40,12 @@ from gfx2hlsl import Unsupported, reg_range, parse  # noqa: E402
 GROUP = 128           # PSV0 numthreads (128, 1, 1) in all 9282 archive mesh records
 MAX_VERTICES = 128    # PSV0 MaxOutputVertices
 MAX_PRIMITIVES = 128  # PSV0 MaxOutputPrimitives
+ALL_LANES = (1 << 64) - 1
+FUSED = ('v_fma_f32', 'v_fmac_f32', 'v_fmamk_f32', 'v_fmaak_f32')
+# X2W_MESH_EXACT_FMA=1: fused multiply-adds through binary64 (needs double-precision shader ops); default off,
+# as the pipeline translator (`a * b + c`, which the compiler may or may not fuse)
+EXACT_FMA = os.environ.get('X2W_MESH_EXACT_FMA') == '1'
+LDS_DWORDS = 1024     # groupshared x2w_lds (4 KB of the 28 KB a D3D12 mesh shader may use); addresses are clamped
 TOKEN = re.compile(r'\b(v\d+|s\d+|exec|vcc|m0|scc|a|w|t|q|tid|lane)\b')
 SIMPLE = re.compile(r'^\s*(?:if \(exec & 1\) )?(v\d+|s\d+|exec|vcc|m0|scc|a|w|t|q)\s*=\s*(.*)$')
 
@@ -55,7 +61,8 @@ MESH_HELPERS = {
                  'r |= x2w_perm_byte(s0, s1, (s2 >> (8u * i)) & 255u) << (8u * i); return r; }'),
     # v_mbcnt_{lo,hi}_u32_b32 D, S0, S1 in a 64-lane wave: S1 + the number of set S0 bits below this lane in the
     # low (lanes 0-31) or high (lanes 32-63) half of the wave mask.
-    'x2w_mbcnt_lo': 'uint x2w_mbcnt_lo(uint m, uint lane) { return countbits(m & (lane >= 32u ? 0xffffffffu : ((1u << lane) - 1u))); }',
+    'x2w_fma': 'float x2w_fma(float a, float b, float c) { return (float)fma((double)a, (double)b, (double)c); }',
+    'x2w_mbcnt_lo':'uint x2w_mbcnt_lo(uint m, uint lane) { return countbits(m & (lane >= 32u ? 0xffffffffu : ((1u << lane) - 1u))); }',
     'x2w_mbcnt_hi': 'uint x2w_mbcnt_hi(uint m, uint lane) { return lane < 32u ? 0u : countbits(m & ((1u << (lane - 32u)) - 1u)); }',
 }
 
@@ -70,6 +77,8 @@ def scalar_regs(text):
             out.update(range(int(m.group(1)), int(m.group(2)) + 1))
     return out
 
+
+CARRY = re.compile(r'v_(add|sub|subrev)_co(_ci)?_u32')
 
 NO_DEST = ('s_cmp', 's_bitcmp', 's_cbranch', 's_branch', 's_waitcnt', 's_sendmsg', 's_barrier', 's_nop', 's_setreg',
            's_inst_prefetch', 's_endpgm', 's_clause', 's_setprio', 's_code_end', 's_sopp')
@@ -92,6 +101,12 @@ def reads_writes(name, asm):
         writes = scalar_regs(ops[0])
         wvcc = ops[0].startswith('vcc')
         rest = ops[1:]
+    elif CARRY.fullmatch(base) and len(ops) >= 4:
+        # VOP2/VOP3b carry-out: the disassembler names one SGPR (or vcc_lo); in wave64 the mask is the pair
+        writes = scalar_regs(ops[1])
+        writes |= {n + 1 for n in writes}
+        wvcc = ops[1].startswith('vcc')
+        rest = ops[2:]
     else:
         rest = ops
         if base.startswith('v_cmp') and len(ops) == 2:
@@ -119,9 +134,132 @@ class MeshStage(G.Stage):
         self.exported_prim = False
         self.alloc_seen = False
         self.wave = 64
+        self.exec_static = ALL_LANES  # exec as a known 64-bit lane mask (the same in every wave), else None
+        self.static_copies = {}      # SGPR -> the static exec mask it holds
+        self._static_set = False
+        self.shadow = {}             # VGPR -> (unguarded variable, exec mask at the write); straight-line code only
+        self.shadow_vars = []
+        self.pending = []            # statements that start the next block (after a broadcast barrier)
+        self.lds_used = False
+        self.lds_written_in_phase = False
         super().__init__(pipe, 'ms', code)
         if not self.alloc_seen:
             raise Unsupported('no GS_ALLOC_REQ (s_sendmsg 0x9): not an NGG mesh stage')
+        self.barriers = self.barrier_count()
+
+    def translate(self):
+        # The program ends at the s_code_end padding; the words after it are data, not code.
+        for i, x in enumerate(self.ins):
+            if x[2] == 's_code_end':
+                self.ins = self.ins[:i]
+                break
+        self.has_lds = any(x[2].startswith('ds_') for x in self.ins)
+        return super().translate()
+
+    def next_offset(self):
+        for off, n, _, _ in self.ins:
+            if off == self.pc:
+                return off + n
+        return None
+
+    def branch_targets(self):
+        if getattr(self, '_targets', None) is None:
+            self._targets = {int(parse(asm)[1][0].split('_')[1], 16) for _, _, name, asm in self.ins
+                             if name.startswith('s_cbranch') or name == 's_branch'}
+        return self._targets
+
+    def body(self):
+        """With barriers: the program runs as barriers + 1 phases, written out one after the other with a group
+        barrier between them in straight-line code (no barrier inside a loop). barrier_count() put every block in
+        exactly one phase; within a phase a thread runs its blocks until it reaches a barrier (pc gets
+        0x10000 | the block after it) or the end (0x20000). Each console barrier is thus the phase boundary every
+        wave of the group reaches."""
+        if not any(b[2] and b[2][0] == 'barrier' for b in self.blocks):
+            return super().body()
+        index = {b[0]: i for i, b in enumerate(self.blocks)}
+
+        def goto(off):
+            if off not in index:
+                raise Unsupported('branch into the middle of a block (+0x%x)' % off)
+            return index[off]
+        out = ['    uint pc = 0;']
+        for phase in range(self.barriers + 1):
+            members = [i for i in range(len(self.blocks)) if self.phase_of.get(i) == phase]
+            loop = any(t and t[0] in ('jump', 'branch') and goto(t[-1]) <= i
+                       for i in members for t in [self.blocks[i][2]])
+            out.append('    // phase %d' % phase)
+            ind = '    '
+            if loop:
+                out.append('    [loop] for (uint guard = 0; guard < 65536 && pc < 0x10000u; ++guard) {')
+                ind = '        '
+            for k, i in enumerate(members):
+                off, lines, term = self.blocks[i]
+                out.append('%s%sif (pc == %d) {' % (ind, 'else ' if loop and k else '', i))
+                out += [ind + '    ' + line for line in lines]
+                last = i + 1 >= len(self.blocks)
+                nxt = '0x20000u' if last else '%d' % (i + 1)
+                if not term:
+                    out.append('%s    pc = %s;' % (ind, nxt))
+                elif term[0] == 'end':
+                    out.append('%s    pc = 0x20000u;' % ind)
+                elif term[0] == 'barrier':
+                    out.append('%s    pc = %s;' % (ind, '0x20000u' if last else '0x10000u | %d' % (i + 1)))
+                elif term[0] == 'jump':
+                    out.append('%s    pc = %d;' % (ind, goto(term[1])))
+                else:
+                    out.append('%s    pc = (%s) ? %d : %s;' % (ind, term[1], goto(term[2]), nxt))
+                out.append('%s}' % ind)
+            if loop:
+                out.append('    }')
+            if phase < self.barriers:
+                out += ['    GroupMemoryBarrierWithGroupSync();',
+                        '    if (pc < 0x20000u) pc &= 0xffffu;']
+        return out
+
+    def barrier_count(self):
+        """Every path from the entry to s_endpgm must cross the same number of barriers (the hardware needs every
+        wave to arrive at each barrier). Returns that number; the body runs as that many + 1 phases."""
+        blocks = self.blocks
+        index = {b[0]: i for i, b in enumerate(blocks)}
+        memo = {}
+
+        def counts(i, depth=0):
+            if i in memo:
+                return memo[i]
+            if depth > 10000:
+                raise Unsupported('block graph too deep')
+            off, lines, term = blocks[i]
+            here = 1 if term and term[0] == 'barrier' else 0
+            nxt = []
+            if term is None or term[0] in ('barrier', 'branch'):
+                if i + 1 < len(blocks):
+                    nxt.append(i + 1)
+            if term and term[0] in ('jump', 'branch'):
+                if term[-1] <= off:
+                    if any(blocks[k][2] and blocks[k][2][0] == 'barrier' for k in range(index[term[-1]], i + 1)):
+                        raise Unsupported('barrier inside a loop')
+                    nxt = [k for k in nxt if k != index[term[-1]]]   # loop back edge: counted once
+                else:
+                    nxt.append(index[term[-1]])
+            result = set()
+            for k in nxt:
+                result |= {here + c for c in counts(k, depth + 1)}
+            if not nxt:
+                result = {here}
+            memo[i] = result
+            return result
+        found = counts(0)
+        if len(found) != 1:
+            raise Unsupported('paths cross different numbers of barriers: %s' % sorted(found))
+        total = min(found)
+        # Every reachable block then has one count of barriers still ahead (two would give two totals), so it runs
+        # in exactly one phase: total - that count.
+        self.phase_of = {}
+        for i, c in memo.items():
+            if len(c) != 1:
+                raise Unsupported('block %#x reaches the end across different numbers of barriers' % blocks[i][0])
+            self.phase_of[i] = total - min(c)
+        return total
 
     # ---- entry ---------------------------------------------------------------------------------
     def setup_entry(self):
@@ -193,6 +331,28 @@ class MeshStage(G.Stage):
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
+        if self.pending:
+            self.lines.extend(self.pending)
+            self.pending = []
+        if self.pc in self.branch_targets():
+            self.shadow.clear()      # another path may arrive here without the shadow assignments
+        if base in ('s_waitcnt_depctr',):
+            return None
+        if base.startswith('s_cbranch_exec') and self.exec_static is not None:
+            # exec is a known mask (the same in every wave): the wave-level branch is decided here
+            taken = (self.exec_static == 0) == (base == 's_cbranch_execz')
+            return ('jump', int(ops[0].split('_')[1], 16)) if taken else None
+        if base.startswith('ds_'):
+            return self.lds(base, ops, mods)
+        if base in FUSED and EXACT_FMA:
+            # v_fma / v_fmac / v_fmamk / v_fmaak are fused (one rounding); `a * b + c` lets the compiler round the
+            # product first. The product of two binary32 values is exact in binary64, so fma in double then one
+            # rounding to float gives the fused result (except for rare double-rounding ties).
+            arity, _ = G.VEC_F[base]
+            args = [self.f(o) for o in ops[1:1 + arity]]
+            if base == 'v_fmac_f32':
+                args.append(self.f(ops[0]))
+            return self.set_vf(reg_range(ops[0])[1], 'x2w_fma(%s, %s, %s)' % tuple(args), mods)
         if base == 's_sendmsg':
             if ops != ['0x9']:
                 raise Unsupported('s_sendmsg %s' % ops)
@@ -204,7 +364,16 @@ class MeshStage(G.Stage):
             self.alloc_guarded = True
             return None
         if base == 's_barrier':
-            return None  # no LDS is lowered, so a barrier orders nothing this translation models
+            if not self.has_lds:
+                # A barrier orders LDS (and memory) traffic between the waves; a program without LDS instructions
+                # writes nothing another wave reads here (the archive form's barriers sit in per-lane regions
+                # around the allocation, which the one-lane model could not place anyway)
+                return None
+            # s_barrier runs whatever exec is; a lane that skipped it per lane would arrive at a different one
+            if self.pc < self.divergent_until:
+                raise Unsupported('s_barrier inside a per-lane skipped range at %#x' % self.pc)
+            self.lds_written_in_phase = False
+            return ('barrier',)
         if base in ('s_waitcnt_vmcnt', 's_waitcnt_lgkmcnt', 's_waitcnt_expcnt', 's_waitcnt_vscnt'):
             return None
         # Every scalar destination stops being a lane mask unless the handler marks it again (the base
@@ -230,7 +399,12 @@ class MeshStage(G.Stage):
             else:
                 self.au_scalars.pop(r, None)
         self._known_at_start = self.exec_known
+        self._static_set = False
+        for r in writes:
+            self.static_copies.pop(r, None)
         term = super().one(name, asm)
+        if not self._static_set and self.exec_written(name, ops):
+            self.exec_static = None   # exec changed in a way not modelled as a constant mask
         if term and term[0] == 'branch':
             cond = term[1]
             off = self.pc
@@ -249,6 +423,116 @@ class MeshStage(G.Stage):
                 self.check_skipped_scalars(off, target)
                 self.divergent_until = max(self.divergent_until, target)
         return term
+
+    @staticmethod
+    def exec_written(name, ops):
+        base = re.sub(r'_e(32|64)$', '', name)
+        return ('saveexec' in base or base.startswith('v_cmpx') or
+                (base.startswith('s_') and ops and ops[0] in ('exec', 'exec_lo')))
+
+    def exec_mask_expr(self, mask):
+        """This lane's bit of a constant 64-bit exec mask."""
+        lo, hi = mask & 0xffffffff, mask >> 32
+        if hi == 0 and lo == 1:
+            return '(lane == 0u ? 1u : 0u)'
+        return '((lane < 32u ? (0x%08xu >> lane) : (0x%08xu >> (lane - 32u))) & 1u)' % (lo, hi)
+
+    def set_v(self, n, expr):
+        # Shadow: under a constant partial exec, a value computed only from wave-uniform inputs is also kept in an
+        # unguarded variable, so a later v_readfirstlane can read it although the HLSL thread's lane was off
+        # (the hardware reads the first active lane, which held that same value if it was active at the write).
+        sub = expr
+        if self.exec_static is not None and not self.exec_known:
+            for v in set(re.findall(r'\bv(\d+)\b', expr)):
+                if int(v) in self.shadow:
+                    sub = re.sub(r'\bv%s\b' % v, self.shadow[int(v)][0], sub)
+        super().set_v(n, expr)
+        self.shadow.pop(n, None)
+        if self.exec_static is None or self.exec_known or self.exec_static == 0:
+            return
+        if set(TOKEN.findall(sub)) & (self.tainted | {'exec', 'lane', 'tid'}):
+            return
+        var = 'x2w_u%d' % len(self.shadow_vars)
+        self.shadow_vars.append(var)
+        self.lines.append('%s = %s;' % (var, sub))
+        self.shadow[n] = (var, self.exec_static)
+
+    def declarations(self):
+        lines = super().declarations()
+        if self.shadow_vars:
+            lines.append('    uint %s;' % ', '.join('%s = 0' % v for v in self.shadow_vars))
+        return lines
+
+    def snapshot(self):
+        return super().snapshot() + (self.exec_static, dict(self.static_copies))
+
+    def merge(self, states):
+        super().merge(states)
+        statics = [s[3] for s in states]
+        self.exec_static = statics[0] if all(x == statics[0] for x in statics) else None
+        self.static_copies = {r: m for r, m in states[0][4].items() if all(s[4].get(r) == m for s in states)}
+
+    def set_exec_static(self, mask):
+        """exec = a constant lane mask (s_mov_b64 exec, <constant> or a copy of one)."""
+        mask &= ALL_LANES
+        self._static_set = True
+        self.exec_static = mask
+        if mask == ALL_LANES:
+            self.emit('exec = 1;')
+            self.exec_known = True
+        else:
+            self.emit('exec = %s;' % self.exec_mask_expr(mask))
+            self.exec_known = False
+
+    def op_s_and_b32(self, ops, mods):
+        # merged_wave_info & mask: the wave index field (bits 27:24) is the only part this translation models
+        for i, j in ((1, 2), (2, 1)):
+            src = reg_range(ops[i])
+            if src and src[0] == 's' and self.sym.get(src[1]) == ('waveinfo',):
+                if not re.fullmatch(r'0x[0-9a-f]+|\d+', ops[j]) or int(ops[j], 0) & ~0x0f000000:
+                    raise Unsupported('merged_wave_info & %s' % ops[j])
+                d = reg_range(ops[0])
+                if not d or d[0] != 's':
+                    raise Unsupported('s_and_b32 of merged_wave_info to %s' % ops[0])
+                self.masks.discard(d[1])
+                self.set_s(d[1], '((wave << 24) & 0x%08xu)' % int(ops[j], 0), scc='$ != 0u')
+                return None
+        return self.scalar('s_and_b32', ops)
+
+    def lds(self, base, ops, mods):
+        """ds_read_b32 / ds_write_b32 / _b64 with offset:N as groupshared uint x2w_lds[] (byte address / 4).
+        Lanes of one wave run independently between barriers here, so an LDS read after an LDS write in the same
+        barrier phase (lane-to-lane traffic inside a wave) is refused."""
+        size = {'ds_read_b32': 1, 'ds_write_b32': 1, 'ds_read_b64': 2, 'ds_write_b64': 2}.get(base)
+        if size is None:
+            raise Unsupported(base)
+        off = 0
+        for m in mods:
+            if m.startswith('offset:'):
+                off = int(m[7:], 0)
+            else:
+                raise Unsupported('%s with %s' % (base, m))
+        if off + 4 * size > 4 * LDS_DWORDS:
+            raise Unsupported('%s offset %d beyond the modelled LDS' % (base, off))
+        self.lds_used = True
+        if base.startswith('ds_write'):
+            addr, data = ops[0], reg_range(ops[1])
+            self.emit('a = (%s + %du) >> 2;' % (self.u(addr), off))
+            for i in range(size):
+                self.emit('if (exec & 1) x2w_lds[min(a + %du, %du)] = v%d;' % (i, LDS_DWORDS - 1, data[1] + i))
+                self.used_v.add(data[1] + i)
+            self.lds_written_in_phase = True
+            return None
+        if self.lds_written_in_phase:
+            raise Unsupported('LDS read after an LDS write without a barrier at %#x' % self.pc)
+        dst, addr = reg_range(ops[0]), ops[1]
+        ar = reg_range(addr)
+        if ar and ar[0] == 'v' and dst[1] <= ar[1] < dst[1] + size - 1:   # a later word would read the new value
+            raise Unsupported('%s overwrites its address register' % base)
+        for i in range(size):
+            # the address expression is repeated (no temporary), so a shadow (see set_v) can substitute into it
+            self.set_v(dst[1] + i, 'x2w_lds[min(((%s + %du) >> 2) + %du, %du)]' % (self.u(addr), off, i, LDS_DWORDS - 1))
+        return None
 
     def liveness(self):
         """Scalar registers (numbers; -1 = vcc) live on entry to each instruction offset (backward dataflow over
@@ -298,6 +582,10 @@ class MeshStage(G.Stage):
                 if name in ('s_mov_b64', 's_mov_b32') and len(ops) == 2 and ops[1] in ('exec', 'exec_lo'):
                     copies.add(low[0])
                     continue
+                if (re.match(r's_(and|andn2)_b(32|64)$', name) and len(ops) == 3 and ops[0] not in ('exec', 'exec_lo')
+                        and low[1] in copies):
+                    copies.add(low[0])   # a subset of a copy taken in the range (`copy & ~exec`: the else lanes)
+                    continue
                 if name.startswith('s_') and ops and ops[0] in ('exec', 'exec_lo'):
                     # A wave-level exec write can turn on lanes the per-lane model left behind, unless it only
                     # narrows exec (and / andn2 with exec) or restores / complements a copy taken in the range.
@@ -329,16 +617,24 @@ class MeshStage(G.Stage):
         # restoring exec from a copy taken while every lane was active makes every lane active again;
         # s_mov_b64 exec, -1 (the program's first instruction) activates all 64 lanes, which all exist
         # (128 threads = two full waves)
-        if dname in ('exec', 'exec_lo') and base in ('s_mov_b64', 's_mov_b32'):
-            if ops[1] == '-1' and base == 's_mov_b64':
-                self.emit('exec = 1;')
-                self.exec_known = True
+        if dname == 'exec' and base == 's_mov_b64':
+            if re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', ops[1]):
+                self.set_exec_static(int(ops[1], 0))
                 return None
             src = reg_range(ops[1])
-            if src and src[0] == 's' and self.sym.get(src[1]) == ('execcopy',):
-                self.emit('exec = 1;')
-                self.exec_known = True
+            if src and src[0] == 's' and src[1] in self.static_copies:
+                self.set_exec_static(self.static_copies[src[1]])
                 return None
+            if src and src[0] == 's' and self.sym.get(src[1]) == ('execcopy',):
+                self.set_exec_static(ALL_LANES)
+                return None
+        if base == 's_mov_b64' and len(ops) == 2 and ops[1] == 'exec' and self.exec_static is not None:
+            d = reg_range(dname)
+            if d and d[0] == 's':
+                mask = self.exec_static
+                term = super().scalar(base, ops)
+                self.static_copies[d[1]] = mask
+                return term
         if r0 and r0[0] == 's':
             for t in ops[1:]:
                 rr = reg_range(t)
@@ -378,6 +674,53 @@ class MeshStage(G.Stage):
             return None
         self.set_s(d, '%s | (1u << (%s & 31u))' % (self.S(d), self.u(ops[1])))
 
+    # s_pack_{lh,hl,hh}_b32_b16: D = low half from S0 (l = bits 15:0, h = bits 31:16), high half from S1
+    # (RDNA 2 ISA, S_PACK_*). s_pack_ll is in the base table.
+    def pack(self, ops, text):
+        d = reg_range(ops[0])
+        if not d or d[0] != 's':
+            raise Unsupported('s_pack to %s' % ops[0])
+        self.masks.discard(d[1])
+        self.set_s(d[1], text.format(self.u(ops[1]), self.u(ops[2])))
+
+    def op_s_pack_lh_b32_b16(self, ops, mods):
+        self.pack(ops, '(({0} & 0xffffu) | ({1} & 0xffff0000u))')
+
+    def op_s_pack_hl_b32_b16(self, ops, mods):
+        self.pack(ops, '(({0} >> 16) | ({1} << 16))')
+
+    def op_s_pack_hh_b32_b16(self, ops, mods):
+        self.pack(ops, '(({0} >> 16) | ({1} & 0xffff0000u))')
+
+    def carry_op(self, base, ops, mods):
+        """v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 and the _ci forms: D, carry-out mask, S0, S1[, carry-in mask].
+        Add: sum = S0 + S1 + cin (mod 2^32), carry = cin ? sum <= S0 : sum < S0. Sub: d = S0 - S1 - bin, borrow =
+        bin ? d >= S0 : d > S0 (subrev swaps the sources). Both read only S0, the result and the carry-in, so the
+        carry-in may be the destination mask. The carry is the lane's bit of the destination mask."""
+        m = CARRY.fullmatch(base)
+        if mods or len(ops) != (5 if m.group(2) else 4):
+            raise Unsupported('%s form %s %s' % (base, ops, mods))
+        x, y = self.u(ops[2]), self.u(ops[3])
+        if m.group(1) == 'subrev':
+            x, y = y, x
+        cin = '(%s & 1u)' % self.u(ops[4]) if m.group(2) else '0u'
+        if m.group(1) == 'add':
+            self.emit('a = %s; w = a + %s + %s;' % (x, y, cin))
+            carry = '((%s != 0u ? w <= a : w < a) ? 1u : 0u)' % cin
+        else:
+            self.emit('a = %s; w = a - %s - %s;' % (x, y, cin))
+            carry = '((%s != 0u ? w >= a : w > a) ? 1u : 0u)' % cin
+        dst = ops[1]
+        if dst.startswith('vcc'):
+            dst = 'vcc'
+        else:
+            r = reg_range(dst)
+            if not r or r[0] != 's':
+                raise Unsupported('%s carry to %s' % (base, dst))
+            dst = 's%d' % r[1]
+        self.write_compare(False, dst, carry)
+        self.set_v(reg_range(ops[0])[1], 'w')
+
     def op_v_mbcnt_lo_u32_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'x2w_mbcnt_lo(%s, lane) + %s' % (self.u(ops[1]), self.u(ops[2])))
 
@@ -412,6 +755,14 @@ class MeshStage(G.Stage):
             # (`wbase` = the wave's first thread: the same in every lane of a wave, so not lane-tainted)
             self.set_s(dst[1], '(gid * %du + wbase)' % GROUP)
             return None
+        shadow = self.shadow.get(src[1])
+        read_mask = ALL_LANES if self.exec_known else self.exec_static
+        if shadow and read_mask:
+            first = (read_mask & -read_mask).bit_length() - 1
+            if (shadow[1] >> first) & 1:
+                # the first active lane wrote this wave-uniform value: every thread takes it from the shadow
+                self.set_s(dst[1], shadow[0])
+                return None
         # A source that is the same in every active lane: each active lane's own value is the first active lane's
         # (the result is then active-uniform itself, through emit).
         if self.lane_dependent('v%d' % src[1]):
@@ -420,16 +771,21 @@ class MeshStage(G.Stage):
             # legal), that lane is the wave's first thread: broadcast through groupshared memory.
             if not self.exec_known or self.pc < self.divergent_until:
                 raise Unsupported('v_readfirstlane_b32 of a lane-dependent v%d with lanes off at %#x' % (src[1], self.pc))
+            # The group barrier is a phase boundary of the body (see body()): the read starts the next block, so
+            # that block must not also be entered by a branch.
+            nxt = self.next_offset()
+            if nxt in self.branch_targets():
+                raise Unsupported('v_readfirstlane_b32 broadcast followed by a branch target at %#x' % self.pc)
             slot = self.broadcasts
             self.broadcasts += 1
             self.emit('if (lane == 0u) x2w_rfl[%d][wave] = %s;' % (slot, self.u(ops[1])))
-            self.lines.append('GroupMemoryBarrierWithGroupSync();')
             self.sym.pop(dst[1], None)
             self.used_s.add(dst[1])
-            self.lines.append('s%d = x2w_rfl[%d][wave];' % (dst[1], slot))
+            self.pending.append('s%d = x2w_rfl[%d][wave];' % (dst[1], slot))
             self.tainted.discard('s%d' % dst[1])
             self.au.pop('s%d' % dst[1], None)
-            return None
+            self.lds_written_in_phase = False
+            return ('barrier',)
         self.set_s(dst[1], self.u(ops[1]))
         if self.is_tainted('v%d' % src[1]):
             self.au_scalars[dst[1]] = self.epoch
@@ -528,6 +884,12 @@ class MeshStage(G.Stage):
         return None
 
 
+for _op in ('add', 'sub', 'subrev'):
+    for _ci in ('', '_ci'):
+        _name = 'v_%s_co%s_u32' % (_op, _ci)
+        setattr(MeshStage, 'op_' + _name, lambda self, ops, mods, _n=_name: self.carry_op(_n, ops, mods))
+
+
 class MeshPipeline(G.Pipeline):
     """Mesh + pixel pipeline. ps_code None: the mesh stage alone (coverage runs; params = what it exports)."""
 
@@ -577,7 +939,9 @@ class MeshPipeline(G.Pipeline):
                 ['RWByteAddressBuffer x2w_dump : register(u0);'] if dump else []) + [
                 'groupshared uint x2w_alloc;'] + (
                 ['groupshared uint x2w_rfl[%d][2];  // v_readfirstlane broadcasts, one slot per instruction' % s.broadcasts]
-                if s.broadcasts else []) + [
+                if s.broadcasts else []) + (
+                ['groupshared uint x2w_lds[%d];  // LDS (ds_read / ds_write), dword addressed' % LDS_DWORDS]
+                if s.lds_used else []) + [
                 '[outputtopology("triangle")]',
                 '[numthreads(%d, 1, 1)]' % GROUP,
                 'void main(uint tid : SV_GroupIndex, uint3 group : SV_GroupID,',
