@@ -174,6 +174,103 @@ void report(ULONGLONG second) noexcept
     x2w_local::logf("%s", line);
 }
 
+// LOCAL memcut: X2W_MEM_CENSUS_CLASSES=1 adds an "x2w-mem census-classes" line at each census second:
+// committed private memory outside the startup blocks by page protection (4 = read/write, 404 = write-
+// combined: the driver's CPU views of GPU allocations and upload heaps), how much of it is resident
+// (working set), the mapped views (slabs) with their residency, and the allocations that are new since
+// the previous census. Residency is sampled: one page per 64 KiB (title pages are 64 KiB), times 64 KiB.
+// Answers: do the desktop GPU copies also occupy RAM, and which allocations keep growing (memcut NOTES).
+struct CensusRegion { ULONG_PTR start, base; ULONGLONG bytes; DWORD protect; bool mapped; };
+bool census_classes_on() noexcept
+{
+    static const bool on = [] {
+        char v[4]{};
+        return GetEnvironmentVariableA("X2W_MEM_CENSUS_CLASSES", v, sizeof(v)) && v[0] == '1';
+    }();
+    return on;
+}
+// Resident bytes of [start, start + bytes), one sample per 64 KiB (the whole range when smaller).
+ULONGLONG sampled_resident(ULONG_PTR start, ULONGLONG bytes, std::vector<PSAPI_WORKING_SET_EX_INFORMATION>& info)
+{
+    constexpr ULONGLONG stride = 65536;
+    const ULONGLONG samples = bytes <= stride ? 1 : (bytes + stride - 1) / stride;
+    const ULONGLONG weight = bytes <= stride ? bytes : stride;
+    ULONGLONG valid = 0;
+    for (ULONGLONG done = 0; done < samples;) {
+        const ULONGLONG n = std::min<ULONGLONG>(info.size(), samples - done);
+        for (ULONGLONG i = 0; i < n; ++i) info[i].VirtualAddress = reinterpret_cast<void*>(start + (done + i) * stride);
+        if (!QueryWorkingSetEx(GetCurrentProcess(), info.data(), static_cast<DWORD>(n * sizeof(info[0])))) break;
+        for (ULONGLONG i = 0; i < n; ++i) valid += info[i].VirtualAttributes.Valid;
+        done += n;
+    }
+    return std::min(bytes, valid * weight);
+}
+void census_classes(ULONGLONG second, const std::vector<CensusRegion>& regions) noexcept
+{
+    try {
+        const ULONGLONG began = GetTickCount64();
+        static std::vector<ULONG_PTR> previous;  // allocation bases at the last census (reporter thread only)
+        const bool first = previous.empty();
+        std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(16384);
+        // reservations: the stand-in's reserved ranges (size, not commit), where the title's pages are mapped
+        enum { p4, p404, other, mapped, reservations, classes };
+        const char* const names[classes] = {"p4", "p404", "other", "mapped", "stand-in reservations"};
+        ULONGLONG committed[classes]{}, resident[classes]{}, count[classes]{};
+        ULONGLONG fresh_committed[classes]{}, fresh_resident[classes]{}, fresh_count[classes]{};
+        struct Fresh { ULONG_PTR base; ULONGLONG committed, resident; DWORD protect; };
+        std::vector<Fresh> fresh;
+        std::vector<ULONG_PTR> bases;
+        for (const CensusRegion& r : regions) {
+            const int c = r.mapped ? (r.protect ? mapped : reservations) : (r.protect & ~0x100u) == PAGE_READWRITE ? p4
+                        : (r.protect & ~0x100u) == (PAGE_READWRITE | PAGE_WRITECOMBINE) ? p404 : other;
+            const ULONGLONG res = sampled_resident(r.start, r.bytes, info);
+            const bool new_base = !std::binary_search(previous.begin(), previous.end(), r.base);
+            committed[c] += r.bytes;
+            resident[c] += res;
+            if (bases.empty() || bases.back() != r.base) {
+                bases.push_back(r.base);
+                ++count[c];
+                if (new_base) ++fresh_count[c];
+            }
+            if (!new_base || first) continue;
+            fresh_committed[c] += r.bytes;
+            fresh_resident[c] += res;
+            if (!fresh.empty() && fresh.back().base == r.base) {
+                fresh.back().committed += r.bytes;
+                fresh.back().resident += res;
+            } else {
+                fresh.push_back({r.base, r.bytes, res, r.protect});
+            }
+        }
+        std::sort(bases.begin(), bases.end());
+        bases.erase(std::unique(bases.begin(), bases.end()), bases.end());
+        previous.swap(bases);
+        char line[1500];
+        int n = std::snprintf(line, sizeof(line), "x2w-mem census-classes %llu s: outside startup blocks, committed/resident MiB (allocations):",
+                              second);
+        if (n < 0) return;
+        for (int c = 0; c < classes; ++c)
+            n = append(line, n, sizeof(line), " %s %llu/%llu (%llu)", names[c], committed[c] / mib, resident[c] / mib, count[c]);
+        if (first) {
+            n = append(line, n, sizeof(line), "; first census: nothing to compare");
+        } else {
+            n = append(line, n, sizeof(line), "; new since the last census:");
+            for (int c = 0; c < classes; ++c)
+                n = append(line, n, sizeof(line), " %s %llu/%llu (%llu)", names[c], fresh_committed[c] / mib, fresh_resident[c] / mib,
+                           fresh_count[c]);
+            std::sort(fresh.begin(), fresh.end(), [](const Fresh& a, const Fresh& b) { return a.committed > b.committed; });
+            n = append(line, n, sizeof(line), "; largest new:");
+            for (std::size_t i = 0; i < fresh.size() && i < 12; ++i)
+                n = append(line, n, sizeof(line), " %p:%llu/%llu p%lx", reinterpret_cast<void*>(fresh[i].base), fresh[i].committed / mib,
+                           fresh[i].resident / mib, fresh[i].protect);
+        }
+        n = append(line, n, sizeof(line), " (%llu ms)", GetTickCount64() - began);
+        x2w_local::logf("%s", line);
+    } catch (...) {
+        // out of memory while counting: no line this time
+    }
+}
+
 // A VirtualQuery walk outside the stand-in's page reservations: private committed bytes by kind
 // and the largest private allocations. Bounded to a few seconds.
 void census(ULONGLONG second) noexcept
@@ -198,6 +295,8 @@ void census(ULONGLONG second) noexcept
     ULONGLONG blocks_bytes = 0, private_bytes = 0, image_charged = 0, mapped_bytes = 0, skipped_bytes = 0;
     ULONGLONG buckets[5]{}, bucket_counts[5]{};  // <1 MiB, <16, <256, <1024, >=1024 MiB
     ULONGLONG queries = 0;
+    const bool classes_on = census_classes_on();  // LOCAL memcut
+    std::vector<CensusRegion> regions;
     Allocation current{0, 0, 0, 0};
     auto close = [&] {
         if (!current.base || !current.committed) return;
@@ -229,6 +328,8 @@ void census(ULONGLONG second) noexcept
         ULONG_PTR end = reinterpret_cast<ULONG_PTR>(info.BaseAddress) + info.RegionSize;
         if (next_skip < skip.size() && end > skip[next_skip].first) end = skip[next_skip].first;  // the part before a reservation
         const ULONGLONG bytes = end - at;
+        if (info.State == MEM_COMMIT && classes_on && (info.Type == MEM_PRIVATE || info.Type == MEM_MAPPED) && !in_block(at))
+            regions.push_back({at, reinterpret_cast<ULONG_PTR>(info.AllocationBase), bytes, info.Protect, info.Type == MEM_MAPPED});  // LOCAL memcut
         if (info.State == MEM_COMMIT) {
             if (info.Type == MEM_PRIVATE) {
                 private_bytes += bytes;
@@ -275,6 +376,11 @@ void census(ULONGLONG second) noexcept
     n = block_resident_text(line, n, sizeof(line));  // LOCAL memcut
     n = append(line, n, sizeof(line), " (%llu ms)", GetTickCount64() - walk);
     x2w_local::logf("%s", line);
+    if (classes_on) {  // LOCAL memcut
+        // The stand-in reservations (title pages are mapped there) as one class: base = the reservation.
+        for (const auto& [start, end] : skip) regions.push_back({start, start, end - start, 0, true});
+        census_classes(second, regions);
+    }
 }
 
 DWORD WINAPI reporter(void*)
