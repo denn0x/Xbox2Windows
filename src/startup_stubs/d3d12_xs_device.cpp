@@ -21,6 +21,7 @@
 #include <tuple>
 #include <d3d12.h>
 #include "startup_stubs/logical_view_table.h"
+#include "startup_stubs/placed_pool.h"
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
@@ -3746,9 +3747,14 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     if (FAILED(hr)) {
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
         copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &copy, initial_state,
-                                                      nullptr, IID_PPV_ARGS(&resource));
-        placement = "not aliased";
+        static x2w_startup::PlacedPool pool;  // LOCAL: X2W_D3D12_PLACED_POOL=1 (placed_pool.h)
+        hr = pool.create(device_of(self), copy, initial_state, &resource);
+        placement = "not aliased pooled";
+        if (FAILED(hr)) {
+            hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &copy, initial_state,
+                                                          nullptr, IID_PPV_ARGS(&resource));
+            placement = "not aliased";
+        }
     }
     create_time.stop();
     TimedPart log_time(time_placed_log);
