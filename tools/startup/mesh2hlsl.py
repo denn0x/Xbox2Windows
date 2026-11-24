@@ -1483,6 +1483,7 @@ class MeshPipeline(G.Pipeline):
         self.vs_out_cntl = None
         self.packed_position_vgpr = None
         self.ps_input_layout = None
+        self.quad_ops = True  # the pixel stage compiles with dxc ps_6_0: DPP quad reads (gfx2hlsl Stage.quad_dpp)
         self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False

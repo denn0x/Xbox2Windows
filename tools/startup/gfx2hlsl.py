@@ -221,6 +221,8 @@ class Stage:
         if tok == 'src_scc':
             # SCC read as a 32-bit operand (0 or 1)
             return '(scc ? 1u : 0u)'
+        if tok in getattr(self, 'dpp_names', ()):
+            return tok  # the quad-read source of a DPP instruction (quad_dpp)
         r = reg_range(tok)
         if r:
             if r[0] == 'v':
@@ -482,6 +484,7 @@ class Stage:
         if self.lines:
             self.blocks.append((start, self.lines, None))
         self.check_scc(scc_written, scc_unknown)
+        self.check_quad_ops()
 
     def check_scc(self, written, unknown):
         """Refuse when an SCC value the translation does not compute can be read.
@@ -537,6 +540,8 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
+        if base.endswith('_dpp'):
+            return self.quad_dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
         if handler:
             return handler(ops, mods)
@@ -578,6 +583,80 @@ class Stage:
         if base in SCA:
             return self.scalar(base, ops)
         raise Unsupported(base)
+
+    # DPP16 quad permutations in a pixel stage: src0 is read from lane perm[lane & 3] of the lane's 2x2 quad, the
+    # rest of the instruction is the plain VOP1/VOP2 operation. LLVM AMDGPUModifierSyntax.md: quad_perm is a "full
+    # permute of 4 threads"; fi:1 "fetch pre-existing values from inactive lanes"; bound_ctrl only acts on invalid
+    # lanes, which a quad permutation never names. Quad lane 1 is +x and lane 2 is +y (Mesa ACO
+    # aco_select_nir_intrinsics.cpp: ddx_coarse = v_subrev_f32 with quad_perm(0,0,0,0) then v_mov_b32
+    # quad_perm(1,1,1,1), ddy_coarse with (2,2,2,2)), the order of D3D QuadReadLaneAt (0 top-left, 1 top-right,
+    # 2 bottom-left, 3 bottom-right). The HLSL quad reads need SM 6.0 (the mesh pipelines' dxc ps_6_0, which sets
+    # pipe.quad_ops; draws compile with fxc ps_5_1 and refuse), and every lane of the quad must execute them:
+    # each read is its own statement outside the exec guard, and check_quad_ops refuses one that a lane can skip.
+    QUAD_READS = {(1, 0, 3, 2): 'QuadReadAcrossX({0})', (2, 3, 0, 1): 'QuadReadAcrossY({0})',
+                  (3, 2, 1, 0): 'QuadReadAcrossDiagonal({0})'}
+
+    def quad_dpp(self, base, ops, mods):
+        if self.kind != 'ps' or not getattr(self.pipe, 'quad_ops', False):
+            raise Unsupported('%s_dpp' % base)  # as before: no lane reads outside an SM 6.0 pixel stage
+        control = mods[0] if mods else 'no control'
+        m = re.fullmatch(r'quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\]', control)
+        if not m:
+            raise Unsupported('%s_dpp with %s (not a quad permutation)' % (base, control))
+        rest = set(mods[1:])
+        if len(rest) != len(mods) - 1 or not {'row_mask:0xf', 'bank_mask:0xf', 'fi:1'} <= rest \
+                or rest - {'row_mask:0xf', 'bank_mask:0xf', 'fi:1', 'bound_ctrl:1'}:
+            raise Unsupported('%s_dpp with %s' % (base, ' '.join(mods[1:])))
+        perm = tuple(int(x) for x in m.groups())
+        src = re.fullmatch(r'(-?\|?)(v\d+)(\|?)', ops[1]) if len(ops) > 1 else None
+        if not src:
+            raise Unsupported('%s_dpp source %s' % (base, ops[1] if len(ops) > 1 else None))
+        value = self.u(src.group(2))
+        if len(set(perm)) == 1:
+            expr = 'QuadReadLaneAt(%s, %du)' % (value, perm[0])
+        elif perm in self.QUAD_READS:
+            expr = self.QUAD_READS[perm].format(value)
+        else:
+            raise Unsupported('%s_dpp with %s' % (base, control))
+        names = self.__dict__.setdefault('dpp_names', [])
+        name = 'dpp%d' % len(names)
+        names.append(name)
+        self.__dict__.setdefault('dpp_at', []).append(self.pc)
+        self.emit('uint %s = %s;' % (name, expr))
+        return self.one(base, '%s %s' % (base, ', '.join([ops[0], src.group(1) + name + src.group(3)] + ops[2:])))
+
+    def check_quad_ops(self):
+        """Refuse a quad read (quad_dpp) that some lane of the HLSL may not execute: the program has a loop (the
+        dispatch loop lets lanes reach a block in different iterations), or a path from the entry to the end
+        avoids the instruction (a per-lane branch around it)."""
+        at = getattr(self, 'dpp_at', ())
+        if not at:
+            return
+        info = {off: (name, asm) for off, n, name, asm in self.ins}
+        order = [ins[0] for ins in self.ins]
+        following = dict(zip(order, order[1:]))
+        def successors(off):
+            name, asm = info[off]
+            if name == 's_endpgm':
+                return []
+            nxt = [] if name == 's_branch' else [following[off]] if off in following else []
+            if name.startswith('s_cbranch') or name == 's_branch':
+                nxt.append(int(parse(asm)[1][0].split('_')[1], 16))
+            return [o for o in nxt if o in info]
+        for off in order:
+            if any(t <= off for t in successors(off) if t != following.get(off)):
+                raise Unsupported('quad read (DPP) at %#x in a program with a loop (branch at %#x)' % (at[0], off))
+        for target in at:
+            seen, todo = set(), [order[0]]
+            while todo:
+                off = todo.pop()
+                if off in seen or off == target:
+                    continue
+                seen.add(off)
+                nxt = successors(off)
+                if not nxt:
+                    raise Unsupported('quad read (DPP) at %#x is skipped on a path to %#x' % (target, off))
+                todo.extend(nxt)
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged;
