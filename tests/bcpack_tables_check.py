@@ -42,7 +42,12 @@ def extract_array(text: str, name: str):
 class BCPackTablesCheck(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.text = strip_comments(HEADER.read_text(encoding="utf-8"))
+        content = HEADER.read_text(encoding="utf-8")
+        inl = ROOT / "src" / "startup_stubs" / "bcpack_tables_bcn.inl"
+        # The BC3/BC4/BC5 tables are included by bcpack_decoder.h inside the same namespace.
+        if inl.exists():
+            content += "\n" + inl.read_text(encoding="utf-8")
+        cls.text = strip_comments(content)
 
     def test_rans_model_tables(self):
         for name in ("BASE_TABLE", "FREQ_TABLE", "RF_TABLE", "RN_TABLE", "RS_TABLE"):
@@ -136,6 +141,25 @@ class BCPackTablesCheck(unittest.TestCase):
         window_json = json.loads((REF_DATA / "bc1_window.json").read_text(encoding="utf-8"))["slots"]
         expected_window = [[0] * 6 if e is None else e["value"] for e in window_json]
         self.assertEqual(extract_array(self.text, "BC1_WINDOW"), expected_window)
+
+        # BC4 checks
+        bc4_json = json.loads((REF_DATA / "bc4.json").read_text(encoding="utf-8"))
+        self.assertEqual(extract_array(self.text, "RANK_PAIR_BC4"), bc4_json["pairs"])
+        expected_bc4_dict = [[e["ep"], e["ix"]] for e in bc4_json["dictionary"]]
+        self.assertEqual(extract_array(self.text, "BC4_DICTIONARY"), expected_bc4_dict)
+
+        # BC5 checks
+        bc5_json = json.loads((REF_DATA / "bc5.json").read_text(encoding="utf-8"))
+        self.assertEqual(extract_array(self.text, "RANK_PAIR_BC5"), bc5_json["pairs"])
+        expected_bc5_dict = [[e["ep"], e["ix"]] for e in bc5_json["dictionary"]]
+        self.assertEqual(extract_array(self.text, "BC5_DICTIONARY"), expected_bc5_dict)
+
+        # BC3 checks
+        bc3_json = json.loads((REF_DATA / "bc3.json").read_text(encoding="utf-8"))
+        self.assertEqual(extract_array(self.text, "RANK_PAIR_BC3_ALPHA"), bc3_json["pairs"])
+        self.assertEqual(extract_array(self.text, "RANK_QUAD_BC3_COLOUR"), bc3_json["quads"])
+        expected_bc3_dict = [[e["ep"], e["ix"]] for e in bc3_json["dictionary"]]
+        self.assertEqual(extract_array(self.text, "BC3_DICTIONARY"), expected_bc3_dict)
 
 
 if __name__ == "__main__":
