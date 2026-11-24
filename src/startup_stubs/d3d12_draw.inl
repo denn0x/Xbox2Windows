@@ -510,23 +510,37 @@ ManifestWatch& manifest_watch() { static ManifestWatch w; return w; }
 std::unordered_map<const Translation*, volatile LONG>& manifest_seen() { static std::unordered_map<const Translation*, volatile LONG> m; return m; }
 bool manifest_poll() { static const bool on = x2w_local::env_on("X2W_MANIFEST_POLL"); return on; }
 
-// Marks a missing translation as seen. name: a file name from a change notification (only that key
-// matches), or null for a full scan (one attribute query per missing key).
-void manifest_check(const wchar_t* name)
+// Marks a missing translation as seen. name: a file name from a change record (only that key matches),
+// or null for a full scan: one enumeration of <dir>\*.txt (one open, however many keys are missing;
+// run 91 had 150 distinct missing keys).
+void manifest_check(const wchar_t* dir, const wchar_t* name)
 {
     std::vector<std::pair<Translation*, std::string>> look;
     AcquireSRWLockShared(&manifest_watch().lock);
     look = manifest_watch().missing;
     ReleaseSRWLockShared(&manifest_watch().lock);
+    if (look.empty() || (!name && !dir[0])) return;
+    std::unordered_set<std::wstring> present;
+    if (!name) {
+        std::wstring pattern = std::wstring(dir) + L"\\*.txt";
+        WIN32_FIND_DATAW found{};
+        const HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &found, FindExSearchNameMatch, nullptr,
+                                             FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) return;
+        do {
+            std::wstring file(found.cFileName);
+            for (wchar_t& c : file) c = static_cast<wchar_t>(towlower(c));
+            present.insert(std::move(file));
+        } while (FindNextFileW(find, &found));
+        FindClose(find);
+    }
     for (const auto& [tr, request] : look) {
         wchar_t path[MAX_PATH];
         if (!cache_path(path, L"", tr->key, L".txt")) continue;
-        if (name) {
-            const wchar_t* slash = std::wcsrchr(path, L'\\');
-            if (_wcsicmp(slash ? slash + 1 : path, name) != 0) continue;
-        } else if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
-            continue;
-        }
+        const wchar_t* slash = std::wcsrchr(path, L'\\');
+        std::wstring file(slash ? slash + 1 : path);
+        for (wchar_t& c : file) c = static_cast<wchar_t>(towlower(c));
+        if (name ? _wcsicmp(file.c_str(), name) != 0 : !present.count(file)) continue;
         AcquireSRWLockExclusive(&manifest_watch().lock);
         auto& m = manifest_watch().missing;
         m.erase(std::remove_if(m.begin(), m.end(), [&](const auto& e) { return e.first == tr; }), m.end());
@@ -539,7 +553,7 @@ void manifest_check(const wchar_t* name)
 DWORD WINAPI manifest_watcher(void*)
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    wchar_t dir[MAX_PATH];
+    wchar_t dir[MAX_PATH] = L"";
     HANDLE handle = INVALID_HANDLE_VALUE;
     if (cache_path(dir, L"", 0, L".txt")) {
         if (wchar_t* slash = std::wcsrchr(dir, L'\\')) *slash = 0;
@@ -547,31 +561,32 @@ DWORD WINAPI manifest_watcher(void*)
                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
     }
     log("x2w-draw manifest watcher: %s", handle != INVALID_HANDLE_VALUE ? "directory change records" : "30 s rescans");
-    manifest_check(nullptr);  // a manifest published before the watch started
     alignas(DWORD) static unsigned char buffer[64 * 1024];
     OVERLAPPED overlapped{};
     overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     bool pending = false;
+    bool scan = true;  // first pass: a manifest published before the watch started
     for (;;) {
         // File names only: the stand-in itself writes req_* files here; a manifest is published by rename
-        // or creation, both name changes, and the record names the file, so no query is needed.
+        // or creation, both name changes, and the record names the file, so no query is needed. The read
+        // is armed before any scan, so a file named during the scan is still recorded.
         if (!pending && handle != INVALID_HANDLE_VALUE && overlapped.hEvent) {
             ResetEvent(overlapped.hEvent);
             pending = ReadDirectoryChangesW(handle, buffer, sizeof(buffer), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME, nullptr,
                                             &overlapped, nullptr) != FALSE;
         }
+        if (scan) manifest_check(dir, nullptr);
+        scan = true;
         // 30 s rescan: a manifest published between a failed open and its registration has no record.
-        if (!pending || WaitForSingleObject(overlapped.hEvent, 30000) != WAIT_OBJECT_0) {
-            if (!pending) Sleep(30000);
-            manifest_check(nullptr);
+        if (!pending) {
+            Sleep(30000);
             continue;
         }
+        if (WaitForSingleObject(overlapped.hEvent, 30000) != WAIT_OBJECT_0) continue;
         pending = false;
         DWORD bytes = 0;
-        if (!GetOverlappedResult(handle, &overlapped, &bytes, FALSE) || bytes == 0) {  // overflow: names lost
-            manifest_check(nullptr);
-            continue;
-        }
+        if (!GetOverlappedResult(handle, &overlapped, &bytes, FALSE) || bytes == 0) continue;  // overflow: names lost
+        scan = false;
         for (DWORD at = 0;;) {
             const auto* record = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer + at);
             if (record->Action == FILE_ACTION_ADDED || record->Action == FILE_ACTION_RENAMED_NEW_NAME) {
@@ -580,7 +595,7 @@ DWORD WINAPI manifest_watcher(void*)
                 if (chars < MAX_PATH) {
                     std::wmemcpy(name, record->FileName, chars);
                     name[chars] = 0;
-                    if (chars > 4 && _wcsicmp(name + chars - 4, L".txt") == 0) manifest_check(name);
+                    if (chars > 4 && _wcsicmp(name + chars - 4, L".txt") == 0) manifest_check(dir, name);
                 }
             }
             if (!record->NextEntryOffset) break;
