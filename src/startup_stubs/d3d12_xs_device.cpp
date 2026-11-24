@@ -3093,12 +3093,21 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
         return;
     }
     // The translated vertex shaders read their fetch table through root parameter 0.
-    if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
+    const bool real_drawn = list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1);
+    if (real_drawn) {
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
         const LONG n = InterlockedIncrement(&render_draws);
         if (x2w_local::first_of(n, 3)) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
         InterlockedIncrement(&render_draws_skipped);
+    }
+    // LOCAL (scene): the desktop-pipeline path in a traced frame, so no draw of the frame goes unlogged.
+    if (trace_frame_active) {
+        note_traced_target(self, pass.target0, real_drawn);
+        const D3D12_RESOURCE_DESC rd = pass.target0 ? pass.target0->GetDesc() : D3D12_RESOURCE_DESC{};
+        log("x2w-frame draw %u %s target %p %llux%u fmt %d topology 0x%x desktop pipeline%s", vertices, real_drawn ? "drawn" : "NOT drawn",
+            static_cast<void*>(pass.target0), static_cast<unsigned long long>(rd.Width), rd.Height, rd.Format, pass.topology,
+            real_drawn ? "" : !list ? ": not recording" : !pass.pipeline_real ? ": no pipeline" : ": state (targets/topology/srv 0)");
     }
 }
 
