@@ -16,7 +16,7 @@ struct RawKey {
     std::vector<ra::Seed> seeds;
     std::vector<u64> learned;  // addresses missed by earlier dispatches (page start), at most 4
     UINT slot = 0;             // statistics slot in rawaddr_stats
-    LONG dispatches = 0, resolved = 0, unresolved = 0, skipped = 0, shown = 0;
+    LONG dispatches = 0, resolved = 0, unresolved = 0, overflow = 0, skipped = 0, shown = 0;
     LONG reported_dispatches = 0;
     std::uint32_t seen_misses = 0;
 };
@@ -129,8 +129,9 @@ bool rawaddr_pipeline(u64 key, Wrapper* root, Wrapper* pipeline)
     return true;
 }
 
-// The largest span [address, address + span) (64 KiB .. X2W_RAWADDR_SPAN_MIB, default 16 MiB) contiguous in
-// one desktop window.
+// The largest span [address, address + span) contiguous in one desktop window, up to X2W_RAWADDR_SPAN_MIB
+// (default 16 MiB), to 64 KiB granularity: the cap, then quarters until one fits, then a binary search
+// between that span and the failing one above it. At least the 4 KiB page, else unresolved.
 bool rawaddr_region(u64 address, ra::Region* region, ID3D12Resource** window)
 {
     static const u64 cap = [] {
@@ -139,19 +140,37 @@ bool rawaddr_region(u64 address, ra::Region* region, ID3D12Resource** window)
         const unsigned long mib = n && n < sizeof(text) ? std::strtoul(text, nullptr, 10) : 0;
         return u64{mib >= 1 && mib <= 192 ? mib : 16} << 20;
     }();
+    u64 offset = 0, good = 0, bad = 0;
+    ID3D12Resource* w = nullptr;
     for (u64 span = cap; span >= 0x10000; span >>= 2) {
-        u64 offset = 0;
-        if (desktop_range(address, span, window, &offset)) {
-            *region = ra::make_region(address, span, offset);
-            return true;
+        if (desktop_range(address, span, &w, &offset)) {
+            good = span;
+            break;
         }
+        bad = span;
     }
-    u64 offset = 0;
-    if (desktop_range(address, 0x1000, window, &offset)) {  // at least the page
+    if (!good) {
+        if (!desktop_range(address, 0x1000, &w, &offset)) return false;  // at least the page
+        *window = w;
         *region = ra::make_region(address, 0x1000, offset);
         return true;
     }
-    return false;
+    u64 good_offset = offset;
+    ID3D12Resource* good_window = w;
+    while (bad && bad - good > 0x10000) {
+        const u64 mid = (good + (bad - good) / 2) & ~0xffffull;
+        if (mid <= good) break;
+        if (desktop_range(address, mid, &w, &offset)) {
+            good = mid;
+            good_offset = offset;
+            good_window = w;
+        } else {
+            bad = mid;
+        }
+    }
+    *window = good_window;
+    *region = ra::make_region(address, good, good_offset);
+    return true;
 }
 
 // execute_dispatch hook: runs the dispatch when the bound pipeline is a raw-address pipeline. False when
@@ -175,8 +194,8 @@ bool rawaddr_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UI
         }
     }
     // learned seeds: addresses this key missed before (statistics slot, written by the GPU)
-    rawaddr_ensure_stats();
     AcquireSRWLockExclusive(&rawaddr_lock);
+    rawaddr_ensure_stats();  // lists record on several threads: created under the lock
     if (rawaddr_stats_words) {
         const volatile std::uint32_t* s = rawaddr_stats_words + key.slot * (ra::kStatsBytes / 4);
         const std::uint32_t misses = s[0];
@@ -193,18 +212,25 @@ bool rawaddr_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UI
     // seeds -> regions: root constants first, then learned, then root descriptors
     ra::Region regions[ra::kRegions]{};
     ID3D12Resource* windows[ra::kRegions] = {};
-    UINT count = 0, resolved = 0, unresolved = 0;
+    UINT count = 0, resolved = 0, unresolved = 0, overflow = 0;
+    std::vector<u64> forget;  // learned addresses that do not resolve: dropped so they free their place
     const bool show = InterlockedIncrement(&key.shown) <= 2;
     auto add = [&](u64 address, const char* what) {
-        if (!address || count >= ra::kRegions) return;
+        if (!address) return;
         for (UINT k = 0; k < count; ++k)
             if (ra::region_contains(regions[k], address)) return;
+        if (count >= ra::kRegions) {
+            ++overflow;
+            if (show) log("x2w-rawaddr   %016llx seed %s 0x%llx -> DROPPED (table full)", key.key, what, address);
+            return;
+        }
         if (rawaddr_region(address, &regions[count], &windows[count])) {
             ++resolved;
             if (show) log("x2w-rawaddr   %016llx seed %s 0x%llx -> region %u, %u bytes", key.key, what, address, count, regions[count].size);
             ++count;
         } else {
             ++unresolved;
+            if (what[0] == 'l') forget.push_back(address);
             if (show) log("x2w-rawaddr   %016llx seed %s 0x%llx -> UNRESOLVED", key.key, what, address);
         }
     };
@@ -215,6 +241,12 @@ bool rawaddr_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UI
         if (s.kind == ra::SeedKind::rootdesc) add(ra::seed_address(s, pass.compute_kind, pass.compute_constants, pass.compute_address), "rootdesc");
     InterlockedExchangeAdd(&key.resolved, static_cast<LONG>(resolved));
     InterlockedExchangeAdd(&key.unresolved, static_cast<LONG>(unresolved));
+    InterlockedExchangeAdd(&key.overflow, static_cast<LONG>(overflow));
+    if (!forget.empty()) {
+        AcquireSRWLockExclusive(&rawaddr_lock);
+        for (u64 a : forget) key.learned.erase(std::remove(key.learned.begin(), key.learned.end(), a), key.learned.end());
+        ReleaseSRWLockExclusive(&rawaddr_lock);
+    }
     std::uint32_t table[ra::kTableDwords];
     ra::fill_table(regions, count, table);
 
@@ -278,8 +310,8 @@ void rawaddr_report()
         const LONG d = k->dispatches;
         if (d == k->reported_dispatches) continue;
         const std::uint32_t misses = rawaddr_stats_words ? rawaddr_stats_words[k->slot * (ra::kStatsBytes / 4)] : 0;
-        log("x2w-rawaddr %016llx: dispatches %ld (+%ld), seeds resolved %ld unresolved %ld, gpu misses %u%s, learned %zu, skipped %ld",
-            id, d, d - k->reported_dispatches, k->resolved, k->unresolved, misses, rawaddr_stats_words ? "" : " (not counted)",
+        log("x2w-rawaddr %016llx: dispatches %ld (+%ld), seeds resolved %ld unresolved %ld dropped %ld, gpu misses %u%s, learned %zu, skipped %ld",
+            id, d, d - k->reported_dispatches, k->resolved, k->unresolved, k->overflow, misses, rawaddr_stats_words ? "" : " (not counted)",
             k->learned.size(), k->skipped);
         k->reported_dispatches = d;
     }
