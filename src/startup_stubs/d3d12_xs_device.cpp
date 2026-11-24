@@ -141,6 +141,84 @@ struct DescriptorRange {
 SRWLOCK descriptor_lock = SRWLOCK_INIT;
 std::vector<DescriptorRange> descriptor_ranges;
 
+// LOCAL (video): X2W_NOOP_CENSUS=1 counts the calls of every unimplemented (no-op) slot per object
+// kind, and logs the first calls whose register or stack arguments (or the first 64 bytes they point
+// to, for the first 64 calls of each slot) hold a descriptor handle inside a title heap. A console
+// "create view" or "write descriptors" entry point would show up here with handles into the main heap.
+// One census line per 4096 no-op calls (at most 60).
+LONG64 noop_census[16][512];
+LONG64 noop_census_total;
+bool noop_census_on()
+{
+    static const bool on = [] {
+        char value[4]{};
+        return GetEnvironmentVariableA("X2W_NOOP_CENSUS", value, sizeof(value)) && value[0] == '1';
+    }();
+    return on;
+}
+void log(const char* format, ...);
+bool first_calls(LONG& counter, LONG limit);
+bool noop_census_enabled()
+{
+    static const bool on = [] {
+        if (noop_census_on()) log("x2w-noop-census on: counting no-op slot calls and descriptor handles in their arguments");
+        return noop_census_on();
+    }();
+    return on;
+}
+bool noop_census_heap_index(std::uint64_t value, std::uint64_t* index, bool* desktop)
+{
+    bool found = false;
+    AcquireSRWLockShared(&descriptor_lock);
+    for (const auto& r : descriptor_ranges) {
+        if (value >= r.title && value < r.title + r.bytes && r.title_stride) {
+            *index = (value - r.title) / r.title_stride;
+            *desktop = false;
+            found = true;
+            break;
+        }
+        if (r.desktop && r.desktop_stride && value >= r.desktop && value < r.desktop + r.desktop_descriptors * r.desktop_stride) {
+            *index = (value - r.desktop) / r.desktop_stride;
+            *desktop = true;
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&descriptor_lock);
+    return found;
+}
+void noop_census_note(int kind, int slot, const std::uint64_t* args, std::uint64_t ret)
+{
+    const LONG64 calls = InterlockedIncrement64(&noop_census[kind & 15][slot & 511]);
+    const LONG64 total = InterlockedIncrement64(&noop_census_total);
+    static const char* const names[8] = {"rcx", "rdx", "r8", "r9", "s0", "s1", "s2", "s3"};
+    static LONG hits;
+    for (int i = 1; i < 8 && hits < 64; ++i) {
+        std::uint64_t index = 0;
+        bool desktop = false;
+        if (noop_census_heap_index(args[i], &index, &desktop) && first_calls(hits, 64))
+            log("x2w-noop-census %s::slot%d call %lld: %s=0x%llx is %s descriptor index 0x%llx; ret=+0x%llx", kind_names[kind], slot, calls,
+                names[i], args[i], desktop ? "a DESKTOP" : "a title", index, ret);
+        if (calls > 64 || args[i] < 0x10000) continue;
+        std::uint64_t words[8]{};
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(args[i]), words, sizeof(words), &got) || got != sizeof(words)) continue;
+        for (int w = 0; w < 8 && hits < 64; ++w)
+            if (noop_census_heap_index(words[w], &index, &desktop) && first_calls(hits, 64))
+                log("x2w-noop-census %s::slot%d call %lld: [%s+0x%x]=0x%llx is %s descriptor index 0x%llx; ret=+0x%llx", kind_names[kind], slot, calls,
+                    names[i], w * 8, words[w], desktop ? "a DESKTOP" : "a title", index, ret);
+    }
+    static LONG reports;
+    if ((total & 4095) == 0 && first_calls(reports, 60)) {
+        char text[1024];
+        int at = std::snprintf(text, sizeof(text), "x2w-noop-census after %lld no-op calls:", total);
+        for (int k = 0; k < kind_count && at < 960; ++k)
+            for (int s = 0; s < 512 && at < 960; ++s)
+                if (noop_census[k][s]) at += std::snprintf(text + at, sizeof(text) - at, " %s::%d=%lld", kind_names[k], s, noop_census[k][s]);
+        log("%s", text);
+    }
+}
+
 // Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: the
 // API documents 1,048,576, but a driver may accept fewer (1,000,000 on the GTX 1660 SUPER here), so
 // the accepted maximum is measured once and cached rather than assumed.
@@ -598,6 +676,10 @@ __declspec(noinline) u64 noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64
             arg_kind(r8), r9, *arg_kind(r9) ? ":" : "", arg_kind(r9), s0, s1, s2, s3, ret);
     }
     if (K == list_kind && list_typed[N]) return list_typed[N](rcx, rdx, r8, r9, s0, s1, s2, s3);
+    if (noop_census_enabled()) {
+        const u64 args[8] = {rcx, rdx, r8, r9, s0, s1, s2, s3};
+        noop_census_note(K, N, args, reinterpret_cast<u64>(_ReturnAddress()) - reinterpret_cast<u64>(GetModuleHandleW(nullptr)));
+    }
     // Register arguments only: stale caller stack words often still point at an IID. The probe
     // costs over a millisecond per call in this process (memory queries), so only the first calls
     // of each slot are checked.
@@ -629,6 +711,10 @@ template <int N>
 __declspec(noinline) u64 device_noop_slot(u64 rcx, u64 rdx, u64 r8, u64 r9, u64 s0, u64 s1, u64 s2, u64 s3)
 {
     Timed timed(time_device_noop);
+    if (noop_census_enabled()) {
+        const u64 args[8] = {rcx, rdx, r8, r9, s0, s1, s2, s3};
+        noop_census_note(device_kind, N, args, reinterpret_cast<u64>(_ReturnAddress()) - reinterpret_cast<u64>(GetModuleHandleW(nullptr)));
+    }
     static LONG shape_checks;
     if (shape_checks < 32 && InterlockedIncrement(&shape_checks) <= 32 && create_shaped(rdx, r8, r9, s0, s1, s2, s3)) {
         char name[64];
