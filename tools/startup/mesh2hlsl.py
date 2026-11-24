@@ -24,7 +24,10 @@ Cross-lane facts the one-lane model cannot see are checked and refused (Unsuppor
   * a per-lane branch (execz/execnz/vccz/vccnz) is taken per lane; that equals the wave-level branch only when
     no scalar register written in the skipped range is read after it, and, for vcc, when vcc is uniform over the
     active lanes (`exec & uniform`);
-  * a branch on an SCC that depends on lane masks is refused (the hardware reads the whole mask).
+  * a branch on an SCC that depends on lane masks (the hardware sets SCC from the whole 64-bit result) is taken
+    per lane only when that SCC is the same in every active lane and every running thread is an active lane;
+    otherwise the wave's SCC is published through groupshared memory and a group barrier (MeshStage.lane_scc),
+    or the program is refused where a barrier cannot be placed (X2W_MESH_LANE_SCC=0 refuses all of them).
 LDS, DPP, permlane, readlane/writelane are not lowered (refused by the base translator).
 """
 import os
@@ -99,6 +102,20 @@ MESH_HELPERS = {
 MESH_FEATURES = frozenset(f for f in os.environ.get('X2W_MESH_FEATURES', '').replace(' ', '').split(',') if f)
 if MESH_FEATURES - {'heapwords'}:
     raise SystemExit('X2W_MESH_FEATURES: unknown %s' % ', '.join(sorted(MESH_FEATURES - {'heapwords'})))
+# Lane-mask SCC (wave "any lane" value through groupshared memory, MeshStage.lane_scc): on unless
+# X2W_MESH_LANE_SCC=0. X2W_MESH_TEST_DROP=publish|restore (TESTS ONLY, negative controls) leaves out the wave
+# publish of such an SCC / the restore of hit scalars after a group-uniform execz range: both give wrong results.
+LANE_SCC = os.environ.get('X2W_MESH_LANE_SCC', '1') != '0'
+TEST_DROP = frozenset(os.environ.get('X2W_MESH_TEST_DROP', '').replace(' ', '').split(',')) - {''}
+
+
+class LaneScc(Unsupported):
+    """A branch on an SCC computed from lane masks; `origins` = offsets of the SALU mask instructions it comes from
+    (MeshPipeline translates again with those publishing the wave's value)."""
+
+    def __init__(self, text, origins):
+        super().__init__(text)
+        self.origins = origins
 
 
 def scalar_regs(text):
@@ -174,6 +191,11 @@ class MeshStage(G.Stage):
         self.shadow = {}             # VGPR -> (unguarded variable, exec mask at the write); straight-line code only
         self.shadow_vars = []
         self.pending = []            # statements that start the next block (after a broadcast barrier)
+        self.scc_from = {}           # register -> offsets of lane-mask SCC definitions its value derives from
+        self.scc_any = []            # lane-mask SCCs published per wave (offsets): x2w_sany[k][wave]
+        self.join_from = {}          # branch target -> scc_from union over the branches to it
+        self.fell_off = False        # the previous instruction does not fall through (jump, end)
+        self.running_active = False  # inside a per-lane execz range, no exec write since: running threads = active lanes
         self.lds_used = False
         self.lds_written_in_phase = False
         super().__init__(pipe, 'ms', code)
@@ -191,6 +213,7 @@ class MeshStage(G.Stage):
         self.wave_any = []           # group-uniform execz branches (offsets): x2w_any[k][wave] = some lane active
         self.group_restore = {}      # range end -> statements restoring hit scalars in a wave that had no lane on
         self.group_checks = {}       # range end -> (register, symbolic value before the range, branch offset)
+        self.uniform_skips = set()   # offsets of the inserted group-uniform skip blocks
         result = super().translate()
         # A group-uniform branch block ends in a barrier (the lanes publish their exec bit); the block after it
         # skips the range when no lane of the group was active (group_branch).
@@ -200,6 +223,7 @@ class MeshStage(G.Stage):
                 k = b[2][2]
                 blocks.append((b[0], self.group_restore.get(b[0], []) + b[1], ('barrier',)))
                 blocks.append((b[0] + 0.5, [], ('branch', '(x2w_any[%d][0] | x2w_any[%d][1]) == 0u' % (k, k), b[2][3])))
+                self.uniform_skips.add(b[0] + 0.5)
             elif b[0] in self.group_restore:
                 blocks.append((b[0], self.group_restore[b[0]] + b[1], b[2]))
             else:
@@ -258,6 +282,9 @@ class MeshStage(G.Stage):
                 ind = '        '
             for k, i in enumerate(members):
                 off, lines, term = self.blocks[i]
+                if loop and term and term[0] in ('jump', 'branch') and self.phase_of.get(goto(term[-1])) != phase:
+                    # (a group-uniform skip into a later phase: the loop would spin on that pc until its guard)
+                    raise Unsupported('jump from a looping phase into another phase at %#x' % int(off))
                 out.append('%s%sif (pc == %d) {' % (ind, 'else ' if loop and k else '', i))
                 out += [ind + '    ' + line for line in lines]
                 last = i + 1 >= len(self.blocks)
@@ -286,6 +313,26 @@ class MeshStage(G.Stage):
         blocks = self.blocks
         index = {b[0]: i for i, b in enumerate(blocks)}
         memo = {}
+        cmemo = {}
+
+        def console(i, depth=0):
+            """Sorted counts of console barriers (not lane-mask SCC publishes) from block i to the end."""
+            if i in cmemo:
+                return cmemo[i]
+            if depth > 10000:
+                raise Unsupported('block graph too deep')
+            cmemo[i] = ()
+            off, lines, term = blocks[i]
+            here = 1 if term and term[0] == 'barrier' and term[1:2] != ('lane-scc',) else 0
+            nxt = [i + 1] if (term is None or term[0] in ('barrier', 'branch')) and i + 1 < len(blocks) else []
+            if term and term[0] in ('jump', 'branch'):
+                if term[0] == 'jump':
+                    nxt = []
+                if term[-1] > off:
+                    nxt.append(index[term[-1]])
+            got = sorted({here + c for k in nxt for c in console(k, depth + 1)}) if nxt else [here]
+            cmemo[i] = tuple(got)
+            return cmemo[i]
 
         def counts(i, depth=0):
             if i in memo:
@@ -294,6 +341,20 @@ class MeshStage(G.Stage):
                 raise Unsupported('block graph too deep')
             off, lines, term = blocks[i]
             here = 1 if term and term[0] == 'barrier' else 0
+            if off in self.uniform_skips:
+                # group-uniform skip of an execz range (group_branch): every thread of the group goes the same
+                # way, so the skip may jump over barriers inside the range (body() runs the target in its later
+                # phase; the threads still pass every phase barrier in between, doing nothing)
+                through, skip = counts(i + 1, depth + 1), counts(index[term[-1]], depth + 1)
+                if len(through) != 1 or len(skip) != 1 or min(skip) > min(through):
+                    raise Unsupported('group-uniform execz range at %#x: barrier counts %s / %s'
+                                      % (int(off), sorted(through), sorted(skip)))
+                # only barriers this translation added (lane-mask SCC publishes) may be skipped: a console
+                # s_barrier inside the range would be skipped by a wave without active lanes on the hardware
+                if console(i + 1) != console(index[term[-1]]):
+                    raise Unsupported('s_barrier inside a group-uniform execz range at %#x' % int(off))
+                memo[i] = through
+                return through
             nxt = []
             if term is None or term[0] in ('barrier', 'branch'):
                 if i + 1 < len(blocks):
@@ -367,6 +428,13 @@ class MeshStage(G.Stage):
             deps = set(TOKEN.findall(expr))
             if stmt.strip().startswith('if (exec & 1)'):
                 deps.add('exec')
+            origins = frozenset().union(*(self.scc_from.get(d, ()) for d in deps))
+            if stmt.strip().startswith('if '):
+                origins |= self.scc_from.get(target, frozenset())   # a guarded write keeps the old value elsewhere
+            if origins:
+                self.scc_from[target] = origins
+            else:
+                self.scc_from.pop(target, None)
             if target == 'exec':
                 narrow = expr.startswith('(exec & ') or getattr(self, '_known_at_start', True)
                 if not narrow:
@@ -394,6 +462,30 @@ class MeshStage(G.Stage):
 
     # ---- instructions --------------------------------------------------------------------------
     def one(self, name, asm):
+        """one_body, plus the lane-mask SCC provenance (scc_from) carried along branch edges: the scan is linear,
+        so a branch target gets the union of the states at the branches to it (and at its fall-through when the
+        previous instruction falls through). Backward edges are not followed (a missed origin only refuses)."""
+        if self.pc in self.join_from:
+            saved = self.join_from.pop(self.pc)
+            if self.fell_off:
+                self.scc_from = dict(saved)
+            else:
+                for k, v in saved.items():
+                    self.scc_from[k] = self.scc_from.get(k, frozenset()) | v
+        term = self.one_body(name, asm)
+        self.fell_off = bool(term) and term[0] in ('jump', 'end')
+        target = None
+        if term and term[0] in ('jump', 'branch'):
+            target = term[-1]
+        elif term and term[0] == 'barrier' and len(term) > 3:
+            target = term[3]      # group-uniform execz: the skip edge
+        if target is not None and target > self.pc:
+            into = self.join_from.setdefault(target, {})
+            for k, v in self.scc_from.items():
+                into[k] = into.get(k, frozenset()) | v
+        return term
+
+    def one_body(self, name, asm):
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
         if self.pending:
@@ -404,6 +496,8 @@ class MeshStage(G.Stage):
                 raise Unsupported('execz range %#x-%#x changes s%d from %s to %s' % (at, self.pc, r, before[0], self.sym.get(r)))
         if self.pc in self.branch_targets():
             self.shadow.clear()      # another path may arrive here without the shadow assignments
+        if self.pc >= self.divergent_until or self.pc in self.loop_heads():
+            self.running_active = False
         if self.pc in self.loop_heads():
             # the linear scan reaches a loop head with the state from before the loop; a later iteration can
             # arrive with any exec
@@ -452,6 +546,7 @@ class MeshStage(G.Stage):
         # translator only updates the mask set in its ALU paths, so a load into a former mask register kept
         # the mark and a later s_or of it was cut to bit 0).
         reads, writes, _, _ = reads_writes(name, asm)
+        masks_before = set(self.masks)
         self.masks -= writes
         if base == 's_sendmsg' or 'm0' in ops[1:]:
             reads = reads | {'m0'}
@@ -481,6 +576,14 @@ class MeshStage(G.Stage):
         if not self._static_set and (self.exec_written(name, ops) or
                                      any(re.search(r'\bexec = ', l) for l in self.lines[before:])):
             self.exec_static = None   # exec changed in a way not modelled as a constant mask
+        if self.exec_written(name, ops) or any(re.search(r'\bexec = ', l) for l in self.lines[before:]):
+            self.running_active = False   # threads with exec 0 may run on from here
+        if self.mask_scc(base, ops, masks_before, self.lines[before:]):
+            self.scc_from['scc'] = frozenset([self.pc])
+            if self.pc in getattr(self.pipe, 'scc_publish', ()):
+                if term is not None:
+                    raise Unsupported('lane-mask SCC at %#x ends a block' % self.pc)
+                return self.lane_scc()
         if term and term[0] == 'branch':
             cond = term[1]
             off = self.pc
@@ -488,7 +591,16 @@ class MeshStage(G.Stage):
             per_lane = base[10:] in ('execz', 'execnz', 'vccz', 'vccnz')
             lane_cond = self.is_tainted(cond)
             if base[10:] in ('scc0', 'scc1') and lane_cond:
-                raise Unsupported('branch on an SCC that depends on lane masks at %#x' % off)
+                tokens = TOKEN.findall(cond)
+                if (LANE_SCC and not any(self.lane_dependent(t) for t in tokens)
+                        and (self.exec_known or self.running_active)):
+                    # SCC the same in every active lane (e.g. `vcc & exec` with vcc from a uniform compare), and
+                    # every thread that runs here is an active lane (all lanes on, or right inside a per-lane
+                    # skipped range with no exec write since): each thread's SCC is the wave's, so the per-lane
+                    # branch is the wave's branch
+                    return term
+                origins = frozenset().union(*(self.scc_from.get(d, ()) for d in tokens))
+                raise LaneScc('branch on an SCC that depends on lane masks at %#x' % off, origins)
             if per_lane and lane_cond:
                 if target <= off:
                     raise Unsupported('per-lane loop branch %s at %#x' % (base, off))
@@ -500,6 +612,10 @@ class MeshStage(G.Stage):
                     return self.group_branch(off, target)
                 self.check_skipped_scalars(off, target)
                 self.divergent_until = max(self.divergent_until, target)
+                if base == 's_cbranch_execz':
+                    self.running_active = True   # the threads that go on are exactly the active lanes
+                elif base[10:] in ('execnz', 'vccnz'):
+                    self.running_active = False  # the threads that go on may be inactive lanes
         return term
 
     def group_branch(self, off, target):
@@ -547,8 +663,57 @@ class MeshStage(G.Stage):
             self.emit('%s = 1u;' % seen)
             restore.append('%s = 0u;' % seen)
         self.emit('if (exec & 1) x2w_any[%d][wave] = 1u;' % k)
-        self.group_restore.setdefault(target, []).extend(restore)
+        if 'restore' not in TEST_DROP:
+            self.group_restore.setdefault(target, []).extend(restore)
         return ('barrier', 'wave-branch', k, target)
+
+    MASK_OPS = ('and', 'or', 'xor', 'andn2', 'orn2', 'nand', 'nor', 'xnor', 'not')
+
+    def mask_scc(self, base, ops, masks_before, lines):
+        """The SALU instruction just translated set SCC from a lane mask, lane-dependently: SCC = (64-bit result
+        != 0) is one bit for the whole wave (RDNA 2 ISA: S_AND_B64 etc. "SCC = (D != 0)"; S_*_SAVEEXEC_B64
+        "SCC = (EXEC != 0)"), while the one-lane model computed it from this lane's bit only."""
+        if not base.startswith('s_') or not any(re.search(r'\bscc = ', l) for l in lines):
+            return False
+        if 'scc' not in self.tainted:
+            return False
+        if 'saveexec' in base or 'wrexec' in base:
+            return True
+        if base.split('_')[1] not in self.MASK_OPS:
+            return False
+        for t in ops[1:]:
+            r = reg_range(t)
+            if t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or (r and r[0] == 's' and r[1] in masks_before):
+                return True
+        return False
+
+    def lane_scc(self):
+        """Publish the wave's SCC of a lane-mask instruction: every thread whose bit of the result is set marks
+        x2w_sany[k][wave], a group barrier follows (a phase boundary, as the readfirstlane broadcast), and the next
+        block starts with scc = the wave's value, which is then the same in every lane of the wave (not tainted).
+        Inactive lanes take part with their own bits: in a group-uniform execz range they run with exec 0, so a
+        result masked with exec has 0 there, as on the hardware. Every thread of the group must reach the barrier:
+        refused inside a per-lane skipped range, before a branch target, and (barrier_count) inside loops or on one
+        side of a branch only."""
+        if self.pc < self.divergent_until:
+            raise Unsupported('lane-mask SCC at %#x inside a per-lane skipped range' % self.pc)
+        if self.pending:
+            raise Unsupported('lane-mask SCC at %#x right after a broadcast' % self.pc)
+        if self.next_offset() in self.branch_targets():
+            raise Unsupported('lane-mask SCC at %#x followed by a branch target' % self.pc)
+        self.scc_from.pop('scc', None)
+        self.tainted.discard('scc')
+        self.au.pop('scc', None)
+        if 'publish' in TEST_DROP:
+            return None            # negative control: the lane's own bit is taken as the wave's SCC
+        k = len(self.scc_any)
+        if 2 * (k + 1) > GROUP:
+            raise Unsupported('more than %d lane-mask SCCs (the slots are cleared by one thread each)' % (GROUP // 2))
+        self.scc_any.append(self.pc)
+        self.lines.append('if (scc) x2w_sany[%d][wave] = 1u;' % k)
+        self.pending.append('scc = x2w_sany[%d][wave] != 0u;' % k)
+        self.lds_written_in_phase = False
+        return ('barrier', 'lane-scc')
 
     @staticmethod
     def exec_written(name, ops):
@@ -1260,6 +1425,20 @@ class MeshPipeline(G.Pipeline):
         # First user SGPR: s16 for the run programs (measured, real roots). Archive programs (offline, synthesized
         # root) may start at s8: callers pass entry_sgpr(code) together with synth_root(code).
         self.user_sgpr = user_sgpr
+        # Lane-mask SCCs to publish per wave: found by translating, refusing at the branch with the offsets of the
+        # mask instructions the SCC comes from (LaneScc), and translating again with those published.
+        self.scc_publish = frozenset()
+        for _ in range(8):
+            try:
+                self.build(ms_code, ps_code, sampler_heap, rtv_formats)
+                return
+            except LaneScc as refusal:
+                if not LANE_SCC or not refusal.origins or refusal.origins <= self.scc_publish:
+                    raise Unsupported(str(refusal))
+                self.scc_publish |= refusal.origins
+        raise Unsupported('lane-mask SCC: no fixed point after 8 translations')
+
+    def build(self, ms_code, ps_code, sampler_heap, rtv_formats):
         # Fields of G.Pipeline.__init__ (which this does not call: it builds a vertex stage) that newer base
         # translators read. The draw lowerings (manifest `heap 1`, `udsrc bufword3`, `uav`) are named in
         # X2W_DRAW_FEATURES as for draws (pstrans gfx2hlsl.draw_features); a base without them keeps refusing.
@@ -1323,7 +1502,9 @@ class MeshPipeline(G.Pipeline):
                 ['groupshared uint x2w_lds[%d];  // LDS (ds_read / ds_write), dword addressed' % LDS_DWORDS]
                 if s.lds_used else []) + (
                 ['groupshared uint x2w_any[%d][2];  // wave-level execz branches: some lane of the wave active'
-                 % len(s.wave_any)] if s.wave_any else []) + [
+                 % len(s.wave_any)] if s.wave_any else []) + (
+                ['groupshared uint x2w_sany[%d][2];  // lane-mask SCCs: some lane of the wave has its result bit set'
+                 % len(s.scc_any)] if s.scc_any else []) + [
                 '[outputtopology("triangle")]',
                 '[numthreads(%d, 1, 1)]' % GROUP,
                 'void main(uint tid : SV_GroupIndex, uint3 group : SV_GroupID,',
@@ -1331,7 +1512,8 @@ class MeshPipeline(G.Pipeline):
                 % (MAX_VERTICES, MAX_PRIMITIVES, MAX_PRIMITIVES),
                 '    uint gid = group.x, lane = tid & 63u, wave = tid >> 6, wbase = tid & ~63u;',
                 '    if (tid == 0) x2w_alloc = 0;'] + (
-                ['    if (tid < %du) x2w_any[tid >> 1][tid & 1u] = 0u;' % (2 * len(s.wave_any))] if s.wave_any else []) + [
+                ['    if (tid < %du) x2w_any[tid >> 1][tid & 1u] = 0u;' % (2 * len(s.wave_any))] if s.wave_any else []) + (
+                ['    if (tid < %du) x2w_sany[tid >> 1][tid & 1u] = 0u;' % (2 * len(s.scc_any))] if s.scc_any else []) + [
                 '    GroupMemoryBarrierWithGroupSync();',
                 '    MSOut o = (MSOut)0;',
                 '    uint x2w_prim = 0x80000000u;']
