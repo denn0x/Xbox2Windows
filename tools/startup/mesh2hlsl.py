@@ -109,6 +109,9 @@ LANE_SCC = os.environ.get('X2W_MESH_LANE_SCC', '1') != '0'
 TEST_DROP = frozenset(os.environ.get('X2W_MESH_TEST_DROP', '').replace(' ', '').split(',')) - {''}
 # Lane taint merged at joins of forward edges (MeshStage.merge): on unless X2W_MESH_JOIN_TAINT=0 (the linear scan).
 JOIN_TAINT = os.environ.get('X2W_MESH_JOIN_TAINT', '1') != '0'
+# The per-lane shortcut for an active-uniform lane-mask SCC with lanes off needs a mask result confined to the
+# active lanes (MeshStage.one_body): on unless X2W_MESH_CONFINED_SCC=0 (tests only: the unrestricted shortcut).
+CONFINED_SCC = os.environ.get('X2W_MESH_CONFINED_SCC', '1') != '0'
 
 
 class LaneScc(Unsupported):
@@ -198,6 +201,7 @@ class MeshStage(G.Stage):
         self.join_from = {}          # branch target -> scc_from union over the branches to it
         self.fell_off = False        # the previous instruction does not fall through (jump, end)
         self.running_active = False  # inside a per-lane execz range, no exec write since: running threads = active lanes
+        self.scc_confined = set()    # lane-mask SCC offsets whose mask result is inside the active lanes (`x & exec`)
         self.lds_used = False
         self.lds_written_in_phase = False
         super().__init__(pipe, 'ms', code)
@@ -580,12 +584,22 @@ class MeshStage(G.Stage):
             self.exec_static = None   # exec changed in a way not modelled as a constant mask
         if self.exec_written(name, ops) or any(re.search(r'\bexec = ', l) for l in self.lines[before:]):
             self.running_active = False   # threads with exec 0 may run on from here
+        mask_read = any(t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or (reg_range(t) and reg_range(t)[0] == 's' and
+                                                                          reg_range(t)[1] in masks_before)
+                        for t in ops[1:])
         if self.mask_scc(base, ops, masks_before, self.lines[before:]):
             self.scc_from['scc'] = frozenset([self.pc])
+            if re.match(r's_and_b(32|64)$', base) and ('exec' in ops[1:] or 'exec_lo' in ops[1:]):
+                self.scc_confined.add(self.pc)   # result inside the active lanes (see the per-lane shortcut below)
             if self.pc in getattr(self.pipe, 'scc_publish', ()):
                 if term is not None:
                     raise Unsupported('lane-mask SCC at %#x ends a block' % self.pc)
                 return self.lane_scc()
+        elif (base.startswith('s_') and mask_read and 'scc' in self.tainted
+              and any(re.search(r'\bscc = ', l) for l in self.lines[before:])):
+            # SCC of a non-mask SALU op on a lane mask (e.g. s_lshl_b32 of vcc_lo): the one-lane bit has no
+            # per-wave rule here (an OR of the threads' results is not the op on the 64-bit mask): origin -(pc+1)
+            self.scc_from['scc'] = frozenset([-(self.pc + 1)])
         if term and term[0] == 'branch':
             cond = term[1]
             off = self.pc
@@ -594,14 +608,17 @@ class MeshStage(G.Stage):
             lane_cond = self.is_tainted(cond)
             if base[10:] in ('scc0', 'scc1') and lane_cond:
                 tokens = TOKEN.findall(cond)
+                origins = frozenset().union(*(self.scc_from.get(d, ()) for d in tokens))
+                # with lanes off, a lane-mask SCC is the active lanes' value only when its mask result was confined
+                # to them (`x & exec`): `saved & ~exec` has 0 in every active lane and the wave's SCC is 1
+                confined = self.exec_known or origins <= self.scc_confined or not CONFINED_SCC
                 if (LANE_SCC and not any(self.lane_dependent(t) for t in tokens)
-                        and (self.exec_known or self.running_active)):
+                        and (self.exec_known or self.running_active) and confined):
                     # SCC the same in every active lane (e.g. `vcc & exec` with vcc from a uniform compare), and
                     # every thread that runs here is an active lane (all lanes on, or right inside a per-lane
                     # skipped range with no exec write since): each thread's SCC is the wave's, so the per-lane
                     # branch is the wave's branch
                     return term
-                origins = frozenset().union(*(self.scc_from.get(d, ()) for d in tokens))
                 raise LaneScc('branch on an SCC that depends on lane masks at %#x' % off, origins)
             if per_lane and lane_cond:
                 if target <= off:
@@ -1470,6 +1487,9 @@ class MeshPipeline(G.Pipeline):
             except LaneScc as refusal:
                 if not LANE_SCC or not refusal.origins or refusal.origins <= self.scc_publish:
                     raise Unsupported(str(refusal))
+                if min(refusal.origins) < 0:
+                    raise Unsupported('%s (through a non-mask op on a lane mask at %#x)'
+                                      % (refusal, -min(refusal.origins) - 1))
                 self.scc_publish |= refusal.origins
         raise Unsupported('lane-mask SCC: no fixed point after 8 translations')
 

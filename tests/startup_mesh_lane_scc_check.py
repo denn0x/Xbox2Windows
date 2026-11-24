@@ -182,6 +182,19 @@ UNIFORM_B = PROLOGUE + [
 # would carry into the other side (the join merge takes the state of the vccz branch instead).
 # N = 40 + 60 * (g & 1), T = 30 * (g & 3). Expected param0.x: lanes v0 < N of a wave with a lane v0 < min(N, T):
 # 60; every other lane 5. (g = 2: wave 1 has no lane in the range; g = 3: wave 1 lanes 64..99 get 60.)
+# Program D: inside a per-lane execz range, an SCC from a saved exec copy and NOT exec (`s_andn2_b64 s, saved,
+# exec`): the active lanes' own bits are all 0, the wave's SCC is 1 when the wave has a lane outside the range. Not
+# an active-uniform SCC: it must be published. Expected param0.x: lanes v0 < N of a wave with a lane v0 >= N: 60;
+# every other lane 5 (g even: lanes 0..39; g odd: lanes 64..99).
+ANDN2_D = PROLOGUE + [
+    ('v_mov_b32_e32 v1, 5', lambda: ins('vop1', 'v_mov_b32_e32', d=1, s0='5')),
+    ('s_mov_b64 s[8:9], exec', lambda: ins('sop1', 's_mov_b64', d=8, s0='exec_lo')),
+    ('v_cmpx_gt_u32_e32 s21, v0', lambda: ins('vopc', 'v_cmpx_gt_u32_e32', s0='s21', s1='v0')),
+    ('s_cbranch_execz AFTER', 'execz'),
+    ('s_andn2_b64 s[12:13], s[8:9], exec', lambda: ins('sop2', 's_andn2_b64', d=12, s0='s8', s1='exec_lo')),
+    ('s_cbranch_scc0 AFTER', 'scc0'),
+    ('v_mov_b32_e32 v1, 60', lambda: ins('vop1', 'v_mov_b32_e32', d=1, s0='60')),
+] + EPILOGUE
 PROLOGUE_C = PROLOGUE[:-1] + [
     ('s_mul_i32 s22, s22, 30', lambda: ins('sop2', 's_mul_i32', d=22, s0='s22', s1='30')),
 ]
@@ -292,6 +305,8 @@ def translate(env):
     e = dict(os.environ)
     e.pop('X2W_MESH_LANE_SCC', None)
     e.pop('X2W_MESH_TEST_DROP', None)
+    e.pop('X2W_MESH_JOIN_TAINT', None)
+    e.pop('X2W_MESH_CONFINED_SCC', None)
     e.update(env)
     r = subprocess.run([sys.executable, '-B', '-c', child, BIN], capture_output=True, text=True, env=e)
     if r.returncode:
@@ -359,6 +374,20 @@ def main():
     check('C negative control: X2W_MESH_JOIN_TAINT=0 (linear taint) translates WITHOUT the publish',
           lin.startswith('OK') and 'x2w_sany' not in lin, lin[:200])
     print('program C written to %s (difftest also with X2W_MESH_TEST_DROP=publish: must FAIL)' % BIN)
+    # program D: an SCC of the inactive lanes' bits (saved exec & ~exec) is not active-uniform: published
+    code_d, texts_d = program(ANDN2_D)
+    BIN = os.path.join(out_dir, 'lane_scc_andn2.bin')
+    with open(BIN, 'wb') as f:
+        f.write(code_d)
+    got = decoded(code_d)
+    check('D decodes to the intended %d instructions' % len(texts_d), [t for _, t in got] == [t for _, t in texts_d],
+          ' | '.join('%x %s / %s' % (o, t, g) for (o, t), (_, g) in zip(texts_d, got) if t != g))
+    on = translate({})
+    check('D translates with the SCC published (not taken per lane)', on.startswith('OK') and 'x2w_sany' in on, on[:300])
+    loose = translate({'X2W_MESH_CONFINED_SCC': '0'})
+    check('D negative control: X2W_MESH_CONFINED_SCC=0 takes the branch per lane (no publish)',
+          loose.startswith('OK') and 'x2w_sany' not in loose, loose[:200])
+    print('program D written to %s (difftest also with X2W_MESH_CONFINED_SCC=0: must FAIL)' % BIN)
     if failures:
         print('%d check(s) failed' % len(failures))
         return 1
