@@ -7,6 +7,20 @@
 //            dump <bytes> | hits <bytes> | out <prefix>   -> writes <prefix>.dump, <prefix>.hits
 // Exit 77 (capability skip) when the adapter has no mesh shader support.
 //
+// Resource-heap programs (manifest `heap 1`, `heapwords 1`; gfx2hlsl HEAP_KINDS, RUNTIME_NEEDS.md 6.3) add:
+//   heapmem <file> | vinfo <file> | vdesc <file>   t0, t1, t2 in space1 (title heap memory with the X2WV token
+//                                                  + view id per 32-byte slot; 16 bytes per id; 32 bytes per id)
+//   blob <file>                                    bytes the view lines below point into
+//   hbuf <id> <offset> <bytes>                     raw buffer view of blob[offset, offset + bytes) (offset 16-aligned)
+//   htex1d <id> <dxgi> <width> <offset>            Texture1D of blob texels from offset, one level
+//   htex2d <id> <dxgi> <width> <height> <offset>   Texture2D, rows packed (width * texel bytes apart)
+// The three space1 buffers are bounded raw views in ONE descriptor table (the runtime binds them as root SRVs; a
+// root SRV has no bounds check, MESH.md 4.4). The view-id region is a second table: 8 + 8 * 90000 descriptors,
+// the five arrays t0 in spaces 2..6 (Texture2D, Texture2DArray, Texture3D, Texture1D, raw buffer) all start at
+// offset 0, as the runtime's create_draw_root (each array is indexed 8 + 8 * id + kind, so the kinds never meet).
+// Slots 0..7 (the empty views x2w_hix falls back to) and all kinds of every listed id hold null views; the
+// listed views overwrite theirs. The region range is DESCRIPTORS_VOLATILE: the slots of unlisted ids stay unset.
+//
 // Build (x64 Developer prompt): cl /nologo /EHsc /O2 /std:c++17 mesh_harness.cpp d3d12.lib dxgi.lib
 #include <windows.h>
 #include <d3d12.h>
@@ -117,6 +131,13 @@ int main(int argc, char** argv) {
     std::vector<UINT> consts;
     std::vector<std::string> srvs;
     UINT64 dump_bytes = 16, hits_bytes = 16;
+    std::string heap_files[3], blob_path;  // heapmem, vinfo, vdesc
+    struct HeapView {
+        UINT id = 0, kind = 4;  // gfx2hlsl HEAP_KINDS slot: 0 tex2d, 3 tex1d, 4 buf
+        UINT dxgi = 0, width = 0, height = 1;
+        UINT64 offset = 0, bytes = 0;
+    };
+    std::vector<HeapView> hviews;
     {
         std::ifstream cfg(argv[1]);
         std::string line;
@@ -132,8 +153,21 @@ int main(int argc, char** argv) {
             else if (key == "dump") s >> dump_bytes;
             else if (key == "hits") s >> hits_bytes;
             else if (key == "out") std::getline(s >> std::ws, out);
+            else if (key == "heapmem") std::getline(s >> std::ws, heap_files[0]);
+            else if (key == "vinfo") std::getline(s >> std::ws, heap_files[1]);
+            else if (key == "vdesc") std::getline(s >> std::ws, heap_files[2]);
+            else if (key == "blob") std::getline(s >> std::ws, blob_path);
+            else if (key == "hbuf") { HeapView v; s >> v.id >> v.offset >> v.bytes; hviews.push_back(v); }
+            else if (key == "htex1d") { HeapView v; v.kind = 3; s >> v.id >> v.dxgi >> v.width >> v.offset; hviews.push_back(v); }
+            else if (key == "htex2d") { HeapView v; v.kind = 0; s >> v.id >> v.dxgi >> v.width >> v.height >> v.offset; hviews.push_back(v); }
+            else if (!key.empty() && key[0] != '#') { std::fprintf(stderr, "cfg: unknown line '%s'\n", line.c_str()); return 2; }
         }
     }
+    const bool heap = !heap_files[0].empty();
+    if (heap && (heap_files[1].empty() || heap_files[2].empty())) { std::fprintf(stderr, "cfg: heapmem needs vinfo and vdesc\n"); return 2; }
+    constexpr UINT heap_ids = 90000, region_size = 8 + 8 * heap_ids;  // gfx2hlsl HEAP_IDS, array size 8 + 8 * HEAP_IDS
+    for (const auto& v : hviews)
+        if (v.id >= heap_ids || (v.kind == 4 && (v.offset & 15))) { std::fprintf(stderr, "cfg: bad view id %u / offset %llu\n", v.id, v.offset); return 2; }
     if (consts.empty()) consts.push_back(0);
 
     OSVERSIONINFOW os{sizeof(os)};
@@ -191,6 +225,32 @@ int main(int argc, char** argv) {
         q.DescriptorTable.pDescriptorRanges = &srv_range;
         params.push_back(q);
     }
+    // heap: t0..t2 space1 (bounded raw views) and the view-id region (spaces 2..6, overlaid at offset 0)
+    D3D12_DESCRIPTOR_RANGE1 space1_range{};
+    space1_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    space1_range.NumDescriptors = 3;
+    space1_range.RegisterSpace = 1;
+    space1_range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC;
+    D3D12_DESCRIPTOR_RANGE1 region_ranges[5]{};
+    for (UINT k = 0; k < 5; ++k) {
+        region_ranges[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        region_ranges[k].NumDescriptors = region_size;
+        region_ranges[k].RegisterSpace = 2 + k;
+        region_ranges[k].OffsetInDescriptorsFromTableStart = 0;
+        region_ranges[k].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+    }
+    UINT heap_param = 0;
+    if (heap) {
+        heap_param = (UINT)params.size();
+        D3D12_ROOT_PARAMETER1 q{};
+        q.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        q.DescriptorTable.NumDescriptorRanges = 1;
+        q.DescriptorTable.pDescriptorRanges = &space1_range;
+        params.push_back(q);
+        q.DescriptorTable.NumDescriptorRanges = 5;
+        q.DescriptorTable.pDescriptorRanges = region_ranges;
+        params.push_back(q);
+    }
     const UINT uav_param = (UINT)params.size();
     for (UINT i = 0; i < 2; ++i) {
         D3D12_ROOT_PARAMETER1 q{};
@@ -203,7 +263,10 @@ int main(int argc, char** argv) {
     rsd.Desc_1_1.NumParameters = (UINT)params.size();
     rsd.Desc_1_1.pParameters = params.data();
     Ref<ID3DBlob> rs_blob, rs_err;
-    CHECK(D3D12SerializeVersionedRootSignature(&rsd, &rs_blob, &rs_err));
+    if (FAILED(D3D12SerializeVersionedRootSignature(&rsd, &rs_blob, &rs_err))) {
+        std::fprintf(stderr, "root signature: %s\n", rs_err ? (const char*)rs_err->GetBufferPointer() : "?");
+        return 1;
+    }
     Ref<ID3D12RootSignature> root;
     CHECK(device->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&root)));
 
@@ -239,11 +302,108 @@ int main(int argc, char** argv) {
         std::memcpy(m, data.data(), data.size());
         srv_res[i]->Unmap(0, nullptr);
     }
+    // one shader-visible heap: [0, n) the srv table, then (heap) 3 space1 views, then the view-id region
+    const UINT n_srv = (UINT)srvs.size(), space1_at = n_srv, region_at = n_srv + 3;
+    const UINT heap_size = heap ? region_at + region_size : (n_srv ? n_srv : 1u);
     Ref<ID3D12DescriptorHeap> srv_heap;
-    D3D12_DESCRIPTOR_HEAP_DESC shd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, srvs.empty() ? 1u : (UINT)srvs.size(),
-                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    D3D12_DESCRIPTOR_HEAP_DESC shd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, heap_size, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     CHECK(device->CreateDescriptorHeap(&shd, IID_PPV_ARGS(&srv_heap)));
     UINT srv_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto cpu_at = [&](UINT i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T{i} * srv_step;
+        return h;
+    };
+    auto upload = [&](const std::vector<char>& data, UINT64 at_least, Ref<ID3D12Resource>& res) -> HRESULT {
+        auto d = buffer_desc(data.size() > at_least ? data.size() : at_least);
+        HRESULT hr = device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(&res));
+        if (FAILED(hr)) return hr;
+        void* m = nullptr;
+        if (FAILED(hr = res->Map(0, nullptr, &m))) return hr;
+        std::memset(m, 0, (size_t)d.Width);
+        if (!data.empty()) std::memcpy(m, data.data(), data.size());
+        res->Unmap(0, nullptr);
+        return S_OK;
+    };
+    auto raw_view = [&](ID3D12Resource* res, UINT64 offset, UINT64 bytes, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = DXGI_FORMAT_R32_TYPELESS;
+        v.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Buffer.FirstElement = offset / 4;
+        v.Buffer.NumElements = (UINT)(bytes / 4);
+        v.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        device->CreateShaderResourceView(v.Buffer.NumElements ? res : nullptr, &v, h);
+    };
+    auto null_view = [&](UINT kind, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        switch (kind) {
+        case 0: v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; v.Texture2D.MipLevels = 1; break;
+        case 1: v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; v.Texture2DArray.MipLevels = 1; v.Texture2DArray.ArraySize = 1; break;
+        case 2: v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D; v.Texture3D.MipLevels = 1; break;
+        case 3: v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D; v.Texture1D.MipLevels = 1; break;
+        default: raw_view(nullptr, 0, 0, h); return;
+        }
+        device->CreateShaderResourceView(nullptr, &v, h);
+    };
+    Ref<ID3D12Resource> heap_res[3], blob_res;
+    std::vector<Ref<ID3D12Resource>> tex_res(hviews.size()), tex_up(hviews.size());
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> tex_fp(hviews.size());
+    if (heap) {
+        // space1: exact sizes, so a load past the end reads 0 (heapmem: the title heap; vinfo 16 and vdesc 32 bytes per id)
+        const UINT64 min_bytes[3] = {16, 16ull * heap_ids, 32ull * heap_ids};
+        for (int i = 0; i < 3; ++i) {
+            auto data = read_file(heap_files[i]);
+            if (data.empty() && i == 0) { std::fprintf(stderr, "missing %s\n", heap_files[i].c_str()); return 1; }
+            CHECK(upload(data, min_bytes[i], heap_res[i]));
+            raw_view(heap_res[i], 0, data.size() > min_bytes[i] ? data.size() : min_bytes[i], cpu_at(space1_at + i));
+        }
+        auto blob = read_file(blob_path);
+        CHECK(upload(blob, 16, blob_res));
+        for (UINT k = 0; k < 8; ++k) null_view(k, cpu_at(region_at + k));
+        for (const auto& v : hviews)
+            for (UINT k = 0; k < 5; ++k) null_view(k, cpu_at(region_at + 8 + 8 * v.id + k));
+        UINT counts[5] = {};
+        for (size_t i = 0; i < hviews.size(); ++i) {
+            const auto& v = hviews[i];
+            const D3D12_CPU_DESCRIPTOR_HANDLE h = cpu_at(region_at + 8 + 8 * v.id + v.kind);
+            ++counts[v.kind];
+            if (v.kind == 4) {
+                if (v.offset + v.bytes > blob.size()) { std::fprintf(stderr, "hbuf %u past the blob\n", v.id); return 1; }
+                raw_view(blob_res, v.offset, v.bytes, h);
+                continue;
+            }
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = v.kind == 3 ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = v.width;
+            td.Height = v.kind == 3 ? 1 : v.height;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.Format = (DXGI_FORMAT)v.dxgi;
+            td.SampleDesc.Count = 1;
+            CHECK(device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&tex_res[i])));
+            UINT rows = 0;
+            UINT64 row_bytes = 0, total = 0;
+            device->GetCopyableFootprints(&td, 0, 1, 0, &tex_fp[i], &rows, &row_bytes, &total);
+            if (v.offset + row_bytes * rows > blob.size()) { std::fprintf(stderr, "htex %u past the blob\n", v.id); return 1; }
+            std::vector<char> staged((size_t)total);
+            for (UINT r = 0; r < rows; ++r)
+                std::memcpy(staged.data() + tex_fp[i].Offset + (size_t)r * tex_fp[i].Footprint.RowPitch, blob.data() + v.offset + r * row_bytes, (size_t)row_bytes);
+            CHECK(upload(staged, total, tex_up[i]));
+            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = td.Format;
+            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (v.kind == 3) { sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D; sv.Texture1D.MipLevels = 1; }
+            else { sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1; }
+            device->CreateShaderResourceView(tex_res[i], &sv, h);
+        }
+        std::printf("heap: heapmem %zu bytes, region %u descriptors at %u, views tex2d %u tex1d %u buf %u\n",
+                    read_file(heap_files[0]).size(), region_size, region_at, counts[0], counts[3], counts[4]);
+    }
     for (size_t i = 0; i < srvs.size(); ++i) {
         D3D12_SHADER_RESOURCE_VIEW_DESC v{};
         v.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -318,6 +478,15 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 2; ++i) list->CopyBufferRegion(uav[i], 0, zero, 0, buffer_desc(sizes[i]).Width);
     for (int i = 0; i < 2; ++i) b[i] = transition(uav[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->ResourceBarrier(2, b);
+    for (size_t i = 0; i < hviews.size(); ++i) {
+        if (!tex_res[i]) continue;
+        D3D12_TEXTURE_COPY_LOCATION dst{tex_res[i], D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, src{tex_up[i], D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        dst.SubresourceIndex = 0;
+        src.PlacedFootprint = tex_fp[i];
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER t = transition(tex_res[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(1, &t);
+    }
     const float clear[4] = {0, 0, 0, 0};
     list->ClearRenderTargetView(rtv, clear, 0, nullptr);
     list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -331,6 +500,13 @@ int main(int argc, char** argv) {
     ID3D12DescriptorHeap* heaps[] = {srv_heap};
     list->SetDescriptorHeaps(1, heaps);
     if (!srvs.empty()) list->SetGraphicsRootDescriptorTable(1, srv_heap->GetGPUDescriptorHandleForHeapStart());
+    if (heap) {
+        D3D12_GPU_DESCRIPTOR_HANDLE g = srv_heap->GetGPUDescriptorHandleForHeapStart();
+        g.ptr += UINT64{space1_at} * srv_step;
+        list->SetGraphicsRootDescriptorTable(heap_param, g);
+        g.ptr += UINT64{3} * srv_step;
+        list->SetGraphicsRootDescriptorTable(heap_param + 1, g);
+    }
     for (UINT i = 0; i < 2; ++i) list->SetGraphicsRootUnorderedAccessView(uav_param + i, uav[i]->GetGPUVirtualAddress());
     if (stats_ok) list->BeginQuery(qheap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS1, 0);
     list->DispatchMesh(groups, 1, 1);
