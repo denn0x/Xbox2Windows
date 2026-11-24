@@ -246,10 +246,14 @@ Wrapper* the_device;
 
 // Time spent inside the stand-in per entry-point family, reported with the heartbeat.
 enum { time_list, time_device_noop, time_forward, time_create, time_view, time_queue, time_present, time_wait,
-       time_pipeline, time_heap, time_copy, time_count };
+       time_pipeline, time_heap, time_copy, time_cx_fill_views, time_cx_desktop_range, time_cx_readable, time_cx_texture,
+       time_cx_execute, time_vquery, time_count };
 const char* const time_names[time_count] = {"list", "device-noop", "forward", "create", "view", "queue", "present", "wait",
-                                            "pipeline", "heap", "copy"};
+                                            "pipeline", "heap", "copy", "cx-fill-views", "cx-desktop-range", "cx-readable",
+                                            "cx-texture-view", "cx-execute", "vquery"};
 volatile LONG64 time_ticks[time_count], time_calls[time_count];
+struct Timed;
+SIZE_T timed_query(const void* address, MEMORY_BASIC_INFORMATION* info);  // VirtualQuery, timed as "vquery"
 volatile LONG64 list_slot_ticks[256], list_slot_calls[256];  // per command-list slot
 volatile LONG64 list_slot_census[256];  // per command-list slot, reported with the render totals
 struct Timed {
@@ -264,6 +268,12 @@ struct Timed {
         InterlockedIncrement64(&time_calls[category]);
     }
 };
+
+SIZE_T timed_query(const void* address, MEMORY_BASIC_INFORMATION* info)
+{
+    Timed timed(time_vquery);
+    return VirtualQuery(address, info, sizeof(*info));
+}
 
 void log(const char* format, ...)
 {
@@ -2051,6 +2061,7 @@ bool ring_copy(u64 title_address, std::size_t bytes, u64* offset)
 // Number of contiguous readable bytes at address, up to wanted.
 std::size_t readable_window(u64 address, std::size_t wanted)
 {
+    Timed timed(time_cx_readable);
     return x2w_local::probe_readable(static_cast<std::uintptr_t>(address), wanted);
 }
 
@@ -2647,7 +2658,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         if (!ready.empty()) {
             auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
             const UINT ready_count = static_cast<UINT>(ready.size());
-            AcquireSRWLockExclusive(&draw_lock);
+            AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(0 + __LINE__);
             if (draw_dump_frame()) {
                 const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
                 if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
@@ -3218,6 +3229,35 @@ HRESULT __stdcall device_frame_event(Wrapper*, UINT type, UINT offset_us, void* 
 // title address; nothing translates title GPU addresses yet. Textures trap.
 std::mutex placed_mutex;
 std::vector<std::pair<void*, ID3D12Heap*>> existing_heaps;
+// LOCAL: the address ranges of the private allocations opened as desktop heaps. A memory query
+// costs over a millisecond in this process (very many mapped sections); desktop_va and
+// desktop_range ask this table first and query the kernel only for addresses outside it.
+struct PrivateRange { u64 base, end; };
+SRWLOCK private_range_lock = SRWLOCK_INIT;
+std::vector<PrivateRange> private_ranges;
+void note_private_range(void* base, ID3D12Heap* heap)
+{
+    if (!base || !heap) return;
+    const u64 size = heap->GetDesc().SizeInBytes;
+    AcquireSRWLockExclusive(&private_range_lock);
+    private_ranges.push_back({reinterpret_cast<u64>(base), reinterpret_cast<u64>(base) + size});
+    ReleaseSRWLockExclusive(&private_range_lock);
+}
+// The allocation base and end of a private allocation opened as a heap that contains address.
+bool known_private(u64 address, u64* base, u64* end)
+{
+    bool found = false;
+    AcquireSRWLockShared(&private_range_lock);
+    for (const PrivateRange& r : private_ranges)
+        if (address >= r.base && address < r.end) {
+            *base = r.base;
+            *end = r.end;
+            found = true;
+            break;
+        }
+    ReleaseSRWLockShared(&private_range_lock);
+    return found;
+}
 ID3D12Heap* existing_heap(void* base)
 {
     std::lock_guard lock(placed_mutex);
@@ -3235,6 +3275,7 @@ ID3D12Heap* existing_heap(void* base)
         return nullptr;
     }
     existing_heaps.emplace_back(base, heap);
+    note_private_range(base, heap);
     return heap;
 }
 // LOCAL: title GPU address -> desktop GPU address. Title GPU memory is the title's own (CPU) memory.
@@ -3310,7 +3351,16 @@ D3D12_GPU_VIRTUAL_ADDRESS desktop_va(u64 address)
 {
     if (!address) return 0;
     MEMORY_BASIC_INFORMATION info{};
-    if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info) && info.Type == MEM_MAPPED) {
+    u64 known_base = 0, known_end = 0;
+    const bool known = known_private(address, &known_base, &known_end);
+    if (known) {
+        info.AllocationBase = reinterpret_cast<void*>(known_base);
+        info.Type = MEM_PRIVATE;
+        info.State = MEM_COMMIT;
+    } else if (timed_query(reinterpret_cast<const void*>(address), &info) != sizeof(info)) {
+        info = {};
+    }
+    if (info.Type == MEM_MAPPED) {
         // Physical pages in 1 GiB chunk sections (xmem X2W_XMEM_CHUNKS=1): a heap over the chunk.
         using Location = BOOL(WINAPI*)(const void*, HANDLE*, ULONG64*);
         static const Location location = [] {
@@ -3324,8 +3374,7 @@ D3D12_GPU_VIRTUAL_ADDRESS desktop_va(u64 address)
         if (InterlockedIncrement(&va_failed) <= 8) log("x2w-va 0x%llx: mapped page without a chunk location", address);
         return 0;
     }
-    if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) != sizeof(info) || info.Type != MEM_PRIVATE ||
-        info.State != MEM_COMMIT) {
+    if (info.Type != MEM_PRIVATE || info.State != MEM_COMMIT) {
         if (InterlockedIncrement(&va_failed) <= 8)
             log("x2w-va 0x%llx: not a committed private allocation (type 0x%lx state 0x%lx)", address, info.Type, info.State);
         return 0;
@@ -3452,7 +3501,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                 hr = device3->OpenExistingHeapFromAddress(base, IID_PPV_ARGS(&heap));
                 device3->Release();
             }
-            if (SUCCEEDED(hr)) existing_heaps.emplace_back(base, heap);
+            if (SUCCEEDED(hr)) {
+                existing_heaps.emplace_back(base, heap);
+                note_private_range(base, heap);
+            }
         }
     }
     D3D12_RESOURCE_DESC copy = *desc;
@@ -4047,7 +4099,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
     if (render_mode() && frame % 300 == 0) {
-        AcquireSRWLockExclusive(&draw_lock);
+        AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(0 + __LINE__);
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
@@ -4078,7 +4130,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);
-            char text[512];
+            char text[768];
             int used = 0;
             for (int i = 0; i < time_count; ++i) {
                 const LONG64 ticks = InterlockedExchange64(&time_ticks[i], 0), calls = InterlockedExchange64(&time_calls[i], 0);

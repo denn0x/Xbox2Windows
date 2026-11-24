@@ -62,6 +62,95 @@ bool find_blend(const std::vector<unsigned char>& block, D3D12_BLEND_DESC* out, 
 }
 
 SRWLOCK draw_lock = SRWLOCK_INIT;
+// LOCAL: who took draw_lock last (line, thread, time), and a monitor that logs when the lock has
+// been held for 10 s or more (title threads waiting on it trip the title's own hang watchdog).
+// Logs another thread's stack (module+offset per frame), unwound through the unwind tables while
+// the thread is suspended; nothing is allocated or logged until it runs again.
+void log_thread_stack(DWORD thread_id, const char* what)
+{
+    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, thread_id);
+    if (!thread) return;
+    DWORD64 frames[40] = {};
+    int depth = 0;
+    if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(thread, &context)) {
+            for (; depth < 40 && context.Rip; ++depth) {
+                frames[depth] = context.Rip;
+                DWORD64 image = 0;
+                PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image, nullptr);
+                if (!function) {
+                    // A leaf function: the return address is at rsp.
+                    if (IsBadReadPtr(reinterpret_cast<void*>(context.Rsp), 8)) break;
+                    context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);
+                    context.Rsp += 8;
+                    continue;
+                }
+                void* handler_data = nullptr;
+                DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, function, &context, &handler_data, &establisher, nullptr);
+            }
+        }
+        ResumeThread(thread);
+    }
+    CloseHandle(thread);
+    char text[2400];
+    int at = 0;
+    for (int i = 0; i < depth && at < static_cast<int>(sizeof(text)) - 80; ++i) {
+        HMODULE module = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(frames[i]), &module) && module) {
+            GetModuleFileNameA(module, name, MAX_PATH);
+            const char* slash = std::strrchr(name, '\\');
+            at += std::snprintf(text + at, sizeof(text) - at, " %s+0x%llx", slash ? slash + 1 : name,
+                                static_cast<unsigned long long>(frames[i] - reinterpret_cast<DWORD64>(module)));
+        } else {
+            at += std::snprintf(text + at, sizeof(text) - at, " 0x%llx", static_cast<unsigned long long>(frames[i]));
+        }
+    }
+    log("x2w-draw %s thread %lu stack:%s", what, thread_id, text);
+}
+volatile LONG draw_lock_line, draw_lock_thread;
+volatile LONG64 draw_lock_since;
+void draw_lock_taken(int line)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    draw_lock_line = line;
+    draw_lock_thread = static_cast<LONG>(GetCurrentThreadId());
+    draw_lock_since = now.QuadPart;
+    static const HANDLE monitor = CreateThread(nullptr, 0, [](void*) -> DWORD {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        LONG64 reported = 0;
+        for (;;) {
+            Sleep(5000);
+            if (TryAcquireSRWLockExclusive(&draw_lock)) {
+                ReleaseSRWLockExclusive(&draw_lock);
+                continue;
+            }
+            const LONG64 since = draw_lock_since;
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const double held = static_cast<double>(now.QuadPart - since) / static_cast<double>(frequency.QuadPart);
+            // Two more looks 5 s apart show whether the holder is moving.
+            static int looks;
+            if (held >= 10.0 && since == reported && looks < 2) {
+                ++looks;
+                log_thread_stack(static_cast<DWORD>(draw_lock_thread), "draw_lock holder (again)");
+            }
+            if (held >= 10.0 && since != reported) {
+                looks = 0;
+                reported = since;
+                log("x2w-draw draw_lock held %.1f s by thread %ld (taken at line %ld)", held, draw_lock_thread, draw_lock_line);
+                log_thread_stack(static_cast<DWORD>(draw_lock_thread), "draw_lock holder");
+            }
+        }
+    }, nullptr, 0, nullptr);
+    (void)monitor;
+}
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
 LONG translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings;
@@ -267,7 +356,7 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     if (found != root_blobs().end()) root_blob = found->second;
     ReleaseSRWLockShared(&note_lock);
     if (root_blob.empty()) return nullptr;
-    AcquireSRWLockExclusive(&draw_lock);
+    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
     auto* result = cached_translation(stages[0].pShaderBytecode, stages[0].BytecodeLength,
                                       stages[1].pShaderBytecode, stages[1].BytecodeLength, root_blob);
     ReleaseSRWLockExclusive(&draw_lock);
@@ -490,7 +579,7 @@ std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
 
 void discard_draw_sampler_heaps(Wrapper* self)
 {
-    AcquireSRWLockExclusive(&draw_lock);
+    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
     recorded_draw_sampler_heaps.erase(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
     ReleaseSRWLockExclusive(&draw_lock);
 }
@@ -820,7 +909,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     Pass& pass = pass_of(self);
     const bool rect = pass.topology == 0x11;
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
-    AcquireSRWLockExclusive(&draw_lock);
+    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
     ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass) : nullptr;

@@ -28,6 +28,7 @@ LONG range_split, range_unmapped, range_ok;
 // when the range is contiguous in one window. Results are cached for the frame.
 bool desktop_range(u64 address, u64 bytes, ID3D12Resource** buffer, u64* offset)
 {
+    Timed timed(time_cx_desktop_range);
     struct Hit { ID3D12Resource* buffer; u64 offset; };
     static SRWLOCK lock = SRWLOCK_INIT;
     static std::unordered_map<u64, Hit> cache;
@@ -59,17 +60,43 @@ bool desktop_range(u64 address, u64 bytes, ID3D12Resource** buffer, u64* offset)
             }
         ReleaseSRWLockShared(&window_span_lock);
         MEMORY_BASIC_INFORMATION info{};
-        if (hit.buffer && VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info)) {
+        u64 known_base = 0, known_end = 0;
+        if (hit.buffer && known_private(address, &known_base, &known_end)) {
+            // A private allocation opened as a heap: the range is one allocation when it ends inside it.
+            if (address + bytes > known_end) hit.buffer = nullptr;
+            if (!hit.buffer) InterlockedIncrement(&range_split);
+        } else if (hit.buffer && timed_query(reinterpret_cast<const void*>(address), &info) == sizeof(info)) {
             if (info.Type == MEM_MAPPED) {
                 // Chunk pages: each 64 KiB page of the range must sit at the matching section offset.
-                for (u64 at = (address | 0xffff) + 1; at < address + bytes; at += 0x10000)
-                    if (desktop_va(at) != va + (at - address)) {
-                        hit.buffer = nullptr;
-                        break;
+                // LOCAL: asked of xmem directly (one lookup per page) instead of desktop_va, which
+                // queried the page's memory and walked the windows for every page.
+                using Location = BOOL(WINAPI*)(const void*, HANDLE*, ULONG64*);
+                static const Location location = [] {
+                    const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+                    return xmem ? reinterpret_cast<Location>(GetProcAddress(xmem, "x2w_xmem_gpu_location")) : nullptr;
+                }();
+                HANDLE first_section = nullptr;
+                ULONG64 first_at = 0;
+                if (!location || !location(reinterpret_cast<const void*>(address), &first_section, &first_at)) {
+                    for (u64 at = (address | 0xffff) + 1; at < address + bytes; at += 0x10000)
+                        if (desktop_va(at) != va + (at - address)) {
+                            hit.buffer = nullptr;
+                            break;
+                        }
+                } else {
+                    for (u64 at = (address | 0xffff) + 1; at < address + bytes; at += 0x10000) {
+                        HANDLE section = nullptr;
+                        ULONG64 where = 0;
+                        if (!location(reinterpret_cast<const void*>(at), &section, &where) || section != first_section ||
+                            where != first_at + (at - address)) {
+                            hit.buffer = nullptr;
+                            break;
+                        }
                     }
+                }
             } else {
                 MEMORY_BASIC_INFORMATION last{};
-                if (VirtualQuery(reinterpret_cast<const void*>(address + bytes - 1), &last, sizeof(last)) != sizeof(last) ||
+                if (timed_query(reinterpret_cast<const void*>(address + bytes - 1), &last) != sizeof(last) ||
                     last.AllocationBase != info.AllocationBase)
                     hit.buffer = nullptr;
             }
@@ -269,6 +296,7 @@ void null_view(const ComputeTranslation::Res& r, D3D12_CPU_DESCRIPTOR_HANDLE des
 // prepare: also upload a plain texture and move it to the view's state (false for the bulk heap fill).
 bool texture_view(Wrapper* self, const ComputeTranslation::Res& r, const ViewRecord& record, D3D12_CPU_DESCRIPTOR_HANDLE dest, bool prepare = true)
 {
+    Timed timed(time_cx_texture);
     Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
     ID3D12Resource* texture = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
     if (!texture || record.desc_bytes < 24) return false;
@@ -398,6 +426,7 @@ void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
 // draw_lock held.
 void fill_views(Wrapper* self)
 {
+    Timed timed(time_cx_fill_views);
     if (!vinfo_buffer) {
         D3D12_HEAP_PROPERTIES up{D3D12_HEAP_TYPE_UPLOAD};
         D3D12_RESOURCE_DESC rd{};
@@ -454,8 +483,9 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
 {
     static const bool enabled = !x2w_local::env_on("X2W_CX_OFF");
     if (!enabled || !list || (key >> 56) != 0x67) return false;
+    Timed timed(time_cx_execute);
     Pass& pass = pass_of(self);
-    AcquireSRWLockExclusive(&draw_lock);
+    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(200000 + __LINE__);
     ComputeTranslation& tr = compute_translations()[key];
     if (!tr.state) load_compute(key, tr);
     if (tr.state != 1 || !ensure_draw_heap(the_device)) {
