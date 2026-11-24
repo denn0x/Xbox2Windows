@@ -819,8 +819,11 @@ def main():
         # short close, so the reports are still written.
         interrupted = True
         fast_exit = True
+    finally:
+        # Also on an unexpected error in the loop: the buffered last half second is the part
+        # that explains a crash.
+        flush_logs(force=True)
     elapsed = time.time() - start
-    flush_logs(force=True)
     close_phases = []  # (name, seconds): how long each step of the close took, for finished.txt
 
     def timed(name, function, *args):
