@@ -2030,6 +2030,9 @@ void __stdcall list_draw_indexed(Wrapper* self, UINT count, UINT instances, UINT
 // The destination range is registered as GPU-written: translated draws read it in place from then on, not from
 // a record-time snapshot (which is stale by construction).
 void __stdcall list_copy_buffer(Wrapper* self, Wrapper* dest, u64 dest_offset, Wrapper* source, u64 source_offset, u64 bytes);
+void note_issued_dispatch(ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z, bool indirect);  // d3d12_xs_device.cpp (DRED report)
+extern thread_local u64 cx_issue_key;
+extern thread_local char cx_issue_path;
 constexpr char copy_gpu_source[] = R"(
 RWByteAddressBuffer from : register(u0);
 RWByteAddressBuffer to : register(u1);
@@ -2128,6 +2131,14 @@ void __stdcall list_copy_buffer_gpu(Wrapper* self, Wrapper* dest, u64 dest_offse
     list->SetComputeRootUnorderedAccessView(0, from_window->GetGPUVirtualAddress() + from_base);
     list->SetComputeRootUnorderedAccessView(1, to_window->GetGPUVirtualAddress() + to_base);
     list->SetComputeRoot32BitConstants(2, 4, values, 0);
+    // The copy pass is a Dispatch op in DRED too; record it (path 'b', key 0) so the report's Dispatch op count matches.
+    const u64 issue_key = cx_issue_key;
+    const char issue_path = cx_issue_path;
+    cx_issue_key = 0;
+    cx_issue_path = 'b';
+    note_issued_dispatch(list, groups, 1, 1, false);
+    cx_issue_key = issue_key;
+    cx_issue_path = issue_path;
     list->Dispatch(groups, 1, 1);
     D3D12_RESOURCE_BARRIER after[3]{};
     after[0] = uav;

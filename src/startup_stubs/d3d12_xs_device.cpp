@@ -2664,7 +2664,7 @@ void forget_list_dispatches(ID3D12GraphicsCommandList* list)
 }
 const char* issued_path_name(char path)
 {
-    return path == 'c' ? "slot-62" : path == 't' ? "translated" : path == 'r' ? "raw-address" : path == 'g' ? "indirect guard pass" : "?";
+    return path == 'c' ? "slot-62" : path == 't' ? "translated" : path == 'r' ? "raw-address" : path == 'g' ? "indirect guard pass" : path == 'b' ? "GPU buffer copy (draw-rt)" : "?";
 }
 // For one incomplete DRED list: the dispatch at op `done` (the Dispatch ops before it are counted from the op
 // types, so the barriers between dispatches need no fixed stride) and the five before and after it.
