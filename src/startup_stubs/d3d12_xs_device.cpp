@@ -1580,7 +1580,15 @@ SRWLOCK shown_lock = SRWLOCK_INIT;
 char shown_note[160] = "no frame read back yet";
 
 void write_file(const wchar_t* path, const void* data, std::size_t bytes);
-void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
+void reduce_presented(const D3D12_RESOURCE_DESC& desc, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, bool rgba, UINT64 total,
+                      ID3D12Resource* readback);
+
+// LOCAL stall: the read-back copy is issued here (issue) and picked up by a later call once its fence
+// has passed, instead of waiting for it (up to 3 s, on the presenting thread, every 6th frame). Present
+// calls this with issue false on every frame, so a copy is picked up at the first present after the GPU
+// finished it. While a copy is in flight no new one is issued (its allocator is still in use).
+// X2W_READBACK_WAIT=1 restores the wait after each copy.
+void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, bool issue = true)
 {
     static ID3D12CommandAllocator* allocator;
     static ID3D12GraphicsCommandList* list;
@@ -1588,6 +1596,25 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     static ID3D12Resource* readback;
     static UINT64 readback_bytes, fence_value;
     static HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    static const bool wait_for_copy = x2w_local::env_on("X2W_READBACK_WAIT");
+    struct InFlight {
+        ID3D12Resource* surface = nullptr;  // held until the copy is done
+        D3D12_RESOURCE_DESC desc{};
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        bool rgba = false;
+        UINT64 total = 0;
+    };
+    static InFlight in_flight;
+    if (in_flight.surface) {
+        if (fence->GetCompletedValue() < fence_value) {
+            if (issue) std::snprintf(shown_note, sizeof(shown_note), "readback still in flight");
+            return;
+        }
+        reduce_presented(in_flight.desc, in_flight.footprint, in_flight.rgba, in_flight.total, readback);
+        in_flight.surface->Release();
+        in_flight.surface = nullptr;
+    }
+    if (!issue || !queue || !surface) return;
     ID3D12Device* device = device_of(the_device);
     const D3D12_RESOURCE_DESC desc = surface->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -1642,11 +1669,22 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     ID3D12CommandList* lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
     queue->Signal(fence, ++fence_value);
+    surface->AddRef();
+    in_flight = {surface, desc, footprint, rgba, total};
+    if (!wait_for_copy) return;
     fence->SetEventOnCompletion(fence_value, event);
     if (WaitForSingleObject(event, 3000) != WAIT_OBJECT_0) {
         std::snprintf(shown_note, sizeof(shown_note), "readback timed out");
-        return;
+        return;  // picked up by a later call once the fence passes
     }
+    reduce_presented(desc, footprint, rgba, total, readback);
+    in_flight.surface->Release();
+    in_flight.surface = nullptr;
+}
+
+void reduce_presented(const D3D12_RESOURCE_DESC& desc, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, bool rgba, UINT64 total,
+                      ID3D12Resource* readback)
+{
     void* mapped = nullptr;
     const D3D12_RANGE range{0, static_cast<SIZE_T>(total)};
     if (FAILED(readback->Map(0, &range, &mapped))) return;
@@ -4542,6 +4580,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         const unsigned long frames = n && n < sizeof(value) ? std::strtoul(value, nullptr, 10) : 0ul;
         return frames ? static_cast<ULONGLONG>(frames) : 60ull;
     }();
+    if (render_mode()) read_back_presented(nullptr, nullptr, false);  // LOCAL stall: picks up a finished copy
     if (render_mode() && frame % (shown_in_window ? shot_frames : 6) == 0 && planes && plane_parameters) {
         // Plane parameters: +0x00 frame token, +0x08 resource count, +0x10 pointer to the resources.
         const auto* words = static_cast<const u64*>(plane_parameters);
