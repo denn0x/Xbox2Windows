@@ -17,6 +17,7 @@
 #include "xmem_low.h"
 
 #include <algorithm>
+#include <deque>
 #include <map>
 #include <tuple>
 #include <d3d12.h>
@@ -2983,6 +2984,9 @@ void complete_c67_request(u64 key, Wrapper* pipeline, const PipelineInfo* info, 
             whole ? ", .done written" : failed ? ", a write failed (no .done)" : ", no .regs or .meta yet (no .done)");
 }
 // The compute key of the pipeline bound on list self (also used by indirect dispatches).
+u64 compute_key_for(Wrapper* pipeline);
+bool prewarm_enabled();      // d3d12_compute.inl
+void prewarm_compute(u64 key);
 u64 compute_key_of(Wrapper* self)
 {
     Pass& pass = pass_of(self);
@@ -2993,13 +2997,20 @@ u64 compute_key_of(Wrapper* self)
         key = found != compute_keys().end() ? found->second : ~1ull;  // ~1: no compute key known for it
     }
     ReleaseSRWLockExclusive(&compute_lock);
-    if (key == ~1ull) {
+    return key == ~1ull ? compute_key_for(pass.pipeline) : key;
+}
+// The compute key of a pipeline, derived from its creation description and remembered in compute_keys()
+// (also at creation, for the background prewarm in d3d12_compute.inl).
+u64 compute_key_for(Wrapper* pipeline)
+{
+    u64 key = ~1ull;
+    {
         // Device slot 67: a console compute pipeline. Its description has the layout of slot 57:
         // [0] root signature, [5]/[6] machine code address and length, [7]/[8] the stage's metadata.
         // The key is fnv(root blob, fnv(code)), tagged with 0x67 in the top byte; the code, metadata
         // and root blob are written to the shader cache as req_c67_<key>.{cs,meta,root,desc,regs}, then .done
         // (complete_c67_request).
-        const PipelineInfo* info = pipeline_info(pass.pipeline);
+        const PipelineInfo* info = pipeline_info(pipeline);
         if (info && info->path == 67 && info->desc.size() >= 0x48) {
             u64 words[9];
             std::memcpy(words, info->desc.data(), sizeof(words));
@@ -3014,7 +3025,7 @@ u64 compute_key_of(Wrapper* self)
             const auto* meta = reinterpret_cast<const void*>(words[7]);
             if (words[6] && words[6] <= (1u << 20) && x2w_local::readable(code, words[6])) {
                 key = (fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(code, words[6])) & 0x00ffffffffffffffull) | (0x67ull << 56);
-                complete_c67_request(key, pass.pipeline, info, code, words[6], meta, words[8], root_blob);
+                complete_c67_request(key, pipeline, info, code, words[6], meta, words[8], root_blob);
             } else {
                 key = 0x67ull << 56;  // code unreadable
             }
@@ -3022,7 +3033,7 @@ u64 compute_key_of(Wrapper* self)
             key = (0xeeull << 56) | static_cast<u64>(info->path);  // another creation path
         }
         AcquireSRWLockExclusive(&compute_lock);
-        compute_keys()[pass.pipeline] = key;
+        compute_keys()[pipeline] = key;
         ReleaseSRWLockExclusive(&compute_lock);
     }
     return key;
@@ -4307,6 +4318,8 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
         AcquireSRWLockExclusive(&compute_lock);
         compute_regs()[static_cast<Wrapper*>(*out)] = std::move(regs);
         ReleaseSRWLockExclusive(&compute_lock);
+        // LOCAL stall: key it now and load its translation in the background (d3d12_compute.inl).
+        if (prewarm_enabled()) prewarm_compute(compute_key_for(static_cast<Wrapper*>(*out)));
     }
     return S_OK;
 }

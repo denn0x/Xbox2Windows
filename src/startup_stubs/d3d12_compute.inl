@@ -700,6 +700,61 @@ ComputeTranslation& loaded_compute(u64 key)
     return tr;
 }
 
+// LOCAL stall: the translation of a slot 67 pipeline is loaded (and its desktop pipeline compiled by the
+// driver) when the title creates the pipeline, on two below-normal background threads, so the first
+// dispatch usually finds it ready instead of compiling on a recording thread inside the frame. A
+// dispatch of a key still queued compiles it itself; one of a key being compiled waits for that key
+// only (loaded_compute). X2W_CX_PREWARM_OFF=1 (or X2W_CX_COMPILE_LOCKED=1) turns this off;
+// X2W_CX_PREWARM_THREADS=<1..4> sets the thread count.
+SRWLOCK prewarm_lock = SRWLOCK_INIT;
+CONDITION_VARIABLE prewarm_wanted = CONDITION_VARIABLE_INIT;
+std::deque<u64>& prewarm_queue()
+{
+    static std::deque<u64> q;
+    return q;
+}
+LONG cx_prewarm_queued, cx_prewarm_done;
+DWORD WINAPI prewarm_thread(void*)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        AcquireSRWLockExclusive(&prewarm_lock);
+        while (prewarm_queue().empty()) SleepConditionVariableSRW(&prewarm_wanted, &prewarm_lock, INFINITE, 0);
+        const u64 key = prewarm_queue().front();
+        prewarm_queue().pop_front();
+        ReleaseSRWLockExclusive(&prewarm_lock);
+        loaded_compute(key);
+        const LONG n = InterlockedIncrement(&cx_prewarm_done);
+        if (n <= 4 || n % 200 == 0) log("x2w-cx prewarm %ld of %ld queued pipelines loaded (latest %016llx)", n, cx_prewarm_queued, key);
+    }
+}
+bool prewarm_enabled()
+{
+    static const bool off = x2w_local::env_on("X2W_CX_PREWARM_OFF") || x2w_local::env_on("X2W_CX_COMPILE_LOCKED") ||
+                            x2w_local::env_on("X2W_CX_OFF") || x2w_local::env_on("X2W_COMPUTE_OFF");
+    return !off;
+}
+void prewarm_compute(u64 key)
+{
+    if (!prewarm_enabled() || (key >> 56) != 0x67 || !(key & 0x00ffffffffffffffull)) return;
+    static const int threads = [] {
+        char value[4]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_CX_PREWARM_THREADS", value, sizeof(value));
+        int count = n && n < sizeof(value) ? std::atoi(value) : 2;
+        count = count < 1 ? 1 : count > 4 ? 4 : count;
+        for (int i = 0; i < count; ++i)
+            if (const HANDLE t = CreateThread(nullptr, 0, prewarm_thread, nullptr, 0, nullptr)) CloseHandle(t);
+        log("x2w-cx prewarm: %d background threads", count);
+        return count;
+    }();
+    (void)threads;
+    InterlockedIncrement(&cx_prewarm_queued);
+    AcquireSRWLockExclusive(&prewarm_lock);
+    prewarm_queue().push_back(key);
+    ReleaseSRWLockExclusive(&prewarm_lock);
+    WakeConditionVariable(&prewarm_wanted);
+}
+
 // Runs a dispatch through the translation of compute key `key`. False: not translated (or no list).
 bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT x, UINT y, UINT z)
 {
