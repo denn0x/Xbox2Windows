@@ -826,7 +826,62 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     return entry;
 }
 
-ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass)
+// LOCAL stall: a desktop graphics pipeline compiled outside draw_lock. CreateGraphicsPipelineState runs
+// the driver's shader compiler (seconds for a large shader on a cold driver cache); under draw_lock it
+// stalled every recording thread behind one compile. On a miss pipeline_for fills a PsoBuild and returns
+// nullptr; draw_translated drops draw_lock, build_pipeline compiles (one compile per (pipeline, key),
+// other threads wanting the same one wait for it), then draw_translated takes draw_lock again and
+// pipeline_for installs the result. X2W_DRAW_PSO_LOCKED=1 restores the compile under draw_lock.
+struct PsoBuild {
+    BoundPipeline* bound = nullptr;  // never freed (translation_by_pipeline keeps them)
+    u64 key = 0;                     // pipeline_for's key in bound->pipelines
+    u64 translation = 0;             // for the log
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};  // points at the translation's blobs and root signature, which are never freed
+};
+struct PsoSlot {
+    int state = 0;  // 1 compiling, 2 done
+    ID3D12PipelineState* pipeline = nullptr;
+};
+SRWLOCK pso_build_lock = SRWLOCK_INIT;  // inside draw_lock when both are held
+CONDITION_VARIABLE pso_built = CONDITION_VARIABLE_INIT;
+// Slots are never erased: a thread that missed before another installed the pipeline finds it done.
+std::map<std::pair<const BoundPipeline*, u64>, PsoSlot>& pso_slots()
+{
+    static std::map<std::pair<const BoundPipeline*, u64>, PsoSlot> m;
+    return m;
+}
+
+void build_pipeline(const PsoBuild& build)
+{
+    AcquireSRWLockExclusive(&pso_build_lock);
+    PsoSlot& slot = pso_slots()[{build.bound, build.key}];  // std::map references stay valid
+    while (slot.state == 1) SleepConditionVariableSRW(&pso_built, &pso_build_lock, INFINITE, 0);
+    if (slot.state == 2) {
+        ReleaseSRWLockExclusive(&pso_build_lock);
+        return;
+    }
+    slot.state = 1;
+    ReleaseSRWLockExclusive(&pso_build_lock);
+    LARGE_INTEGER start, end, frequency;
+    QueryPerformanceCounter(&start);
+    ID3D12PipelineState* pipeline = nullptr;
+    const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&build.desc, IID_PPV_ARGS(&pipeline));
+    QueryPerformanceCounter(&end);
+    QueryPerformanceFrequency(&frequency);
+    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d), compiled in %lld ms outside draw_lock",
+        build.translation, build.desc.NumRenderTargets, build.desc.NumRenderTargets ? build.desc.RTVFormats[0] : 0,
+        static_cast<unsigned long>(hr), static_cast<int>(build.desc.DSVFormat), build.desc.DepthStencilState.DepthEnable ? 1 : 0,
+        static_cast<long long>((end.QuadPart - start.QuadPart) * 1000 / frequency.QuadPart));
+    check_device("translated CreateGraphicsPipelineState", 0);
+    AcquireSRWLockExclusive(&pso_build_lock);
+    slot.pipeline = pipeline;
+    slot.state = 2;
+    ReleaseSRWLockExclusive(&pso_build_lock);
+    WakeAllConditionVariable(&pso_built);
+}
+
+// draw_lock held. With `deferred`, a pipeline not built yet is described there and nullptr is returned.
+ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, PsoBuild* deferred = nullptr)
 {
     const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
     u64 key = pass.target_count;
@@ -835,6 +890,17 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     if (bound.has_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
+    {
+        AcquireSRWLockShared(&pso_build_lock);
+        const auto built = pso_slots().find({&bound, key});
+        const bool done = built != pso_slots().end() && built->second.state == 2;
+        ID3D12PipelineState* const ready = done ? built->second.pipeline : nullptr;
+        ReleaseSRWLockShared(&pso_build_lock);
+        if (done) {
+            bound.pipelines[key] = ready;
+            return ready;
+        }
+    }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root;
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
@@ -863,6 +929,13 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     for (UINT i = 0; i < pass.target_count; ++i) desc.RTVFormats[i] = pass.target_formats[i];
     desc.DSVFormat = dsv_format;
     desc.SampleDesc.Count = 1;
+    if (deferred) {
+        deferred->bound = &bound;
+        deferred->key = key;
+        deferred->translation = tr.key;
+        deferred->desc = desc;
+        return nullptr;
+    }
     ID3D12PipelineState* pipeline = nullptr;
     const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
     log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
@@ -1556,9 +1629,22 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
     lock_draw(100000 + __LINE__);
     report_draw_rt();
-    BoundPipeline* bound = translation_for(pass.pipeline);
-    Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
-    ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass) : nullptr;
+    static const bool pso_locked = x2w_local::env_on("X2W_DRAW_PSO_LOCKED");
+    BoundPipeline* bound = nullptr;
+    Translation* tr = nullptr;
+    ID3D12PipelineState* pipeline = nullptr;
+    for (int attempt = 0;; ++attempt) {
+        // A second attempt finds the pipeline build_pipeline made (pipeline_for installs it).
+        bound = translation_for(pass.pipeline);
+        tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+        PsoBuild build;
+        pipeline = tr && tr->state == 1 && ensure_draw_heap(self->own().list_device)
+                       ? pipeline_for(*bound, *tr, pass, pso_locked || attempt ? nullptr : &build) : nullptr;
+        if (pipeline || !build.bound) break;
+        ReleaseSRWLockExclusive(&draw_lock);
+        build_pipeline(build);
+        lock_draw(100000 + __LINE__);
+    }
     if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
