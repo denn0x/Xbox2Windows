@@ -671,9 +671,10 @@ inline bool decode_bc1_blocks(const std::vector<uint16_t>& symbols, size_t targe
 //   BC3 12 lanes {3,3,7,5,5,5,5,4,5,4,7,7}, 2/block: d, x, alpha e0/e1, 4 alpha pair lanes,
 //       R/G/B 565 endpoints (E = colour 0, O = colour 1), 2 colour quadrant lanes (TL TR, BL BR).
 // UNVERIFIED: the pair/quadrant rank tables and the pre-history dictionaries are fitted by
-// bcpack-rs, which itself reports only partial byte agreement. Locally, decoded endpoints form
-// coherent pictures, but texels inside blocks are only modestly smoother than a texel shuffle of
-// the same blocks, so some index detail is probably wrong.
+// bcpack-rs, which itself reports only partial byte agreement. Locally, decoded pictures are
+// coherent, and each format's own pair table gives smoother texels than the other formats' tables
+// on every sampled interval, but there is no ground truth. 87% of BC5 blocks have an endpoint
+// reference chain that starts in the dictionary, so a wrong dictionary entry shifts them all.
 //
 // BC6H (format 6): lane layout only, not decoded. 16 lanes {3,3,7,7,7,4,4,4,5,5,5,7,7,7,7,4},
 // 2 symbols per lane per block, verified on all 268 local BC6H intervals as above. Measured on
@@ -682,7 +683,9 @@ inline bool decode_bc1_blocks(const std::vector<uint16_t>& symbols, size_t targe
 // zero in one-region modes; lanes 2..4 and 5..7 carry the base and first delta fields split into
 // ceil/floor halves across E and O; lanes 11..14 carry index pairs (8 bits one-region, 6 bits
 // two-region). Missing: the prediction domain for endpoints across modes, the use of the index
-// reference x (non-zero in BC6H data, unlike BC3/4/5), and a dictionary for pre-history refs.
+// reference x (non-zero in BC6H data, unlike BC3/4/5), and a dictionary for pre-history refs:
+// 93.5% of BC6H blocks have an endpoint reference chain, and 70% an index chain, that starts
+// before the first block, so no field mapping alone can give correct blocks.
 
 inline constexpr uint8_t ALPHA_CODE[8] = { 0, 2, 3, 4, 5, 6, 7, 1 };
 inline constexpr uint8_t COLOUR_CODE[4] = { 0, 2, 3, 1 };
