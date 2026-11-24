@@ -19,7 +19,8 @@
 // (X2W_MESH unset): nothing drawn, no x2w-mesh line; missing: nothing drawn, "no translation" for the key; depth:
 // the depth-only pipeline (no pixel stage) is created and issued (depth value printed; today's default state has
 // depth off, so it is not checked). Every mode: no debug-layer error or corruption message, device not removed.
-// Exit 0 pass, 77 capability skip (no adapter, no existing-heap support, MeshShaderTier 0), other values name the step.
+// Exit 0 pass, 77 capability skip (no adapter, no existing-heap support, MeshShaderTier 0, depth on WARP), other
+// values name the step.
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
@@ -88,7 +89,10 @@ struct Observer {
     }
     bool run()
     {
-        if (FAILED(list->Close())) return false;
+        if (const HRESULT hr = list->Close(); FAILED(hr)) {
+            std::printf("observer list Close -> 0x%08lx\n", static_cast<unsigned long>(hr));
+            return false;
+        }
         ID3D12CommandList* lists[] = {list.Get()};
         queue->ExecuteCommandLists(1, lists);
         if (FAILED(queue->Signal(fence.Get(), ++value))) return false;
@@ -197,6 +201,13 @@ int main(int argc, char** argv)
             std::printf("OpenExistingHeapFromAddress -> 0x%08lx: capability skip\n", static_cast<unsigned long>(hr));
             return 77;
         }
+    }
+    // Measured on WARP 10.0.26100.9818 (2026-11-24): a mesh PSO without a pixel stage removes the device on its first
+    // DispatchMesh (with depth off and with depth test/write on; with the debug layer on and off; no debug-layer
+    // message before the removal). The same stream with a pixel stage draws, and hardware draws it without one.
+    if (depth && std::strcmp(argv[1], "warp") == 0) {
+        std::printf("WARP removes the device for a mesh pipeline without a pixel stage: capability skip\n");
+        return 77;
     }
 
     // Shader cache and log of this process.
@@ -408,7 +419,18 @@ int main(int argc, char** argv)
     std::printf("record in title memory: {%u %u %u} (writer stored {%u 1 1})\n", stored[0], stored[1], stored[2], x);
     std::vector<std::uint32_t> pixels;
     const std::vector<std::pair<UINT, UINT>> at = {{8, 16}, {24, 16}, {16, 2}};  // left triangle, right triangle, outside both
-    if (!read_pixels(desktop.Get(), observer, target.Get(), depth, at, pixels)) return 15;
+    if (!read_pixels(desktop.Get(), observer, target.Get(), depth, at, pixels)) {
+        ComPtr<ID3D12InfoQueue> messages;
+        if (SUCCEEDED(desktop.As(&messages)))
+            for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
+                SIZE_T bytes = 0;
+                messages->GetMessage(i, nullptr, &bytes);
+                std::vector<char> storage(bytes);
+                auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+                if (bytes && SUCCEEDED(messages->GetMessage(i, message, &bytes))) std::printf("debug: %s\n", message->pDescription);
+            }
+        return 15;
+    }
     int failures = 0;
     if (stored[0] != x || stored[1] != 1 || stored[2] != 1) {
         std::printf("the record in title memory is not what the writer stored\n");
@@ -439,8 +461,14 @@ int main(int argc, char** argv)
     const bool issued = has(std::string("x2w-mesh pipeline ") + key_text + ": first call issued");
     const bool missing = has(std::string("x2w-mesh pipeline ") + key_text + ": no translation");
     const bool any_mesh = has("x2w-mesh ");
-    std::printf("log: issued %d, no translation %d, any x2w-mesh line %d\n", issued, missing, any_mesh);
-    if (mode == "off" ? any_mesh : mode == "missing" ? (!missing || issued) : !issued) {
+    // The coverage line (board/msgs/210900_mesh): "x2w-mesh key K first bound frame F (cache: ok|fail|missing)".
+    std::string bound_line;
+    if (const std::size_t p = log.find(std::string("x2w-mesh key ") + key_text + " first bound frame "); p != std::string::npos)
+        bound_line = log.substr(p, log.find('\n', p) - p);
+    const bool bound_ok = bound_line.find(mode == "missing" ? "(cache: missing)" : "(cache: ok)") != std::string::npos;
+    std::printf("log: issued %d, no translation %d, any x2w-mesh line %d, first bound line \"%s\"\n", issued, missing, any_mesh,
+                bound_line.c_str());
+    if (mode == "off" ? any_mesh : mode == "missing" ? (!missing || issued || !bound_ok) : (!issued || !bound_ok)) {
         std::printf("FAIL: the x2w-mesh lines do not match mode %s\n", mode.c_str());
         ++failures;
     }
