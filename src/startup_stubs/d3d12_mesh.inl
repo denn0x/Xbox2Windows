@@ -22,7 +22,9 @@
 //
 // Per 300 frames: "x2w-mesh N frames: calls X issued Y; skipped: ..." (report_mesh), then the bound keys with their
 // call counts (report_mesh_keys, top 64). Per key: "x2w-mesh key K first bound frame F (cache: ok|fail|missing)"
-// (first 4096 keys), "no translation" / "translation failed" once, "first call issued" once.
+// (first 4096 keys), "no translation" / "translation failed (...)" once, "call refused (no targets | rtv variant |
+// no PSO | bind refused ...)" once per reason, "first call issued" once. Manifest `fma exact|precise` (RUNTIME_NEEDS 8):
+// exact or unstated needs DoublePrecisionFloatShaderOps; a cache mixing rules is logged once, not refused.
 // Fixed-function state: the default state (opaque blend; depth-stencil only from a stream pipeline, else off; cull
 // none). The decoded mesh state (+0x54 from the vertex-record offsets) replaces mesh_state_desc's body.
 
@@ -179,6 +181,7 @@ struct MeshEntry {
     Translation* tr = nullptr;
     std::unordered_map<u64, MeshPso> psos;  // by target formats, DSV format and fixed-function state
     bool issued_once = false;
+    unsigned refusals_logged = 0;  // bit per MeshSkip: its "call refused" line was written (mesh_lock)
 };
 SRWLOCK mesh_lock = SRWLOCK_INIT;
 CONDITION_VARIABLE mesh_loaded = CONDITION_VARIABLE_INIT;
@@ -222,6 +225,20 @@ MeshEntry& loaded_mesh(u64 key)
     ReleaseSRWLockExclusive(&mesh_lock);
     WakeAllConditionVariable(&mesh_loaded);
     return e;  // a failed Translation is kept (leaked) like draw translations: never retried
+}
+
+// Once per key and reason (first 4096 lines PER REASON, so keys refused for one reason cannot use up the lines of
+// another): "x2w-mesh pipeline K: call refused (<why>)", for the refusals that have no per-key line of their own
+// (no targets, rtv variant, no PSO, translation taken, bind refused). "no translation" and "translation failed (...)"
+// are written once per key by loaded_mesh / load_mesh_stages.
+void mesh_refusal_line(MeshEntry& e, u64 key, MeshSkip why, const char* detail)
+{
+    AcquireSRWLockExclusive(&mesh_lock);
+    const bool first = (e.refusals_logged & (1u << why)) == 0;
+    e.refusals_logged |= 1u << why;
+    ReleaseSRWLockExclusive(&mesh_lock);
+    static LONG shown[mesh_skips];
+    if (first && first_calls(shown[why], 4096)) log("x2w-mesh pipeline %016llx: call refused (%s)", key, detail);
 }
 
 // ---- Coverage: which mesh keys are bound (board/msgs/210900_mesh) ----------------------------------------------
@@ -448,10 +465,20 @@ bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
     if (!binding.mesh || !binding.key.keyed || !binding.bound) return mesh_skip(mesh_no_record), false;
     MeshEntry& e = loaded_mesh(binding.key.key);
     mesh_note_use(binding.key.key, e.state);  // every keyed call, whatever is refused below (coverage)
-    if (!pass.targets_bound) return mesh_skip(mesh_no_targets), false;
+    if (!pass.targets_bound) {
+        mesh_refusal_line(e, binding.key.key, mesh_no_targets, "no targets: no render target or depth view bound by the list");
+        return mesh_skip(mesh_no_targets), false;
+    }
     // Integer / 32-bit float targets need an RTV variant of the pixel stage (translation_for_targets); none exists
     // for mesh translations yet.
-    if (std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) return mesh_skip(mesh_rtv_variant), false;
+    if (std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+        char detail[160];
+        int n = std::snprintf(detail, sizeof(detail), "rtv variant: target formats");
+        for (UINT i = 0; i < pass.target_count && n < 120; ++i) n += std::snprintf(detail + n, sizeof(detail) - n, " %d", static_cast<int>(pass.target_formats[i]));
+        std::snprintf(detail + n, sizeof(detail) - n, "; integer / 32-bit float targets need a pixel-stage variant, none for mesh");
+        mesh_refusal_line(e, binding.key.key, mesh_rtv_variant, detail);
+        return mesh_skip(mesh_rtv_variant), false;
+    }
     if (e.state == 4) return mesh_skip(mesh_no_translation), false;
     if (e.state != 1) return mesh_skip(mesh_failed), false;
     if (binding.attached != e.tr) {
@@ -461,13 +488,19 @@ bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
         const bool free = !binding.bound->translation || binding.bound->translation == e.tr;
         if (free) binding.bound->translation = e.tr;
         ReleaseSRWLockExclusive(&draw_lock);
-        if (!free) return mesh_skip(mesh_failed), false;
+        if (!free) {
+            mesh_refusal_line(e, binding.key.key, mesh_failed, "translation taken: the bound pipeline already has another translation");
+            return mesh_skip(mesh_failed), false;
+        }
         AcquireSRWLockExclusive(&mesh_key_lock);
         mesh_bindings()[pass.pipeline].attached = e.tr;
         ReleaseSRWLockExclusive(&mesh_key_lock);
     }
     ID3D12PipelineState* pso = mesh_pso(e, *binding.bound, pass);
-    if (!pso) return mesh_skip(mesh_no_pso), false;
+    if (!pso) {
+        mesh_refusal_line(e, binding.key.key, mesh_no_pso, "no PSO: CreatePipelineState failed, see its desktop pipeline line");
+        return mesh_skip(mesh_no_pso), false;
+    }
     mesh_ready = {self, e.tr, pso, &e};
     return true;
 }
@@ -482,7 +515,10 @@ bool mesh_hook(Wrapper* self, ID3D12GraphicsCommandList* list)
     mesh_binding_now = false;
     MeshEntry* e = mesh_ready.entry;
     mesh_ready = {};
-    if (!issued) return mesh_skip(mesh_bind), false;
+    if (!issued) {
+        if (e) mesh_refusal_line(*e, e->tr->key, mesh_bind, "bind refused by draw_translated; heap / vinfo / vdesc refusals also have an x2w-draw-rt line, others none");
+        return mesh_skip(mesh_bind), false;
+    }
     InterlockedIncrement(&mesh_issued);
     if (e && !e->issued_once) {
         e->issued_once = true;  // a benign race: at worst two lines
