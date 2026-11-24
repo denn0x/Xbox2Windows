@@ -601,6 +601,16 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
 endforeach()
 
+# OMSetRenderTargets with a single descriptor range and handles that hold no view, through the outcome counters.
+add_executable(startup_rtv_bind tests/startup_rtv_bind.cpp)
+target_compile_features(startup_rtv_bind PRIVATE cxx_std_17)
+target_link_libraries(startup_rtv_bind PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_rtv_bind_${backend} COMMAND startup_rtv_bind ${backend})
+    set_tests_properties(startup_rtv_bind_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
+
 add_executable(startup_nv12_draw tests/startup_nv12_draw.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_nv12_draw PRIVATE cxx_std_17)
 target_include_directories(startup_nv12_draw PRIVATE src)
@@ -815,6 +825,16 @@ add_executable(startup_sampler_comparison_check tests/startup_sampler_comparison
 target_include_directories(startup_sampler_comparison_check PRIVATE src)
 target_compile_features(startup_sampler_comparison_check PRIVATE cxx_std_17)
 add_test(NAME startup_sampler_comparison COMMAND startup_sampler_comparison_check)
+# LOCAL: console view facts for translated compute programs (src/startup_stubs/gfx10_view_words.h): typed buffer
+# view layout, GFX10_FORMAT codes, synthesized V#/T# words, integer UAV format. Mutated runs are negative controls.
+add_executable(startup_gfx10_view_words_check tests/startup_gfx10_view_words_check.cpp)
+target_include_directories(startup_gfx10_view_words_check PRIVATE src)
+target_compile_features(startup_gfx10_view_words_check PRIVATE cxx_std_17)
+add_test(NAME startup_gfx10_view_words COMMAND startup_gfx10_view_words_check)
+foreach(mutation IN ITEMS legacy width order uint)
+    add_test(NAME startup_gfx10_view_words_${mutation}_control COMMAND startup_gfx10_view_words_check --mutate ${mutation})
+    set_tests_properties(startup_gfx10_view_words_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # Diagnostic line for a refused device slot 70 call (src/startup_stubs/memory_srv_report.h).
 add_executable(startup_memory_srv_report_check tests/startup_memory_srv_report_check.cpp)
 target_include_directories(startup_memory_srv_report_check PRIVATE src)

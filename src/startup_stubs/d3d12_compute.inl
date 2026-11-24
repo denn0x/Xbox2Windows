@@ -113,8 +113,10 @@ bool desktop_range(u64 address, u64 bytes, ID3D12Resource** buffer, u64* offset)
 }
 
 struct ComputeTranslation {
-    struct Res { bool uav; int kind, source, a, b; };  // kind 0 buffer, 1 2D, 2 2D array, 3 3D, 4 1D; source 0 table(param a, byte b), 2 root a
-    struct Ud { int kind, a, b; };                     // 3 root constant(param a, word b), 4 stride of res a, 5 word 3 of res a, 6 base of res a
+    struct Res { bool uav; int kind, source, a, b; bool integer = false; };  // kind 0 buffer, 1 2D, 2 2D array, 3 3D, 4 1D; source 0 table(param a, byte b), 2 root a
+                                                                             // integer: R32_UINT texture UAV (manifest kinds tex2du, tex3du)
+    struct Ud { int kind, a, b; };                     // 3 root constant(param a, word b), 4 stride of res a, 5 word 3 of res a, 6 base of res a,
+                                                       // 7 descriptor dword at byte b of table param a (descword)
     int state = 0;                                     // 1 ready, 2 unavailable
     std::vector<Res> res;
     std::vector<Ud> uds;
@@ -156,6 +158,7 @@ void load_compute(u64 key, ComputeTranslation& tr)
             else if (!std::strcmp(source, "stride")) ud.kind = 4;
             else if (!std::strcmp(source, "bufword3")) ud.kind = 5;
             else if (!std::strcmp(source, "bufbase")) ud.kind = 6;
+            else if (!std::strcmp(source, "descword")) ud.kind = 7;
             if (ud.kind < 0 || static_cast<std::size_t>(i) != tr.uds.size()) {
                 log("x2w-cx %016llx: entry value %d from %s not supported", key, i, source);
                 return;
@@ -165,6 +168,14 @@ void load_compute(u64 key, ComputeTranslation& tr)
                    (!std::strcmp(view, "srv") || !std::strcmp(view, "uav"))) {
             ComputeTranslation::Res r{view[0] == 'u', !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 : !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0,
                                       !std::strcmp(source, "root") ? 2 : 0, x, y};
+            if (!std::strcmp(kind, "tex2du") || !std::strcmp(kind, "tex3du")) {
+                r.kind = kind[3] == '2' ? 1 : 3;
+                r.integer = true;
+                if (!r.uav) {
+                    log("x2w-cx %016llx: integer texture kind %s only as a uav", key, kind);
+                    return;
+                }
+            }
             if (static_cast<std::size_t>(i) != tr.res.size()) return;
             tr.res.push_back(r);
         } else if (std::sscanf(line.c_str(), "smp %d %x %x %x %x", &i, &w[0], &w[1], &w[2], &w[3]) == 5) {
@@ -265,7 +276,7 @@ void null_view(const ComputeTranslation::Res& r, D3D12_CPU_DESCRIPTOR_HANDLE des
     InterlockedIncrement(&cx_null_res);
     if (uav) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-        d.Format = r.kind ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_TYPELESS;
+        d.Format = r.integer ? DXGI_FORMAT_R32_UINT : r.kind ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_TYPELESS;
         d.ViewDimension = r.kind == 1 ? D3D12_UAV_DIMENSION_TEXTURE2D : r.kind == 2 ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY
             : r.kind == 3 ? D3D12_UAV_DIMENSION_TEXTURE3D : r.kind == 4 ? D3D12_UAV_DIMENSION_TEXTURE1D : D3D12_UAV_DIMENSION_BUFFER;
         if (!r.kind) {
@@ -290,6 +301,17 @@ void null_view(const ComputeTranslation::Res& r, D3D12_CPU_DESCRIPTOR_HANDLE des
         }
         device_of(the_device)->CreateShaderResourceView(nullptr, &d, dest);
     }
+}
+
+// LOCAL: integer texture UAVs (tex2du/tex3du) bound and refused, for the 300-frame report.
+LONG cxu_bound, cxu_refused;
+void note_integer_uav(bool bound, DXGI_FORMAT resource_format, UINT flags)
+{
+    InterlockedIncrement(bound ? &cxu_bound : &cxu_refused);
+    static LONG logged_bound, logged_refused;
+    if (bound ? first_calls(logged_bound, 1) : first_calls(logged_refused, 6))
+        log("x2w-cx integer texture uav %s: resource format %u flags 0x%x%s", bound ? "bound as R32_UINT" : "REFUSED (null R32_UINT view)",
+            resource_format, flags, bound ? "" : " (needs ALLOW_UNORDERED_ACCESS and an R32_TYPELESS or R32_UINT resource)");
 }
 
 // Binds a texture behind a view record as SRV or UAV (true when a real view was written).
@@ -317,10 +339,13 @@ bool texture_view(Wrapper* self, const ComputeTranslation::Res& r, const ViewRec
     }
     if (mip >= rd.MipLevels) mip = 0;
     if (r.uav) {
-        if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || !float_format(format)) {
+        if (r.integer) format = x2w_startup::integer_uav_format(rd.Format);
+        if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || (r.integer ? format == DXGI_FORMAT_UNKNOWN : !float_format(format))) {
             InterlockedIncrement(&cx_bad_uav);
+            if (r.integer) note_integer_uav(false, rd.Format, rd.Flags);
             return false;
         }
+        if (r.integer) note_integer_uav(true, rd.Format, rd.Flags);
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
         d.Format = format;
         if (r.kind == 1) { d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; d.Texture2D.MipSlice = mip; }
@@ -350,12 +375,46 @@ bool texture_view(Wrapper* self, const ComputeTranslation::Res& r, const ViewRec
 // The view-id region of the shader-visible heap: 8 views per title view id i at
 // draw_heap_size + 8 + 8 * i (0 Texture2D, 1 Texture2DArray, 2 Texture3D, 3 Texture1D, 4 raw buffer SRV,
 // 5 RWTexture2D, 6 RWTexture2DArray, 7 raw buffer UAV), empty views of each kind at draw_heap_size.
-// vinfo (an upload buffer, 16 bytes per id) holds the buffer stride. Filled up to the newest record.
+// vinfo (an upload buffer, 16 bytes per id): word 0 the index stride in bytes (structured: the structure stride,
+// typed: the element size, raw: 0), word 1 the GFX10_FORMAT code of a typed view (0: raw, structured or unmapped).
+// Filled up to the newest record.
 constexpr UINT view_ids_max = 90000;
 UINT views_filled;
 ID3D12Resource* vinfo_buffer;
 std::uint32_t* vinfo_words;
 LONG views_bound, views_null;
+// LOCAL: typed buffer views (FirstElement x element size, index stride = element size). X2W_CX_TYPED_OFF=1 restores
+// the old layout (element 4 bytes, stride 0, no format) for heap views, table views and bufword3.
+bool typed_views_off()
+{
+    static const bool off = x2w_local::env_on("X2W_CX_TYPED_OFF");
+    return off;
+}
+LONG cxv_typed_heap, cxv_typed_table, cxv_misaligned, cxv_word3;  // heap: views filled; table: bindings
+LONG cxd_image, cxd_buffer, cxd_title, cxd_null, cxd_unmapped;  // descword values by source
+void note_typed_view(const x2w_startup::BufferViewLayout& l, const ViewRecord& record, bool heap)
+{
+    if (l.kind != x2w_startup::BufferViewKind::typed) return;
+    InterlockedIncrement(heap ? &cxv_typed_heap : &cxv_typed_table);
+    static LONG logged;
+    if (first_calls(logged, 6)) {
+        std::uint32_t format = 0;
+        std::memcpy(&format, record.desc, 4);
+        log("x2w-cx typed buffer view %u (%s): format %u -> gfx10 format %u, %u-byte elements from byte %llu, %llu bytes%s", record.id, heap ? "heap" : "table", format,
+            l.format.code, l.index_stride, static_cast<unsigned long long>(l.offset), static_cast<unsigned long long>(l.bytes),
+            typed_views_off() ? " (X2W_CX_TYPED_OFF)" : "");
+    }
+}
+// Called every 300 frames (render mode): view facts handed to translated programs since the last report.
+void report_cx_views()
+{
+    log("x2w-cx view facts (300 frames): typed buffer views heap %ld table %ld (heap misaligned %ld), bufword3 synthesized %ld%s; "
+        "descword values image %ld buffer %ld title %ld null %ld (unmapped format %ld); integer texture uavs bound %ld refused %ld",
+        InterlockedExchange(&cxv_typed_heap, 0), InterlockedExchange(&cxv_typed_table, 0), InterlockedExchange(&cxv_misaligned, 0),
+        InterlockedExchange(&cxv_word3, 0), typed_views_off() ? " (X2W_CX_TYPED_OFF)" : "", InterlockedExchange(&cxd_image, 0),
+        InterlockedExchange(&cxd_buffer, 0), InterlockedExchange(&cxd_title, 0), InterlockedExchange(&cxd_null, 0), InterlockedExchange(&cxd_unmapped, 0),
+        InterlockedExchange(&cxu_bound, 0), InterlockedExchange(&cxu_refused, 0));
+}
 void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
 {
     const SIZE_T inc = draw_heap_increment;
@@ -372,27 +431,30 @@ void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
         } else if (buffer_view) {
             u64 address = 0;
             std::size_t bytes = 0;
-            std::uint32_t stride = 0;
+            std::uint32_t stride = 0, format_code = 0;
+            bool typed = false;
             if (record->slot == 17 && record->desc_bytes >= 12) {
                 std::uint32_t size = 0;
                 std::memcpy(&address, record->desc, 8);
                 std::memcpy(&size, record->desc + 8, 4);
                 bytes = size;
             } else if ((record->slot == 18 || record->slot == 19) && record->desc_bytes >= 24 && resource && resource->own().title_memory) {
-                u64 first_element = 0;
-                std::uint32_t count = 0;
-                const std::size_t off = record->slot == 18 ? 16 : 8;
-                std::memcpy(&first_element, record->desc + off, 8);
-                std::memcpy(&count, record->desc + off + 8, 4);
-                std::memcpy(&stride, record->desc + off + 12, 4);
-                const UINT element = stride ? stride : 4;
-                address = reinterpret_cast<u64>(resource->own().title_memory) + first_element * element;
-                bytes = std::size_t{count} * element;
+                x2w_startup::BufferViewLayout l;
+                if (x2w_startup::buffer_view_layout_from_desc(record->slot == 19, record->desc, record->desc_bytes, l, typed_views_off())) {
+                    address = reinterpret_cast<u64>(resource->own().title_memory) + l.offset;
+                    bytes = static_cast<std::size_t>(l.bytes);
+                    stride = l.index_stride;
+                    format_code = l.format.code;
+                    note_typed_view(l, *record, true);
+                    typed = l.kind == x2w_startup::BufferViewKind::typed;
+                }
             }
             if (bytes > (256u << 20)) bytes = 256u << 20;
             ID3D12Resource* window = nullptr;
             u64 offset = 0;
-            if (address && bytes && desktop_range(address, bytes, &window, &offset) && (offset & 15) == 0) {
+            const bool in_window = address && bytes && desktop_range(address, bytes, &window, &offset);
+            if (in_window && (offset & 15) && typed) InterlockedIncrement(&cxv_misaligned);  // raw views must start 16-aligned
+            if (in_window && (offset & 15) == 0) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
                 sd.Format = DXGI_FORMAT_R32_TYPELESS;
                 sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -410,7 +472,10 @@ void fill_view_kinds(Wrapper* self, UINT base, const ViewRecord* record)
                 device_of(the_device)->CreateUnorderedAccessView(window, nullptr, &ud, at(7));
                 done[4] = done[7] = true;
             }
-            if (vinfo_words && record->id < view_ids_max) vinfo_words[record->id * 4] = stride;
+            if (vinfo_words && record->id < view_ids_max) {
+                vinfo_words[record->id * 4] = stride;
+                vinfo_words[record->id * 4 + 1] = format_code;
+            }
         }
     }
     for (UINT k = 0; k < 8; ++k) {
@@ -478,17 +543,103 @@ bool title_view_heap(const Pass& pass, u64* address, u64* bytes)
     return best != nullptr;
 }
 
+// LOCAL: `udsrc <i> descword <param> <byte offset>`: the dword at <byte offset> of the descriptor table bound at root
+// parameter <param>, as the console would hold it. Entries are 32 bytes: entry = offset & ~31, word = (offset & 31) / 4.
+// A view token becomes the synthesized gfx10 T# (texture view) or V# (buffer view, CBV) word (gfx10_view_words.h);
+// any other readable entry gives the title's own dword; null, unreadable or unknown views give 0.
+std::uint32_t descword_value(const Pass& pass, int param, int offset, u64 key)
+{
+    if (param < 0 || param >= 16 || offset < 0 || pass.compute_kind[param] != 5 || !pass.compute_address[param]) {
+        static LONG logged;
+        if (first_calls(logged, 4))
+            log("x2w-cx %016llx descword %d %d: root parameter is not a bound descriptor table (kind %d): value 0", key, param, offset,
+                param >= 0 && param < 16 ? pass.compute_kind[param] : -1);
+        InterlockedIncrement(&cxd_null);
+        return 0;
+    }
+    const u64 entry = pass.compute_address[param] + (static_cast<u64>(offset) & ~31ull);
+    const int word = (offset & 31) / 4;
+    std::uint32_t words[8] = {};
+    if (!x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) {
+        InterlockedIncrement(&cxd_null);
+        return 0;
+    }
+    std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
+    if (words[0] != view_token_magic) {
+        InterlockedIncrement(words[word] ? &cxd_title : &cxd_null);
+        return words[word];
+    }
+    ViewRecord record{};
+    AcquireSRWLockShared(&note_lock);
+    const bool known = words[1] < view_records().size();
+    if (known) record = view_records()[words[1]];
+    ReleaseSRWLockShared(&note_lock);
+    Wrapper* resource = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
+    ID3D12Resource* real = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
+    std::uint32_t out[8] = {};
+    bool made = false, image = false;
+    x2w_startup::BufferViewLayout l;
+    if (known && record.slot == 17 && record.desc_bytes >= 12) {
+        std::uint32_t size = 0;
+        std::memcpy(&size, record.desc + 8, 4);
+        l = x2w_startup::buffer_view_layout(DXGI_FORMAT_R32_TYPELESS, 0, size / 4, 0, 1);  // a CBV reads as a raw buffer
+        made = true;
+    } else if (known && (record.slot == 18 || record.slot == 19) &&
+               x2w_startup::buffer_view_layout_from_desc(record.slot == 19, record.desc, record.desc_bytes, l, typed_views_off())) {
+        made = true;
+    } else if (known && real && (record.slot == 18 || record.slot == 19)) {
+        x2w_startup::ImageViewFacts v;
+        if (x2w_startup::image_view_from_desc(record.slot == 19, record.desc, record.desc_bytes, v)) {
+            const D3D12_RESOURCE_DESC rd = real->GetDesc();
+            v.dimension = rd.Dimension;
+            v.width = rd.Width;
+            v.height = rd.Height;
+            v.depth_or_array = rd.DepthOrArraySize;
+            v.mip_levels = rd.MipLevels;
+            v.format = typeless_to_float(desktop_format(v.format ? v.format : rd.Format));
+            bool unmapped = false;
+            image = made = x2w_startup::gfx10_image_words(v, out, &unmapped);
+            if (made && unmapped) {
+                InterlockedIncrement(&cxd_unmapped);
+                static LONG logged;
+                if (first_calls(logged, 8))
+                    log("x2w-cx descword: view format %u has no gfx10 format here: FORMAT 0 (word 1 may then read as a null view)", v.format);
+            }
+        }
+    }
+    if (made && !image) x2w_startup::gfx10_buffer_words(l, out);
+    if (!made) {
+        InterlockedIncrement(&cxd_null);
+        return 0;
+    }
+    InterlockedIncrement(image ? &cxd_image : &cxd_buffer);
+    static LONG logged_image, logged_buffer;
+    if (first_calls(image ? logged_image : logged_buffer, 1))
+        log("%s", image ? "x2w-cx descword: image views give T# FORMAT, WIDTH, HEIGHT, DST_SEL, BASE_LEVEL, LAST_LEVEL, TYPE, DEPTH, BASE_ARRAY, "
+                    "ARRAY_PITCH, MAX_MIP; left 0: base address, MIN_LOD, RESOURCE_LEVEL, SW_MODE, BC_SWIZZLE, PERF_MOD, words 6-7"
+                  : "x2w-cx descword: buffer views give V# STRIDE, NUM_RECORDS, DST_SEL, FORMAT, OOB_SELECT; left 0: base address, "
+                    "SWIZZLE_ENABLE, CACHE_SWIZZLE, INDEX_STRIDE, ADD_TID_ENABLE, RESOURCE_LEVEL, words 4-7");
+    static LONG logged_value;
+    if (first_calls(logged_value, 8))
+        log("x2w-cx %016llx descword %d %d: view %u slot %u %s word %d = %08x", key, param, offset, record.id, record.slot, image ? "T#" : "V#", word, out[word]);
+    return out[word];
+}
+
 // Runs a dispatch through the translation of compute key `key`. False: not translated (or no list).
 bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT x, UINT y, UINT z)
 {
     static const bool enabled = !x2w_local::env_on("X2W_CX_OFF");
-    if (!enabled || !list || (key >> 56) != 0x67) return false;
+    if (!enabled || !list || (key >> 56) != 0x67) {
+        InterlockedIncrement(&compute_outcomes[!enabled ? co_c67_off : list ? co_c67_other_key : co_not_run]);
+        return false;
+    }
     Timed timed(time_cx_execute);
     Pass& pass = pass_of(self);
     AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(200000 + __LINE__);
     ComputeTranslation& tr = compute_translations()[key];
     if (!tr.state) load_compute(key, tr);
     if (tr.state != 1 || !ensure_draw_heap(the_device)) {
+        InterlockedIncrement(&compute_outcomes[tr.state != 1 ? co_c67_untranslated : co_c67_heap]);
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -498,11 +649,13 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
         static LONG logged_heap;
         if (draw_heap_increment != 32 || !title_view_heap(pass, &heap_address, &heap_bytes) || !(heap_va = desktop_va(heap_address))) {
             if (first_calls(logged_heap, 4)) log("x2w-cx %016llx: title view heap not reachable (increment %u)", key, draw_heap_increment);
+            InterlockedIncrement(&compute_outcomes[co_c67_heap]);
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
         fill_views(self);
         if (!vinfo_buffer) {
+            InterlockedIncrement(&compute_outcomes[co_c67_heap]);
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
         }
@@ -556,17 +709,20 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
                 Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
                 D3D12_SRV_DIMENSION dim{};
                 std::memcpy(&dim, record.desc + 4, 4);
-                if (dim == 1 /* BUFFER in both SRV and UAV enums */ && resource && resource->own().title_memory) {
-                    u64 first_element = 0;
-                    std::uint32_t count = 0, stride = 0;
-                    const std::size_t at = record.slot == 18 ? 16 : 8;
-                    std::memcpy(&first_element, record.desc + at, 8);
-                    std::memcpy(&count, record.desc + at + 8, 4);
-                    std::memcpy(&stride, record.desc + at + 12, 4);
-                    const UINT element = stride ? stride : 4;
-                    address = reinterpret_cast<u64>(resource->own().title_memory) + first_element * element;
-                    bytes = std::size_t{count} * element;
-                    strides[i] = stride;
+                x2w_startup::BufferViewLayout l;
+                if (dim == 1 /* BUFFER in both SRV and UAV enums */ && resource && resource->own().title_memory &&
+                    x2w_startup::buffer_view_layout_from_desc(record.slot == 19, record.desc, record.desc_bytes, l, typed_views_off())) {
+                    address = reinterpret_cast<u64>(resource->own().title_memory) + l.offset;
+                    bytes = static_cast<std::size_t>(l.bytes);
+                    strides[i] = l.index_stride;
+                    note_typed_view(l, record, false);
+                    if (!typed_views_off()) {
+                        // word 3 of the V# the console holds for this view (format, swizzle), for bufword3 entry values
+                        std::uint32_t v[8];
+                        x2w_startup::gfx10_buffer_words(l, v);
+                        word3[i] = v[3];
+                        InterlockedIncrement(&cxv_word3);
+                    }
                 }
             } else if (entry && words[0] != view_token_magic) {
                 address = words[0] | (static_cast<u64>(words[1] & 0xffff) << 32);
@@ -613,6 +769,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
         const bool in = ud.a >= 0 && ud.a < 64;
         values[i] = ud.kind == 3 ? ((ud.a < 16 && ud.b < 16) ? pass.compute_constants[ud.a][ud.b] : 0)
             : ud.kind == 4 ? (in ? strides[ud.a] : 0) : ud.kind == 5 ? (in ? word3[ud.a] : 0) : (in ? bases[ud.a] : 0);
+        if (ud.kind == 7) values[i] = descword_value(pass, ud.a, ud.b, key);
     }
     list->SetPipelineState(tr.pso);
     if (!pass.heap_set) {
@@ -635,6 +792,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
     const LONG done = InterlockedIncrement(&cx_dispatched);
+    InterlockedIncrement(&compute_outcomes[co_c67_run]);
     if (done <= 8 || done % 5000 == 0)
         log("x2w-cx dispatch %ld: %016llx (%u, %u, %u); ready %ld missing %ld null %ld bad-uav %ld; ranges ok %ld split %ld unmapped %ld", done, key, x, y, z,
             cx_ready, cx_missing, cx_null_res, cx_bad_uav, range_ok, range_split, range_unmapped);

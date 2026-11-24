@@ -162,6 +162,28 @@ void count_null_binding(x2w_local::NullCause cause)
     InterlockedIncrement(&null_bindings);
     InterlockedIncrement(&null_by_cause[static_cast<int>(cause)]);
 }
+// LOCAL (video): X2W_DRAW_NULL_TEXTURE_LOG=1 logs the first null texture binding of each pipeline key
+// and srv (at most 96 lines) with the 8 descriptor words, to find which draws lose their texture
+// and whether the title wrote a hardware descriptor there instead of a view the wrapper made.
+void note_null_texture(u64 key, UINT srv, u64 entry, const std::uint32_t* words, x2w_local::NullCause cause)
+{
+    static const bool on = [] {
+        const bool value = x2w_local::env_on("X2W_DRAW_NULL_TEXTURE_LOG");
+        if (value) log("x2w-draw X2W_DRAW_NULL_TEXTURE_LOG=1: null texture bindings are logged per pipeline key and srv");
+        return value;
+    }();
+    if (!on || cause == x2w_local::NullCause::none) return;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::unordered_set<u64>* seen = new std::unordered_set<u64>;
+    static LONG lines;
+    AcquireSRWLockExclusive(&lock);
+    const bool fresh = seen->insert(key * 31 + srv).second;
+    ReleaseSRWLockExclusive(&lock);
+    if (!fresh || !first_calls(lines, 96)) return;
+    log("x2w-draw null texture %016llx srv %u cause %s frame %ld: entry 0x%llx words %08x %08x %08x %08x %08x %08x %08x %08x", key, srv,
+        x2w_local::null_cause_names[static_cast<int>(cause)], frame_number, entry, words[0], words[1], words[2], words[3], words[4],
+        words[5], words[6], words[7]);
+}
 LONG frame_number;
 
 u64 fnv_bytes(const void* data, std::size_t bytes, u64 hash = 1469598103934665603ull)
@@ -281,15 +303,21 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         tr.key, tr.uds.size(), tr.srvs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
 
-// draw_lock held. Both pipeline forms use the same request writer and shader cache.
-Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
-                                const std::vector<unsigned char>& root_blob)
+u64 pipeline_key(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
+                 const std::vector<unsigned char>& root_blob)
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
     constexpr char revision[] = "x2w-startup-shader-3";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
-    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
+    return fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
+}
+
+// draw_lock held. Both pipeline forms use the same request writer and shader cache.
+Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
+                                const std::vector<unsigned char>& root_blob)
+{
+    const u64 key = pipeline_key(a, a_bytes, b, b_bytes, root_blob);
     auto& entry = translation_by_key()[key];
     if (!entry) {
         entry = new Translation;
@@ -939,6 +967,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     const bool rect = pass.topology == 0x11;
+    if (list && pass.pipeline && !pass.targets_bound) InterlockedIncrement(&draws_without_targets);
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
     AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
     BoundPipeline* bound = translation_for(pass.pipeline);
@@ -1078,6 +1107,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             facts.resource_wrapper = had_texture;
             facts.dimension_matches = !mismatched;
             count_null_binding(x2w_local::classify_null_binding(facts));
+            note_null_texture(tr->key, i, entry, words, x2w_local::classify_null_binding(facts));
             D3D12_SHADER_RESOURCE_VIEW_DESC depth_default{};
             const bool no_desc = texture && record.desc_bytes < 40;
             const bool depth_desc = no_desc && default_depth_srv(texture, depth_default);

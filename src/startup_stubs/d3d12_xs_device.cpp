@@ -43,6 +43,7 @@
 #include "present_view_format.h"
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
+#include "gfx10_view_words.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
@@ -1494,16 +1495,17 @@ HRESULT __stdcall list_close(Wrapper* self)
 
 // List slot 52 (desktop 48 + 4), ClearRenderTargetView(view, colour, rect count, rects). Desktop
 // resources rest in COMMON here, so the target is moved to RENDER_TARGET around the clear.
+LONG clears_dropped[2];  // slot 52 dropped: [0] list not open or no colour, [1] view resolves to no target
 void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour, UINT rect_count, const D3D12_RECT* rects)
 {
-    if (!self->own().list_open || !colour) return;
+    if (!self->own().list_open || !colour) return (void)InterlockedIncrement(&clears_dropped[0]);
     const u64 desktop = desktop_cpu_handle(handle);
     ID3D12Resource* target = view_target(desktop);
     static LONG logged;
     if (first_calls(logged, 4))
         log("x2w-render ClearRenderTargetView view=0x%llx target=%p colour=%.3f %.3f %.3f %.3f rects=%u", handle,
             static_cast<void*>(target), colour[0], colour[1], colour[2], colour[3], rect_count);
-    if (!target) return;
+    if (!target) return (void)InterlockedIncrement(&clears_dropped[1]);
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     use_as_target(self, target);
     list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
@@ -2238,9 +2240,24 @@ bool format_has_stencil(DXGI_FORMAT format)
     return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
            format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R32G8X24_TYPELESS;
 }
+// Outcome of every slot 50 call (exactly one each), reported and reset every 300 presented frames.
+enum TargetBind {
+    bind_bound, bind_single_range_bound, bind_not_recording, bind_count_over_8, bind_handles_unreadable,
+    bind_range_past_heap, bind_wrong_kind, bind_unresolved, bind_empty, bind_depth_wrong_kind, bind_depth_unknown,
+    bind_depth_one_plane, bind_outcomes
+};
+LONG target_binds[bind_outcomes], target_unresolved_at[8];
+LONG target_depth_unreadable, target_depth_unmapped;  // bound without the depth the title passed
+LONG draws_without_targets;  // translated draws refused because no bind succeeded on the list (d3d12_draw.inl)
+LONG state_dropped[3];  // while recording: viewports, scissors (count 0, over 16 or unreadable), blend factor unreadable
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
-// A descriptor of the wrong kind, a DSV with only one plane read-only (needs per-plane states), or a
-// depth view that resolves to nothing refuses the whole bind: nothing is set and draws are skipped.
+// With single_range the title passes only the first handle; target i is at handle + i * the title's RTV
+// stride (title_descriptor_stride: for RTV heaps the same desktop increment the title reads from the
+// forwarded GetDescriptorHandleIncrementSize), and each is mapped to its desktop descriptor on its own.
+// A descriptor of the wrong kind, a colour handle that holds no view, a DSV with only one plane
+// read-only (needs per-plane states), or a depth view that resolves to nothing refuses the whole bind:
+// nothing is set and draws are skipped. Binding fewer or null targets is not done: the title's own
+// pipelines expect its count and formats, and an unresolved view has no known format.
 void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL single_range,
                             const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
 {
@@ -2250,18 +2267,45 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target_count = 0;
     pass.target0 = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
-    if (!list || count > 8 || single_range) return;
-    if (count && !x2w_local::readable(handles, count * sizeof(*handles))) return;
     static LONG refused;
+    const auto refuse = [](TargetBind why) { InterlockedIncrement(&target_binds[why]); };
+    if (!list) return refuse(bind_not_recording);
+    if (count > 8) {
+        if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: %u render targets (at most 8)", count);
+        return refuse(bind_count_over_8);
+    }
+    const UINT listed = single_range ? (count ? 1 : 0) : count;
+    if (listed && !x2w_local::readable(handles, listed * sizeof(*handles))) return refuse(bind_handles_unreadable);
+    u64 stride = 0;
+    if (single_range && count) {
+        const UINT increment = the_device ? device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) : 0;
+        stride = title_descriptor_stride(handles[0].ptr, increment);
+        UINT available = 0;
+        desktop_cpu_handle(handles[0].ptr, nullptr, &available);
+        if (!stride || available < count) {
+            if (first_calls(refused, 6))
+                log("x2w-d3d12 OMSetRenderTargets refused: single range of %u at 0x%llx has %u descriptors left in its heap",
+                    count, static_cast<unsigned long long>(handles[0].ptr), available);
+            return refuse(bind_range_past_heap);
+        }
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop[8];
     ID3D12Resource* targets[8]{};
     DXGI_FORMAT formats[8]{};
     for (UINT i = 0; i < count; ++i) {
-        desktop[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(handles[i].ptr));
+        const u64 title = single_range ? handles[0].ptr + i * stride : handles[i].ptr;
+        desktop[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(title));
         const ResolvedView view = resolve_view(desktop[i].ptr, 20);
         if (view.wrong_kind && first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: render target %u is not a render target view", i);
         targets[i] = view.resource;
-        if (!targets[i]) return;
+        if (!targets[i]) {
+            if (view.wrong_kind) return refuse(bind_wrong_kind);
+            if (first_calls(refused, 6))
+                log("x2w-d3d12 OMSetRenderTargets refused: render target %u of %u (title 0x%llx, %s) holds no known view", i, count,
+                    static_cast<unsigned long long>(title), single_range ? "single range" : "array");
+            InterlockedIncrement(&target_unresolved_at[i]);
+            return refuse(bind_unresolved);
+        }
         formats[i] = view_format_of(desktop[i].ptr, targets[i]);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop_dsv{};
@@ -2269,15 +2313,17 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     ID3D12Resource* dsv_target = nullptr;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     D3D12_RESOURCE_STATES dsv_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    if (depth && !x2w_local::readable(depth, sizeof(*depth))) InterlockedIncrement(&target_depth_unreadable);
     if (depth && x2w_local::readable(depth, sizeof(*depth))) {
         const u64 resolved = desktop_cpu_handle(depth->ptr);
+        if (!resolved && depth->ptr) InterlockedIncrement(&target_depth_unmapped);
         if (resolved) {
             const ResolvedView view = resolve_view(resolved, 21);
             dsv_target = view.resource;
             if (!dsv_target) {
                 if (first_calls(refused, 6))
                     log("x2w-d3d12 OMSetRenderTargets refused: depth handle is %s", view.wrong_kind ? "not a depth stencil view" : "not a known depth stencil view");
-                return;
+                return refuse(view.wrong_kind ? bind_depth_wrong_kind : bind_depth_unknown);
             }
             dsv_format = view_format_of(resolved, dsv_target);
             const bool read_depth = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0;
@@ -2285,14 +2331,14 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
             if (read_depth != read_stencil) {
                 if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: depth stencil view with one read-only plane (flags 0x%x)", view.dsv_flags);
-                return;
+                return refuse(bind_depth_one_plane);
             }
             if (read_depth) dsv_state = D3D12_RESOURCE_STATE_DEPTH_READ;
             desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
             dsv_ptr = &desktop_dsv;
         }
     }
-    if (!count && !dsv_ptr) return;
+    if (!count && !dsv_ptr) return refuse(bind_empty);
     for (UINT i = 0; i < count; ++i) {
         use_as_target(self, targets[i]);
         pass.target_formats[i] = formats[i];
@@ -2303,6 +2349,35 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.dsv_format = dsv_format;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
+    InterlockedIncrement(&target_binds[single_range ? bind_single_range_bound : bind_bound]);
+}
+// One line per 300 presented frames: slot 50 outcomes since the last line (counters reset here).
+void report_target_binds()
+{
+    LONG n[bind_outcomes], at[8];
+    LONG calls = 0;
+    for (int i = 0; i < bind_outcomes; ++i) calls += n[i] = InterlockedExchange(&target_binds[i], 0);
+    for (int i = 0; i < 8; ++i) at[i] = InterlockedExchange(&target_unresolved_at[i], 0);
+    log("x2w-targets 300 frames: binds %ld bound %ld single-range %ld refused by reason (not recording %ld, count over 8 %ld, "
+        "handles unreadable %ld, range past heap %ld, wrong kind %ld, unresolved target %ld [at %ld %ld %ld %ld %ld %ld %ld %ld], "
+        "empty %ld, depth wrong kind %ld, depth unknown %ld, depth one read-only plane %ld), bound without depth (unreadable %ld, "
+        "unmapped %ld), draws without targets %ld; also dropped: clears (list closed or no colour %ld, no target %ld), "
+        "viewports %ld, scissors %ld, blend factor %ld",
+        calls, n[bind_bound] + n[bind_single_range_bound], n[bind_single_range_bound], n[bind_not_recording],
+        n[bind_count_over_8], n[bind_handles_unreadable], n[bind_range_past_heap], n[bind_wrong_kind], n[bind_unresolved],
+        at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7], n[bind_empty], n[bind_depth_wrong_kind],
+        n[bind_depth_unknown], n[bind_depth_one_plane], InterlockedExchange(&target_depth_unreadable, 0),
+        InterlockedExchange(&target_depth_unmapped, 0), InterlockedExchange(&draws_without_targets, 0),
+        InterlockedExchange(&clears_dropped[0], 0), InterlockedExchange(&clears_dropped[1], 0), InterlockedExchange(&state_dropped[0], 0),
+        InterlockedExchange(&state_dropped[1], 0), InterlockedExchange(&state_dropped[2], 0));
+}
+// Fixtures: slot 50 outcome counts since the last report, in TargetBind order (bound, single-range bound,
+// then the refusal reasons). Returns how many outcomes exist.
+extern "C" __declspec(dllexport) unsigned x2w_d3d12_target_bind_stats(unsigned* counts, unsigned capacity)
+{
+    for (unsigned i = 0; counts && i < capacity && i < bind_outcomes; ++i)
+        counts[i] = static_cast<unsigned>(InterlockedCompareExchange(&target_binds[i], 0, 0));
+    return bind_outcomes;
 }
 // List slots 21 / 22 / 23, RSSetViewports / RSSetScissorRects / OMSetBlendFactor.
 void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* viewports)
@@ -2311,18 +2386,19 @@ void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* v
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports))) {
         list->RSSetViewports(count, viewports);
         pass_of(self).viewport_set = true;
-    }
+    } else if (list) InterlockedIncrement(&state_dropped[0]);
 }
 void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
 {
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects))) {
         list->RSSetScissorRects(count, rects);
         pass_of(self).scissor_set = true;
-    }
+    } else if (list) InterlockedIncrement(&state_dropped[1]);
 }
 void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 {
     if (auto* list = recording(self); list && x2w_local::readable(factor, 16)) list->OMSetBlendFactor(factor);
+    else if (list) InterlockedIncrement(&state_dropped[2]);
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
@@ -2367,10 +2443,12 @@ std::vector<IndirectCall>& indirect_trace()
     static std::vector<IndirectCall> calls;
     return calls;
 }
+void indirect_execute(Wrapper* self, void* signature, UINT max_count, Wrapper* arguments, u64 offset, Wrapper* count_resource, u64 count_offset);
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT max_count, Wrapper* arguments, u64 offset,
                                      Wrapper* count_resource, u64 count_offset)
 {
     InterlockedIncrement(&indirect_calls);
+    indirect_execute(self, signature, max_count, arguments, offset, count_resource, count_offset);  // LOCAL: d3d12_indirect.inl
     if (!trace_frame_active) return;
     SignatureInfo info;
     AcquireSRWLockShared(&signature_lock);
@@ -2484,6 +2562,7 @@ struct TextureWrite {
 std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 #include "startup_stubs/d3d12_draw.inl"
+#include "startup_stubs/d3d12_regblob.inl"
 
 
 LONG frame_dispatches;  // dispatches since the last present (LOCAL instrumentation)
@@ -2504,6 +2583,10 @@ std::unordered_map<Wrapper*, ID3D12PipelineState*>& compute_psos()
     return m;
 }
 LONG compute_executed, compute_skipped_args;
+// LOCAL: dispatch outcomes since the last 300-frame report, by path and reason (report_dispatches).
+enum ComputeOutcome { co_c62_run, co_c62_table_arg, co_c62_unmapped, co_c67_run, co_c67_off, co_c67_other_key, co_c67_untranslated,
+                      co_c67_heap, co_not_run, co_count };
+LONG compute_outcomes[co_count];
 // slot 33, SetComputeRootSignature(root)
 void __stdcall list_compute_root(Wrapper* self, Wrapper* root)
 {
@@ -2560,7 +2643,10 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
     static const bool enabled = !x2w_local::env_on("X2W_COMPUTE_OFF");
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    if (!enabled || !list || !pass.pipeline) return false;
+    if (!enabled || !list || !pass.pipeline) {
+        InterlockedIncrement(&compute_outcomes[co_not_run]);
+        return false;
+    }
     if (!pass.compute_root || !pass.compute_root->own().real) return execute_translated(self, list, key, x, y, z);
     AcquireSRWLockShared(&compute_pso_lock);
     const auto found = compute_psos().find(pass.pipeline);
@@ -2572,12 +2658,14 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
         const int kind = pass.compute_kind[i];
         if (kind == 5) {
             InterlockedIncrement(&compute_skipped_args);
+            InterlockedIncrement(&compute_outcomes[co_c62_table_arg]);
             return false;
         }
         if (kind >= 2 && kind <= 4) {
             addresses[i] = desktop_va(pass.compute_address[i]);
             if (!addresses[i] && pass.compute_address[i]) {
                 InterlockedIncrement(&compute_skipped_args);
+                InterlockedIncrement(&compute_outcomes[co_c62_unmapped]);
                 return false;
             }
         }
@@ -2598,6 +2686,7 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
     const LONG n = InterlockedIncrement(&compute_executed);
+    InterlockedIncrement(&compute_outcomes[co_c62_run]);
     if (n <= 4 || n % 5000 == 0) log("x2w-compute dispatch %ld executed (%u, %u, %u)", n, x, y, z);
     return true;
 }
@@ -2675,16 +2764,34 @@ void report_dispatches()
     dispatch_counts().clear();
     ReleaseSRWLockExclusive(&compute_lock);
     std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.second.calls > b.second.calls; });
+    // LOCAL: every key is listed; a full line continues on another line with the same prefix, and a closing
+    // line gives the key and line counts so a reader can tell the list is complete.
+    static const char prefix[] = "x2w-render dispatches per compute key (300 frames):";
     char line[2048];
-    int n = std::snprintf(line, sizeof(line), "x2w-render dispatches per compute key (300 frames):");
+    int n = std::snprintf(line, sizeof(line), "%s", prefix), lines = 0;
     for (const auto& entry : all) {
-        if (n > static_cast<int>(sizeof(line)) - 80) break;
+        if (n > static_cast<int>(sizeof(line)) - 80) {
+            log("%s", line);
+            ++lines;
+            n = std::snprintf(line, sizeof(line), "%s", prefix);
+        }
         wchar_t path[MAX_PATH];
         const bool signed_ready = cache_path(path, L"", entry.first, L".cs.dxbc") && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
         n += std::snprintf(line + n, sizeof(line) - n, " %016llx%s:%lld(%u,%u,%u)", entry.first, signed_ready ? "*" : "",
                            entry.second.calls, entry.second.x, entry.second.y, entry.second.z);
     }
     log("%s", line);
+    ++lines;
+    log("x2w-render dispatch keys (300 frames): %zu keys in %d lines", all.size(), lines);
+    LONG o[co_count];
+    for (int i = 0; i < co_count; ++i) o[i] = InterlockedExchange(&compute_outcomes[i], 0);
+    log("x2w-compute dispatches (300 frames): executed %ld skipped %ld; slot-62 desktop pipeline executed %ld skipped %ld "
+        "(table argument %ld, unmapped root address %ld); translated executed %ld skipped %ld (X2W_CX_OFF %ld, not a slot-67 key %ld, "
+        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF)",
+        o[co_c62_run] + o[co_c67_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap],
+        o[co_c62_run], o[co_c62_table_arg] + o[co_c62_unmapped], o[co_c62_table_arg], o[co_c62_unmapped], o[co_c67_run],
+        o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap], o[co_c67_off], o[co_c67_other_key], o[co_c67_untranslated],
+        o[co_c67_heap], o[co_not_run]);
 }
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
@@ -3852,7 +3959,8 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
-    if (N == 67 && x2w_local::readable(desc, 0x28)) {
+    if (N == 57) regblob::dump57(desc, static_cast<Wrapper*>(*out));
+    if (N == 67 &&x2w_local::readable(desc, 0x28)) {
         u64 words[5];
         std::memcpy(words, desc, sizeof(words));
         std::vector<unsigned char> regs;
@@ -3893,6 +4001,7 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
     }
     *out = wrap(nullptr, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), 55, base, desc, bytes_in_patches);
+    regblob::dump55(base, desc, bytes_in_patches);
     return S_OK;
 }
 
@@ -4054,7 +4163,9 @@ void draw_overlay(LONG frame, double seconds)
 }
 
 #include "startup_stubs/d3d12_compute.inl"
+#include "startup_stubs/d3d12_indirect.inl"
 #include "startup_stubs/d3d12_present.inl"
+#include "startup_stubs/d3d12_copy_buffer.inl"
 
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
@@ -4065,6 +4176,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
     frame_number = frame;
+    note_present_planes(frame, planes, plane_parameters, present_parameters);
     draw_dump_flush();
     {
         static const LONG wanted = [] {
@@ -4159,6 +4271,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
             texture_bytes_uploaded, textures_unreadable);
+    if (render_mode() && frame % 300 == 0) report_target_binds();
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];
@@ -4169,6 +4282,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
         log("%s", line);
         report_dispatches();
+        report_indirect(300);  // LOCAL: d3d12_indirect.inl
+        regblob::report();
+        report_cx_views();
     }
     if (now - last_report >= 5000) {
         last_report = now;
@@ -4318,6 +4434,7 @@ void build_tables()
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
+        install_copy_buffer(list_typed);
     }
     tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
 
