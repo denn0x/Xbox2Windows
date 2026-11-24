@@ -45,7 +45,60 @@ struct BoundPipeline {
     D3D12_DEPTH_STENCIL_DESC depth_stencil{};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
+    // LOCAL (renderstate): fixed-function state decoded from the slot 57 base's state block A (vertex or
+    // mesh layout, pipeline_state_decode.h) and the nearest slot 55 parts; used only under X2W_DRAW_STATE_*.
+    bool has_words = false;          // state block A read (ds / rs / masked_blend valid where .ok)
+    bool mesh_layout = false;        // A+0x004 == 6: the fields sit 0x54 later (read_words handled it)
+    bool blend_overridden = false;   // a slot 55 blend patch or a stream blend subobject replaces the register words
+    bool derived_ds = false, derived_rs = false;  // a slot 55 depth-stencil / rasterizer part replaces A's
+    x2w_pipeline_state::DepthStencil ds;
+    x2w_pipeline_state::Raster rs;
+    x2w_pipeline_state::Blend masked_blend;
+    D3D12_DEPTH_STENCIL_DESC patch_ds{};
+    D3D12_RASTERIZER_DESC patch_rs{};
 };
+
+// LOCAL (renderstate): counters for the decoded fixed-function state, reported every 300 frames.
+namespace draw_state {
+enum Counter {
+    decoded, decoded_mesh, class_depth_off, class_depth_read, class_depth_write, class_stencil, class_cull, class_blend, class_masked,
+    class_dual, refused_depth, refused_raster, refused_blend, derived_ds, derived_rs, derived_invalid, depth_bounds_ignored,
+    stencil_masks_differ, clip_split, bias_rounded, conservative_dropped, pso_new, pso_failed_fallback, pso_failed_both,
+    draws_depth_no_target, draws_stencil_no_plane, draws_read_only, draws_rect_cull_off, dual_multi_target, count
+};
+LONG n[count];
+void add(Counter c) { InterlockedIncrement(&n[c]); }
+const x2w_pipeline_state::Switches& switches()
+{
+    static const x2w_pipeline_state::Switches s = [] {
+        const auto v = x2w_pipeline_state::switches_from_env();
+        log("x2w-draw-state switches: depth %d cull %d (flip %d) blend masks %d (X2W_DRAW_STATE_DEPTH / _CULL / _CULL_FLIP / _BLEND, "
+            "X2W_DRAW_STATE=0 all off)", v.depth, v.cull, v.flip, v.blend);
+        return v;
+    }();
+    return s;
+}
+}  // namespace draw_state
+
+// One line per 300 frames (counters reset here).
+void report_draw_state()
+{
+    using namespace draw_state;
+    LONG v[count];
+    for (int i = 0; i < count; ++i) v[i] = InterlockedExchange(&n[i], 0);
+    const auto& s = switches();
+    log("x2w-draw-state 300 frames (depth %d cull %d flip %d masks %d): pipelines decoded %ld (mesh layout %ld) [depth off %ld, read %ld, "
+        "write %ld, stencil %ld, cull %ld, blend %ld, masked %ld, dual-source %ld]; refused depth %ld raster %ld blend %ld; derived parts "
+        "depth-stencil %ld rasterizer %ld invalid %ld; flagged: depth bounds ignored %ld, stencil back masks differ %ld, one zclip "
+        "%ld, bias rounded %ld, conservative dropped %ld; PSOs new-state %ld, failed->old state %ld, failed both %ld; draws: depth/"
+        "stencil test without depth target %ld, stencil without plane %ld, read-only target writes off %ld, rect list cull off %ld, "
+        "dual-source with >1 target %ld",
+        s.depth, s.cull, s.flip, s.blend, v[decoded], v[decoded_mesh], v[class_depth_off], v[class_depth_read], v[class_depth_write],
+        v[class_stencil], v[class_cull], v[class_blend], v[class_masked], v[class_dual], v[refused_depth], v[refused_raster],
+        v[refused_blend], v[derived_ds], v[derived_rs], v[derived_invalid], v[depth_bounds_ignored], v[stencil_masks_differ],
+        v[clip_split], v[bias_rounded], v[conservative_dropped], v[pso_new], v[pso_failed_fallback], v[pso_failed_both],
+        v[draws_depth_no_target], v[draws_stencil_no_plane], v[draws_read_only], v[draws_rect_cull_off], v[dual_multi_target]);
+}
 // LOCAL meshrt (d3d12_mesh.inl): mesh pipelines through draw_translated.
 int load_mesh_stages(Translation& tr, const std::string& manifest);
 bool mesh_issue_active(Wrapper* self);
@@ -838,6 +891,51 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     return result;
 }
 
+// LOCAL (renderstate): fixed-function state of the slot 57 base (pipeline_state_decode.h), decoded once
+// per title pipeline; read_words picks the vertex or the mesh layout (A+0x004 == 6) itself. Counted and,
+// for the first 16, logged; applied only by apply_draw_state under the switches.
+void decode_draw_state(BoundPipeline& bound, Wrapper* pipeline, const PipelineInfo* info)
+{
+    using namespace x2w_pipeline_state;
+    Words words;
+    if (!info || info->path != 57 || !read_words(info->state_a.data(), info->state_a.size(), words)) return;
+    bound.has_words = true;
+    bound.mesh_layout = words.mesh;
+    bound.ds = decode_depth_stencil(words.depth, words.stencil, words.refmask, words.refmask_bf);
+    bound.rs = decode_rasterizer(words.mode, words.clip, words.bias_clamp, words.bias_scale, words.bias_offset, draw_state::switches().flip);
+    bound.masked_blend = decode_blend(words.blend, words.target_mask, words.shader_mask, true, false);
+    const D3D12_DEPTH_STENCIL_DESC& d = bound.derived_ds ? bound.patch_ds : bound.ds.desc;
+    const bool ds_known = bound.derived_ds || bound.ds.ok;
+    draw_state::add(draw_state::decoded);
+    if (words.mesh) draw_state::add(draw_state::decoded_mesh);
+    if (ds_known)
+        draw_state::add(!d.DepthEnable ? draw_state::class_depth_off : d.DepthWriteMask ? draw_state::class_depth_write : draw_state::class_depth_read);
+    if (ds_known && d.StencilEnable) draw_state::add(draw_state::class_stencil);
+    if (bound.rs.ok && bound.rs.desc.CullMode != D3D12_CULL_MODE_NONE) draw_state::add(draw_state::class_cull);
+    if (bound.masked_blend.ok && bound.masked_blend.desc.RenderTarget[0].BlendEnable) draw_state::add(draw_state::class_blend);
+    if (bound.masked_blend.masked_targets) draw_state::add(draw_state::class_masked);
+    if (bound.masked_blend.dual_source) draw_state::add(draw_state::class_dual);
+    if (!bound.ds.ok) draw_state::add(draw_state::refused_depth);
+    if (!bound.rs.ok) draw_state::add(draw_state::refused_raster);
+    if (!bound.masked_blend.ok) draw_state::add(draw_state::refused_blend);
+    if (bound.ds.depth_bounds) draw_state::add(draw_state::depth_bounds_ignored);
+    if (bound.ds.masks_differ) draw_state::add(draw_state::stencil_masks_differ);
+    if (bound.rs.clip_split) draw_state::add(draw_state::clip_split);
+    if (bound.rs.bias_rounded) draw_state::add(draw_state::bias_rounded);
+    static LONG logged_state;
+    if (first_calls(logged_state, 16)) {
+        const auto& r = bound.rs.desc;
+        log("x2w-draw-state pipeline %p%s: DB_DEPTH_CONTROL %08x STENCIL %08x REFMASK %08x/%08x -> %s depth %d write %d func %d "
+            "stencil %d%s; MODE %08x CLIP %08x bias %g/%g/%g -> %s cull %d ccw %d bias %d/%g/%g clip %d; masks %08x & %08x -> "
+            "rt0 0x%x%s%s", static_cast<void*>(pipeline), words.mesh ? " (mesh layout)" : "", words.depth, words.stencil, words.refmask,
+            words.refmask_bf, bound.ds.ok ? "ok" : bound.ds.reason, d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable,
+            bound.derived_ds ? " (derived part)" : "", words.mode, words.clip, words.bias_clamp, words.bias_scale, words.bias_offset,
+            bound.rs.ok ? "ok" : bound.rs.reason, r.CullMode, r.FrontCounterClockwise, r.DepthBias, r.DepthBiasClamp, r.SlopeScaledDepthBias,
+            r.DepthClipEnable, words.target_mask, words.shader_mask, bound.masked_blend.desc.RenderTarget[0].RenderTargetWriteMask,
+            bound.masked_blend.dual_source ? " dual-source" : "", bound.masked_blend.ok ? "" : " (blend refused)");
+    }
+}
+
 // draw_lock held.
 BoundPipeline* translation_for(Wrapper* pipeline)
 {
@@ -859,8 +957,21 @@ BoundPipeline* translation_for(Wrapper* pipeline)
                 from = "derived blend patch";
                 bound->has_blend = true;
             }
+            // LOCAL (renderstate): the nearest derivation's depth-stencil / rasterizer part wins, as for blend.
+            using namespace x2w_pipeline_state;
+            const unsigned char* records = info->desc.data();
+            const std::size_t record_bytes = info->desc.size();
+            if (!bound->derived_ds && last_part(records, record_bytes, part_depth_stencil) != SIZE_MAX) {
+                bound->derived_ds = derived_depth_stencil(records, record_bytes, bound->patch_ds);
+                draw_state::add(bound->derived_ds ? draw_state::derived_ds : draw_state::derived_invalid);
+            }
+            if (!bound->derived_rs && last_part(records, record_bytes, part_rasterizer) != SIZE_MAX) {
+                bound->derived_rs = derived_rasterizer(records, record_bytes, bound->patch_rs);
+                draw_state::add(bound->derived_rs ? draw_state::derived_rs : draw_state::derived_invalid);
+            }
             info = pipeline_info(info->base);
         }
+        bound->blend_overridden = bound->has_blend || (info && info->has_stream_blend);
         if (!bound->has_blend && info && info->has_stream_blend) {
             from = "stream blend subobject";
             bound->blend = info->stream_blend;
@@ -872,6 +983,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         } else if (!bound->has_blend && info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
         else if (!bound->has_blend && info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
         bound->has_blend = from[0] != 'n';
+        decode_draw_state(*bound, pipeline, info);  // LOCAL (renderstate)
         static LONG logged;
         if (first_calls(logged, 24)) {
             const auto& t = bound->blend.RenderTarget[0];
@@ -974,6 +1086,83 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     return entry;
 }
 
+// LOCAL (renderstate): the X2W_DRAW_STATE_* groups over the state a caller built before them (its
+// BlendState / DepthStencilState / RasterizerState; desc.DSVFormat must already be the draw's format).
+// All groups off (the default) leaves desc untouched and returns false. Returns whether anything
+// changed; per-draw adjustments are counted on every call. Also for mesh PSOs (d3d12_mesh.inl):
+// BoundPipeline's decode already read the mesh layout of state block A. s: which groups apply; the
+// vertex draw path passes draw_state::switches(), a mesh caller may pass its own.
+bool apply_draw_state(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                      const x2w_pipeline_state::Switches& s)
+{
+    using namespace x2w_pipeline_state;
+    const DXGI_FORMAT dsv_format = desc.DSVFormat;
+    bool changed = false;
+    if (s.blend && bound.has_words && !bound.blend_overridden && bound.masked_blend.ok) {
+        desc.BlendState = bound.masked_blend.desc;
+        if (bound.masked_blend.dual_source) {
+            // D3D12 blends two colours only into target 0; the words are the same for every target then.
+            desc.BlendState.IndependentBlendEnable = FALSE;
+            if (pass.target_count > 1) draw_state::add(draw_state::dual_multi_target);
+        }
+        changed = true;
+    }
+    if (s.depth && !bound.has_depth_stencil && (bound.derived_ds || (bound.has_words && bound.ds.ok))) {
+        D3D12_DEPTH_STENCIL_DESC d = bound.derived_ds ? bound.patch_ds : bound.ds.desc;
+        const unsigned adjusted = adjust_for_target(d, dsv_format != DXGI_FORMAT_UNKNOWN, format_has_stencil(dsv_format), pass.dsv_read_only);
+        if (adjusted & adjust_no_target) draw_state::add(draw_state::draws_depth_no_target);
+        if (adjusted & adjust_no_stencil) draw_state::add(draw_state::draws_stencil_no_plane);
+        if (adjusted & adjust_read_only) draw_state::add(draw_state::draws_read_only);
+        desc.DepthStencilState = d;
+        changed = true;
+    }
+    if (s.cull && (bound.derived_rs || (bound.has_words && bound.rs.ok))) {
+        D3D12_RASTERIZER_DESC r = bound.derived_rs ? bound.patch_rs : bound.rs.desc;
+        if (bound.derived_rs && s.flip) r.FrontCounterClockwise = !r.FrontCounterClockwise;
+        if (r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF) {
+            r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;  // tier not checked
+            draw_state::add(draw_state::conservative_dropped);
+        }
+        r.MultisampleEnable = FALSE;  // single-sample targets only (desc.SampleDesc.Count = 1)
+        r.ForcedSampleCount = 0;
+        // A rectangle list is drawn as two triangles per rectangle; the console rasterizes it as a
+        // rectangle, which is taken as never culled (assumed).
+        if (pass.topology == 0x11 && r.CullMode != D3D12_CULL_MODE_NONE) {
+            r.CullMode = D3D12_CULL_MODE_NONE;
+            draw_state::add(draw_state::draws_rect_cull_off);
+        }
+        desc.RasterizerState = r;
+        changed = true;
+    }
+    return changed;
+}
+
+// LOCAL (renderstate): creation of a desc with decoded state failed (first): create the state of before
+// instead, count and log. Returns the final result; pipeline is the created one or null.
+HRESULT draw_state_fallback(u64 translation, HRESULT first, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& decoded,
+                            const D3D12_GRAPHICS_PIPELINE_STATE_DESC& fallback, ID3D12PipelineState*& pipeline)
+{
+    if (SUCCEEDED(first)) {
+        draw_state::add(draw_state::pso_new);
+        return first;
+    }
+    pipeline = nullptr;
+    const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&fallback, IID_PPV_ARGS(&pipeline));
+    draw_state::add(SUCCEEDED(hr) ? draw_state::pso_failed_fallback : draw_state::pso_failed_both);
+    static LONG logged_failure;
+    if (first_calls(logged_failure, 16)) {
+        const auto& b = decoded.BlendState.RenderTarget[0];
+        const auto& d = decoded.DepthStencilState;
+        const auto& r = decoded.RasterizerState;
+        log("x2w-draw-state decoded state refused for %016llx (0x%08lx): blend rt0 %d/%d/%d mask 0x%x independent %d, depth %d write %d "
+            "func %d stencil %d, cull %d ccw %d bias %d/%g/%g clip %d; old state -> 0x%08lx", translation, static_cast<unsigned long>(first),
+            b.BlendEnable, b.SrcBlend, b.DestBlend, b.RenderTargetWriteMask, decoded.BlendState.IndependentBlendEnable, d.DepthEnable,
+            d.DepthWriteMask, d.DepthFunc, d.StencilEnable, r.CullMode, r.FrontCounterClockwise, r.DepthBias, r.DepthBiasClamp,
+            r.SlopeScaledDepthBias, r.DepthClipEnable, static_cast<unsigned long>(hr));
+    }
+    return hr;
+}
+
 // LOCAL stall: a desktop graphics pipeline compiled outside draw_lock. CreateGraphicsPipelineState runs
 // the driver's shader compiler (seconds for a large shader on a cold driver cache); under draw_lock it
 // stalled every recording thread behind one compile. On a miss pipeline_for fills a PsoBuild and returns
@@ -985,6 +1174,10 @@ struct PsoBuild {
     u64 key = 0;                     // pipeline_for's key in bound->pipelines
     u64 translation = 0;             // for the log
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};  // points at the translation's blobs and root signature, which are never freed
+    // LOCAL (renderstate): desc carries decoded X2W_DRAW_STATE_* state; when its creation fails, fallback
+    // (the state of before) is created instead.
+    bool has_fallback = false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC fallback{};
 };
 struct PsoSlot {
     int state = 0;  // 1 compiling, 2 done
@@ -1013,13 +1206,14 @@ void build_pipeline(const PsoBuild& build)
     LARGE_INTEGER start, end, frequency;
     QueryPerformanceCounter(&start);
     ID3D12PipelineState* pipeline = nullptr;
-    const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&build.desc, IID_PPV_ARGS(&pipeline));
+    HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&build.desc, IID_PPV_ARGS(&pipeline));
+    if (build.has_fallback) hr = draw_state_fallback(build.translation, hr, build.desc, build.fallback, pipeline);
     QueryPerformanceCounter(&end);
     QueryPerformanceFrequency(&frequency);
-    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d), compiled in %lld ms outside draw_lock",
+    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d%s), compiled in %lld ms outside draw_lock",
         build.translation, build.desc.NumRenderTargets, build.desc.NumRenderTargets ? build.desc.RTVFormats[0] : 0,
         static_cast<unsigned long>(hr), static_cast<int>(build.desc.DSVFormat), build.desc.DepthStencilState.DepthEnable ? 1 : 0,
-        static_cast<long long>((end.QuadPart - start.QuadPart) * 1000 / frequency.QuadPart));
+        build.has_fallback ? ", decoded state" : "", static_cast<long long>((end.QuadPart - start.QuadPart) * 1000 / frequency.QuadPart));
     check_device("translated CreateGraphicsPipelineState", 0);
     AcquireSRWLockExclusive(&pso_build_lock);
     slot.pipeline = pipeline;
@@ -1027,6 +1221,9 @@ void build_pipeline(const PsoBuild& build)
     ReleaseSRWLockExclusive(&pso_build_lock);
     WakeAllConditionVariable(&pso_built);
 }
+
+void pipeline_desc(const BoundPipeline& bound, const Translation& tr, const Pass& pass, DXGI_FORMAT dsv_format,
+                   D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc);
 
 // draw_lock held. With `deferred`, a pipeline not built yet is described there and nullptr is returned.
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass, PsoBuild* deferred = nullptr)
@@ -1037,6 +1234,21 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
     if (bound.has_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
+    // LOCAL (renderstate): with an X2W_DRAW_STATE_* group on, the decoded state depends on the draw
+    // (depth target, topology), so the key also covers the three final state descriptions. With every
+    // group off, key and desc are what they were before.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC decoded{};
+    bool changed = false;
+    const auto& state_switches = draw_state::switches();
+    if (state_switches.depth || state_switches.cull || state_switches.blend) {
+        pipeline_desc(bound, tr, pass, dsv_format, decoded);
+        changed = apply_draw_state(bound, pass, decoded, state_switches);
+        if (changed) {
+            key = fnv_bytes(&decoded.BlendState, sizeof(decoded.BlendState), key);
+            key = fnv_bytes(&decoded.DepthStencilState, sizeof(decoded.DepthStencilState), key);
+            key = fnv_bytes(&decoded.RasterizerState, sizeof(decoded.RasterizerState), key);
+        }
+    }
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     {
@@ -1051,6 +1263,33 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
         }
     }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    pipeline_desc(bound, tr, pass, dsv_format, desc);
+    if (deferred) {
+        deferred->bound = &bound;
+        deferred->key = key;
+        deferred->translation = tr.key;
+        deferred->desc = changed ? decoded : desc;
+        deferred->has_fallback = changed;
+        if (changed) deferred->fallback = desc;
+        return nullptr;
+    }
+    ID3D12PipelineState* pipeline = nullptr;
+    HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(changed ? &decoded : &desc, IID_PPV_ARGS(&pipeline));
+    if (changed) hr = draw_state_fallback(tr.key, hr, decoded, desc, pipeline);
+    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d%s)", tr.key,
+        pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
+        static_cast<int>(dsv_format), (changed ? decoded : desc).DepthStencilState.DepthEnable ? 1 : 0, changed ? ", decoded state" : "");
+    check_device("translated CreateGraphicsPipelineState", 0);
+    bound.pipelines[key] = pipeline;
+    return pipeline;
+}
+
+// The desktop PSO description of a translated (vertex) draw with the state of before: blend found in the
+// state block, depth-stencil from a stream PSO, no culling.
+void pipeline_desc(const BoundPipeline& bound, const Translation& tr, const Pass& pass, DXGI_FORMAT dsv_format,
+                   D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc)
+{
+    desc = {};
     desc.pRootSignature = tr.root;
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
     desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
@@ -1078,21 +1317,6 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     for (UINT i = 0; i < pass.target_count; ++i) desc.RTVFormats[i] = pass.target_formats[i];
     desc.DSVFormat = dsv_format;
     desc.SampleDesc.Count = 1;
-    if (deferred) {
-        deferred->bound = &bound;
-        deferred->key = key;
-        deferred->translation = tr.key;
-        deferred->desc = desc;
-        return nullptr;
-    }
-    ID3D12PipelineState* pipeline = nullptr;
-    const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
-    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
-        pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
-        static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
-    check_device("translated CreateGraphicsPipelineState", 0);
-    bound.pipelines[key] = pipeline;
-    return pipeline;
 }
 
 // Private shader-visible heap for the translated draws' tables, used as a ring.

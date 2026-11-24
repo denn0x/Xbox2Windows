@@ -601,6 +601,11 @@ add_executable(startup_stream_depth tests/startup_stream_depth.cpp tests/startup
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
 
+# Decoded depth / cull / write-mask state of slot 57 pipelines on translated draws (X2W_DRAW_STATE_*).
+add_executable(startup_draw_state tests/startup_draw_state.cpp tests/startup_stream_setup.cpp)
+target_compile_features(startup_draw_state PRIVATE cxx_std_17)
+target_link_libraries(startup_draw_state PRIVATE d3d12_xs_shim d3d12 dxgi)
+
 # Console queue Wait (slot 17) waits on the GPU instead of signalling the fence.
 add_executable(startup_queue_wait tests/startup_queue_wait.cpp)
 target_compile_features(startup_queue_wait PRIVATE cxx_std_17)
@@ -1894,6 +1899,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_depth_check.py"
             "$<TARGET_FILE:startup_stream_depth>" "${backend}")
         set_tests_properties(startup_stream_depth_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_draw_state_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_state_check.py"
+            "$<TARGET_FILE:startup_draw_state>" "${backend}")
+        set_tests_properties(startup_draw_state_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         foreach(compiler IN ITEMS fxc dxc)
             add_test(NAME startup_mrt_${compiler}_${backend} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mrt_check.py"

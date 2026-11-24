@@ -2559,6 +2559,7 @@ struct Pass {
     D3D12_INDEX_BUFFER_VIEW ib = {};
     DXGI_FORMAT target_formats[8] = {};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
+    bool dsv_read_only = false;          // LOCAL (renderstate): the bound depth target is a read-only view (d3d12_draw.inl drops depth writes)
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     bool heap_set = false;
@@ -2737,6 +2738,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target_count = 0;
     pass.target0 = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
+    pass.dsv_read_only = false;
     static LONG refused;
     const auto refuse = [](TargetBind why) { InterlockedIncrement(&target_binds[why]); };
     if (!list) return refuse(bind_not_recording);
@@ -2817,6 +2819,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     if (dsv_target) require_state(self, dsv_target, dsv_state);
     pass.target_count = count;
     pass.dsv_format = dsv_format;
+    pass.dsv_read_only = dsv_state == D3D12_RESOURCE_STATE_DEPTH_READ;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
     InterlockedIncrement(&target_binds[single_range ? bind_single_range_bound : bind_bound]);
@@ -2876,6 +2879,12 @@ void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 {
     if (auto* list = recording(self); list && x2w_local::readable(factor, 16)) list->OMSetBlendFactor(factor);
     else if (list) InterlockedIncrement(&state_dropped[2]);
+}
+// LOCAL (renderstate): list slot 24, OMSetStencilRef(reference). Traced calls pass one small integer
+// in rdx (0 and 7 seen, run 78), once per frame next to slot 23. Installed with X2W_DRAW_STATE_DEPTH=1.
+void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
+{
+    if (auto* list = recording(self)) list->OMSetStencilRef(reference & 0xFF);
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
@@ -5124,6 +5133,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
             texture_bytes_uploaded, textures_unreadable);
     if (render_mode() && frame % 300 == 0) report_target_binds();
+    if (render_mode() && frame % 300 == 0) report_draw_state();  // LOCAL (renderstate): d3d12_draw.inl
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];
@@ -5286,6 +5296,7 @@ void build_tables()
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
         list_typed[23] = reinterpret_cast<ListTyped>(&list_blend_factor);
+        if (x2w_pipeline_state::switches_from_env().depth) list_typed[24] = reinterpret_cast<ListTyped>(&list_stencil_ref);  // LOCAL (renderstate)
         list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
