@@ -37,11 +37,12 @@ enum IndirectSkip {
     skip_zero_count,         // max count 0
     skip_topology,           // a draw with a console-only topology (rect list)
     skip_no_ring,            // the private argument ring could not be created or the record is too large
+    skip_no_guard,           // the argument guard pass could not be created (calls are never executed unguarded)
     skip_reasons
 };
 constexpr const char* indirect_skip_names[skip_reasons] = {"not-recording", "unknown-signature", "not-implemented", "off",
                                                            "no-pipeline", "unresolved-buffer", "zero-count", "unsupported-topology",
-                                                           "no-ring"};
+                                                           "no-ring", "no-guard"};
 
 struct IndirectCounters {
     LONG calls[itype_types];
@@ -152,6 +153,7 @@ bool ensure_indirect_ring()
         desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;  // the guard pass rewrites records in place
         ID3D12Resource* created = nullptr;
         const HRESULT hr = device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                                                                           nullptr, IID_PPV_ARGS(&created));
@@ -172,6 +174,184 @@ u64 indirect_ring_take(u64 bytes)
         const u64 first = static_cast<u64>(InterlockedExchangeAdd64(&indirect_ring_cursor, static_cast<LONG64>(slots))) % total;
         if (first + slots <= total) return first * indirect_ring_slot;
     }
+}
+
+// ---- Argument guard ----------------------------------------------------------------------------
+//
+// GPU-written records may be garbage while the shaders that produce them are wrong or untranslated, and
+// a Dispatch with huge group counts hangs the GPU (device removed). Every record copied into the ring is
+// checked ON THE GPU by one tiny compute pass before ExecuteIndirect reads it; a record over the bounds
+// is zeroed (a zero-group dispatch / zero-count draw does nothing) and counted in a CPU-visible counter
+// that report_indirect reads once per report. No CPU read-back per call.
+//   Dispatch / DispatchMesh {x, y, z}: each <= X2W_INDIRECT_MAX_GROUPS (default 65535, the desktop limit)
+//     and x*y*z <= X2W_INDIRECT_MAX_GROUP_PRODUCT (default 2^24; DispatchMesh also <= 2^22, the desktop limit).
+//   Draw {vertices, instances, ..} / DrawIndexed {indices, instances, ..}: count <= X2W_INDIRECT_MAX_VERTICES
+//     (default 2^24), instances <= X2W_INDIRECT_MAX_INSTANCES (default 2^16), count*instances <=
+//     X2W_INDIRECT_MAX_DRAW_PRODUCT (default 2^26).
+// X2W_INDIRECT_GUARD=0 executes unguarded (debugging only). When the guard cannot be created, calls are
+// skipped ("no-guard"), never executed unguarded.
+// Not covered: a record within the bounds can still make a shader loop or fault (wrong root data,
+// out-of-range addresses); start offsets (StartIndex, BaseVertex, StartInstance) are not checked
+// (index fetches are bounds-checked by the desktop); the count dword is not checked (ExecuteIndirect
+// already takes min(count, max count)).
+UINT indirect_env_u32(const char* name, UINT fallback)
+{
+    char value[16]{};
+    if (!GetEnvironmentVariableA(name, value, sizeof(value)) || !value[0]) return fallback;
+    const unsigned long long n = std::strtoull(value, nullptr, 0);
+    return n && n <= 0xffffffffull ? static_cast<UINT>(n) : fallback;
+}
+struct IndirectBounds {
+    UINT groups, group_product, mesh_product, vertices, instances, draw_product;
+};
+const IndirectBounds& indirect_bounds()
+{
+    static const IndirectBounds b = [] {
+        IndirectBounds v{};
+        v.groups = indirect_env_u32("X2W_INDIRECT_MAX_GROUPS", 65535);
+        v.group_product = indirect_env_u32("X2W_INDIRECT_MAX_GROUP_PRODUCT", 1u << 24);
+        v.mesh_product = v.group_product < (1u << 22) ? v.group_product : (1u << 22);
+        v.vertices = indirect_env_u32("X2W_INDIRECT_MAX_VERTICES", 1u << 24);
+        v.instances = indirect_env_u32("X2W_INDIRECT_MAX_INSTANCES", 1u << 16);
+        v.draw_product = indirect_env_u32("X2W_INDIRECT_MAX_DRAW_PRODUCT", 1u << 26);
+        return v;
+    }();
+    return b;
+}
+bool indirect_guard_wanted()
+{
+    static const bool wanted = !indirect_env_zero("X2W_INDIRECT_GUARD");
+    return wanted;
+}
+
+constexpr char indirect_guard_source[] = R"(
+RWByteAddressBuffer ring : register(u0);
+RWByteAddressBuffer zeroed : register(u1);
+cbuffer Bounds : register(b0) { uint stride; uint records; uint kind; uint counter; uint each; uint product; uint each2; uint unused; };
+[numthreads(64, 1, 1)]
+void cs(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= records) return;
+    const uint at = id.x * stride;
+    bool bad = false;
+    if (kind == 0) {
+        const uint3 g = ring.Load3(at);
+        bad = g.x > each || g.y > each || g.z > each;
+        if (!bad && g.x != 0 && g.y > product / g.x) bad = true;
+        const uint xy = g.x * g.y;
+        if (!bad && xy != 0 && g.z > product / xy) bad = true;
+        if (bad) ring.Store3(at, uint3(0, 0, 0));
+    } else {
+        const uint2 d = ring.Load2(at);
+        bad = d.x > each || d.y > each2 || (d.x != 0 && d.y > product / d.x);
+        if (bad) ring.Store2(at, uint2(0, 0));
+    }
+    if (bad) {
+        uint previous;
+        zeroed.InterlockedAdd(counter * 4, 1, previous);
+    }
+}
+)";
+ID3D12RootSignature* indirect_guard_root;
+ID3D12PipelineState* indirect_guard_pso;
+ID3D12Resource* indirect_guard_counter;              // 8 dwords: records zeroed, by counter type
+const volatile std::uint32_t* indirect_guard_words;  // mapped (CPU-visible custom heap), or null
+std::uint32_t indirect_guard_reported[itype_types];
+bool ensure_indirect_guard()
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static bool failed;
+    if (indirect_guard_pso) return true;
+    AcquireSRWLockExclusive(&lock);
+    if (!indirect_guard_pso && !failed) {
+        ID3D12Device* device = device_of(the_device);
+        ID3DBlob *code = nullptr, *errors = nullptr, *serialized = nullptr;
+        HRESULT hr = D3DCompile(indirect_guard_source, sizeof(indirect_guard_source) - 1, "indirect_guard", nullptr, nullptr, "cs",
+                                "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+        if (FAILED(hr) && errors) log("x2w-indirect guard compile: %.400s", static_cast<const char*>(errors->GetBufferPointer()));
+        D3D12_ROOT_PARAMETER params[3]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[1].Descriptor.ShaderRegister = 1;
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[2].Constants.Num32BitValues = 8;
+        for (auto& p : params) p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        const D3D12_ROOT_SIGNATURE_DESC root_desc{3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        if (SUCCEEDED(hr)) hr = D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr);
+        ID3D12RootSignature* root = nullptr;
+        if (SUCCEEDED(hr))
+            hr = device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&root));
+        ID3D12PipelineState* pso = nullptr;
+        if (SUCCEEDED(hr)) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+            desc.pRootSignature = root;
+            desc.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+            hr = device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso));
+        }
+        // The counter: a CPU-visible custom heap (write-back, system memory) so a report reads it without a
+        // copy; if the adapter refuses, a default-heap counter (the guard still runs, counts are not shown).
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 64;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ID3D12Resource* counter = nullptr;
+        void* mapped = nullptr;
+        HRESULT counter_hr = E_FAIL;
+        if (SUCCEEDED(hr)) {
+            const D3D12_HEAP_PROPERTIES visible{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0};
+            counter_hr = device->CreateCommittedResource(&visible, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         IID_PPV_ARGS(&counter));
+            if (SUCCEEDED(counter_hr) && SUCCEEDED(counter->Map(0, nullptr, &mapped))) {
+                std::memset(mapped, 0, 64);
+            } else {
+                mapped = nullptr;
+                if (counter) counter->Release(), counter = nullptr;
+                const D3D12_HEAP_PROPERTIES local{D3D12_HEAP_TYPE_DEFAULT};
+                hr = device->CreateCommittedResource(&local, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                     IID_PPV_ARGS(&counter));
+            }
+        }
+        const IndirectBounds& b = indirect_bounds();
+        log("x2w-indirect argument guard -> 0x%08lx (counter %s 0x%08lx): groups <= %u each, product <= %u (mesh %u); draws count <= %u, "
+            "instances <= %u, product <= %u",
+            static_cast<unsigned long>(hr), mapped ? "visible" : "not visible", static_cast<unsigned long>(counter_hr), b.groups,
+            b.group_product, b.mesh_product, b.vertices, b.instances, b.draw_product);
+        if (code) code->Release();
+        if (errors) errors->Release();
+        if (serialized) serialized->Release();
+        if (SUCCEEDED(hr) && pso && root && counter) {
+            indirect_guard_root = root;
+            indirect_guard_counter = counter;
+            indirect_guard_words = static_cast<const volatile std::uint32_t*>(mapped);
+            indirect_guard_pso = pso;
+        } else {
+            if (pso) pso->Release();
+            if (root) root->Release();
+            if (counter) counter->Release();
+            failed = true;
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return indirect_guard_pso != nullptr;
+}
+// Records the guard pass over `records` records at ring offset `slot` (ring in UNORDERED_ACCESS).
+void indirect_guard(ID3D12GraphicsCommandList* list, int type, u64 slot, UINT stride, UINT records)
+{
+    const IndirectBounds& b = indirect_bounds();
+    const bool groups = type == itype_dispatch || type == itype_mesh;
+    const UINT constants[8] = {stride, records, groups ? 0u : 1u, static_cast<UINT>(type),
+                               groups ? b.groups : b.vertices, groups ? (type == itype_mesh ? b.mesh_product : b.group_product) : b.draw_product,
+                               b.instances, 0};
+    list->SetPipelineState(indirect_guard_pso);
+    list->SetComputeRootSignature(indirect_guard_root);
+    list->SetComputeRootUnorderedAccessView(0, indirect_ring->GetGPUVirtualAddress() + slot);
+    list->SetComputeRootUnorderedAccessView(1, indirect_guard_counter->GetGPUVirtualAddress());
+    list->SetComputeRoot32BitConstants(2, 8, constants, 0);
+    list->Dispatch((records + 63) / 64, 1, 1);
 }
 
 // Read-back of executed records (X2W_INDIRECT_READBACK): 32-byte slots, [0] marker copied from the upload
@@ -245,6 +425,11 @@ struct IndirectPending {
     u64 count_at;
     bool issued;
     IndirectSkip refused;          // set by an issue path that refused the call
+    // Set by indirect_stage: the record (and count) sit in the ring at `slot`, checked by the guard; the
+    // ring is in `ring_state` on this list until indirect_issue / indirect_unstage returns it to COMMON.
+    bool staged;
+    u64 slot, ring_count_at;
+    D3D12_RESOURCE_STATES ring_state;
 };
 thread_local IndirectPending* indirect_current;
 
@@ -260,12 +445,17 @@ void indirect_transition(D3D12_RESOURCE_BARRIER& b, ID3D12Resource* resource, D3
     b.Transition.StateAfter = to;
 }
 
-// Records the copy, the barriers and the ExecuteIndirect for the pending call. The pipeline and root
-// state must already be bound on `list`.
-bool indirect_issue(Wrapper* self, ID3D12GraphicsCommandList* list)
+// Records, BEFORE the dispatch / draw / mesh path binds its pipeline and root state (the guard pass binds
+// its own compute pipeline): the copy of the record into the ring, the guard pass over it and the
+// barriers that leave the ring readable as indirect arguments. A forwarded title pipeline (pipeline_real)
+// is bound again afterwards. Returns false (p->refused set) when nothing was recorded.
+bool indirect_stage(Wrapper* self, ID3D12GraphicsCommandList* list, IndirectPending* p)
 {
-    IndirectPending* p = indirect_current;
-    if (!p || p->issued || p->list != self || !list) return false;
+    const bool guard = indirect_guard_wanted();
+    if (guard && !ensure_indirect_guard()) {
+        p->refused = skip_no_guard;
+        return false;
+    }
     const u64 record_bytes = u64{p->stride} * p->max_count;
     const u64 count_at = (record_bytes + 15) & ~u64{15};
     const u64 slot = indirect_ring_take(count_at + (p->count_window ? 16 : 0));
@@ -287,8 +477,42 @@ bool indirect_issue(Wrapper* self, ID3D12GraphicsCommandList* list)
                                                       : D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
     for (UINT i = 0; i < n; ++i) std::swap(b[i].Transition.StateBefore, b[i].Transition.StateAfter);
     b[n - 1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    b[n - 1].Transition.StateAfter = ring_state;
+    b[n - 1].Transition.StateAfter = guard ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : ring_state;
     list->ResourceBarrier(n, b);
+    if (guard) {
+        indirect_guard(list, p->type, slot, p->stride, p->max_count);
+        D3D12_RESOURCE_BARRIER after;
+        indirect_transition(after, indirect_ring, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, ring_state);
+        list->ResourceBarrier(1, &after);
+        const Pass& pass = pass_of(self);
+        if (pass.pipeline_real && pass.pipeline) list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
+    }
+    p->staged = true;
+    p->slot = slot;
+    p->ring_count_at = count_at;
+    p->ring_state = ring_state;
+    return true;
+}
+// A staged call that no path issued: the ring goes back to COMMON on this list.
+void indirect_unstage(ID3D12GraphicsCommandList* list, IndirectPending* p)
+{
+    if (!p->staged) return;
+    D3D12_RESOURCE_BARRIER b;
+    indirect_transition(b, indirect_ring, p->ring_state, D3D12_RESOURCE_STATE_COMMON);
+    list->ResourceBarrier(1, &b);
+    p->staged = false;
+}
+
+// Records the ExecuteIndirect for the pending (staged) call. The pipeline and root state must already be
+// bound on `list`.
+bool indirect_issue(Wrapper* self, ID3D12GraphicsCommandList* list)
+{
+    IndirectPending* p = indirect_current;
+    if (!p || p->issued || !p->staged || p->list != self || !list) return false;
+    const u64 record_bytes = u64{p->stride} * p->max_count;
+    const u64 slot = p->slot, count_at = p->ring_count_at;
+    const D3D12_RESOURCE_STATES ring_state = p->ring_state;
+    const bool readback = (ring_state & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0;
     list->ExecuteIndirect(p->signature, p->max_count, indirect_ring, slot, p->count_window ? indirect_ring : nullptr,
                           p->count_window ? slot + count_at : 0);
     if (readback) {
@@ -308,6 +532,7 @@ bool indirect_issue(Wrapper* self, ID3D12GraphicsCommandList* list)
     D3D12_RESOURCE_BARRIER rest;
     indirect_transition(rest, indirect_ring, ring_state, D3D12_RESOURCE_STATE_COMMON);
     list->ResourceBarrier(1, &rest);
+    p->staged = false;
     p->issued = true;
     return true;
 }
@@ -353,9 +578,10 @@ void indirect_announce()
     if (InterlockedExchange(&once, 1)) return;
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7{};
     const HRESULT hr = device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7, sizeof(options7));
-    log("x2w-indirect execution: dispatch %s, draw %s, mesh %s (hook %s), read-back %ld records per report; MeshShaderTier %d (0x%08lx)",
+    log("x2w-indirect execution: dispatch %s, draw %s, mesh %s (hook %s), guard %s, read-back %ld records per report; MeshShaderTier %d (0x%08lx)",
         indirect_type_enabled(itype_dispatch) ? "on" : "off", indirect_type_enabled(itype_draw) ? "on" : "off",
-        indirect_type_enabled(itype_mesh) ? "on" : "off", indirect_mesh_hook ? "set" : "absent", indirect_readback_wanted(),
+        indirect_type_enabled(itype_mesh) ? "on" : "off", indirect_mesh_hook ? "set" : "absent",
+        indirect_guard_wanted() ? "on" : "OFF (X2W_INDIRECT_GUARD=0)", indirect_readback_wanted(),
         SUCCEEDED(hr) ? static_cast<int>(options7.MeshShaderTier) : -1, static_cast<unsigned long>(hr));
 }
 
@@ -410,11 +636,13 @@ void indirect_run(Wrapper* self, ID3D12GraphicsCommandList* list, int type, Wrap
         (count_resource && !indirect_window(count_resource, count_offset, 4, &p.count_window, &p.count_at)))
         return indirect_skip(type, skip_unresolved_buffer);
     if (!ensure_indirect_ring()) return indirect_skip(type, skip_no_ring);
+    if (!indirect_stage(self, list, &p)) return indirect_skip(type, p.refused);
     indirect_current = &p;
     if (type == itype_dispatch) execute_dispatch(self, 0, 0, 0, compute_key_of(self));
     else if (type == itype_mesh) indirect_mesh_hook(self, list);
     else draw_translated(self, type == itype_indexed, 0, 0, 0, 0, 0);
     indirect_current = nullptr;
+    indirect_unstage(list, &p);
     if (p.issued) {
         InterlockedIncrement(&indirect_counts.executed[type]);
     } else {
@@ -524,5 +752,21 @@ void report_indirect(LONG frames)
         "(draw %ld, indexed %ld, dispatch %ld, mesh %ld, other %ld); skipped by reason (%s); count buffer %ld, max count > 1 %ld, largest %ld",
         frames, calls, c.calls[0], c.calls[1], c.calls[2], c.calls[3], c.calls[4], executed, c.executed[0], c.executed[1], c.executed[2],
         c.executed[3], c.executed[4], at ? skipped : "none", c.with_count_buffer, c.max_count_above_one, c.max_count_max);
+    // Records the guard zeroed since the last report (the GPU adds to the counter; values of lists still in
+    // flight arrive in a later report).
+    if (indirect_guard_pso && executed) {
+        if (indirect_guard_words) {
+            std::uint32_t zeroed[itype_types];
+            for (int t = 0; t < itype_types; ++t) {
+                const std::uint32_t now = indirect_guard_words[t];
+                zeroed[t] = now - indirect_guard_reported[t];
+                indirect_guard_reported[t] = now;
+            }
+            log("x2w-indirect guard: zeroed %u records over the bounds (draw %u, indexed %u, dispatch %u, mesh %u)",
+                zeroed[0] + zeroed[1] + zeroed[2] + zeroed[3], zeroed[0], zeroed[1], zeroed[2], zeroed[3]);
+        } else {
+            log("x2w-indirect guard: active, zeroed count not visible (default-heap counter)");
+        }
+    }
     report_indirect_readback();
 }

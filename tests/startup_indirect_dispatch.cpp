@@ -1,6 +1,7 @@
 // ExecuteIndirect (list slot 61) through the stand-in with GPU-written Dispatch arguments.
 //
-//   startup_indirect_dispatch <warp|hardware> <gpu|no-writer|zero|off>
+//   startup_indirect_dispatch <warp|hardware> <gpu|no-writer|zero|off|huge|huge-product>
+//   (huge / huge-product: a first record over the argument guard's bounds, which must not execute)
 //   (X2W_D3D12_RENDER=1 X2W_D3D12_PERMISSIVE=1; "off" also X2W_INDIRECT_OFF=1)
 //
 // Title memory is one private VirtualAlloc block. The argument buffer is a slot-133 placed buffer at
@@ -63,7 +64,8 @@ int main(int argc, char** argv)
 {
     if (argc != 3) return 2;
     const std::string mode = argv[2];
-    if (mode != "gpu" && mode != "no-writer" && mode != "zero" && mode != "off") return 2;
+    const bool huge = mode == "huge", huge_product = mode == "huge-product";
+    if (mode != "gpu" && mode != "no-writer" && mode != "zero" && mode != "off" && !huge && !huge_product) return 2;
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
     ComPtr<IDXGIAdapter> adapter;
@@ -169,8 +171,13 @@ int main(int argc, char** argv)
         !ok(invoke(device, 73, arg(list_desc), arg(allocator), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list))))
         return 12;
 
-    const std::uint32_t written[2][4] = {{mode == "zero" ? 0u : 3u, mode == "zero" ? 1u : 2u, 1, 0},
-                                         {mode == "zero" ? 0u : 1u, 1, 1, 0x14}};
+    // huge: the first record has 70000 groups in x (over the desktop's 65535); huge-product: 512*256*256 =
+    // 2^25 groups (each dimension legal, product over the guard's 2^24). The guard must zero the record on
+    // the GPU, so only the second record ({1, 1, 1}) runs: counter 1.
+    std::uint32_t written[2][4] = {{mode == "zero" ? 0u : 3u, mode == "zero" ? 1u : 2u, 1, 0},
+                                   {mode == "zero" ? 0u : 1u, 1, 1, 0x14}};
+    if (huge) written[0][0] = 70000, written[0][1] = 1, written[0][2] = 1;
+    if (huge_product) written[0][0] = 512, written[0][1] = 256, written[0][2] = 256;
     const std::uint32_t count_at[4] = {0, 0, 0, 0};
     invoke(list, 139, arg(allocator));                                     // Reset
     invoke(list, 33, arg(root));                                           // SetComputeRootSignature
@@ -201,7 +208,7 @@ int main(int argc, char** argv)
     std::memcpy(records[0], args_memory, 12);
     std::memcpy(records[1], args_memory + 0x14, 12);
     const std::uint32_t got = *counter_word;
-    const std::uint32_t wanted = mode == "gpu" ? 7 : mode == "no-writer" ? 12 : 0;
+    const std::uint32_t wanted = mode == "gpu" ? 7 : mode == "no-writer" ? 12 : huge || huge_product ? 1 : 0;
     std::printf("records in title memory: {%u %u %u} {%u %u %u}\n", records[0][0], records[0][1], records[0][2], records[1][0],
                 records[1][1], records[1][2]);
     std::printf("counter: %u (expected %u)\n", got, wanted);
