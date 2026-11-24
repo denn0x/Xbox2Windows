@@ -542,9 +542,11 @@ bool indirect_issue(Wrapper* self, ID3D12GraphicsCommandList* list)
 void indirect_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z)
 {
     if (indirect_pending(self)) {
+        note_issued_dispatch(list, x, y, z, true);  // LOCAL: for the DRED report (d3d12_xs_device.cpp)
         indirect_issue(self, list);
         return;
     }
+    note_issued_dispatch(list, x, y, z, false);
     list->Dispatch(x, y, z);
 }
 

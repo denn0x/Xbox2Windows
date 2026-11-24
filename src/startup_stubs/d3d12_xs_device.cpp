@@ -348,6 +348,7 @@ ID3D12Device* removal_device;
 LONG removal_reported, debug_lines;
 SRWLOCK debug_lock = SRWLOCK_INIT;
 
+void report_dred_dispatches(const D3D12_AUTO_BREADCRUMB_NODE* node, UINT done);  // LOCAL, by execute_dispatch
 // LOCAL: logs DRED breadcrumbs (the operations around the last completed one, per list) and the page fault.
 void report_dred(ID3D12Device* device)
 {
@@ -367,6 +368,7 @@ void report_dred(ID3D12Device* device)
             const UINT from = done > 6 ? done - 6 : 0, to = done + 4 < node->BreadcrumbCount ? done + 4 : node->BreadcrumbCount;
             for (UINT i = from; i < to; ++i)
                 log("x2w-dred   %s op %u: %d", i == done ? ">>" : "  ", i, static_cast<int>(node->pCommandHistory[i]));
+            report_dred_dispatches(node, done);
         }
         if (!lists) log("x2w-dred no incomplete list in the breadcrumbs");
     }
@@ -1461,6 +1463,7 @@ extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* al
     return size;
 }
 
+void forget_list_dispatches(ID3D12GraphicsCommandList* list);  // LOCAL, by execute_dispatch
 // List slot 139 (Xbox order): (allocator, 0, 0), the per-frame reset.
 HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
 {
@@ -1481,6 +1484,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         ReleaseSRWLockExclusive(&allocator_lock);
     }
     if (SUCCEEDED(hr)) {
+        forget_list_dispatches(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
         self->own().list_ready = false;
         reset_viewport_state(self);
         discard_draw_sampler_heaps(self);
@@ -2609,8 +2613,105 @@ std::unordered_map<Wrapper*, ID3D12PipelineState*>& compute_psos()
 LONG compute_executed, compute_skipped_args;
 // LOCAL: dispatch outcomes since the last 300-frame report, by path and reason (report_dispatches).
 enum ComputeOutcome { co_c62_run, co_c62_table_arg, co_c62_unmapped, co_c67_run, co_c67_off, co_c67_other_key, co_c67_untranslated,
-                      co_c67_heap, co_not_run, co_count };
+                      co_c67_heap, co_not_run, co_cx_skip, co_count };
 LONG compute_outcomes[co_count];
+
+// LOCAL: the dispatches issued on each desktop list (Dispatch or ExecuteIndirect, through indirect_dispatch), in
+// order, since its last Reset, plus the recording before that one (a list can be reset while its previous
+// submission still runs). The DRED report maps the in-progress Dispatch op to one of them.
+struct IssuedDispatch { u64 key; UINT x, y, z; char path; bool indirect; };
+struct IssuedList { std::vector<IssuedDispatch> current, previous; };
+thread_local u64 cx_issue_key;    // set by execute_dispatch for indirect_dispatch
+thread_local char cx_issue_path;  // 'c' slot-62 desktop pipeline, 't' translated, 'r' raw-address
+SRWLOCK issued_lock = SRWLOCK_INIT;
+constexpr std::size_t issued_cap = 16384;  // per recording
+std::unordered_map<const void*, IssuedList>& issued_lists() { static std::unordered_map<const void*, IssuedList> m; return m; }
+const void* issued_id(ID3D12GraphicsCommandList* list) { return static_cast<const void*>(static_cast<ID3D12CommandList*>(list)); }
+void note_issued_dispatch(ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z, bool indirect)
+{
+    AcquireSRWLockExclusive(&issued_lock);
+    std::vector<IssuedDispatch>& v = issued_lists()[issued_id(list)].current;
+    if (v.size() < issued_cap) v.push_back({cx_issue_key, x, y, z, cx_issue_path, indirect});
+    ReleaseSRWLockExclusive(&issued_lock);
+}
+void forget_list_dispatches(ID3D12GraphicsCommandList* list)
+{
+    AcquireSRWLockExclusive(&issued_lock);
+    const auto found = issued_lists().find(issued_id(list));
+    if (found != issued_lists().end()) {
+        found->second.previous.swap(found->second.current);
+        found->second.current.clear();
+    }
+    ReleaseSRWLockExclusive(&issued_lock);
+}
+const char* issued_path_name(char path) { return path == 'c' ? "slot-62" : path == 't' ? "translated" : path == 'r' ? "raw-address" : "?"; }
+// For one incomplete DRED list: the dispatch at op `done` (the Dispatch ops before it are counted from the op
+// types, so the barriers between dispatches need no fixed stride) and the five before and after it.
+void report_dred_dispatches(const D3D12_AUTO_BREADCRUMB_NODE* node, UINT done)
+{
+    if (!node->pCommandList || !node->pCommandHistory) return;
+    UINT before = 0, total = 0;  // Dispatch ops before op `done`, and in the whole list
+    for (UINT i = 0; i < node->BreadcrumbCount; ++i)
+        if (node->pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_DISPATCH) {
+            if (i < done) ++before;
+            ++total;
+        }
+    const bool at_dispatch = done < node->BreadcrumbCount && node->pCommandHistory[done] == D3D12_AUTO_BREADCRUMB_OP_DISPATCH;
+    std::vector<IssuedDispatch> current, previous;
+    AcquireSRWLockShared(&issued_lock);
+    const auto found = issued_lists().find(issued_id(node->pCommandList));
+    if (found != issued_lists().end()) current = found->second.current, previous = found->second.previous;
+    ReleaseSRWLockShared(&issued_lock);
+    const auto direct_of = [](const std::vector<IssuedDispatch>& v) {
+        std::vector<IssuedDispatch> out;
+        for (const IssuedDispatch& d : v)
+            if (!d.indirect) out.push_back(d);
+        return out;
+    };
+    std::vector<IssuedDispatch> direct = direct_of(current);
+    const char* which = "current recording";
+    if (direct.size() != total) {
+        std::vector<IssuedDispatch> older = direct_of(previous);
+        if (older.size() == total) direct.swap(older), which = "previous recording";
+    }
+    const bool match = direct.size() == total;
+    log("x2w-dred dispatches list %p: op %u is %s; %u Dispatch ops before it, %u in the list; %zu direct dispatches in the %s "
+        "(%zu recorded now, %zu before the last Reset)%s",
+        static_cast<const void*>(node->pCommandList), done, at_dispatch ? "a Dispatch" : "not a Dispatch", before, total, direct.size(),
+        which, current.size(), previous.size(), match ? "" : "; COUNT MISMATCH, the mapping below is not reliable");
+    if (direct.empty()) return;
+    const std::size_t at = before < direct.size() ? before : direct.size() - 1;
+    const std::size_t from = at > 5 ? at - 5 : 0, to = at + 6 < direct.size() ? at + 6 : direct.size();
+    for (std::size_t i = from; i < to; ++i)
+        log("x2w-dred   %s dispatch %zu: key %016llx (%u, %u, %u) %s", i == at && at_dispatch ? ">>" : "  ", i, direct[i].key,
+            direct[i].x, direct[i].y, direct[i].z, issued_path_name(direct[i].path));
+}
+
+// LOCAL: X2W_CX_SKIP=<key>[,<key>...] (hex): dispatches of these keys are skipped (outcome "X2W_CX_SKIP").
+bool cx_skip_key(u64 key)
+{
+    static const std::vector<u64> keys = [] {
+        std::vector<u64> out;
+        char value[2048]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_CX_SKIP", value, sizeof(value));
+        if (!n || n >= sizeof(value)) return out;
+        for (const char* p = value; *p;) {
+            char* end = nullptr;
+            const u64 k = std::strtoull(p, &end, 16);
+            if (end == p) {
+                ++p;
+                continue;
+            }
+            out.push_back(k);
+            p = end;
+        }
+        log("x2w-cx X2W_CX_SKIP: %zu keys", out.size());
+        for (const u64 k : out) log("x2w-cx X2W_CX_SKIP key %016llx", k);
+        return out;
+    }();
+    if (keys.empty()) return false;
+    return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
 // slot 33, SetComputeRootSignature(root)
 void __stdcall list_compute_root(Wrapper* self, Wrapper* root)
 {
@@ -2665,19 +2766,29 @@ void __stdcall list_compute_uav(Wrapper* self, UINT parameter, u64 address) { co
 bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
 {
     static const bool enabled = !x2w_local::env_on("X2W_COMPUTE_OFF");
+    if (cx_skip_key(key)) {
+        InterlockedIncrement(&compute_outcomes[co_cx_skip]);
+        static LONG logged;
+        if (first_calls(logged, 8)) log("x2w-cx dispatch of key %016llx skipped (X2W_CX_SKIP)", key);
+        return false;
+    }
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     if (!enabled || !list || !pass.pipeline) {
         InterlockedIncrement(&compute_outcomes[co_not_run]);
         return false;
     }
+    cx_issue_key = key;
+    cx_issue_path = 'r';
     if (rawaddr_dispatch(self, list, x, y, z)) return true;  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
+    cx_issue_path = 't';
     if (!pass.compute_root || !pass.compute_root->own().real) return execute_translated(self, list, key, x, y, z);
     AcquireSRWLockShared(&compute_pso_lock);
     const auto found = compute_psos().find(pass.pipeline);
     ID3D12PipelineState* pso = found != compute_psos().end() ? found->second : nullptr;
     ReleaseSRWLockShared(&compute_pso_lock);
     if (!pso) return execute_translated(self, list, key, x, y, z);
+    cx_issue_path = 'c';
     D3D12_GPU_VIRTUAL_ADDRESS addresses[16] = {};
     for (UINT i = 0; i < 16; ++i) {
         const int kind = pass.compute_kind[i];
@@ -2818,11 +2929,11 @@ void report_dispatches()
     for (int i = 0; i < co_count; ++i) o[i] = InterlockedExchange(&compute_outcomes[i], 0);
     log("x2w-compute dispatches (300 frames): executed %ld skipped %ld; slot-62 desktop pipeline executed %ld skipped %ld "
         "(table argument %ld, unmapped root address %ld); translated executed %ld skipped %ld (X2W_CX_OFF %ld, not a slot-67 key %ld, "
-        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF)",
-        o[co_c62_run] + o[co_c67_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap],
+        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF); X2W_CX_SKIP skipped %ld",
+        o[co_c62_run] + o[co_c67_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap] + o[co_cx_skip],
         o[co_c62_run], o[co_c62_table_arg] + o[co_c62_unmapped], o[co_c62_table_arg], o[co_c62_unmapped], o[co_c67_run],
         o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap], o[co_c67_off], o[co_c67_other_key], o[co_c67_untranslated],
-        o[co_c67_heap], o[co_not_run]);
+        o[co_c67_heap], o[co_not_run], o[co_cx_skip]);
 }
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
