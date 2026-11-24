@@ -76,12 +76,17 @@ CPU_FIXTURES = {
     "xgetbv": "cpu_aot_xgetbv",
     "cpuid_harness": None,  # native CPUID, OSXSAVE and XGETBV reads
     "mxcsr_harness": None,  # native MXCSR reads and writes
+    "sse_fp_harness": None,  # native MXCSR driver for cpu_aot_sse_fp
     "exe_entry": "cpu_aot_exe_entry",
     "xchg": "cpu_aot_xchg",
     "address_size": "cpu_aot_address_size",
     "avx2_regs": "cpu_aot_avx2_regs",
     "avx_int_regs": "cpu_aot_avx_int_regs",
+    "avx_int_ymm_addsub": "cpu_aot_avx_int_ymm_addsub",
+    "avx_int_ymm_minmax": "cpu_aot_avx_int_ymm_minmax",
+    "avx_int_ymm_sat": "cpu_aot_avx_int_ymm_sat",
     "avx_move_regs": "cpu_aot_avx_move_regs",
+    "avx_move_mem": "cpu_aot_avx_move_mem",
     "call_pair": "cpu_aot_call_pair",
     "movbe": "cpu_aot_movbe",
     "bmi1": "cpu_aot_bmi1",
@@ -132,8 +137,21 @@ def masm_mnemonics(text):
             words = words[1:]
         if not words:
             continue
+        if words[0] == "int" and len(words) > 1 and masm_integer(words[1]) == 3:
+            # ML64 has no INT3 mnemonic and encodes INT 3 (also written 3h or 03h) as the one-byte CC form,
+            # the reference's int3.
+            found.add("int3")
+            continue
         found.add(x64_canonical(words[0]))
     return found
+
+
+def masm_integer(token):
+    """A MASM integer literal (decimal, or hexadecimal with an h suffix), or None."""
+    try:
+        return int(token[:-1], 16) if token.endswith("h") else int(token, 10)
+    except ValueError:
+        return None
 
 
 def x64_canonical(mnemonic):
@@ -178,12 +196,18 @@ def read_results(junit):
     status = {"run": "pass", "fail": "fail", "notrun": "skip"}
     results = {}
     for case in suite.iter("testcase"):
+        name = case.get("name")
+        if not name or not name.strip():
+            raise ValueError("CTest <testcase> needs a nonempty name")
+        if name in results:
+            # Coverage records have only the test name, not its CTest directory.
+            raise ValueError(f"duplicate CTest <testcase> name {name!r}; coverage records require unique names")
         state = status.get(case.get("status"), "fail")
         if case.find("failure") is not None or case.find("error") is not None:
             state = "fail"
         elif state == "pass" and case.find("skipped") is not None:
             state = "skip"
-        results[case.get("name")] = state
+        results[name] = state
     return results, (start - 1, start + duration + 2)
 
 

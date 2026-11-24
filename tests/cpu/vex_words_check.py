@@ -16,9 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import export_rva  # noqa: E402
 from cpu_vex_aot import lift, translate  # noqa: E402
 
-FUNCTIONS = ("widen_mix", "word_ops", "shift_edges", "store_reload", "aligned_ops", "byte_pack_reload")
-UNALIGNED = ("widen_mix", "word_ops", "shift_edges", "store_reload",
-             "byte_pack_reload")  # vmovdqu-only functions
+FUNCTIONS = ("widen_mix", "word_ops", "shift_edges", "store_reload", "aligned_ops", "byte_pack_reload",
+             "sat_words", "mul_minmax_words", "cmp_words",
+             "sraw_count_reg", "sraw_count_mem", "sllw_count_reg", "sllw_count_mem",
+             "srlw_count_reg", "srlw_count_mem")
+UNALIGNED = ("widen_mix", "word_ops", "shift_edges", "store_reload", "byte_pack_reload",
+             "sat_words", "mul_minmax_words", "cmp_words",
+             "sraw_count_reg", "sraw_count_mem", "sllw_count_reg", "sllw_count_mem",
+             "srlw_count_reg", "srlw_count_mem")  # vmovdqu-only functions
 # Arena: guard | A | guard | B | guard | OUT | guard, each 16 bytes, starting 16-byte aligned.
 ZONES = {"a": 16, "b": 48, "out": 80}
 ARENA = 112
@@ -68,6 +73,73 @@ def outside_output(arena, output="out"):
     return arena[:start] + arena[start + 16:]
 
 
+def reference(name, a, b, altered=False):
+    """Expected output of the saturating, multiply, min/max and compare functions, from the
+    instruction definitions alone: exact integer arithmetic per lane, no code shared with the
+    translator. With altered=True, the high product is the signed one, as in the altered build."""
+    signed_a, signed_b = struct.unpack("<8h", a), struct.unpack("<8h", b)
+    unsigned_a, unsigned_b = struct.unpack("<8H", a), struct.unpack("<8H", b)
+    lanes = []
+    for sa, sb, ua, ub in zip(signed_a, signed_b, unsigned_a, unsigned_b):
+        if name == "sat_words":
+            adds = max(-32768, min(32767, sa + sb))
+            subs = max(-32768, min(32767, sa - sb))
+            lane = (adds ^ (min(65535, ua + ub) + subs) ^ max(0, ua - ub)) & 0xFFFF
+        elif name == "mul_minmax_words":
+            high = (sa * sb) >> 16 if altered else (ua * ub) >> 16
+            lane = (((sa * sb + high) & 0xFFFF) ^ max(ua, ub)) - min(ua, ub)
+            lane &= 0xFFFF
+        elif name == "cmp_words":
+            lane = 1 if sa == sb else 3 if sa > sb else 7
+        else:
+            raise ValueError(name)
+        lanes.append(lane)
+    return struct.pack("<8H", *lanes)
+
+
+REFERENCED = ("sat_words", "mul_minmax_words", "cmp_words")
+COUNT_SHIFTS = {"sraw": "psraw", "sllw": "psllw", "srlw": "psrlw"}
+COUNT_FUNCTIONS = tuple(f"{kind}_count_{form}" for kind in COUNT_SHIFTS for form in ("reg", "mem"))
+# Low quadwords of the count operand: small counts, the word width, and values whose low 16 or 32
+# bits are small or equal to a valid count while higher bits are set.
+LOW_COUNTS = (tuple(range(0, 40)) + (
+    255, 256, 0xFFFF, 0x10000, 0x10001, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 1 << 32, (1 << 32) + 1,
+    (1 << 32) + 15, (1 << 33) + 3, 1 << 48, 1 << 63, (1 << 63) + 1, 0xFFFFFFFFFFFFFFFF))
+HIGH_QUADWORDS = (0, 0xFFFFFFFFFFFFFFFF, 0x0123456789ABCDEF, 1)
+COUNT_SOURCES = 48
+
+
+def count_reference(function, a, count, truncate=False):
+    """Expected output of a count-form shift of the eight words of A, from the instruction
+    definition alone. The count is the low quadword of the 16-byte count operand as one unsigned
+    integer; truncate=True models a translator that keeps only its low 32 bits."""
+    shift = int.from_bytes(count[:8], "little")
+    if truncate:
+        shift &= 0xFFFFFFFF
+    kind = function.split("_")[0]
+    lanes = []
+    for signed, unsigned in zip(struct.unpack("<8h", a), struct.unpack("<8H", a)):
+        if kind == "sraw":
+            lane = signed >> min(shift, 15)
+        elif kind == "sllw":
+            lane = unsigned << shift if shift < 16 else 0
+        else:
+            lane = unsigned >> shift if shift < 16 else 0
+        lanes.append(lane & 0xFFFF)
+    return struct.pack("<8H", *lanes)
+
+
+def count_cases(pairs):
+    """(A, 16-byte count operand) pairs: every low count with every high quadword over some inputs."""
+    sources = [a for a, _ in pairs[:COUNT_SOURCES]]
+    for low in LOW_COUNTS:
+        for high in HIGH_QUADWORDS:
+            operand = struct.pack("<QQ", low, high)
+            for a in sources:
+                yield a, operand
+OUT = slice(ZONES["out"], ZONES["out"] + 16)
+
+
 def bind(path):
     library = ctypes.CDLL(str(path))
     functions = {}
@@ -110,7 +182,11 @@ REJECTED = (
     ("C5 FA 6F 41 10", "vmovdqu xmm0,[rcx+10h]", "memory operand outside the 16-byte buffers"),
     ("C5 FA 6F 00", "vmovdqu xmm0,[rax]", "memory operand outside the 16-byte buffers"),
     ("C5 FA 7F 01", "vmovdqu [rcx],xmm0", "store outside the output buffer"),
-    ("C5 F1 E1 C2", "vpsraw xmm0,xmm1,xmm2", "unsupported instruction"),
+    ("C5 F5 F1 C2", "vpsllw ymm0,ymm1,xmm2", "VEX.256 form"),
+    ("C5 F1 F1 03", "vpsllw xmm0,xmm1,[rbx]", "memory operand outside the 16-byte buffers"),
+    ("C5 F1 F1 41 08", "vpsllw xmm0,xmm1,[rcx+8]", "memory operand outside the 16-byte buffers"),
+    ("C5 F1 E2 C2", "vpsrad xmm0,xmm1,xmm2", "unsupported instruction"),
+    ("C5 F1 F1 C2", "vpsllw xmm0,xmm1,xmm2", "undefined XMM source"),
 )
 
 
@@ -181,6 +257,41 @@ def main():
                                      f"!= native {expected[out].hex()} for {a.hex()} {b.hex()}")
         print(f"{name}: {len(pairs)} input pairs match bit for bit, guards intact")
 
+    # The new word forms against an independent per-lane reference, in the native and lifted DLLs.
+    for name in REFERENCED:
+        for index, (a, b) in enumerate(pairs):
+            expected = reference(name, a, b)
+            for variant, exports in (("native", native), ("lifted", lifted)):
+                observed = call(exports[name], a, b)[OUT]
+                if observed != expected:
+                    raise AssertionError(f"{name} pair {index}: {variant} {observed.hex()} != "
+                                         f"reference {expected.hex()} for {a.hex()} {b.hex()}")
+        print(f"{name}: native and lifted match the reference on {len(pairs)} pairs")
+
+    # Count forms: the count operand is a register or memory, its low quadword counts as one
+    # unsigned integer and the upper quadword is ignored. Compared with the model in both DLLs.
+    cases = list(count_cases(pairs))
+    for name in COUNT_FUNCTIONS:
+        for a, operand in cases:
+            expected = count_reference(name, a, operand)
+            for variant, exports in (("native", native), ("lifted", lifted)):
+                arena = call(exports[name], a, operand)
+                if arena[OUT] != expected:
+                    raise AssertionError(f"{name}: {variant} {arena[OUT].hex()} != reference "
+                                         f"{expected.hex()} for {a.hex()} count {operand.hex()}")
+                if variant == "native" and outside_output(arena) != outside_output(
+                        call(lambda *args: None, a, operand)):
+                    raise AssertionError(f"{name}: native wrote outside its 16-byte output")
+        print(f"{name}: native and lifted match the reference on {len(cases)} count operands")
+    # A translator that truncated the count to 32 bits must change results: the cases with a set
+    # bit above bit 31 and a small low half must tell the two models apart in every function.
+    for name in COUNT_FUNCTIONS:
+        truncated = sum(count_reference(name, a, operand) != count_reference(name, a, operand, True)
+                        for a, operand in cases)
+        if not truncated:
+            raise AssertionError(f"{name}: a 32-bit truncated count is not distinguished")
+        print(f"{name}: a count truncated to 32 bits changes {truncated} of {len(cases)} outputs")
+
     # Exact aliases: the output is input A or input B. The whole arena must match, so a lifted
     # function that read an input after the native one wrote it (or before) would differ.
     reordered = 0
@@ -217,17 +328,33 @@ def main():
     # The altered fixture replaces one arithmetic shift with a logical one in shift_edges.
     differing = 0
     for a, b in pairs:
-        reference = call(altered["shift_edges"], a, b)
-        if call(altered_lifted["shift_edges"], a, b) != reference:
+        shift_original = call(altered["shift_edges"], a, b)
+        if call(altered_lifted["shift_edges"], a, b) != shift_original:
             raise AssertionError("altered shift_edges: lifted differs from its native build")
-        differing += reference != call(native["shift_edges"], a, b)
+        differing += shift_original != call(native["shift_edges"], a, b)
     if not differing:
         raise AssertionError("replacing vpsraw with vpsrlw changed no output")
-    for name in ("widen_mix", "word_ops", "store_reload", "aligned_ops", "byte_pack_reload"):
+    for name in ("widen_mix", "word_ops", "store_reload", "aligned_ops", "byte_pack_reload",
+                 "sat_words", "cmp_words"):
         for a, b in pairs[:256]:
             if call(altered[name], a, b) != call(native[name], a, b):
                 raise AssertionError(f"altered fixture changed {name}")
     print(f"vpsraw replaced by vpsrlw: {differing} of {len(pairs)} shift_edges outputs differ")
+
+    # The altered build also swaps vpmulhuw for vpmulhw in mul_minmax_words. Its lifted DLL must
+    # follow the altered native build and the altered reference, and both must differ from the
+    # original, so the check fails if the unsigned high product is lowered as the signed one.
+    changed = 0
+    for a, b in pairs:
+        reference_altered = reference("mul_minmax_words", a, b, altered=True)
+        if call(altered["mul_minmax_words"], a, b)[OUT] != reference_altered:
+            raise AssertionError("altered mul_minmax_words: native differs from the altered reference")
+        if call(altered_lifted["mul_minmax_words"], a, b)[OUT] != reference_altered:
+            raise AssertionError("altered mul_minmax_words: lifted differs from the altered reference")
+        changed += reference_altered != reference("mul_minmax_words", a, b)
+    if not changed:
+        raise AssertionError("replacing vpmulhuw with vpmulhw changed no output")
+    print(f"vpmulhuw replaced by vpmulhw: {changed} of {len(pairs)} mul_minmax_words outputs differ")
 
     check_byte_pack_reload((
         ("original", native), ("original lifted", lifted),

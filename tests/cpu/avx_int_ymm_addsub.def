@@ -1,0 +1,26 @@
+EXPORTS
+    op_vpaddb_ymm
+    op_vpaddw_ymm
+    op_vpaddd_ymm
+    op_vpaddq_ymm
+    op_vpsubb_ymm
+    op_vpsubw_ymm
+    op_vpsubd_ymm
+    op_vpsubq_ymm
+    op_vpcmpeqb_ymm
+    op_vpcmpeqw_ymm
+    op_vpcmpeqd_ymm
+    op_vpcmpeqq_ymm
+    op_vpcmpgtb_ymm
+    op_vpcmpgtw_ymm
+    op_vpcmpgtd_ymm
+    op_vpcmpgtq_ymm
+    op_vpsubq_ymm_dst_src1
+    op_vpsubd_ymm_dst_src2
+    op_vpcmpgtq_ymm_dst_src2
+    op_vpaddw_ymm_all
+    op_vpcmpeqd_ymm_all
+    op_vpcmpgtb_ymm_all
+    op_vpaddq_ymm_then_xmm_subb
+    op_vpcmpeqw_ymm_then_xmm_addb
+    op_chain_ymm

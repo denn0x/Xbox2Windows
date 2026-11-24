@@ -1,29 +1,36 @@
-"""Lift bounded Windows x64 leaf functions with legacy SSE/MMX conversion and shuffle ops to C++.
+"""Lift bounded Windows x64 leaf functions with legacy SSE/SSE2/MMX conversion, shuffle and masked-store ops to C++.
 
 Each export uses the leaf ABI void fn(word rcx, word rdx, word r8), where rcx,
 rdx and r8 carry host pointers to caller-owned buffers (16-byte-aligned bases
 when 16-byte-aligned memory operands are used; rcx and rdx are inputs, r8 is the
 output). XMM0..XMM5 are modeled as portable 128-bit value structs (Vec128, two
 64-bit lanes), MM0..MM7 are modeled as std::uint64_t mm[8], and volatile scratch
-GPRs (rax, r9, r10, r11) carry 64-bit movq bridge values. Only legacy encodings
-are accepted; VEX, EVEX and other non-legacy forms reject.
+GPRs (rax, r9, r10, r11) carry 64-bit movq bridge values and RDI save/restore
+slots. Only legacy encodings are accepted; VEX, EVEX and other non-legacy forms
+reject.
 
-Supported SSE instructions (5 forms from docs/coverage/x64_zen2.tsv group SSE):
+Supported instructions (docs/coverage/x64_zen2.tsv groups SSE and SSE2):
   - cvtpi2ps: convert two int32_t in mm/m64 to float32 in xmm[63:0], preserving xmm[127:64]
   - cvtps2pi: convert two float32 in xmm[63:0]/m64 to int32_t in mm (round-to-nearest-even)
   - cvttps2pi: convert two float32 in xmm[63:0]/m64 to int32_t in mm (truncate toward zero)
   - pshufw: 16-bit word permutation of mm/m64 by imm8 into mm
   - movntq: non-temporal 64-bit store from mm to [r8 + disp]
+  - maskmovq: conditional 8-byte store from mm1 under mm2 MSB mask to implicit [rdi]
+  - maskmovdqu: conditional 16-byte store from xmm1 under xmm2 MSB mask to implicit [rdi]
+    (portable first slice for maskmovq/maskmovdqu: requires rdi save/restore via
+    a volatile scratch GPR around mov rdi, r8 and writable ordinary memory for the
+    full 8- or 16-byte destination; touches only bytes with (mask[i] & 0x80) != 0)
 
 Transport/ABI glue: movq (between mm, scratch r64 rax/r9/r10/r11, and flat
-[rcx|rdx|r8] memory), movaps/movdqa (16-byte aligned 128-bit load/store/reg copy),
-movdqu (unaligned 128-bit load/store/reg copy), emms, and terminal ret.
+[rcx|rdx|r8] memory), 64-bit mov for rdi save/set-to-r8/restore, movaps/movdqa
+(16-byte aligned 128-bit load/store/reg copy), movdqu (unaligned 128-bit
+load/store/reg copy), emms, and terminal ret.
 
 Call with default MXCSR controls, an empty x87 stack with no pending unmasked
 exceptions, and no live MMX values. The caller owns the buffers and observes
 the output bytes after return. Floating-point status and physical x87 tag
-updates, and the non-temporal store's caching and inter-thread visibility,
-are outside this leaf profile.
+updates, non-temporal caching hints, and implementation-dependent partial-page
+or all-zero-mask fault behavior are outside this leaf profile.
 
 MMX state policy:
   - mmx_active starts false and becomes true whenever any MM0..MM7 register is
@@ -68,6 +75,10 @@ ALLOWED_CODES = {
     *CVT_PS2PI_HELPERS,
     Code.PSHUFW_MM_MMM64_IMM8,
     Code.MOVNTQ_M64_MM,
+    Code.MASKMOVQ_RDI_MM_MM,
+    Code.MASKMOVDQU_RDI_XMM_XMM,
+    Code.MOV_R64_RM64,
+    Code.MOV_RM64_R64,
     Code.MOVAPS_XMM_XMMM128,
     Code.MOVAPS_XMMM128_XMM,
     Code.MOVDQA_XMM_XMMM128,
@@ -180,6 +191,37 @@ static inline std::uint64_t op_pshufw(std::uint64_t src, std::uint8_t imm8) {
     }
     return out;
 }
+
+static inline void op_maskmovq(word address, std::uint64_t src, std::uint64_t mask) {
+    auto* dst = reinterpret_cast<volatile std::uint8_t*>(address);
+    // Portable first slice: require [address..address+7] to be writable ordinary
+    // memory and touch only bytes selected by mask MSB ((mask[i] & 0x80) != 0).
+    for (unsigned i = 0; i < 8u; ++i) {
+        const auto mask_byte = static_cast<std::uint8_t>(mask >> (i * 8u));
+        if ((mask_byte & 0x80u) != 0u) {
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+            dst[i] = static_cast<std::uint8_t>(src >> (i * 8u));
+        }
+    }
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+}
+
+static inline void op_maskmovdqu(word address, const Vec128& src, const Vec128& mask) {
+    std::uint8_t src_bytes[16]{};
+    std::uint8_t mask_bytes[16]{};
+    std::memcpy(src_bytes, src.q, 16);
+    std::memcpy(mask_bytes, mask.q, 16);
+    auto* dst = reinterpret_cast<volatile std::uint8_t*>(address);
+    // Portable first slice: require [address..address+15] to be writable ordinary
+    // memory and touch only bytes selected by mask MSB ((mask[i] & 0x80) != 0).
+    for (unsigned i = 0; i < 16u; ++i) {
+        if ((mask_bytes[i] & 0x80u) != 0u) {
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+            dst[i] = src_bytes[i];
+        }
+    }
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+}
 """
 
 
@@ -244,6 +286,9 @@ def lift_code(name, start, raw):
     defined_mm = set()
     used_gpr = set()
     defined_gpr = set()
+    # Track caller's nonvolatile RDI across save/set-to-r8/restore for maskmovq/maskmovdqu.
+    caller_rdi_holders = {"rdi"}
+    rdi_expr = None
     mmx_active = False
     statements = []
     returned = False
@@ -289,6 +334,8 @@ def lift_code(name, start, raw):
             raise ValueError(f"expected GPR operand {op_index} at RVA {ins.ip:#x}: {ins}")
         reg_name = gpr64_scratch(ins.op_register(op_index), ins)
         if reg_name not in defined_gpr:
+            if reg_name in caller_rdi_holders:
+                raise ValueError(f"GPR {reg_name} holds saved rdi at RVA {ins.ip:#x}: {ins}")
             raise ValueError(f"undefined GPR {reg_name} at RVA {ins.ip:#x}: {ins}")
         used_gpr.add(reg_name)
         return reg_name
@@ -324,6 +371,8 @@ def lift_code(name, start, raw):
         if ins.code == Code.RETNQ:
             if mmx_active:
                 raise ValueError(f"missing emms before ret with active MMX state at RVA {ins.ip:#x}: {ins}")
+            if "rdi" not in caller_rdi_holders:
+                raise ValueError(f"unrestored nonvolatile GPR rdi at ret RVA {ins.ip:#x}: {ins}")
             statements.append("return;")
             returned = True
         elif ins.code == Code.EMMS:
@@ -355,6 +404,51 @@ def lift_code(name, start, raw):
                 raise ValueError(f"expected memory destination at RVA {ins.ip:#x}: {ins}")
             src = read_mm(1, ins)
             statements.append(f"store64({flat_address(ins, store=True)}, {src});")
+        elif ins.code == Code.MASKMOVQ_RDI_MM_MM:
+            if ins.op0_kind != OpKind.MEMORY_SEG_RDI or ins.memory_segment != R.DS:
+                raise ValueError(f"unsupported maskmovq target at RVA {ins.ip:#x}: {ins}")
+            if rdi_expr != "r8":
+                raise ValueError(f"maskmovq requires r8-rooted rdi at RVA {ins.ip:#x}: {ins}")
+            src = read_mm(1, ins)
+            mask = read_mm(2, ins)
+            statements.append(f"op_maskmovq({rdi_expr}, {src}, {mask});")
+        elif ins.code == Code.MASKMOVDQU_RDI_XMM_XMM:
+            if ins.op0_kind != OpKind.MEMORY_SEG_RDI or ins.memory_segment != R.DS:
+                raise ValueError(f"unsupported maskmovdqu target at RVA {ins.ip:#x}: {ins}")
+            if rdi_expr != "r8":
+                raise ValueError(f"maskmovdqu requires r8-rooted rdi at RVA {ins.ip:#x}: {ins}")
+            src = read_vec(1, ins)
+            mask = read_vec(2, ins)
+            statements.append(f"op_maskmovdqu({rdi_expr}, {src}, {mask});")
+        elif ins.code in (Code.MOV_R64_RM64, Code.MOV_RM64_R64):
+            if ins.op0_kind != OpKind.REGISTER or ins.op1_kind != OpKind.REGISTER:
+                raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
+            op0_reg = ins.op0_register
+            op1_reg = ins.op1_register
+            if op0_reg not in (R.RDI, R.EDI) and op1_reg not in (R.RDI, R.EDI):
+                raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
+            if not (RegisterExt.is_gpr64(op0_reg) and RegisterExt.is_gpr64(op1_reg)):
+                raise ValueError(f"unsupported mov operand width at RVA {ins.ip:#x}: {ins}")
+            if op1_reg == R.RDI:
+                if op0_reg == R.RDI:
+                    raise ValueError(f"nonvolatile GPR {op0_reg} at RVA {ins.ip:#x}: {ins}")
+                dst_gpr = gpr64_scratch(op0_reg, ins)
+                if "rdi" not in caller_rdi_holders:
+                    raise ValueError(f"cannot save clobbered rdi at RVA {ins.ip:#x}: {ins}")
+                # Caller's RDI is outside this ABI: keep dst_gpr only for RDI restoration.
+                defined_gpr.discard(dst_gpr)
+                caller_rdi_holders.add(dst_gpr)
+            elif op0_reg == R.RDI:
+                if op1_reg == R.R8:
+                    if not any(s in caller_rdi_holders for s in SCRATCH_GPR64.values()):
+                        raise ValueError(f"rdi modified without saving to volatile scratch at RVA {ins.ip:#x}: {ins}")
+                    caller_rdi_holders.discard("rdi")
+                    rdi_expr = "r8"
+                elif op1_reg in SCRATCH_GPR64 and SCRATCH_GPR64[op1_reg] in caller_rdi_holders:
+                    caller_rdi_holders.add("rdi")
+                    rdi_expr = None
+                else:
+                    raise ValueError(f"non-r8 or unsaved write to nonvolatile GPR rdi at RVA {ins.ip:#x}: {ins}")
         elif ins.code in (*LOAD_ALIGNED_VEC_CODES, Code.MOVDQU_XMM_XMMM128):
             alignment = 16 if ins.code in LOAD_ALIGNED_VEC_CODES else 1
             src = vec_src128(1, ins, alignment=alignment)
@@ -394,6 +488,7 @@ def lift_code(name, start, raw):
                 statements.append(f"store64({flat_address(ins, store=True)}, {src});")
             else:
                 reg_name = write_gpr64(0, ins)
+                caller_rdi_holders.discard(reg_name)
                 statements.append(f"{reg_name} = {src};")
                 defined_gpr.add(reg_name)
         else:

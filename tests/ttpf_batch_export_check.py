@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -178,6 +179,30 @@ class BatchExportTests(unittest.TestCase):
         self.assertEqual(batch.parse_indices("  2, , 4 "), [2, 4])
         with self.assertRaises(ValueError):
             batch.parse_indices("10-2")
+
+    def test_malformed_indices_are_usage_errors(self):
+        cases = {
+            "5-3": "Invalid range '5-3'",
+            "1-": "Invalid index '' in '1-'",
+            "abc": "Invalid index 'abc' in 'abc'",
+            "-2": "Invalid index '' in '-2'",
+        }
+        self.assertEqual(batch.parse_indices("0-1,3"), [0, 1, 3])
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "empty.ttpf"
+            pool.write_bytes(b"")
+            for spec, expected in cases.items():
+                out_dir = Path(tmp) / "out"
+                with self.subTest(spec=spec):
+                    proc = subprocess.run(
+                        [sys.executable, "-B", str(ROOT / "tools" / "ttpf_batch_export.py"),
+                         str(pool), "-o", str(out_dir), f"--indices={spec}"],
+                        capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("--indices:", proc.stderr)
+                    self.assertIn(expected, proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertFalse(out_dir.exists())
 
     def test_export_texture_entry_strict_default(self):
         with tempfile.TemporaryDirectory() as tmp:

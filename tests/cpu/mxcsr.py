@@ -25,6 +25,8 @@ EXPORTS = ("mxcsr_round", "mxcsr_leak", "mxcsr_after", "mxcsr_badload", "mxcsr_f
 # LDMXCSR and STMXCSR in each export of mxcsr.asm.
 SOURCE_READS = {"mxcsr_round": 4, "mxcsr_leak": 1, "mxcsr_after": 1, "mxcsr_badload": 1, "mxcsr_fault": 1}
 REJECT = "{{ *mxcsr_status = {status}; return 0; }}"
+# The MXCSR instructions of the fixtures, legacy and VEX, by name.
+MXCSR_MNEMONICS = {M.LDMXCSR: "LDMXCSR", M.STMXCSR: "STMXCSR", M.VLDMXCSR: "VLDMXCSR", M.VSTMXCSR: "VSTMXCSR"}
 DEFAULT = 0x1F80  # all six exceptions masked, round to nearest-even, FTZ and DAZ clear
 CALLER = 0x7FA0   # a non-default caller word: round toward zero and the sticky precision flag
 FILL = 0xA5
@@ -90,7 +92,7 @@ def rejected_by_default(image):
         for name in EXPORTS:
             (bounds,) = function_ranges(pe, export_rva(pe, name))
             body = region(pe, *bounds)
-            sites = [i for i in body if i.mnemonic in (M.LDMXCSR, M.STMXCSR)]
+            sites = [i for i in body if i.mnemonic in MXCSR_MNEMONICS]
             for k, site in enumerate(sites):
                 skip = {earlier.ip: ";" for earlier in sites[:k]}
                 try:
@@ -98,7 +100,7 @@ def rejected_by_default(image):
                 except ValueError as exc:
                     if "unsupported query operation" not in str(exc) or f"{site.ip:#x}" not in str(exc):
                         raise AssertionError(f"{name}: expected the refusal of {site} at {site.ip:#x}, got {exc}")
-                    refused.append(str(site.mnemonic == M.LDMXCSR and "LDMXCSR" or "STMXCSR"))
+                    refused.append(MXCSR_MNEMONICS[site.mnemonic])
                 else:
                     raise AssertionError(f"{name}: the default profile lowered {site}")
     return refused
@@ -172,12 +174,15 @@ def round_case(host, lib, rc, sticky):
 
 
 def lifted_violation(host, native, lib, label):
-    """The first broken rule of a translated library, or None."""
+    """The first broken rule of a translated library, or None. native None skips the native comparison and keeps
+    the fixed expectations."""
     for rc in range(4):
         for sticky in (0, 0x3F):
             got, problem = round_case(host, lib, rc, sticky)
             if problem:
                 return f"{label} mxcsr_round: {problem}"
+            if native is None:
+                continue
             expected, problem = round_case(host, native, rc, sticky)
             if problem:
                 raise AssertionError(f"native mxcsr_round: {problem}")
@@ -280,7 +285,7 @@ def reads_in(path):
                     if not base <= ip < base + len(image):
                         break
                     instruction = Decoder(64, image[ip - base:ip - base + 15], ip=ip).decode()
-                    count += instruction.mnemonic in (M.LDMXCSR, M.STMXCSR)
+                    count += instruction.mnemonic in MXCSR_MNEMONICS
                     flow = instruction.flow_control
                     if flow == FlowControl.RETURN:
                         break

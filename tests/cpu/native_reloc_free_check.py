@@ -15,7 +15,7 @@ import pefile
 from direct_check import input_pairs, observe, reference, register_probe
 from native_map_check import Mapper
 
-MEM_RESERVE, PAGE_NOACCESS = 0x2000, 0x01
+MEM_RESERVE, MEM_RELEASE, PAGE_NOACCESS = 0x2000, 0x8000, 0x01
 SEARCH_DLL_LOAD_DIR_AND_DEFAULT = 0x100 | 0x1000
 DYNAMIC_BASE = 0x40
 RELOCS_STRIPPED = 0x0001
@@ -34,6 +34,8 @@ def kernel32():
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
     kernel.VirtualAlloc.restype = ctypes.c_void_p
+    kernel.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+    kernel.VirtualFree.restype = ctypes.c_int
     kernel.VirtualQuery.argtypes = [ctypes.c_void_p, ctypes.POINTER(MemoryInfo), ctypes.c_size_t]
     kernel.VirtualQuery.restype = ctypes.c_size_t
     kernel.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
@@ -43,27 +45,34 @@ def kernel32():
     return kernel
 
 
-def reserve(kernel, preferred, size):
-    """Reserve [preferred, preferred + size) and prove the whole range is held by this reservation."""
-    reserved = kernel.VirtualAlloc(ctypes.c_void_p(preferred), size, MEM_RESERVE, PAGE_NOACCESS)
-    if reserved != preferred:
-        raise AssertionError(f"could not reserve the preferred base {preferred:#x} (error {ctypes.get_last_error()})")
+def choose_preferred(kernel, image):
+    """Give the temporary relocation-free copy a preferred base reserved in this child."""
+    with pefile.PE(image, fast_load=True) as pe:
+        size = pe.OPTIONAL_HEADER.SizeOfImage
+        base_at = pe.OPTIONAL_HEADER.get_field_absolute_offset("ImageBase")
+    preferred = kernel.VirtualAlloc(None, size, MEM_RESERVE, PAGE_NOACCESS)
+    if preferred is None:
+        raise ctypes.WinError(ctypes.get_last_error())
     info = MemoryInfo()
     if not kernel.VirtualQuery(ctypes.c_void_p(preferred), ctypes.byref(info), ctypes.sizeof(info)):
         raise AssertionError("VirtualQuery failed on the preferred base")
-    if info.State != MEM_RESERVE or info.AllocationBase != preferred or info.RegionSize < size:
+    if (info.State != MEM_RESERVE or info.BaseAddress != preferred or
+            info.AllocationBase != preferred or info.RegionSize < size):
         raise AssertionError(f"reservation does not cover the image: state {info.State:#x}, "
                              f"allocation base {info.AllocationBase}, region {info.RegionSize:#x}")
+    with open(image, "r+b") as copy:
+        copy.seek(base_at)
+        copy.write(struct.pack("<Q", preferred))
+    return preferred
 
 
 def run(loader, image, provider, mapper_path, probe_path, reserve_base):
     """Child process: optionally reserve the preferred base, load the image, call call_mix on every pair."""
     kernel = kernel32()
-    with pefile.PE(image, fast_load=True) as pe:
-        preferred, size = pe.OPTIONAL_HEADER.ImageBase, pe.OPTIONAL_HEADER.SizeOfImage
-    if reserve_base == "reserve":
-        reserve(kernel, preferred, size)
     probe = register_probe(probe_path)
+    preferred = choose_preferred(kernel, image)
+    if reserve_base == "no-reserve" and not kernel.VirtualFree(preferred, 0, MEM_RELEASE):
+        raise ctypes.WinError(ctypes.get_last_error())
     if loader == "windows":
         base = kernel.LoadLibraryExW(image, None, SEARCH_DLL_LOAD_DIR_AND_DEFAULT)
         error = None if base else ctypes.get_last_error()
@@ -139,14 +148,19 @@ def check(mapper, probe, image, provider):
         # Control: with IMAGE_FILE_RELOCS_STRIPPED set and the base reserved, neither loader may place it.
         stripped = lambda data: struct.pack_into("<H", data, flags_at, flags | RELOCS_STRIPPED)
         copy, copied_provider = write_copy(root / "stripped", image, provider, stripped)
+        free = child("windows", copy, copied_provider, mapper, probe, "no-reserve")
+        if (free["base"] != free["preferred"] or free["error"] is not None or
+                free["matches"] != free["pairs"]):
+            raise AssertionError(f"RELOCS_STRIPPED / windows: unreserved control failed: {free}")
         windows = child("windows", copy, copied_provider, mapper, probe)
         mapped = child("pe_map", copy, copied_provider, mapper, probe)
         if windows["base"] or windows["error"] != ERROR_INVALID_ADDRESS:
             raise AssertionError(f"RELOCS_STRIPPED / windows: base {windows['base']} error {windows['error']}")
         if mapped["base"] or mapped["error"] != [MAP_RELOCATION, "relocations stripped"]:
             raise AssertionError(f"RELOCS_STRIPPED / pe_map: {mapped['error']}")
-        print(f"RELOCS_STRIPPED set: Windows refused the load with error {ERROR_INVALID_ADDRESS} "
-              "(ERROR_INVALID_ADDRESS), pe_map rejected it as relocations stripped")
+        print(f"RELOCS_STRIPPED set: Windows loaded and called the unreserved copy at its preferred base, "
+              f"then refused the reserved case with error {windows['error']}; "
+              "pe_map rejected it as relocations stripped")
     print(f"{image.name} has an empty relocation directory; Windows and pe_map both load it away from its "
           "reserved preferred base, with or without DYNAMIC_BASE, and it runs correctly there")
 

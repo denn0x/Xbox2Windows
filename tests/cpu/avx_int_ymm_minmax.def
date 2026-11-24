@@ -1,0 +1,16 @@
+EXPORTS
+    op_vpmaxsb_ymm
+    op_vpmaxsw_ymm
+    op_vpmaxsd_ymm
+    op_vpmaxub_ymm
+    op_vpmaxuw_ymm
+    op_vpmaxud_ymm
+    op_vpminsb_ymm
+    op_vpminsw_ymm
+    op_vpminsd_ymm
+    op_vpminub_ymm
+    op_vpminuw_ymm
+    op_vpminud_ymm
+    op_vpmaxsd_ymm_dst_src2
+    op_vpminuw_ymm_dst_src1
+    op_vpmaxub_ymm_then_xmm_minsb

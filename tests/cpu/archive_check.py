@@ -55,6 +55,11 @@ def mapped_exports(mapper, image, providers):
 
 
 def mapped_archive(mapper_path, native, codec, source=None):
+    # DXGI loads d3d10warp.dll from the process's directory first. This host is python.exe, so load the
+    # app-local WARP (OFFSCREEN_WARP_DIR) beside the native EXE explicitly, as the native run finds it.
+    warp = native.with_name("d3d10warp.dll")
+    if warp.exists():
+        ctypes.WinDLL(str(warp))
     if source is None:
         provider = ctypes.CDLL(str(codec))
     else:

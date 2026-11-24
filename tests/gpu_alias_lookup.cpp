@@ -368,6 +368,67 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
         lowest = (std::min)(lowest, number);
         highest = (std::max)(highest, number);
     }
+    // Signed zeros. The shader replaces only on a strict < or >, and -0 < +0 is false, so a min or
+    // max between the two zeros keeps the stored word: that is the fixture's expectation, not
+    // IEEE minNum/maxNum. Compared as raw bits. Four single-record ties, then four contended words
+    // that start at a signed zero: two where a strictly smaller (min) or larger (max) input must
+    // win, and two where every contender is a tie or a loser, so the starting zero must survive.
+    // A zero that can win is never contended by the opposite zero, so every result is
+    // deterministic. A ninth word has only negative contenders and is seeded at -infinity,
+    // below them, because under a strict > no negative input can replace a zero.
+    const Word positive_zero = float_bits(0.0f);
+    const Word negative_zero = float_bits(-0.0f);
+    const std::uint64_t zero_base = fixture.titles[1]->begin() + 0x400;
+    struct ZeroWord {
+        std::uint64_t address;
+        Word initial;
+        Word expected;
+    };
+    std::vector<ZeroWord> zero_words;
+    const auto add_tie = [&](Word initial, Word operation, Word candidate) {
+        const std::uint64_t address = zero_base + 4 * zero_words.size();
+        zero_words.push_back({address, initial, initial});
+        records.push_back({address, operation, candidate});
+    };
+    add_tie(positive_zero, MinFloat, negative_zero);
+    add_tie(negative_zero, MinFloat, positive_zero);
+    add_tie(positive_zero, MaxFloat, negative_zero);
+    add_tie(negative_zero, MaxFloat, positive_zero);
+    // Contended words: with zeros, every third contender alternates -0 and +0; the others are strictly
+    // negative or strictly positive inputs from the generator above.
+    const auto add_contended = [&](float seed, Word operation, bool with_zeros, bool with_negative,
+                                   bool with_positive) {
+        const Word initial = float_bits(seed);
+        const std::uint64_t address = zero_base + 4 * zero_words.size();
+        float best = seed;
+        bool replaced = false;
+        for (Word i = 0; i < contenders; ++i) {
+            const float magnitude = static_cast<float>((i * 2654435761u) % 10000u + 1) / 8.0f;
+            Word candidate;
+            if (with_zeros && i % 3 == 0) {
+                candidate = (i / 3) % 2 ? positive_zero : negative_zero;
+            } else {
+                // i % 3 == 1 takes a negative input and i % 3 == 2 a positive one, where allowed.
+                const bool negative = i % 3 == 2 ? !with_positive : with_negative;
+                const float number = negative ? -magnitude : magnitude;
+                candidate = float_bits(number);
+                if (operation == MinFloat ? number < best : number > best) {
+                    best = number;
+                    replaced = true;
+                }
+            }
+            records.push_back({address, operation, candidate});
+        }
+        zero_words.push_back({address, initial, replaced ? float_bits(best) : initial});
+    };
+    const float infinity = std::numeric_limits<float>::infinity();
+    add_contended(0.0f, MinFloat, true, true, true);    // the lowest negative wins
+    add_contended(-0.0f, MaxFloat, true, true, true);   // the highest positive wins
+    add_contended(0.0f, MinFloat, true, false, true);   // ties and larger inputs: +0 stays
+    add_contended(-0.0f, MaxFloat, true, true, false);  // ties and smaller inputs: -0 stays
+    add_contended(-infinity, MaxFloat, false, true, false);  // negatives only: the highest negative wins
+    for (const auto& zero : zero_words) word_at(zero.address) = zero.initial;
+
     // Rejected records must report 0 and change nothing, including bytes of a rejected word
     // that lie inside a range: stores to unmapped addresses, a store and a float min on the
     // placed range's tail-crossing word, and misaligned store, add and sub inside ranges.
@@ -399,6 +460,7 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
     expect_word(sub_word, 1'000'000 - sum);
     expect_word(min_word, float_bits(lowest));
     expect_word(max_word, float_bits(highest));
+    for (const auto& zero : zero_words) expect_word(zero.address, zero.expected);
     std::vector<Word> expected_results(records.size());
     Word misses = 0;
     for (std::size_t r = 0; r < records.size(); ++r) {
@@ -438,6 +500,10 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
                 word_at(add_word), word_at(sub_word), sum, 1'000'000 - sum, add_sub_mismatches);
     std::printf("gpu_alias_lookup_writes other results=%zu words=%zu mismatches=%u\n", records.size(), words - 2,
                 other_mismatches);
+    std::printf("gpu_alias_lookup_writes signed_zero words=%zu", zero_words.size());
+    for (const auto& zero : zero_words)
+        std::printf(" %08x/%08x", word_at(zero.address), zero.expected);
+    std::printf("\n");
     std::printf("gpu_alias_lookup_writes ranges=%zu records=%zu stores=%zu contenders=%u sum=%u min=%g max=%g "
                 "misses=%u words_checked=%zu mismatches=%u\n",
                 fixture.packed.size(), records.size(), stored.size(), contenders, sum, lowest, highest, misses, words,

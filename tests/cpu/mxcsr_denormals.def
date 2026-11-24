@@ -1,0 +1,4 @@
+EXPORTS
+    den_add
+    den_after
+    den_fault

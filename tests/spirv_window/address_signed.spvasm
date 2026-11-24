@@ -1,0 +1,107 @@
+OpCapability Shader
+OpCapability Int64
+OpCapability PhysicalStorageBufferAddresses
+OpExtension "SPV_KHR_physical_storage_buffer"
+OpMemoryModel PhysicalStorageBuffer64 GLSL450
+OpEntryPoint GLCompute %main "main" %user_data
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %rt_uint ArrayStride 4
+OpDecorate %rt_int ArrayStride 4
+OpDecorate %words ArrayStride 4
+OpDecorate %UserData Block
+OpMemberDecorate %UserData 0 Offset 0
+%void = OpTypeVoid
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%ulong = OpTypeInt 64 0
+%fn = OpTypeFunction %void
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%c2 = OpConstant %uint 2
+%c3 = OpConstant %uint 3
+%c4 = OpConstant %uint 4
+%c5 = OpConstant %uint 5
+%c6 = OpConstant %uint 6
+%shift32 = OpConstant %uint 32
+%four = OpConstant %ulong 4
+%eight = OpConstant %ulong 8
+%twelve = OpConstant %ulong 12
+%mask_high = OpConstant %int -65536
+%bits_low = OpConstant %int 3855
+%xor_bits = OpConstant %int 267390960
+%sign_bit = OpConstant %int -2147483648
+%next_first = OpConstant %int 305419896
+%next_second = OpConstant %int -123456
+%rt_uint = OpTypeRuntimeArray %uint
+%rt_int = OpTypeRuntimeArray %int
+%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint
+%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint
+%_ptr_PSB_arri = OpTypePointer PhysicalStorageBuffer %rt_int
+%_ptr_PSB_int = OpTypePointer PhysicalStorageBuffer %int
+%words = OpTypeArray %uint %c4
+%UserData = OpTypeStruct %words
+%_ptr_PC_UserData = OpTypePointer PushConstant %UserData
+%_ptr_PC_uint = OpTypePointer PushConstant %uint
+%user_data = OpVariable %_ptr_PC_UserData PushConstant
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%base_low_ptr = OpAccessChain %_ptr_PC_uint %user_data %c0 %c0
+%base_low = OpLoad %uint %base_low_ptr
+%low64 = OpUConvert %ulong %base_low
+%base_high_ptr = OpAccessChain %_ptr_PC_uint %user_data %c0 %c3
+%base_high = OpLoad %uint %base_high_ptr
+%high64 = OpUConvert %ulong %base_high
+%shifted = OpShiftLeftLogical %ulong %high64 %shift32
+%base = OpBitwiseOr %ulong %low64 %shifted
+%array = OpConvertUToPtr %_ptr_PSB_arri %base
+%min_target = OpAccessChain %_ptr_PSB_int %array %c1
+%max_target = OpAccessChain %_ptr_PSB_int %array %c2
+%load_target = OpAccessChain %_ptr_PSB_int %array %c3
+%chain_target = OpAccessChain %_ptr_PSB_int %array %c4
+%operand_ptr = OpAccessChain %_ptr_PC_uint %user_data %c0 %c1
+%operand_bits = OpLoad %uint %operand_ptr
+%operand = OpBitcast %int %operand_bits
+%output_ptr = OpAccessChain %_ptr_PC_uint %user_data %c0 %c2
+%output_low = OpLoad %uint %output_ptr
+%output_address = OpUConvert %ulong %output_low
+%output_first = OpConvertUToPtr %_ptr_PSB_int %output_address
+%output_second_address = OpIAdd %ulong %output_address %four
+%output_second = OpConvertUToPtr %_ptr_PSB_int %output_second_address
+%output_third_address = OpIAdd %ulong %output_address %eight
+%output_third = OpConvertUToPtr %_ptr_PSB_int %output_third_address
+%output_tail_address = OpIAdd %ulong %output_address %twelve
+%output_tail = OpConvertUToPtr %_ptr_PSB_arri %output_tail_address
+%masked = OpBitwiseAnd %int %operand %mask_high
+%ored = OpBitwiseOr %int %masked %bits_low
+%expected = OpBitwiseXor %int %ored %xor_bits
+%wrong = OpBitwiseXor %int %expected %sign_bit
+%old_min = OpAtomicSMin %int %min_target %c1 %c0 %operand
+%old_max = OpAtomicSMax %int %max_target %c1 %c0 %operand
+%loaded = OpLoad %int %load_target Aligned 4
+%old_add = OpAtomicIAdd %int %chain_target %c1 %c0 %operand
+%old_exchange = OpAtomicExchange %int %chain_target %c1 %c0 %operand
+%old_and = OpAtomicAnd %int %chain_target %c1 %c0 %mask_high
+%old_or = OpAtomicOr %int %chain_target %c1 %c0 %bits_low
+%old_xor = OpAtomicXor %int %chain_target %c1 %c0 %xor_bits
+%old_miss = OpAtomicCompareExchange %int %chain_target %c1 %c0 %c0 %next_first %wrong
+%old_hit = OpAtomicCompareExchange %int %chain_target %c1 %c0 %c0 %next_second %expected
+OpStore %output_first %old_min Aligned 4
+OpStore %output_second %old_max Aligned 4
+OpStore %output_third %loaded Aligned 4
+%tail_0 = OpAccessChain %_ptr_PSB_int %output_tail %c0
+OpStore %tail_0 %old_add Aligned 4
+%tail_1 = OpAccessChain %_ptr_PSB_int %output_tail %c1
+OpStore %tail_1 %old_exchange Aligned 4
+%tail_2 = OpAccessChain %_ptr_PSB_int %output_tail %c2
+OpStore %tail_2 %old_and Aligned 4
+%tail_3 = OpAccessChain %_ptr_PSB_int %output_tail %c3
+OpStore %tail_3 %old_or Aligned 4
+%tail_4 = OpAccessChain %_ptr_PSB_int %output_tail %c4
+OpStore %tail_4 %old_xor Aligned 4
+%tail_5 = OpAccessChain %_ptr_PSB_int %output_tail %c5
+OpStore %tail_5 %old_miss Aligned 4
+%tail_6 = OpAccessChain %_ptr_PSB_int %output_tail %c6
+OpStore %tail_6 %old_hit Aligned 4
+OpReturn
+OpFunctionEnd

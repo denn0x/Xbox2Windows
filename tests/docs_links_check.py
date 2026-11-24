@@ -116,6 +116,9 @@ def link_error(root, source, target, headings, tracked=None):
     relative = Path(path)
     if relative.anchor or path.startswith(("/", "\\")):
         return "target is outside the repository"
+    if "\\" in path:
+        # GitHub treats a backslash as a filename character; Windows would read it as a separator.
+        return "backslash in path (use /)"
     linked = ((source.parent / relative) if path else source).resolve()
     if not linked.is_relative_to(root):
         return "target is outside the repository"
@@ -131,6 +134,9 @@ def link_error(root, source, target, headings, tracked=None):
             return "fragment on a directory" if fragment else None
         if relative_target not in files:
             return "file is not tracked (check the case of the path)"
+        if path.endswith("/"):
+            # normpath drops the slash, but GitHub does not resolve a file link that ends in one.
+            return "trailing slash on a file"
     elif not linked.is_file():
         return "file does not exist"
     if fragment and (not path or linked.suffix.lower() == ".md"):
@@ -207,6 +213,15 @@ def self_test():
         assert check_links(root, [Path("links.md")], tracked) == (
             4, ["links.md:1: docs/guide.md (file is not tracked (check the case of the path))",
                 "links.md:4: docs/#guide (fragment on a directory)"],
+        )
+        # A backslash is not a separator on GitHub or Linux, so it fails everywhere; a slash
+        # after a file fails, while the same slash after a tracked directory is the control.
+        (root / "portable.md").write_text(
+            "[back](docs\\Guide.md)\n[file](docs/Guide.md/)\n[dir](docs/)\n", encoding="utf-8")
+        tracked.add(Path("portable.md"))
+        assert check_links(root, [Path("portable.md")], tracked) == (
+            3, ["portable.md:1: docs\\Guide.md (backslash in path (use /))",
+                "portable.md:2: docs/Guide.md/ (trailing slash on a file)"],
         )
         # A directory without Git metadata, like an extracted source archive, is not a checkout.
         assert not git_checkout(root)

@@ -2,6 +2,10 @@
 
 Only source-built CRT-free fixtures are read or executed. All cases run as child
 processes so a failing mapped image cannot terminate the CTest host.
+
+Lingering-thread control (#1375): with a provider whose mix_args leaves a thread running, the native EXE
+must still end at once with its result, because its entry ends the process. A build whose entry returns
+instead must stay alive until the harness kills it, which shows the control can see a lingering process.
 """
 import ctypes
 import json
@@ -17,15 +21,19 @@ ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools" / "pe_run_package.py"
 MODULE = "cpu_package_ordinal_provider.dll"
 EXE = "cpu_package_ordinal_exe.exe"
+RETURN_EXE = "cpu_package_ordinal_exe_return.exe"
+LINGER_DEADLINE = 10  # s; the EXE itself ends in milliseconds
+RETURN_DEADLINE = 3  # s; the returning control never ends by itself while the provider's thread sleeps
 
 
-def import_fixture(exe, provider, altered, wrong):
-    with pefile.PE(str(exe), fast_load=True) as pe:
-        pe.parse_data_directories(directories=[1])
-        rows = [(d.dll.decode().casefold(), imp.ordinal, imp.name) for d in pe.DIRECTORY_ENTRY_IMPORT
-                for imp in d.imports]
-    assert rows == [(MODULE, 77, None)], rows
-    for path, expected in ((provider, 77), (altered, 77), (wrong, 78)):
+def import_fixture(exe, provider, altered, wrong, live, returning):
+    for image in (exe, returning):  # ending the process adds no import
+        with pefile.PE(str(image), fast_load=True) as pe:
+            pe.parse_data_directories(directories=[1])
+            rows = [(d.dll.decode().casefold(), imp.ordinal, imp.name) for d in pe.DIRECTORY_ENTRY_IMPORT
+                    for imp in d.imports]
+        assert rows == [(MODULE, 77, None)], (image, rows)
+    for path, expected in ((provider, 77), (altered, 77), (wrong, 78), (live, 77)):
         with pefile.PE(str(path), fast_load=True) as pe:
             pe.parse_data_directories(directories=[0])
             entries = [(exp.ordinal, exp.name, exp.forwarder) for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols]
@@ -76,6 +84,28 @@ def check_wrong_provider(mapper, exe, wrong):
         print("missing DLL: package runner rejects before guest entry")
 
 
+def check_lingering(exe, returning, live):
+    with TemporaryDirectory(ignore_cleanup_errors=True) as temp:  # a killed control may hold its EXE briefly
+        root = Path(temp)
+        shutil.copyfile(exe, root / EXE)
+        shutil.copyfile(returning, root / RETURN_EXE)
+        shutil.copyfile(live, root / MODULE)
+        try:
+            native = subprocess.run([str(root / EXE)], capture_output=True, text=True, timeout=LINGER_DEADLINE)
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(f"lingering thread: native EXE still alive after {LINGER_DEADLINE} s") from error
+        assert (native.returncode, native.stdout, native.stderr) == (13, "", ""), native
+        try:
+            control = subprocess.run([str(root / RETURN_EXE)], capture_output=True, timeout=RETURN_DEADLINE)
+        except subprocess.TimeoutExpired:
+            pass  # expected: the entry returned, and the provider's thread keeps the process alive
+        else:
+            raise AssertionError(f"returning control ended with {control.returncode:#x} within {RETURN_DEADLINE} s; "
+                                 "the lingering-thread control does not hold the process open")
+    print(f"lingering thread: native EXE exited 13 while the provider's thread was alive; "
+          f"the returning control was still alive after {RETURN_DEADLINE} s")
+
+
 def check_mapper_ordinal(mapper, provider):
     # Exercise the new PE export lookup directly, including holes and invalid ordinals.
     # The mapper executes the source-built DLL's trivial process-attach only.
@@ -108,13 +138,14 @@ def check_mapper_ordinal(mapper, provider):
 
 
 def main():
-    if len(sys.argv) != 6:
-        raise SystemExit("usage: package_ordinal_check.py pe_map.exe exe provider altered wrong")
-    mapper, exe, provider, altered, wrong = map(Path, sys.argv[1:])
-    import_fixture(exe, provider, altered, wrong)
+    if len(sys.argv) != 8:
+        raise SystemExit("usage: package_ordinal_check.py pe_map.exe exe provider altered wrong live exe_return")
+    mapper, exe, provider, altered, wrong, live, returning = map(Path, sys.argv[1:])
+    import_fixture(exe, provider, altered, wrong, live, returning)
     check_case(mapper, exe, provider, 13)
     check_case(mapper, exe, altered, 14)
     check_wrong_provider(mapper, exe, wrong)
+    check_lingering(exe, returning, live)
     check_mapper_ordinal(mapper, provider)
 
 

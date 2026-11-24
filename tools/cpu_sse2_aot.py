@@ -9,6 +9,9 @@ values. Only legacy encodings are accepted; VEX, EVEX and other non-legacy forms
 Supported SSE2 instructions (23 of the 64 forms in docs/coverage/x64_zen2.tsv
 group SSE2):
   - Packed compare: cmppd (imm8 predicates 0..7, xmm and aligned m128 source)
+  - Scalar compare: cmpsd (imm8 predicates 0..7 on the low double, xmm or m64
+    source, bits 127:64 of dest preserved; this SSE2 form shares its mnemonic
+    with the string compare, which is a different iced Code and is not accepted)
   - Packed converts: cvtdq2pd, cvtdq2ps, cvtpd2dq, cvtpd2ps, cvtps2dq,
     cvtps2pd, cvttpd2dq, cvttps2dq
   - MMX-source convert: cvtpi2pd (m64 memory form only)
@@ -26,7 +29,7 @@ Rejected: the 36 SSE2-group forms reserved for sibling translators (see
 docs/experiments.md), the five task forms that cannot be expressed through the
 leaf ABI (cvtpd2pi, cvttpd2pi, movdq2q, movq2dq use MMX register operands;
 maskmovdqu uses implicit RDI), the mm-register source of cvtpi2pd, cmppd
-immediates above 7, non-legacy (VEX/EVEX) encodings, MMX forms, instruction prefixes,
+and cmpsd immediates above 7, non-legacy (VEX/EVEX) encodings, MMX forms, instruction prefixes,
 nonvolatile or argument registers, non-flat memory operands, branches and all
 other instructions.
 """
@@ -98,8 +101,9 @@ ALLOWED_CODES = {
     Code.MOV_R64_RM64,
     Code.MOV_RM32_R32,
     Code.MOV_RM64_R64,
-    # Packed compare.
+    # Packed and scalar compare.
     Code.CMPPD_XMM_XMMM128_IMM8,
+    Code.CMPSD_XMM_XMMM64_IMM8,
     # Packed and scalar converts.
     *PACKED_CVT_HELPERS,
     *QWORD_CVT_HELPERS,
@@ -226,6 +230,28 @@ static Vec128 op_cmppd(const Vec128& a, const Vec128& b, std::uint8_t imm8) {
         out.q[i] = res ? 0xffffffffffffffffull : 0ull;
     }
     return out;
+}
+
+// CMPSD predicates 0..7 on the low double, same predicate order as CMPPD. The
+// host SSE2 compare runs on the operands' raw bits, so the live MXCSR (DAZ
+// reads subnormal inputs as zero) applies exactly as for the instruction, and
+// a NaN input follows the predicate's ordered or unordered rule. The result is
+// an all-ones or all-zero qword; the caller keeps bits 127:64 of the destination.
+static std::uint64_t op_cmpsd_q(std::uint64_t a, std::uint64_t b, std::uint8_t imm8) {
+    const __m128d x = _mm_castsi128_pd(_mm_cvtsi64_si128(static_cast<long long>(a)));
+    const __m128d y = _mm_castsi128_pd(_mm_cvtsi64_si128(static_cast<long long>(b)));
+    __m128d r;
+    switch (imm8 & 7u) {
+        case 0u: r = _mm_cmpeq_sd(x, y); break;
+        case 1u: r = _mm_cmplt_sd(x, y); break;
+        case 2u: r = _mm_cmple_sd(x, y); break;
+        case 3u: r = _mm_cmpunord_sd(x, y); break;
+        case 4u: r = _mm_cmpneq_sd(x, y); break;
+        case 5u: r = _mm_cmpnlt_sd(x, y); break;
+        case 6u: r = _mm_cmpnle_sd(x, y); break;
+        default: r = _mm_cmpord_sd(x, y); break;
+    }
+    return static_cast<std::uint64_t>(_mm_cvtsi128_si64(_mm_castpd_si128(r)));
 }
 
 // MAXSD/MINSD return src2 on ties, unordered inputs and equal values.
@@ -499,6 +525,15 @@ def lift_code(name, start, raw):
             src = vec_src128(1, ins)
             dst_idx, dst_name = write_vec(0, ins)
             statements.append(f"{dst_name} = op_cmppd({dst}, {src}, {imm:#x}u);")
+            defined.add(dst_idx)
+        elif ins.code == Code.CMPSD_XMM_XMMM64_IMM8:
+            imm = ins.immediate8 & 0xff
+            if imm > 7:
+                raise ValueError(f"unsupported cmpsd predicate {imm:#x} at RVA {ins.ip:#x}: {ins}")
+            dst = read_vec(0, ins)
+            src = vec_src64(1, ins)
+            dst_idx, dst_name = write_vec(0, ins)
+            statements.append(f"{dst_name}.q[0] = op_cmpsd_q({dst}.q[0], {src}, {imm:#x}u);")
             defined.add(dst_idx)
         elif ins.code in PACKED_CVT_HELPERS:
             src = vec_src128(1, ins)

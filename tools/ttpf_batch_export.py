@@ -43,6 +43,13 @@ FORMAT_NAMES = {
 }
 
 
+def _index_int(token: str, part: str) -> int:
+    try:
+        return int(token.strip())
+    except ValueError:
+        raise ValueError(f"Invalid index '{token.strip()}' in '{part}': expected an integer") from None
+
+
 def parse_indices(spec: str, total_count: int | None = None) -> list[int]:
     """Parse index specifications like '0,8253', '0-10', or '0-5,10,20-25'."""
     result: set[int] = set()
@@ -52,14 +59,14 @@ def parse_indices(spec: str, total_count: int | None = None) -> list[int]:
             continue
         if "-" in part:
             start_str, end_str = part.split("-", 1)
-            start, end = int(start_str.strip()), int(end_str.strip())
+            start, end = _index_int(start_str, part), _index_int(end_str, part)
             if start > end:
                 raise ValueError(f"Invalid range '{part}': start ({start}) > end ({end})")
             if total_count is not None:
                 end = min(end, total_count - 1)
             result.update(range(start, end + 1))
         else:
-            idx = int(part)
+            idx = _index_int(part, part)
             if total_count is None or idx < total_count:
                 result.add(idx)
     return sorted(result)
@@ -365,7 +372,10 @@ def main():
     if not args.pool.exists():
         parser.error(f"Pool not found: {args.pool}")
 
-    indices = parse_indices(args.indices) if args.indices else None
+    try:
+        indices = parse_indices(args.indices) if args.indices else None
+    except ValueError as exc:
+        parser.error(f"--indices: {exc}")
 
     try:
         summary = batch_export(

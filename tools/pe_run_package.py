@@ -6,20 +6,35 @@ import ctypes as C
 from ctypes import wintypes as W
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 
 from pe_package_preflight import inspect
+from host_commit import read_host_commit, require_commit_budget
+
+# --trap-callable exit codes are TRAP_EXIT_BASE | trap number (1-based, in sorted dll!symbol order).
+TRAP_EXIT_BASE = 0xE7A00000
+TRAP_LIMIT = 0xFFFF
+_TRAP_CALLBACKS = []  # Process lifetime: trap thunks must outlive every guest thread.
 
 
-def plan(report):
-    """Resolve the entire import graph before any guest attachment."""
+def plan(report, *, allow_external=True):
+    """Resolve the entire import graph before any guest attachment.
+
+    The default keeps external host imports as unverified candidates. Set
+    allow_external=False for a strict closed-package plan: every reachable
+    import must terminate in an export bundled in the package. This pure check
+    runs before any module is loaded or mapped.
+    """
+    accepted = {"bundled_export_present"}
+    if allow_external:
+        accepted.update(("external_unverified", "forwarded_external_unverified"))
     routes = defaultdict(dict)
     needs = defaultdict(set)
     for row in report["imports"]:
         image, name = row["image"], (row["dll"].casefold(), row["symbol"])
-        if row["status"] not in ("bundled_export_present", "external_unverified",
-                                 "forwarded_external_unverified"):
+        if row["status"] not in accepted:
             raise ValueError(f"{image}: {name[0]}!{name[1]}: {row['status']}")
         chain = row["chain"]
         for caller, provider in zip([image, *(step["provider"] for step in chain)], chain):
@@ -45,13 +60,68 @@ def plan(report):
     return order, routes
 
 
+def is_host_create_thread(dll, symbol):
+    """A host CreateThread import: kernel32, kernelbase or a processthreads API-set contract."""
+    dll = dll.casefold()
+    return symbol == "CreateThread" and (dll in ("kernel32.dll", "kernelbase.dll")
+                                         or dll.startswith("api-ms-win-core-processthreads-"))
+
+
 def prototype(lib, name, args, result):
     function = getattr(lib, name)
     function.argtypes, function.restype = args, result
     return function
 
 
-def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=()):
+def trap_key(name):
+    """Parse a --trap-callable DLL!SYMBOL (or DLL!#ORDINAL) into an import key."""
+    dll, sep, symbol = name.partition("!")
+    if not sep or not dll or not symbol or Path(dll).name != dll:
+        raise ValueError(f"--trap-callable expects DLL!SYMBOL or DLL!#ORDINAL, got {name!r}")
+    return dll.casefold(), symbol
+
+
+def bind_traps(kernel, trap_importers):
+    """Bind each listed callable import to a numbered trap for a diagnostic run.
+
+    trap_importers maps (dll, symbol) to the images that import it. A trap never returns
+    to its caller: it writes its number and name to stderr, best effort, and terminates
+    the process with TRAP_EXIT_BASE | number even when that report fails. No DLL is
+    loaded or written, so a trap cannot be mistaken for a provider. Returns
+    (addresses, callbacks, labels); keep the callbacks alive for the whole run.
+    """
+    if len(trap_importers) > TRAP_LIMIT:
+        raise ValueError(f"--trap-callable supports at most {TRAP_LIMIT} traps, got {len(trap_importers)}")
+    terminate = prototype(kernel, "TerminateProcess", [W.HANDLE, W.UINT], W.BOOL)
+    current = prototype(kernel, "GetCurrentProcess", [], W.HANDLE)
+    trap_type = C.WINFUNCTYPE(None)
+    addresses, callbacks, labels = {}, [], []
+    for number, key in enumerate(sorted(trap_importers), 1):
+        label = f"{key[0]}!{key[1]}"
+        message = f"trap {number}: {', '.join(sorted(trap_importers[key]))}: {label}\n".encode("ascii", "replace")
+
+        def hit(message=message, code=TRAP_EXIT_BASE | number):
+            # ctypes swallows an exception raised here and returns to the guest, so the report
+            # is best effort and termination happens in finally, whatever the report did.
+            try:
+                try:
+                    os.write(2, message)  # unbuffered, so the line is out before the process ends
+                except BaseException:
+                    pass
+            finally:
+                try:
+                    terminate(current(), code)
+                finally:
+                    os._exit(code)
+
+        trap = trap_type(hit)
+        callbacks.append(trap)
+        addresses[key] = C.cast(trap, C.c_void_p).value
+        labels.append(label)
+    return addresses, callbacks, labels
+
+
+def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=(), trap_callable=()):
     order, routes = plan(report)
     callback = C.WINFUNCTYPE(C.c_void_p, C.c_char_p, C.c_char_p, C.c_uint32)
     kernel = C.WinDLL("kernel32", use_last_error=True)
@@ -62,8 +132,13 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
     modules, addresses = {}, {}
     if set(pin_shims) - shims.keys():
         raise ValueError("Pinned providers must be named with --shim")
+    trap_keys = {trap_key(name) for name in trap_callable}
+    if trap_keys and preflight_only:
+        raise ValueError("--trap-callable applies to execution mode, not --preflight-only")
+    trap_labels = []
     with ExitStack() as stack:
-        missing = []
+        missing, missing_keys = [], defaultdict(set)
+        missing_entry_keys = []
         for image in order:
             for terminal in routes[image].values():
                 if terminal.get("package"):
@@ -71,6 +146,8 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                 dll, symbol = terminal["dll"].casefold(), terminal["symbol"]
                 key = (dll, symbol)
                 if key in addresses:
+                    if not addresses[key]:
+                        missing_keys[key].add(image)
                     continue
                 if dll not in modules:
                     module = (load(str(shims[dll]), None, 0x900) if dll in shims else
@@ -84,7 +161,30 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                 addresses[key] = find(module, needle) if module else None
                 if not addresses[key]:
                     missing.append(f"{image}: {dll}!{symbol}")
-        if missing and not preflight_only:
+                    missing_keys[key].add(image)
+                    missing_entry_keys.append(key)
+        if trap_keys:
+            # An import table entry does not say whether the caller calls the symbol or reads it as
+            # data, so only names the caller lists as callable get a trap; any other unresolved
+            # external is refused as before.
+            stale = sorted(trap_keys - missing_keys.keys())
+            if stale:
+                raise ValueError(f"--trap-callable {stale[0][0]}!{stale[0][1]} is not an unresolved external")
+            unlisted = [entry for entry, key in zip(missing, missing_entry_keys) if key not in trap_keys]
+            if unlisted:
+                raise ValueError(f"{len(unlisted)} unresolved external symbol(s) not listed with "
+                                 f"--trap-callable, first {unlisted[0]}")
+            trap_addresses, trap_callbacks, trap_labels = bind_traps(
+                kernel, {key: missing_keys[key] for key in trap_keys})
+            # A guest worker may still reach a trap after the entry returns.
+            _TRAP_CALLBACKS.extend(trap_callbacks)
+            addresses.update(trap_addresses)
+            sys.stderr.write(f"trap-callable: {len(trap_labels)} listed unresolved external(s) bound to "
+                             "terminating traps; diagnostic only, not providers\n")
+            for number, label in enumerate(trap_labels, 1):
+                sys.stderr.write(f"  trap {number} (exit {TRAP_EXIT_BASE | number:#x}): {label}\n")
+            sys.stderr.flush()
+        elif missing and not preflight_only:
             raise ValueError(f"{len(missing)} unresolved external symbol(s), first {missing[0]}")
         if preflight_only:
             return {"image_order": order, "external_bindings": len(addresses) - len(missing),
@@ -122,7 +222,14 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                               [W.LPCWSTR, callback, C.POINTER(C.c_uint32), C.c_char_p, C.c_size_t], C.c_void_p)
         export = prototype(lib, "pe_map_export", [C.c_void_p, C.c_char_p], C.c_void_p)
         unmap = prototype(lib, "pe_map_release", [C.c_void_p], C.c_int)
-        start = prototype(lib, "pe_map_run", [C.c_void_p, C.POINTER(C.c_uint32)], C.c_int)
+        # The entry is the package's main executable, as under a Windows launch: pe_map_run_main gives
+        # its TLS block slot 0 on the participating threads (code built with /GA reads slot 0 directly),
+        # and its host CreateThread imports go to pe_map_main_create_thread so its workers participate.
+        try:
+            start = prototype(lib, "pe_map_run_main", [C.c_void_p, C.POINTER(C.c_uint32)], C.c_int)
+            enroll = C.cast(lib.pe_map_main_create_thread, C.c_void_p).value
+        except AttributeError as exc:
+            raise ValueError("the entry EXE requires a mapper with pe_map_run_main") from exc
         mapped = {}
         for image in order:
             imports = {}
@@ -135,6 +242,10 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                                     export(mapped[provider], symbol.encode("ascii")))
                     if not imports[key]:
                         raise ValueError(f"{image}: mapped export {provider}!{symbol} unavailable")
+                elif (image == report["entry"]
+                      and terminal["dll"].casefold() not in shims
+                      and is_host_create_thread(terminal["dll"], symbol)):
+                    imports[key] = enroll
                 else:
                     imports[key] = addresses[terminal["dll"].casefold(), symbol]
 
@@ -154,7 +265,11 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
         code = C.c_uint32()
         if not start(mapped[report["entry"]], C.byref(code)):
             raise ValueError("mapper refused the EXE start")
-        return {"image_order": order, "entry_executed": True, "exit_code": code.value}
+        result = {"image_order": order, "entry_executed": True, "exit_code": code.value}
+        if trap_keys:
+            # Reaching this point means no trap was called.
+            result["unhit_traps"] = trap_labels
+        return result
 
 
 def main():
@@ -166,9 +281,24 @@ def main():
     parser.add_argument("--pin-shim", action="append", default=[], metavar="DLL",
                         help="keep a named external shim loaded until this process exits")
     parser.add_argument("--system", action="append", default=[], metavar="DLL")
-    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--min-commit-mib", type=int, metavar="MIB",
+                        help="optional Windows system commit-headroom check before loading any DLL; "
+                             "0 reports headroom without imposing a minimum")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--preflight-only", action="store_true")
+    mode.add_argument("--trap-callable", action="append", default=[], metavar="DLL!SYMBOL",
+                      help="diagnostic: bind this unresolved external, which the caller must call rather than "
+                           "read as data, to a trap that names it on stderr and terminates the process with "
+                           f"{TRAP_EXIT_BASE:#x} | trap number; any unlisted unresolved external is still refused")
     options = parser.parse_args()
     try:
+        # Perform the opt-in check before parsing the package or loading providers.
+        # A successful check does not reserve memory and cannot promise startup.
+        commit_report = None
+        if options.min_commit_mib is not None:
+            if not 0 <= options.min_commit_mib <= 1 << 20:
+                raise ValueError("--min-commit-mib must be between 0 and 1048576")
+            commit_report = require_commit_budget(options.min_commit_mib, read_host_commit())
         root = options.package.resolve(strict=True)
         shims = {name.casefold(): Path(path).resolve(strict=True) for name, path in options.shim}
         system = {name.casefold() for name in options.system}
@@ -177,7 +307,10 @@ def main():
         report = inspect(root, options.entry)
         result = run(root, report, options.mapper.resolve(), shims, system,
                      preflight_only=options.preflight_only,
-                     pin_shims={name.casefold() for name in options.pin_shim})
+                     pin_shims={name.casefold() for name in options.pin_shim},
+                     trap_callable=options.trap_callable)
+        if commit_report is not None:
+            result = {**result, "host_commit": commit_report}
     except (ValueError, OSError) as exc:
         parser.exit(1, f"{exc}\n")
     print(json.dumps(result, indent=2))

@@ -118,6 +118,16 @@ fiadd_fisub PROC FRAME
     ret
 fiadd_fisub ENDP
 
+fisub_i16_depth2 PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+0]
+    fld tbyte ptr [rcx+16]
+    fisub word ptr [rcx+32]
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+fisub_i16_depth2 ENDP
+
 fidivr_depth8 PROC FRAME
     .endprolog
     fld qword ptr [rcx+0]

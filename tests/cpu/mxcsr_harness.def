@@ -1,3 +1,5 @@
 EXPORTS
     get_mxcsr
     set_mxcsr
+    mxcsr_mask_of
+    has_avx_os

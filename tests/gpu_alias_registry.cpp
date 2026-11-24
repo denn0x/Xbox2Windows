@@ -144,10 +144,16 @@ std::vector<Word> lookup(ID3D12Device* device, const era_title_gpu::ShaderView& 
 
 bool check_gpu_alias_registry(ID3D12Device* device)
 {
-    Graphics first(256 * 1024), second(64 * 1024);
     // A trackable block that is not the base of an allocation, so it can never be aliased. Its region
     // is placed below `first`, so attach meets this failure before an allocation it must still alias.
-    void* below = commit_below(first.begin());
+    // It is taken before `first`: without bottom-up ASLR, first-fit placement can leave no free block
+    // below `first`, but then puts `first` above this one. With randomized placement, search instead.
+    void* below = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    Graphics first(256 * 1024), second(64 * 1024);
+    if (below && address(below) > first.begin()) {
+        VirtualFree(below, 0, MEM_RELEASE);
+        below = commit_below(first.begin());
+    }
     expect(below != nullptr && address(below) < first.begin(), "region below the first allocation");
     void* heap_block = static_cast<char*>(below) + 0x1000;
 

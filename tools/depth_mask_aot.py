@@ -8,6 +8,82 @@ from pixel_aot import container_code, disassemble
 from resource_inventory import parts
 
 
+# Plain binary32 VOP2 forms. src0 may be a constant, scalar word or VGPR; vsrc1 is
+# always a VGPR. subrev swaps the operands. The fixtures keep values finite and
+# normal, so NaN and subnormal behavior is not claimed.
+BINARY_F32 = {
+    "v_add_f32_e32": lambda x, y: f"({x} + {y})",
+    "v_sub_f32_e32": lambda x, y: f"({x} - {y})",
+    "v_subrev_f32_e32": lambda x, y: f"({y} - {x})",
+    "v_mul_f32_e32": lambda x, y: f"({x} * {y})",
+    "v_min_f32_e32": lambda x, y: f"min({x}, {y})",
+    "v_max_f32_e32": lambda x, y: f"max({x}, {y})",
+}
+
+
+# One-source binary32 e32 forms with a VGPR, constant or scalar word source. round is round-half-even, like
+# v_rndne_f32. The result of rcp, rsq, sqrt, exp and log is whatever the host computes: a caller may only rely on inputs
+# whose exact result is an integer, and a zero or negative operand (or an overflow) is not claimed. Source modifiers, clamp,
+# output modifiers and a second source stay rejected; the e64 spelling is accepted only without modifiers (see plain).
+UNARY_F32 = {
+    "v_rcp_f32_e32": "(1.0f / {x})",
+    "v_rsq_f32_e32": "rsqrt({x})",
+    "v_sqrt_f32_e32": "sqrt({x})",
+    "v_floor_f32_e32": "floor({x})",
+    "v_trunc_f32_e32": "trunc({x})",
+    "v_rndne_f32_e32": "round({x})",
+    "v_ceil_f32_e32": "ceil({x})",
+    "v_exp_f32_e32": "exp2({x})",
+    "v_log_f32_e32": "log2({x})",
+}
+
+
+# Ordered binary32 compares that write EXEC with the lanes where the compare holds.
+# A lane for which src0 OP vsrc1 holds is discarded. Only the four ordered forms are
+# claimed: a NaN operand makes every one of them false, as the HLSL operators do. The
+# unordered (n*) forms are true for NaN and stay rejected, as do other widths and the VOP3 compares that write a scalar mask.
+CMPX_F32 = {
+    "v_cmpx_lt_f32_e32": "<",
+    "v_cmpx_le_f32_e32": "<=",
+    "v_cmpx_gt_f32_e32": ">",
+    "v_cmpx_ge_f32_e32": ">=",
+}
+
+
+# Plain VOP3 spellings. An _e64 instruction of exactly the forms above (the binary32 VOP2 and
+# VOP1 math, v_fract_f32, v_mul_legacy_f32, v_fmac_f32 and the four ordered v_cmpx_*_f32
+# compares) is the same operation as its _e32 spelling and is rewritten to it before lowering,
+# so both spellings give identical HLSL and take the same operand rules (a binary32 VOP2
+# vsrc1 stays a VGPR even though VOP3 would allow a scalar or constant there). Rejected VOP3
+# fields: clamp, omod (mul:2, div:2, mul:4), the abs ("|v1|") and neg ("-v1", "neg(v1)")
+# source modifiers, op_sel and every other suffix. Only a plain register, scalar word or
+# constant operand is accepted. A VOP3 compare with a scalar destination (v_cmp_*_e64) and
+# every other _e64 instruction are different instructions and are rejected.
+E64_FORMS = frozenset(
+    (
+        *BINARY_F32,
+        *UNARY_F32,
+        *CMPX_F32,
+        "v_fract_f32_e32",
+        "v_mul_legacy_f32_e32",
+        "v_fmac_f32_e32",
+    )
+)
+PLAIN_OPERAND = r"[vs]\d+|-?\d+(?:\.\d+)?|0x[0-9a-f]+"
+
+
+def plain(line):
+    op, _, operands = line.partition(" ")
+    if not op.endswith("_e64"):
+        return line
+    narrow = op[: -len("_e64")] + "_e32"
+    if narrow not in E64_FORMS:
+        raise ValueError(f"Unsupported depth instruction: {op}")
+    if not all(re.fullmatch(PLAIN_OPERAND, a) for a in operands.split(", ")):
+        raise ValueError(f"VOP3 modifier or unsupported operand: {line}")
+    return f"{narrow} {operands}"
+
+
 def lower(decoded, tables):
     if (
         len(tables) != 2
@@ -40,6 +116,8 @@ def lower(decoded, tables):
 
     def fp(token):
         if re.fullmatch(r"v\d+", token):
+            if int(token[1:]) not in vector:
+                raise ValueError("Unwritten vector register")
             return vector[int(token[1:])]
         if re.fullmatch(r"-?\d+\.\d+", token):
             return token + "f"
@@ -52,6 +130,7 @@ def lower(decoded, tables):
 
     index = 0
     for index, (_, line) in enumerate(decoded):
+        line = plain(line)
         if line.startswith("v_cmpx_"):
             break
         if re.fullmatch(r"s_(?:inst_prefetch|nop) (?:0x[0-9a-f]+|\d+)", line):
@@ -134,10 +213,18 @@ def lower(decoded, tables):
             elif op == "v_mul_legacy_f32_e32" and len(args) == 3:
                 x, y = map(fp, args[1:])
                 expr = f"(({x} == 0 || {y} == 0) ? 0.0f : {x} * {y})"
+            elif op in BINARY_F32 and len(args) == 3 and re.fullmatch(r"v\d+", args[2]):
+                x, y = map(fp, args[1:])
+                expr = BINARY_F32[op](x, y)
             elif op == "v_fmac_f32_e32" and len(args) == 3:
                 expr = f"mad({fp(args[1])}, {fp(args[2])}, {vector[dest]})"
+            elif op in UNARY_F32 and len(args) == 2:
+                expr = UNARY_F32[op].format(x=fp(args[1]))
             elif op == "v_fract_f32_e32" and len(args) == 2:
-                expr = f"min(frac({fp(args[1])}), asfloat(0x3f7fffffu))"
+                # D3D min returns the other operand for a NaN, so a min cap would turn a NaN input
+                # into the finite cap; a comparison fails for NaN and passes it through.
+                frac = f"frac({fp(args[1])})"
+                expr = f"({frac} >= 1.0f ? asfloat(0x3f7fffffu) : {frac})"
             else:
                 raise ValueError(f"Unsupported depth instruction: {op}")
             vector[dest] = f"value{index}"
@@ -148,7 +235,8 @@ def lower(decoded, tables):
     compare, invert, branch, restore, depth, end, empty, null, last = (
         s for _, s in tail
     )
-    cmp = re.fullmatch(r"v_cmpx_lt_f32_e32 (s\d+), (v\d+)", compare)
+    compare = plain(compare)
+    cmp = re.fullmatch(r"(v_cmpx_(?:lt|le|gt|ge)_f32_e32) (s\d+), (v\d+)", compare)
     inv = re.fullmatch(r"s_andn2_b64 (s\[(\d+):(\d+)\]), \1, exec", invert)
     take = re.fullmatch(r"s_cbranch_scc0 (-?\d+)", branch)
     mask = re.fullmatch(r"s_and_b64 exec, (s\[(\d+):(\d+)\]), (s\[\d+:\d+\])", restore)
@@ -174,7 +262,7 @@ def lower(decoded, tables):
         ]:
             raise ValueError("Expected the original entry mask")
     lines += [
-        f"    if ({fp(cmp[1])} < {fp(cmp[2])}) discard;",
+        f"    if ({fp(cmp[2])} {CMPX_F32[cmp[1]]} {fp(cmp[3])}) discard;",
         f"    return {fp(exp[1])};",
         "}",
     ]

@@ -35,7 +35,7 @@ inline void write_all(HANDLE handle, const char* text, DWORD length) noexcept
     WriteFile(handle, text, length, &written, nullptr);
 }
 
-// Local experiment switch: %X2W_TRAP_CONTINUE% lists export names (comma-separated, or *) whose
+// Switch: %X2W_TRAP_CONTINUE% lists export names (comma-separated, or *) whose
 // trap logs the call with "x2w-continue" and returns 0 instead of terminating. Off when unset.
 inline bool listed(const char* variable, const char* name) noexcept
 {

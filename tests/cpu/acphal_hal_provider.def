@@ -1,0 +1,20 @@
+LIBRARY acphal
+EXPORTS
+    ApuCreateHeap
+    ApuAlloc
+    ApuFree
+    AcpHalCreate
+    AcpHalAllocateShapeContexts
+    AcpHalReleaseShapeContexts
+    get_acphal_heap_create_calls
+    get_acphal_heap_limit
+    get_acphal_alloc_calls
+    get_acphal_free_calls
+    get_acphal_hal_create_calls
+    get_acphal_shape_alloc_calls
+    get_acphal_shape_alloc_successes
+    get_acphal_shape_release_calls
+    get_acphal_double_release_refusals
+    get_acphal_handle_refusals
+    get_acphal_live_shape_allocations
+    reset_acphal_hal_records

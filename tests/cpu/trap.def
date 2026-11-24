@@ -1,0 +1,4 @@
+EXPORTS
+    trap_int3
+    trap_ud2
+    trap_branch

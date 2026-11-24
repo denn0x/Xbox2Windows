@@ -28,6 +28,10 @@ EXPORTS = (
     # cmppd predicates 0..7 (all eight covered) + aligned m128 source (9)
     "op_cmppd_0", "op_cmppd_1", "op_cmppd_2", "op_cmppd_3",
     "op_cmppd_4", "op_cmppd_5", "op_cmppd_6", "op_cmppd_7", "op_cmppd_mem",
+    # cmpsd predicates 0..7, m64 source, unaligned +1 m64 source (10)
+    "op_cmpsd_0", "op_cmpsd_1", "op_cmpsd_2", "op_cmpsd_3",
+    "op_cmpsd_4", "op_cmpsd_5", "op_cmpsd_6", "op_cmpsd_7",
+    "op_cmpsd_mem", "op_cmpsd_mem_plus1",
     # Scalar double ops (6)
     "op_maxsd_reg", "op_maxsd_mem", "op_minsd_reg", "op_minsd_mem",
     "op_sqrtsd_reg", "op_sqrtsd_mem",
@@ -57,8 +61,13 @@ EXPORTS = (
     "op_pipeline",
 )
 
-# Exports whose cmppd predicate flips in the ALTER_IMM build.
-ALTERED_PREDICATES = {"op_cmppd_1": (1, 5), "op_cmppd_3": (3, 7), "op_cmppd_6": (6, 2)}
+# Exports whose compare predicate flips in the ALTER_IMM build.
+ALTERED_PREDICATES = {
+    "op_cmppd_1": (1, 5), "op_cmppd_3": (3, 7), "op_cmppd_6": (6, 2),
+    "op_cmpsd_1": (1, 5), "op_cmpsd_3": (3, 7), "op_cmpsd_6": (6, 2),
+}
+# Fixed predicates of the cmpsd memory-source exports.
+CMPSD_MEM_PREDICATES = {"op_cmpsd_mem": 6, "op_cmpsd_mem_plus1": 2}
 
 
 # --- Independent Python ISA reference model ---
@@ -220,6 +229,15 @@ def reference(name, a, b, altered=False):
             pred = ALTERED_PREDICATES[name][1]
         out[0:16] = pk_q(MASK64 if cmp_pred(d64(aq0), d64(bq0), pred) else 0,
                          MASK64 if cmp_pred(d64(aq1), d64(bq1), pred) else 0)
+    elif name.startswith("op_cmpsd"):
+        pred = CMPSD_MEM_PREDICATES.get(name)
+        if pred is None:
+            pred = int(name[-1])
+        if altered and name in ALTERED_PREDICATES:
+            pred = ALTERED_PREDICATES[name][1]
+        src = u64(b[1:9]) if name == "op_cmpsd_mem_plus1" else bq0
+        # Only the low double is compared; bits 127:64 of the destination are kept.
+        out[0:16] = pk_q(MASK64 if cmp_pred(d64(aq0), d64(src), pred) else 0, aq1)
     elif name == "op_maxsd_mem_plus1":
         out[0:16] = pk_q(ref_maxsd(aq0, u64(b[1:9])), aq1)
     elif name.startswith("op_maxsd"):
@@ -384,6 +402,22 @@ def float_inputs():
     return out
 
 
+def cmpsd_pairs(offset=0):
+    """Every ordered pair of DOUBLE_BITS on the compared lane, dirty distinct upper qwords.
+
+    With a nonzero offset the second operand starts that many bytes into b, for the
+    unaligned m64 export; the bytes before it are a filler pattern.
+    """
+    rng = random.Random(0xC3D5 + offset)
+    pairs = []
+    for x in DOUBLE_BITS:
+        for y in DOUBLE_BITS:
+            a = pk_q(x, rng.getrandbits(64)) + rng.randbytes(16)
+            b = b"\x77" * offset + pk_q(y, rng.getrandbits(64)) + rng.randbytes(16)
+            pairs.append((a, b[:32]))
+    return pairs + [(rng.randbytes(32), rng.randbytes(32)) for _ in range(8)]
+
+
 def general_pairs():
     pairs = [
         (bytes(range(0x20, 0x40)), bytes(range(0x80, 0xA0))),
@@ -402,6 +436,8 @@ DBL_OPS = ("op_cmppd", "op_maxsd", "op_minsd", "op_sqrtsd", "op_cvtpd2dq", "op_c
 
 
 def inputs_for(name):
+    if name.startswith("op_cmpsd"):
+        return cmpsd_pairs(1 if name == "op_cmpsd_mem_plus1" else 0)
     if name.startswith(DQ_OPS):
         return int32_inputs()
     if name.startswith(PS_OPS):
@@ -553,6 +589,11 @@ def check_alt_encodings_and_rejections(original_path):
             Code.MOVLPD_M64_XMM, MemoryOperand(R.R8, displ=0x18, displ_size=1), R.XMM0), ret_ins)),
         ("cmppd_self", (ld_xmm0, Instruction.create_reg_reg_u32(
             Code.CMPPD_XMM_XMMM128_IMM8, R.XMM0, R.XMM0, 0), st_xmm0, ret_ins)),
+        ("cmpsd_mem_disp", (ld_xmm0, Instruction.create_reg_mem_u32(
+            Code.CMPSD_XMM_XMMM64_IMM8, R.XMM0,
+            MemoryOperand(R.RDX, displ=0x18, displ_size=1), 3), st_xmm0, ret_ins)),
+        ("cmpsd_self", (ld_xmm0, Instruction.create_reg_reg_u32(
+            Code.CMPSD_XMM_XMMM64_IMM8, R.XMM0, R.XMM0, 7), st_xmm0, ret_ins)),
     ]
     alt_expected = {
         "cvtsd2si_r9": "r9 = op_cvtsd2si64(xmm1.q[0])",
@@ -565,6 +606,8 @@ def check_alt_encodings_and_rejections(original_path):
         "movhpd_load_disp": ".q[1] = load64((rdx + 0x18ull))",
         "movlpd_store_disp": "store64((r8 + 0x18ull), xmm0.q[0])",
         "cmppd_self": "op_cmppd(xmm0, xmm0, 0x0u)",
+        "cmpsd_mem_disp": "xmm0.q[0] = op_cmpsd_q(xmm0.q[0], load64((rdx + 0x18ull)), 0x3u)",
+        "cmpsd_self": "xmm0.q[0] = op_cmpsd_q(xmm0.q[0], xmm0.q[0], 0x7u)",
     }
     for label, seq in alt_accept:
         src, count = lift_code(label, 0x1000, encode_seq(*seq))
@@ -634,12 +677,18 @@ def check_alt_encodings_and_rejections(original_path):
     cmppd_imm_case = ("cmppd_imm8", (ld_xmm0, Instruction.create_reg_reg_u32(
         Code.CMPPD_XMM_XMMM128_IMM8, R.XMM0, R.XMM1, 0x1B), ret_ins), "unsupported cmppd predicate")
 
+    # The cmpsd immediate above 7 is reserved in the legacy encoding and rejects too.
+    cmpsd_imm_case = ("cmpsd_imm8", (ld_xmm0, Instruction.create_reg_reg_u32(
+        Code.CMPSD_XMM_XMMM64_IMM8, R.XMM0, R.XMM1, 0x1B), ret_ins), "unsupported cmpsd predicate")
+
     # 4) VEX/EVEX encodings of implemented forms reject as non-legacy.
     nonlegacy_cases = [
         ("vaddpd_vex", (ld_xmm1, ld_xmm2, Instruction.create_reg_reg_reg(
             Code.VEX_VADDPD_XMM_XMM_XMMM128, R.XMM0, R.XMM1, R.XMM2), ret_ins), "non-legacy encoding"),
         ("vmaxsd_vex", (ld_xmm1, ld_xmm2, Instruction.create_reg_reg_reg(
             Code.VEX_VMAXSD_XMM_XMM_XMMM64, R.XMM0, R.XMM1, R.XMM2), ret_ins), "non-legacy encoding"),
+        ("vcmpsd_vex", (ld_xmm1, ld_xmm2, Instruction.create_reg_reg_reg_u32(
+            Code.VEX_VCMPSD_XMM_XMM_XMMM64_IMM8, R.XMM0, R.XMM1, R.XMM2, 0), ret_ins), "non-legacy encoding"),
         ("vmovapd_vex", (Instruction.create_reg_mem(
             Code.VEX_VMOVAPD_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX)), ret_ins), "non-legacy encoding"),
         ("vmovapd_evex", (Instruction.create_reg_mem(
@@ -661,6 +710,10 @@ def check_alt_encodings_and_rejections(original_path):
          "unaligned 16-byte memory operand"),
         ("nonvolatile_xmm6", (Instruction.create_reg_mem(
             Code.MOVDQA_XMM_XMMM128, R.XMM6, MemoryOperand(R.RCX)), ret_ins), "nonvolatile vector register"),
+        ("nonvolatile_xmm6_cmpsd", (ld_xmm1, Instruction.create_reg_reg_u32(
+            Code.CMPSD_XMM_XMMM64_IMM8, R.XMM6, R.XMM1, 0), ret_ins), "nonvolatile vector register"),
+        ("undefined_cmpsd_dst", (ld_xmm1, Instruction.create_reg_reg_u32(
+            Code.CMPSD_XMM_XMMM64_IMM8, R.XMM0, R.XMM1, 0), ret_ins), "undefined vector register xmm0"),
         ("nonvolatile_xmm15", (Instruction.create_reg_reg(
             Code.MAXSD_XMM_XMMM64, R.XMM15, R.XMM1), ret_ins), "nonvolatile vector register"),
         ("nonvolatile_gpr_ebx", (ld_xmm0, Instruction.create_reg_reg(
@@ -707,7 +760,7 @@ def check_alt_encodings_and_rejections(original_path):
         [(lbl, (ld_xmm0, ld_xmm1, ins, ret_ins), "unsupported instruction")
          for lbl, ins in reserved_cases]
         + [(lbl, seq + (ret_ins,), reason) for lbl, seq, reason in abi_infeasible_cases]
-        + [cmppd_imm_case]
+        + [cmppd_imm_case, cmpsd_imm_case]
         + nonlegacy_cases
         + other_cases
     )
@@ -754,6 +807,7 @@ def check_alt_encodings_and_rejections(original_path):
         ("pe_maskmovdqu", bytes.fromhex("660ff7c8") + encode_seq(ret_ins), "implicit RDI"),
         ("pe_vex_vaddpd", encode_seq(*nonlegacy_cases[0][1]), "non-legacy encoding"),
         ("pe_cmppd_imm8", encode_seq(*cmppd_imm_case[1]), "unsupported cmppd predicate"),
+        ("pe_cmpsd_imm8", encode_seq(*cmpsd_imm_case[1]), "unsupported cmpsd predicate"),
         ("pe_nonvolatile_xmm6", encode_seq(*other_sequences["nonvolatile_xmm6"]), "nonvolatile vector register"),
         ("pe_undef_xmm3", encode_seq(*other_sequences["undefined_xmm3"]), "undefined vector register xmm3"),
         ("pe_rsp_mem", encode_seq(*other_sequences["rsp_mem"]), "unsupported memory operand"),
@@ -780,7 +834,7 @@ def check_alt_encodings_and_rejections(original_path):
     unit_total = len(all_unit) + len(raw_prefix_cases)
     print(f"{len(alt_accept)} alternate-encoding lift checks, {unit_total} unit rejection controls "
           f"({len(reserved_cases)} reserved SSE2 forms, {len(abi_infeasible_cases) + 1} MMX/implicit-address, "
-          f"1 cmppd immediate, {len(nonlegacy_cases)} VEX/EVEX, "
+          f"2 cmppd/cmpsd immediate, {len(nonlegacy_cases)} VEX/EVEX, "
           f"{len(other_cases) + len(raw_prefix_cases) - 1} ABI/state/addressing/prefix) "
           f"and {len(pe_patches)} PE-patched rejection controls passed")
 

@@ -1,6 +1,7 @@
 """Differential checks, mutation controls and rejection controls for legacy SSE/MMX AOT."""
 
 import ctypes
+from ctypes import wintypes
 import math
 from pathlib import Path
 import random
@@ -34,6 +35,8 @@ EXPORTS = (
     "op_pshufw_reg_ff", "op_pshufw_mem_4e", "op_pshufw_mem_39",
     # movntq, GPR bridge & chained pipeline (4)
     "op_movntq", "op_movntq_disp", "op_movq_gpr_bridge", "op_pipeline",
+    # maskmovq, maskmovdqu & chained maskmov pipeline (3)
+    "op_maskmovq", "op_maskmovdqu", "op_maskmov_pipeline",
 )
 
 ALTERED_EXPORTS = (
@@ -41,6 +44,8 @@ ALTERED_EXPORTS = (
     "op_cvttps2pi_reg",
     "op_pshufw_reg_e4",
     "op_pshufw_mem_4e",
+    "op_maskmovq",
+    "op_maskmovdqu",
 )
 
 
@@ -108,6 +113,22 @@ def ref_pshufw(src_bytes, imm8):
     return pk_w(*(words[(imm8 >> (i * 2)) & 3] for i in range(4)))
 
 
+def ref_maskmov(src, mask, base, width):
+    out = bytearray(base[:width])
+    for i in range(width):
+        if mask[i] & 0x80:
+            out[i] = src[i]
+    return bytes(out)
+
+
+def ref_maskmovq(src, mask, base):
+    return ref_maskmov(src, mask, base, 8)
+
+
+def ref_maskmovdqu(src, mask, base):
+    return ref_maskmov(src, mask, base, 16)
+
+
 def reference(name, a, b, altered=False):
     """Expected 32-byte output region; unwritten bytes keep the FILL pattern."""
     out = bytearray(FILL)
@@ -154,6 +175,18 @@ def reference(name, a, b, altered=False):
         out[0:8] = mm1
         out[8:16] = mm4
         out[16:32] = xmm0
+    elif name == "op_maskmovq":
+        src, mask = (b[:8], a[:8]) if altered else (a[:8], b[:8])
+        out[0:8] = ref_maskmovq(src, mask, FILL[:8])
+    elif name == "op_maskmovdqu":
+        src, mask = (b[:16], a[:16]) if altered else (a[:16], b[:16])
+        out[0:16] = ref_maskmovdqu(src, mask, FILL[:16])
+    elif name == "op_maskmov_pipeline":
+        out[0:16] = ref_maskmovdqu(b[1:17], a[0:16], a[0:16])
+        mm0 = ref_cvtps2pi(a[0:8], truncate=False)
+        mm1 = ref_cvtps2pi(b[1:9], truncate=True)
+        out[0:8] = ref_maskmovq(mm1, mm0, out[0:8])
+        out[16:24] = mm0
     else:
         raise AssertionError(f"unhandled export {name}")
     return bytes(out)
@@ -270,11 +303,37 @@ def shuffle_pairs():
     return pairs
 
 
+def maskmov_pairs():
+    """32-byte input pairs sweeping byte-MSB mask patterns across all 16 lanes."""
+    src = bytes(range(0x10, 0x30))
+    masks = [
+        b"\x00" * 32,
+        b"\x7F" * 32,
+        b"\x80" * 32,
+        b"\xFF" * 32,
+        bytes((0x7F if i % 2 == 0 else 0x80) for i in range(32)),
+        bytes((0x81 if i % 2 == 0 else 0x01) for i in range(32)),
+    ]
+    for lane in range(16):
+        m = bytearray(b"\x7F" * 32)
+        m[lane] = 0x80
+        masks.append(bytes(m))
+    rng = random.Random(0x55E04)
+    pairs = [(src, m) for m in masks]
+    for _ in range(10):
+        pairs.append((rng.randbytes(32), rng.randbytes(32)))
+    return pairs
+
+
 def inputs_for(name):
     if name.startswith("op_cvtpi2ps"):
         return int_pairs()
     if name.startswith(("op_cvtps2pi", "op_cvttps2pi")) or name == "op_pipeline":
         return float_pairs()
+    if name in ("op_maskmovq", "op_maskmovdqu"):
+        return maskmov_pairs()
+    if name == "op_maskmov_pipeline":
+        return maskmov_pairs() + float_pairs()[:6]
     return shuffle_pairs()
 
 
@@ -350,7 +409,120 @@ def check_discarded_read(native_path, lifted_path):
             )
 
 
+def check_maskmov_page_edge(native_path, lifted_path):
+    """Compare native/lifted on k=8/k=16 page-abutting writes and observe native k<width edges."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.VirtualAlloc.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+    k32.VirtualAlloc.restype = ctypes.c_void_p
+    k32.VirtualProtect.argtypes = [
+        wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+    k32.VirtualProtect.restype = wintypes.BOOL
+    k32.VirtualFree.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD]
+    k32.VirtualFree.restype = wintypes.BOOL
+
+    MEM_COMMIT = 0x1000
+    MEM_RESERVE = 0x2000
+    MEM_RELEASE = 0x8000
+    PAGE_NOACCESS = 0x01
+    PAGE_READONLY = 0x02
+    PAGE_READWRITE = 0x04
+
+    specs = (
+        ("op_maskmovq", 8, ref_maskmovq, (7, 4, 1, 0)),
+        ("op_maskmovdqu", 16, ref_maskmovdqu, (15, 8, 7, 1, 0)),
+    )
+    native_fns = bind_exports(native_path, "", tuple(name for name, _, _, _ in specs))
+    lifted_fns = bind_exports(lifted_path, "lifted_", tuple(name for name, _, _, _ in specs))
+    src_bytes = bytes(range(0x10, 0x30))
+    buf_src, ptr_src, _, _, _ = alloc_aligned_buffer(src_bytes)
+
+    abutting_cases = 0
+    native_obs_cases = 0
+    for export_name, width, ref_fn, partial_ks in specs:
+        sparse_mask = (
+            bytes(0x80 if i in (0, width // 2 - 1, width - 1) else (0x7F if i % 2 else 0x00)
+                  for i in range(width))
+            + b"\x00" * (32 - width)
+        )
+        for guard_prot in (PAGE_NOACCESS, PAGE_READONLY):
+            base = k32.VirtualAlloc(None, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+            if not base:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                old_prot = wintypes.DWORD()
+                if not k32.VirtualProtect(base + 4096, 4096, guard_prot, ctypes.byref(old_prot)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+
+                # Page-abutting writable check (k=8 / k=16): both native and lifted must succeed and match.
+                ptr_dst = base + 4096 - width
+                for mask_name, mask_bytes in (
+                    ("full_mask", b"\x80" * width + b"\x00" * (32 - width)),
+                    ("all_zero_mask", b"\x7F" * width + b"\x00" * (32 - width)),
+                    ("sparse_mask", sparse_mask),
+                ):
+                    buf_mask, ptr_mask, _, _, _ = alloc_aligned_buffer(mask_bytes)
+                    want = ref_fn(src_bytes[:width], mask_bytes[:width], b"\x5A" * width)
+                    for label, fn in (("native", native_fns[export_name]), ("lifted", lifted_fns[export_name])):
+                        ctypes.memset(base + 4096 - 32, 0x5A, 32)
+                        fn(ptr_src, ptr_mask, ptr_dst)
+                        pre_pad = bytes((ctypes.c_ubyte * (32 - width)).from_address(base + 4096 - 32))
+                        assert pre_pad == b"\x5A" * (32 - width), (
+                            f"{label} {export_name} corrupted bytes preceding destination ({mask_name})"
+                        )
+                        after = bytes((ctypes.c_ubyte * width).from_address(ptr_dst))
+                        assert after == want, (
+                            f"{label} {export_name} k={width} page-abutting mismatch ({mask_name}): "
+                            f"{after.hex()} != {want.hex()}"
+                        )
+                        abutting_cases += 1
+                    _ = buf_mask
+
+                # Partial-vector page-edge probe (k<width): strictly native observation (impl-dependent).
+                for k in partial_ks:
+                    ptr_edge = base + 4096 - k
+                    masks = (
+                        ("only_writable_masked",
+                         bytes(0x80 if i < k else 0x7F for i in range(width)) + b"\x00" * (32 - width)),
+                        ("all_zero_mask", b"\x7F" * width + b"\x00" * (32 - width)),
+                        ("edge_byte_masked",
+                         bytes(0x80 if i in (0, k) else 0x00 for i in range(width)) + b"\x00" * (32 - width)),
+                    )
+                    for mask_name, mask_bytes in masks:
+                        buf_mask, ptr_mask, _, _, _ = alloc_aligned_buffer(mask_bytes)
+                        ctypes.memset(base + 4096 - 32, 0x5A, 32)
+                        faulted = False
+                        try:
+                            native_fns[export_name](ptr_src, ptr_mask, ptr_edge)
+                        except OSError as error:
+                            assert "access violation" in str(error).lower(), (
+                                export_name, guard_prot, k, mask_name, error
+                            )
+                            faulted = True
+                        selects_guard = any(byte & 0x80 for byte in mask_bytes[k:width])
+                        assert faulted or not selects_guard, (export_name, guard_prot, k, mask_name)
+                        after = bytes((ctypes.c_ubyte * k).from_address(ptr_edge))
+                        expected = ref_fn(src_bytes[:width], mask_bytes[:width], b"\x5A" * width)[:k]
+                        if faulted:
+                            assert all(actual in (0x5A, wanted) for actual, wanted in zip(after, expected)), (
+                                export_name, guard_prot, k, mask_name, after.hex(), expected.hex()
+                            )
+                        else:
+                            assert after == expected, (
+                                export_name, guard_prot, k, mask_name, after.hex(), expected.hex()
+                            )
+                        print(f"native page edge {export_name} prot={guard_prot:#x} k={k} {mask_name}: "
+                              f"faulted={int(faulted)}, prefix={after.hex()}")
+                        native_obs_cases += 1
+                        _ = buf_mask
+            finally:
+                k32.VirtualFree(base, 0, MEM_RELEASE)
+    _ = buf_src
+    return abutting_cases, native_obs_cases
+
+
 def check_differential(native_path, lifted_path, altered_path):
+    abutting_cases, native_obs_cases = check_maskmov_page_edge(native_path, lifted_path)
     native = bind_exports(native_path)
     lifted = bind_exports(lifted_path, "lifted_")
     altered = bind_exports(altered_path, "lifted_")
@@ -393,7 +565,9 @@ def check_differential(native_path, lifted_path, altered_path):
         raise AssertionError("mutated output was not caught by comparator")
 
     print(f"{total} native/lifted/reference SSE/MMX cases across {len(EXPORTS)} exports matched "
-          f"bit-for-bit; altered controls diverged on {changed}; output mutation control caught")
+          f"bit-for-bit; {abutting_cases} k=8/k=16 page-abutting checks and "
+          f"{native_obs_cases} native partial-edge observations; altered controls diverged on "
+          f"{changed}; output mutation control caught")
 
 
 # --- Alternative-encoding acceptance & translator rejection controls ---
@@ -412,6 +586,7 @@ def check_alt_encodings_and_rejections(original_path):
     ld_xmm4 = Instruction.create_reg_mem(Code.MOVDQA_XMM_XMMM128, R.XMM4, MemoryOperand(R.RCX))
     ld_xmm5 = Instruction.create_reg_mem(Code.MOVDQU_XMM_XMMM128, R.XMM5, MemoryOperand(R.RDX, displ=3, displ_size=1))
     ld_mm0 = Instruction.create_reg_mem(Code.MOVQ_MM_MMM64, R.MM0, MemoryOperand(R.RCX))
+    ld_mm1 = Instruction.create_reg_mem(Code.MOVQ_MM_MMM64, R.MM1, MemoryOperand(R.RDX))
     ld_mm5 = Instruction.create_reg_mem(Code.MOVQ_MM_MMM64, R.MM5, MemoryOperand(R.RDX))
     st_xmm4 = Instruction.create_mem_reg(Code.MOVAPS_XMMM128_XMM, MemoryOperand(R.R8), R.XMM4)
     st_mm5 = Instruction.create_mem_reg(Code.MOVNTQ_M64_MM, MemoryOperand(R.R8), R.MM5)
@@ -443,6 +618,18 @@ def check_alt_encodings_and_rejections(original_path):
             Code.MOVAPS_XMMM128_XMM, R.XMM3, R.XMM0),
             Instruction.create_reg_reg(Code.MOVDQA_XMMM128_XMM, R.XMM4, R.XMM3),
             st_xmm4, ret_ins)),
+        ("maskmovq_r9_save", (ld_mm0, ld_mm1,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R9, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovq(64, R.MM0, R.MM1),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R9),
+            emms_ins, ret_ins)),
+        ("maskmovdqu_rax_rm64_save", (ld_xmm0, ld_xmm4,
+            Instruction.create_reg_reg(Code.MOV_RM64_R64, R.RAX, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_RM64_R64, R.RDI, R.R8),
+            Instruction.create_maskmovdqu(64, R.XMM0, R.XMM4),
+            Instruction.create_reg_reg(Code.MOV_RM64_R64, R.RDI, R.RAX),
+            ret_ins)),
     ]
     alt_expected = {
         "cvtpi2ps_xmm4_mm5": "xmm4.q[0] = op_cvtpi2ps(mm[5]);",
@@ -452,6 +639,8 @@ def check_alt_encodings_and_rejections(original_path):
         "movq_mm_alt_store_opcode": "store64((r8 + 0x10ull), mm[4]);",
         "movq_r11_bridge": "r11 = mm[2];",
         "movaps_movdqa_alt_reg": "xmm4 = xmm3;",
+        "maskmovq_r9_save": "op_maskmovq(r8, mm[0], mm[1]);",
+        "maskmovdqu_rax_rm64_save": "op_maskmovdqu(r8, xmm0, xmm4);",
     }
     for label, seq in alt_accept:
         raw = encode_seq(*seq)
@@ -479,6 +668,8 @@ def check_alt_encodings_and_rejections(original_path):
             Code.EVEX_VMOVAPS_XMM_K1Z_XMMM128, R.XMM0, MemoryOperand(R.RCX)), ret_ins), "non-legacy encoding"),
         ("vmovdqa32_evex", (Instruction.create_reg_mem(
             Code.EVEX_VMOVDQA32_XMM_K1Z_XMMM128, R.XMM0, MemoryOperand(R.RCX)), ret_ins), "non-legacy encoding"),
+        ("vmaskmovdqu_vex", (ld_xmm0, ld_xmm4, Instruction.create_vmaskmovdqu(
+            64, R.XMM0, R.XMM4), ret_ins), "non-legacy encoding"),
     ]
 
     # 2) Unsupported instructions (other SSE/SSE2/MMX/3DNow!/GPR ops).
@@ -527,6 +718,102 @@ def check_alt_encodings_and_rejections(original_path):
             Code.PSHUFW_MM_MMM64_IMM8, R.MM2, MemoryOperand(R.RCX), 0xE4), ret_ins), "missing emms before ret"),
         ("missing_emms_after_reenter", (ld_mm0, emms_ins, Instruction.create_reg_mem(
             Code.MOVQ_MM_MMM64, R.MM3, MemoryOperand(R.RDX)), ret_ins), "missing emms before ret"),
+        ("missing_emms_after_maskmovq", (ld_mm0, ld_mm1,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovq(64, R.MM0, R.MM1),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R10),
+            ret_ins), "missing emms before ret"),
+        ("maskmovq_no_r8_rdi", (ld_mm0, ld_mm1,
+            Instruction.create_maskmovq(64, R.MM0, R.MM1), emms_ins, ret_ins), "maskmovq requires r8-rooted rdi"),
+        ("maskmovdqu_no_r8_rdi", (ld_xmm0, ld_xmm4,
+            Instruction.create_maskmovdqu(64, R.XMM0, R.XMM4), ret_ins), "maskmovdqu requires r8-rooted rdi"),
+        ("maskmovq_unsaved_rdi", (ld_mm0, ld_mm1,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovq(64, R.MM0, R.MM1), emms_ins, ret_ins), "rdi modified without saving"),
+        ("maskmovdqu_unsaved_rdi", (ld_xmm0, ld_xmm4,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovdqu(64, R.XMM0, R.XMM4), ret_ins), "rdi modified without saving"),
+        ("maskmovq_unrestored_rdi", (ld_mm0, ld_mm1,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovq(64, R.MM0, R.MM1), emms_ins, ret_ins), "unrestored nonvolatile GPR rdi"),
+        ("maskmovdqu_unrestored_rdi", (ld_xmm0, ld_xmm4,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovdqu(64, R.XMM0, R.XMM4), ret_ins), "unrestored nonvolatile GPR rdi"),
+        ("maskmov_non_r8_rdi_rcx", (
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.RCX),
+            ret_ins), "non-r8 or unsaved write to nonvolatile GPR rdi"),
+        ("maskmov_clobbered_save_slot", (ld_mm0,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_reg_reg(Code.MOVQ_RM64_MM, R.R10, R.MM0),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R10),
+            emms_ins, ret_ins), "non-r8 or unsaved write to nonvolatile GPR rdi"),
+        ("rdi_save_clobbers_prior_def", (ld_mm0,
+            Instruction.create_reg_reg(Code.MOVQ_RM64_MM, R.RAX, R.MM0),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RAX, R.RDI),
+            Instruction.create_reg_reg(Code.MOVQ_MM_RM64, R.MM1, R.RAX),
+            emms_ins, ret_ins), "GPR rax holds saved rdi"),
+        ("rdi_save_post_restore_still_unavail", (
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RAX, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.RAX),
+            Instruction.create_reg_reg(Code.MOVQ_MM_RM64, R.MM0, R.RAX),
+            emms_ins, ret_ins), "GPR rax holds saved rdi"),
+        ("rdi_save_twice_after_clobber", (
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R11, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R10),
+            ret_ins), "cannot save clobbered rdi"),
+        ("rdi_save_nonvolatile_rbx", (
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RBX, R.RDI),
+            ret_ins), "nonvolatile GPR"),
+        ("rdi_save_arg_rcx", (
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RCX, R.RDI),
+            ret_ins), "unsupported argument GPR operand"),
+        ("rdi_32bit_mov", (
+            Instruction.create_reg_reg(Code.MOV_R32_RM32, R.EDI, R.R8D),
+            ret_ins), "unsupported instruction"),
+        ("maskmovq_edi_override", (ld_mm0, ld_mm1,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovq(32, R.MM0, R.MM1),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R10),
+            emms_ins, ret_ins), "unsupported maskmovq target"),
+        ("maskmovdqu_edi_override", (ld_xmm0, ld_xmm4,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovdqu(32, R.XMM0, R.XMM4),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R10),
+            ret_ins), "unsupported maskmovdqu target"),
+        ("undefined_mm_maskmovq_src", (ld_mm1,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovq(64, R.MM0, R.MM1),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R10),
+            emms_ins, ret_ins), "undefined MMX register mm0"),
+        ("undefined_mm_maskmovq_mask", (ld_mm0,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovq(64, R.MM0, R.MM1),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R10),
+            emms_ins, ret_ins), "undefined MMX register mm1"),
+        ("undefined_xmm_maskmovdqu_src", (ld_xmm4,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovdqu(64, R.XMM0, R.XMM4),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R10),
+            ret_ins), "undefined vector register xmm0"),
+        ("undefined_xmm_maskmovdqu_mask", (ld_xmm0,
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.R10, R.RDI),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R8),
+            Instruction.create_maskmovdqu(64, R.XMM0, R.XMM4),
+            Instruction.create_reg_reg(Code.MOV_R64_RM64, R.RDI, R.R10),
+            ret_ins), "undefined vector register xmm4"),
         ("undefined_xmm_cvtpi2ps_dst", (ld_mm0, Instruction.create_reg_reg(
             Code.CVTPI2PS_XMM_MMM64, R.XMM0, R.MM0), emms_ins, ret_ins), "undefined vector register xmm0"),
         ("undefined_xmm_cvtps2pi_src", (Instruction.create_reg_reg(
@@ -634,6 +921,12 @@ def check_alt_encodings_and_rejections(original_path):
         ("pe_unaligned_movaps", encode_seq(*other_sequences["unaligned_movaps_load"]), "unaligned 16-byte memory operand"),
         ("pe_nonvolatile_rbx", encode_seq(*other_sequences["nonvolatile_gpr_base_rbx"]), "nonvolatile GPR base"),
         ("pe_missing_ret", encode_seq(ld_xmm0), "missing terminal ret"),
+        ("pe_vmaskmovdqu_vex", encode_seq(*nonlegacy_cases[-1][1]), "non-legacy encoding"),
+        ("pe_missing_emms_maskmovq", encode_seq(*other_sequences["missing_emms_after_maskmovq"]), "missing emms before ret"),
+        ("pe_unrestored_rdi_maskmovdqu", encode_seq(*other_sequences["maskmovdqu_unrestored_rdi"]), "unrestored nonvolatile GPR rdi"),
+        ("pe_rdi_save_leak", encode_seq(*other_sequences["rdi_save_clobbers_prior_def"]), "GPR rax holds saved rdi"),
+        ("pe_maskmovq_edi", encode_seq(*other_sequences["maskmovq_edi_override"]), "unsupported maskmovq target"),
+        ("pe_maskmovdqu_undef_xmm", encode_seq(*other_sequences["undefined_xmm_maskmovdqu_mask"]), "undefined vector register xmm4"),
     ]
     with TemporaryDirectory() as folder:
         patched_path = Path(folder) / "patched.dll"

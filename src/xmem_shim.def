@@ -14,4 +14,5 @@ EXPORTS
     XMemVirtualAlloc @12
     XMemTransferMemory @13
     x2w_xmem_write_physical @14
-    x2w_xmem_gpu_location @15
+    x2w_xmem_page_stats @15
+    x2w_xmem_gpu_location @16

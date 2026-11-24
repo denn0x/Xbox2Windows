@@ -641,6 +641,35 @@ def check_compute_pso(device_probe: Path, blob: bytes, *, warp_only: bool = Fals
     return pso
 
 
+def export_compute_catalogue_entry(directory: Path, original: bytes, desktop: bytes,
+                                   entry: dict) -> Path | None:
+    """Publish one signed desktop compute shader under its original byte digest."""
+    from xbox_intrinsic_gate import ALLOW
+
+    status = entry["after"]
+    if (not entry["signed"] or entry["gate"]["verdict"] != ALLOW or
+        status["triple"] != DESKTOP_TRIPLE or
+        (status["container_status"], status["module_status"]) != ("0x00000000", "0x00000000") or
+        len(desktop) < 32 or desktop[:4] != b"DXBC" or not any(desktop[4:20])):
+        return None
+    chunks = parts(desktop)
+    version, *_ = unpack_dxil_program(chunks[b"DXIL"])
+    if version >> 16 != 5 or b"RTS0" not in chunks:
+        return None
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"{hashlib.sha256(original).hexdigest()}.dxil"
+    temporary = None
+    try:
+        with NamedTemporaryFile(dir=directory, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(desktop)
+        temporary.replace(destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return destination
+
+
 def validate_pe_containers(
     pe_path: Path,
     probe: Path,
@@ -654,6 +683,7 @@ def validate_pe_containers(
     sign: bool = False,
     pso_probe: Path | None = None,
     warp_only: bool = False,
+    catalogue_dir: Path | None = None,
 ) -> dict:
     """Extract DXBC containers from a PE image, retarget selected DXIL modules, and validate via root_probe."""
     import pefile
@@ -745,6 +775,9 @@ def validate_pe_containers(
             }
             if pso_result is not None:
                 entry["pso"] = pso_result
+            if catalogue_dir is not None:
+                exported = export_compute_catalogue_entry(catalogue_dir, blob, retargeted_blob, entry)
+                entry["catalogue_file"] = str(exported) if exported is not None else None
             results.append(entry)
 
     report = {
@@ -760,6 +793,8 @@ def validate_pe_containers(
         "gate_rejected": sum(r["gate"]["verdict"] == "REJECT" for r in results),
         "entries": results,
     }
+    if catalogue_dir is not None:
+        report["catalogue_entries"] = len({r["catalogue_file"] for r in results if r["catalogue_file"]})
     if pso_probe is not None:
         report["pso_refused"] = sum(
             r.get("pso", {}).get("gate", {}).get("verdict") == "REJECT" for r in results
@@ -780,6 +815,8 @@ def main() -> int:
     parser.add_argument("output", nargs="?", type=Path, help="Output file path")
     parser.add_argument("--pe", type=Path, help="Extract, retarget, and validate containers embedded in a PE image")
     parser.add_argument("--output-dir", type=Path, help="Optional directory to write retargeted containers in --pe mode")
+    parser.add_argument("--catalogue-dir", type=Path,
+                        help="Export signed, validated desktop compute containers by input SHA-256 in --pe mode")
     parser.add_argument("--report", type=Path, help="Optional JSON report path in --pe mode")
     parser.add_argument("--only-without-xbox-calls", action="store_true",
                         help="In --pe mode, process only DXIL modules that neither call nor otherwise "
@@ -804,13 +841,15 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.pe:
-        for dead in ("--output-dir", "--report", "--only-without-xbox-calls"):
+        for dead in ("--output-dir", "--catalogue-dir", "--report", "--only-without-xbox-calls"):
             if getattr(args, dead[2:].replace("-", "_")):
                 parser.error(f"{dead} requires --pe")
     elif args.extract_module:
         parser.error("--extract-module does not apply to --pe")
     if args.sign and not args.probe:
         parser.error("--sign requires --probe")
+    if args.catalogue_dir and not args.sign:
+        parser.error("--catalogue-dir requires --sign")
     if args.sign and args.extract_module:
         parser.error("--sign cannot be combined with --extract-module")
     if args.pso_probe and args.extract_module:
@@ -837,6 +876,7 @@ def main() -> int:
             sign=args.sign,
             pso_probe=args.pso_probe.resolve(strict=True) if args.pso_probe else None,
             warp_only=args.warp_only,
+            catalogue_dir=args.catalogue_dir,
         )
         if args.report:
             dest = args.report.resolve()

@@ -40,13 +40,17 @@ def verify(case, size, result):
     return payload
 
 
-def compare(mapper, exe, lifted, companion, io, xmem, d3d12):
+def check_lifted_image(exe, lifted):
     digest = hashlib.sha256(exe.read_bytes()).hexdigest()
     with pefile.PE(str(lifted), fast_load=True) as pe:
         pe.parse_data_directories(directories=[0])
         stamp, = [s.address for s in pe.DIRECTORY_ENTRY_EXPORT.symbols if s.name == b"aot_source_sha256"]
         check("AOT input identity", pe.get_string_at_rva(stamp).decode("ascii"), digest)
     print(f"AOT input {exe.name} sha256={digest}")
+
+
+def compare(mapper, exe, lifted, companion, io, xmem, d3d12):
+    check_lifted_image(exe, lifted)
     map_command = [sys.executable, "-B", Path(__file__).with_name("shim_startup_check.py"), "--map",
                    mapper, exe, companion, io, xmem, d3d12, ""]
     markers = sorted(f"bound {dll}!{symbol}" for dll, symbols in SHIM_IMPORTS.items() for symbol in symbols)

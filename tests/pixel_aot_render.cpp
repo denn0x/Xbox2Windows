@@ -146,6 +146,7 @@ struct MipDraw {
     UINT requestedMip = 0;
     bool isTailDraw = false;
     bool partialQuad = false;
+    bool allowUpperRawLodStep = false;
 };
 
 struct Extent {
@@ -157,7 +158,7 @@ struct Extent {
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
                    Extent base, UINT firstResident, const std::vector<MipDraw>& draws, const char* capture,
-                   ID3D12Resource* gpuConstants = nullptr)
+                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr)
 {
     const auto& input = levels.front();
     ComPtr<ID3D12Resource> uploadedConstants;
@@ -424,6 +425,15 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
             std::printf("covered_samples=%u checked_pixels=%zu\n", sum, input.coverage.size());
         }
         auto words = read(back.Get(), resultBytes/4);
+        if (rawReadback) {
+            std::ofstream output(rawReadback, std::ios::binary);
+            for (UINT y = 0; y < height; ++y) {
+                const auto* row = words.data() + y * resultLayout.Footprint.RowPitch / sizeof(UINT);
+                output.write(reinterpret_cast<const char*>(row), width * sizeof(Color));
+            }
+            output.close();
+            if (!output) throw std::runtime_error("Cannot save raw pixel readback");
+        }
         float maxError = 0;
         std::array<UINT, 4> firstBits{};
         std::vector<BYTE> image;
@@ -465,6 +475,14 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                                         x, y, c, expected_bits, actual_bits);
                             if (!is_nan_bits(actual_bits)) return false;
                         } else if (expected_bits != actual_bits) {
+                            // Only the rendered raw-LOD channel in the upper-clamp fixture.
+                            if (req.allowUpperRawLodStep && c == 0 && expected_bits == 0) {
+                                constexpr float step = 1.0f / (1u << D3D12_MIP_LOD_FRACTIONAL_BIT_COUNT);
+                                const float error = std::fabs(actual[c]);
+                                if (!(error <= step)) return false;
+                                candidateError = (std::max)(candidateError, error);
+                                continue;
+                            }
                             if (!input.tolerance) return false;
                             const float error = std::fabs(actual[c] - reference[c]);
                             if (!(error <= input.tolerance)) return false;   // NaN fails too
@@ -528,11 +546,11 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
                    UINT firstResident, UINT sampledLevel, const char* capture,
-                   ID3D12Resource* gpuConstants = nullptr)
+                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr)
 {
     const auto& top = levels.front();
     draw_verified(device, path, levels, {top.width << firstResident, top.height << firstResident},
-                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture, gpuConstants);
+                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture, gpuConstants, rawReadback);
 }
 
 ComPtr<ID3D12Resource> produce_pixel_constants(ID3D12Device* device, const char* path)
@@ -574,7 +592,7 @@ ComPtr<ID3D12Resource> produce_pixel_constants(ID3D12Device* device, const char*
 }
 
 static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference,
-                        UINT8 writeMask, ID3D12Resource* gpuConstants)
+                        UINT8 writeMask, ID3D12Resource* gpuConstants, const char* rawReadback = nullptr)
 {
     PixelInput input{8, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM};
     input.writeMask = writeMask;
@@ -635,12 +653,13 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
     }
     std::vector<PixelInput> levels;
     levels.push_back(std::move(input));
-    draw_verified(device, path, levels, 0, 0, nullptr, gpuConstants);
+    draw_verified(device, path, levels, 0, 0, nullptr, gpuConstants, rawReadback);
 }
 
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference, UINT8 writeMask)
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference,
+                            UINT8 writeMask, const char* rawReadback)
 {
-    check_pixel(device, path, swapRB, reference, writeMask, nullptr);
+    check_pixel(device, path, swapRB, reference, writeMask, nullptr, rawReadback);
 }
 
 void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
@@ -652,7 +671,33 @@ void check_compute_to_pixel(ID3D12Device* device, const char* compute, const cha
                 stale ? stale.Get() : current.Get());
 }
 
-void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
+void check_pixel_gather(ID3D12Device* device, const char* shader, const char* reference)
+{
+    constexpr UINT side = 8;
+    std::ifstream file(reference, std::ios::binary);
+    std::array<UINT, 2> view{};
+    file.read(reinterpret_cast<char*>(view.data()), sizeof(view));
+    const auto [first, count] = view;
+    if (!file || first > 1 || !count || count > 3)
+        throw std::runtime_error("Invalid pixel gather view");
+    std::vector<PixelInput> levels;
+    for (UINT mip = 0; mip < count; ++mip) {
+        const UINT extent = side >> mip;
+        PixelInput input{extent, extent, 1, DXGI_FORMAT_R32G32B32A32_FLOAT};
+        input.rows.resize(size_t(extent) * extent * sizeof(Color));
+        file.read(reinterpret_cast<char*>(input.rows.data()), static_cast<std::streamsize>(input.rows.size()));
+        levels.push_back(std::move(input));
+    }
+    auto& expected = levels.front().expected;
+    expected.resize(side * side);
+    file.read(reinterpret_cast<char*>(expected.data()), side * side * sizeof(Color));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error("Invalid pixel gather case data");
+    draw_verified(device, shader, levels, first, 0, nullptr);
+}
+
+void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* rawReadback,
+                          bool allowUpperRawLodStep)
 {
     PixelInput top{8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
     PixelInput next{4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
@@ -669,7 +714,9 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
         next.rows.insert(next.rows.end(), {0, 255, 0, 255});
     MipDraw draw{0, 1};
     draw.partialQuad = true;
-    draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr);
+    draw.allowUpperRawLodStep = allowUpperRawLodStep;
+    draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr,
+                  nullptr, rawReadback);
 }
 
 namespace {

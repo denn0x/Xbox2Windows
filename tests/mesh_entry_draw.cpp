@@ -53,6 +53,19 @@ struct MeshPipeline {
     Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
 };
 
+// An empty AS subobject is invalid, so an amplified pipeline keeps its own stream.
+struct MeshAmplifiedPipeline {
+    Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+    Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE> as;
+    Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+    Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+    Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> formats;
+    Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
+    Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+    Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> depth_format;
+    Field<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+};
+
 ComPtr<ID3D12PipelineState> fallback_draw_pipeline(ID3D12Device* device, ID3D12RootSignature* root,
     D3D12_SHADER_BYTECODE vs, D3D12_SHADER_BYTECODE ps, const D3D12_DEPTH_STENCIL_DESC& depth,
     DXGI_FORMAT depth_format)
@@ -92,7 +105,7 @@ ComPtr<ID3D12RootSignature> create_draw_root(ID3D12Device* device, const D3D12_R
 
 bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture,
                      bool vertices, MeshConstantBinding binding, const char* fallback_vertex, MeshDrawMode mode,
-                     const MeshTextureProducers* producers)
+                     const MeshTextureProducers* producers, const char* amplification)
 {
     const bool fallback = fallback_vertex != nullptr;
     if (!fallback) {
@@ -196,24 +209,46 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
         desc.CS = {shader.data(), shader.size()};
         check(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&compute_pipeline)), "Create mesh export compute pipeline");
     } else {
-        MeshPipeline stream;
-        stream.root.value = root.Get();
-        stream.ms.value = {shader.data(), shader.size()};
-        stream.ps.value = ps;
-        stream.formats.value.NumRenderTargets = 1;
-        stream.formats.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
-        stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
-        stream.raster.value.DepthClipEnable = TRUE;
-        stream.depth.value = depth_state;
-        stream.depth_format.value = depth_format;
-        stream.topology.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
         ComPtr<ID3D12Device2> device2;
         check(device->QueryInterface(IID_PPV_ARGS(&device2)), "Query mesh pipeline device");
+        // A source-built AS dispatches the mesh groups and passes the payload this
+        // fixture reads. Mesh-only pipelines keep the AS subobject out of their stream.
+        const auto amplification_shader = amplification ? read_bytes(amplification) : std::vector<char>{};
         // tools/mesh_od_pipeline.py reads this line to separate pipeline creation from the process time.
         const auto pipeline_start = std::chrono::steady_clock::now();
-        const HRESULT created = device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        HRESULT created;
+        if (amplification) {
+            MeshAmplifiedPipeline stream;
+            stream.root.value = root.Get();
+            stream.as.value = {amplification_shader.data(), amplification_shader.size()};
+            stream.ms.value = {shader.data(), shader.size()};
+            stream.ps.value = ps;
+            stream.formats.value.NumRenderTargets = 1;
+            stream.formats.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
+            stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
+            stream.raster.value.DepthClipEnable = TRUE;
+            stream.depth.value = depth_state;
+            stream.depth_format.value = depth_format;
+            stream.topology.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+            created = device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        } else {
+            MeshPipeline stream;
+            stream.root.value = root.Get();
+            stream.ms.value = {shader.data(), shader.size()};
+            stream.ps.value = ps;
+            stream.formats.value.NumRenderTargets = 1;
+            stream.formats.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
+            stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
+            stream.raster.value.DepthClipEnable = TRUE;
+            stream.depth.value = depth_state;
+            stream.depth_format.value = depth_format;
+            stream.topology.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+            created = device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        }
         const std::chrono::duration<double, std::milli> pipeline_time = std::chrono::steady_clock::now() - pipeline_start;
         std::printf("mesh_pipeline_ms=%.3f\n", pipeline_time.count());
         std::fflush(stdout);  // Keep the line if the process dies after pipeline creation.
@@ -455,7 +490,7 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     const auto* trace_end = reference + trace_bytes;
     const auto* first_bad = std::mismatch(reference, trace_end, rows + size).first;
     const bool trace_ok = first_bad == trace_end;
-    if (fallback || depth_pair) {
+    if (fallback || depth_pair || !trace_ok) {
         std::printf("mesh_exports bytes=%u matched=%d\n", trace_bytes, trace_ok ? 1 : 0);
         if (!trace_ok) std::printf("first_mesh_export_mismatch_byte=%td\n", first_bad - reference);
     }
@@ -489,14 +524,23 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
 
 bool check_mesh_entry_draw(ID3D12Device* device, const char* mesh, const char* pixel, const char* fixture,
                            bool vertices, MeshConstantBinding binding, MeshDrawMode mode,
-                           const MeshTextureProducers* producers)
+                           const MeshTextureProducers* producers, const char* amplification)
 {
-    return check_mesh_draw(device, mesh, pixel, fixture, vertices, binding, nullptr, mode, producers);
+    return check_mesh_draw(device, mesh, pixel, fixture, vertices, binding, nullptr, mode, producers,
+                           amplification);
+}
+
+bool check_mesh_amplified_draw(ID3D12Device* device, const char* amplification, const char* mesh,
+                               const char* pixel, const char* fixture)
+{
+    return check_mesh_entry_draw(device, mesh, pixel, fixture, false, MeshConstantBinding::root,
+                                 MeshDrawMode::color, nullptr, amplification);
 }
 
 void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
                               const char* pixel, const char* fixture, MeshDrawMode mode,
                               const MeshTextureProducers* producers)
 {
-    check_mesh_draw(device, compute, pixel, fixture, true, MeshConstantBinding::root, vertex, mode, producers);
+    check_mesh_draw(device, compute, pixel, fixture, true, MeshConstantBinding::root, vertex, mode, producers,
+                    nullptr);
 }

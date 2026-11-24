@@ -128,6 +128,33 @@ bool lifetime_check()
         probe[0] != 0xa5a5a5a5a5a5a5a5 || probe[1] != 0xa5a5a5a5a5a5a5a5 ||
         m.granted() != era_physical::capacity_pages - 1) return false;
     if (!m.free(most) || m.granted() != 0) return false;
+
+    // Invalid allocate/release arguments leave granted_pages() unchanged.
+    std::uint64_t sentinel_page = 0xa5a5a5a5a5a5a5a5;
+    std::uint64_t zero_count = 0;
+    std::uint64_t too_many = era_physical::capacity_pages + 1;
+    std::uint64_t one_count = 1;
+    if (m.allocate(era_physical::mem_64k_pages, nullptr, &sentinel_page) != Status::invalid ||
+        m.allocate(era_physical::mem_64k_pages, &zero_count, &sentinel_page) != Status::invalid || zero_count != 0 ||
+        m.allocate(era_physical::mem_64k_pages, &too_many, &sentinel_page) != Status::invalid || too_many != 0 ||
+        m.allocate(era_physical::mem_64k_pages, &one_count, nullptr) != Status::invalid || one_count != 0) {
+        return false;
+    }
+    one_count = 1;
+    if (m.allocate(0, &one_count, &sentinel_page) != Status::invalid || one_count != 0) return false;
+    one_count = 1;
+    if (m.allocate(era_physical::mem_64k_pages | (1ull << 32), &one_count, &sentinel_page) != Status::invalid ||
+        one_count != 0 || sentinel_page != 0xa5a5a5a5a5a5a5a5) {
+        return false;
+    }
+    const std::uint64_t zero_page = 0;
+    const std::uint64_t out_of_range_page = era_physical::capacity_pages + 1;
+    if (m.release(0, &sentinel_page) != Status::invalid || m.release(1, nullptr) != Status::invalid ||
+        m.release(era_physical::capacity_pages + 1, &sentinel_page) != Status::invalid ||
+        m.release(1, &zero_page) != Status::invalid || m.release(1, &out_of_range_page) != Status::invalid ||
+        m.granted() != 0) {
+        return false;
+    }
     std::printf("lifetime: grants=2 pages=7 exhausted_at=%llu\n",
                 static_cast<unsigned long long>(era_physical::capacity_pages - 1));
     return true;

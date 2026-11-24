@@ -1,5 +1,6 @@
 """Synthetic controls and DXC validator checks for tools/dxil_retarget.py."""
 
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -236,6 +237,24 @@ def check_pure_python_controls() -> None:
     assert new_off == 16
     _, _, _, new_st_bc = rt.unpack_dxil_program(out_secs[b"STAT"])
     assert rt.retarget_bitcode(new_st_bc)[1]["original_triple"] == "dxil-ms-dx"
+
+    status = {"triple": rt.DESKTOP_TRIPLE, "container_status": "0x00000000",
+              "module_status": "0x00000000"}
+    accepted = {"signed": True, "after": status, "gate": {"verdict": "ALLOW"}}
+    signed = rt.build_dxbc_container(list(out_secs.items()), digest=b"\x01" * 16)
+    with TemporaryDirectory() as directory:
+        catalogue = Path(directory) / "catalogue"
+        expected = catalogue / f"{hashlib.sha256(synth_dxbc).hexdigest()}.dxil"
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, accepted) == expected
+        assert expected.read_bytes() == signed
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, out_dxbc, accepted) is None
+        missing_root = rt.build_dxbc_container([(b"DXIL", out_secs[b"DXIL"])], digest=b"\x01" * 16)
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, missing_root, accepted) is None
+        rejected = {**accepted, "gate": {"verdict": "REJECT"}}
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, rejected) is None
+        failed = {**accepted, "after": {**status, "module_status": "0x80004005"}}
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, failed) is None
+        assert list(catalogue.iterdir()) == [expected]
 
     kept_dxbc, kept_info = rt.retarget_container(synth_dxbc, clear_root_flags=False)
     assert kept_info["cleared_root_flags"] == "0x0"

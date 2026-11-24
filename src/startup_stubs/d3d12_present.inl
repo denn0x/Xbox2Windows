@@ -1,4 +1,4 @@
-// Local experiment (never upstream): shows the presented surface in the title's window.
+// Experimental (docs/startup-runtime.md): shows the presented surface in the title's window.
 // Included inside d3d12_xs_device.cpp's anonymous namespace, before queue_present.
 //
 // A flip-model swap chain on the title window, created on the queue the title presents with; each
@@ -38,12 +38,12 @@ DWORD WINAPI output_window_thread(void* ready)
         return DefWindowProcW(window, message, w, l);
     };
     cls.hInstance = GetModuleHandleW(nullptr);
-    cls.lpszClassName = L"X2WOutputWindow";
+    cls.lpszClassName = x2w_startup::presenter_class;
     cls.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     RegisterClassW(&cls);
     RECT area{0, 0, 1600, 900};
     AdjustWindowRect(&area, WS_OVERLAPPEDWINDOW, FALSE);
-    output_handle = CreateWindowExW(0, cls.lpszClassName, L"Xbox2Windows local experiment - game output", WS_OVERLAPPEDWINDOW, 60, 60,
+    output_handle = CreateWindowExW(0, cls.lpszClassName, L"Xbox2Windows - output", WS_OVERLAPPEDWINDOW, 60, 60,
                                     area.right - area.left, area.bottom - area.top, nullptr, nullptr, cls.hInstance, nullptr);
     if (output_handle) ShowWindow(output_handle, SW_SHOWNOACTIVATE);
     SetEvent(static_cast<HANDLE>(ready));
@@ -107,7 +107,7 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
     }
     if (SUCCEEDED(hr)) hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&p.allocator));
     if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p.allocator, nullptr, IID_PPV_ARGS(&p.list));
-    if (SUCCEEDED(hr)) p.list->Close();
+    if (SUCCEEDED(hr)) hr = p.list->Close();
     if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&p.fence));
     p.reached = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     static const char source[] =
@@ -162,18 +162,25 @@ bool create_window_presenter(ID3D12CommandQueue* queue, HWND window)
 bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
 {
     WindowPresenter& p = window_presenter;
-    if (p.failed) return false;
+    if (p.failed || !queue || !surface) return false;
+    const D3D12_RESOURCE_DESC desc = surface->GetDesc();
+    if (!x2w_startup::present_surface_supported(desc)) {
+        static LONG refused;
+        if (first_calls(refused, 4))
+            log("x2w-present surface dim=%d samples=%u flags=0x%x format=%d not supported (present_view_format.h)",
+                desc.Dimension, desc.SampleDesc.Count, desc.Flags, desc.Format);
+        return false;
+    }
     HWND window = output_window();
     if (!window) return false;
     if (!p.chain && !create_window_presenter(queue, window)) {
         p.failed = true;
         return false;
     }
-    const D3D12_RESOURCE_DESC desc = surface->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return false;
     ID3D12Device* device = device_of(the_device);
+    const DXGI_FORMAT view_format = x2w_startup::present_view_format(desc.Format);
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-    view.Format = desc.Format;
+    view.Format = view_format;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.Texture2D.MipLevels = 1;
@@ -196,7 +203,10 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     p.list->DrawInstanced(3, 1, 0, 0);
     transition(p.list, p.buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     transition(p.list, surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (FAILED(p.list->Close())) return false;
+    if (FAILED(p.list->Close())) {
+        p.failed = true;
+        return false;
+    }
     ID3D12CommandList* lists[] = {p.list};
     queue->ExecuteCommandLists(1, lists);
     const HRESULT hr = p.chain->Present(0, 0);

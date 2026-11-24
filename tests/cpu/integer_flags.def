@@ -1,0 +1,19 @@
+LIBRARY cpu_integer_flags
+EXPORTS
+    op_add8_lahf
+    op_add16_lahf
+    op_add32_lahf
+    op_add64_lahf
+    op_sub8_lahf
+    op_sub16_lahf
+    op_sub32_lahf
+    op_sub64_lahf
+    op_cmp8_lahf
+    op_cmp16_lahf
+    op_cmp32_lahf
+    op_cmp64_lahf
+    op_add8_al_lahf
+    op_add32_imm_lahf
+    op_sub32_imm_lahf
+    op_cmp64_imm_lahf
+    op_discarded_read

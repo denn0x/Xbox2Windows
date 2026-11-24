@@ -1,0 +1,11 @@
+LIBRARY cpu_sse_fxsave
+EXPORTS
+    op_fxsave_only
+    op_fxsave64_only
+    op_fxrstor_fxsave
+    op_fxrstor64_fxsave64
+    op_fxrstor_fxsave64
+    op_fxrstor64_fxsave
+    op_fxrstor64_disp
+    op_pipeline
+    op_discarded_read

@@ -1,0 +1,8 @@
+; Import-only fixture for pe_run_package --trap-callable. No build product or test
+; package provides trap_fixture.dll, so every import stays unresolved.
+; trap_fixture_data is a data import: trap_missing_data_exe reads it and never calls it.
+LIBRARY trap_fixture
+EXPORTS
+    trap_fixture_alpha
+    trap_fixture_beta
+    trap_fixture_data DATA

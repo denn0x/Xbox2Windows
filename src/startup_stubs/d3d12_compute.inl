@@ -157,7 +157,7 @@ void load_compute(u64 key, ComputeTranslation& tr)
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[1].DescriptorTable = {2, ranges};
     std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
-    for (std::size_t i = 0; i < tr.samplers.size(); ++i) samplers.push_back(decode_sampler(tr.samplers[i], static_cast<UINT>(i), (tr.compare_samplers >> i) & 1));
+    for (std::size_t i = 0; i < tr.samplers.size(); ++i) samplers.push_back(x2w_startup::decode_sampler(tr.samplers[i], static_cast<UINT>(i), (tr.compare_samplers >> i) & 1));
     ID3DBlob* blob = nullptr;
     ID3DBlob* errors = nullptr;
     HRESULT hr = E_FAIL;
@@ -459,7 +459,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     AcquireSRWLockExclusive(&draw_lock);
     ComputeTranslation& tr = compute_translations()[key];
     if (!tr.state) load_compute(key, tr);
-    if (tr.state != 1 || !ensure_draw_heap()) {
+    if (tr.state != 1 || !ensure_draw_heap(the_device)) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }

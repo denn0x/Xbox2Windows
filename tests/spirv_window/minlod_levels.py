@@ -4,8 +4,9 @@ The texture has four mips of distinct solid colors and the coordinate is constan
 so the implicit LOD is the clamp itself. Each clamp runs as a translated SPIR-V
 shader and as a direct HLSL control on the same adapter.
 
-With MIN_MAG_MIP_POINT the sample must read the nearest mip exactly. With
-MIN_MAG_POINT_MIP_LINEAR it blends the two mips around the clamp. Adapters quantize
+Point filtering must read the exact integer mip. At fractional clamps, the
+translated and control shaders must agree on the nearest or observed lower mip.
+With MIN_MAG_POINT_MIP_LINEAR the sample blends the two mips around the clamp. Adapters quantize
 that blend weight to 1/256 steps, rounding or truncating, so the result is checked
 against the exact blend within BLEND_TOLERANCE, and the translated shader must match
 the control bit for bit on the same adapter. The raw bits are printed per adapter.
@@ -15,12 +16,11 @@ import subprocess
 import sys
 import tempfile
 
-# (clamp, mip expected under nearest-mip selection)
-EXACT = (("0", 0), ("1", 1), ("2", 2), ("3", 3))
-FRACTIONAL = (("1.4375", 1), ("1.5625", 2), ("3.75", 3))
-TIE = "1.5"  # either neighbor is reported; the translated shader and the control must agree
+# (clamp, accepted exact mips), listing nearest first.
+EXACT = (("0", (0,)), ("1", (1,)), ("2", (2,)), ("3", (3,)))
+FRACTIONAL = (("1.4375", (1,)), ("1.5", (2, 1)), ("1.5625", (2, 1)), ("3.75", (3,)))
 WRONG = ("1", 2)  # negative control: a clamp of 1 must not read mip 2
-WRONG_FRACTIONAL = ("1.5625", 1)  # the strict point path must reject the lower mip
+WRONG_FRACTIONAL = ("1.5625", 0)  # neither observed rounding rule selects mip zero
 # Clamps for the mip-linear sampler: exact steps, a weight between 1/256 steps (1.3)
 # and weights at and below 1/256 near the mip 1 boundary.
 BLENDS = ("1", "1.25", "1.5", "1.75", "1.3", "1.00390625", "1.001953125", "2.5", "3.75")
@@ -47,7 +47,21 @@ def pixel_mismatch(code, output):
     return code == 1 and "pixel_mismatch x=0 y=0" in output
 
 
-def main(assembler, validator, cross, dxc, renderer, adapter, *, fractional=False):
+def point_mip(renderer, adapter, operation, dxil, clamp, levels, kind):
+    for level in levels:
+        code, output = draw(renderer, adapter, operation, dxil, level)
+        print(f"{kind} clamp={clamp} mip={level}\n{output}", end="", flush=True)
+        if code == SKIP:
+            return None
+        if not code and "pixels=64 channels=256 max_absolute_error=0" in output:
+            return level
+        if not pixel_mismatch(code, output):
+            raise RuntimeError(f"{kind} clamp {clamp} did not produce a valid pixel comparison")
+    raise RuntimeError(f"{kind} clamp {clamp} did not read any accepted mip {levels}")
+
+
+def main(assembler, validator, cross, dxc, renderer, adapter, *, fractional=False,
+         strict_rounding=False):
     # Issue #809 records the fractional point-minimum discrepancy on older WARP.
     shader_model, profile = ("66", "ps_6_6") if fractional else ("60", "ps_6_0")
     operation = "--check-pixel-mip-clamp" if fractional else "--check-pixel-mip-exact"
@@ -85,31 +99,25 @@ def main(assembler, validator, cross, dxc, renderer, adapter, *, fractional=Fals
                             here / "minlod_control.hlsl"], check=True)
             return dxil
 
-        ties, blended = {}, {}
+        selected, blended = {}, {}
         for kind, build in (("translated", translated), ("control", control)):
-            for clamp, level in cases:
+            for clamp, levels in cases:
                 dxil = build(clamp)
                 if dxil is None:
                     print("skip: SPIRV-Cross lacks MinLod support; run tools/setup-spirv-tools.ps1")
                     return SKIP
-                code, output = draw(renderer, adapter, operation, dxil, level)
-                print(f"{kind} clamp={clamp} mip={level}\n{output}", end="", flush=True)
-                if code == SKIP:
+                if strict_rounding and clamp != "1.5":
+                    levels = levels[:1]
+                level = point_mip(renderer, adapter, operation, dxil, clamp, levels, kind)
+                if level is None:
                     return SKIP
-                if code or "pixels=64 channels=256 max_absolute_error=0" not in output:
-                    raise RuntimeError(f"{kind} clamp {clamp} did not read mip {level}")
-            if fractional:
-                dxil = build(TIE)
-                for level in (1, 2):
-                    code, output = draw(renderer, adapter, operation, dxil, level)
-                    if not code and "pixels=64 channels=256 max_absolute_error=0" in output:
-                        ties[kind] = level
-                        print(f"{kind} clamp={TIE} tie_mip={level}\n{output}", end="", flush=True)
-                        break
-                    if not pixel_mismatch(code, output):
-                        raise RuntimeError(output)
-                else:
-                    raise RuntimeError(f"{kind} clamp {TIE} read neither mip 1 nor mip 2\n{output}")
+                if fractional:
+                    print(f"{kind} clamp={clamp} selected_mip={level}", flush=True)
+                    if kind == "translated":
+                        selected[clamp] = level
+                    elif selected[clamp] != level:
+                        raise RuntimeError(f"Clamp {clamp} read mip {selected[clamp]} translated, "
+                                           f"mip {level} in the HLSL control")
             clamp, level = wrong_point
             code, output = draw(renderer, adapter, operation, build(clamp), level)
             print(f"{kind} negative clamp={clamp} mip={level}\n{output}", end="", flush=True)
@@ -128,9 +136,6 @@ def main(assembler, validator, cross, dxc, renderer, adapter, *, fractional=Fals
             print(f"{kind} negative blend clamp={clamp} expected={wrong}\n{output}", end="", flush=True)
             if not pixel_mismatch(code, output):
                 raise RuntimeError(f"{kind} negative blend control did not fail at pixel (0, 0)")
-        if fractional and ties["translated"] != ties["control"]:
-            raise RuntimeError(f"Clamp {TIE} read mip {ties['translated']} translated, "
-                               f"mip {ties['control']} in the HLSL control")
         if not fractional:
             differing = [clamp for clamp in BLENDS if blended["translated", clamp] != blended["control", clamp]]
             if differing:

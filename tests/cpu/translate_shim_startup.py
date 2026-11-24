@@ -83,7 +83,7 @@ static word host_finish(word base, word code) { return finish_exe(reinterpret_ca
 """
 
 
-def emit(image, output):
+def emit(image, output, bindings=IMPORTS, host=HOST):
     data = image.read_bytes()
     with pefile.PE(data=data, fast_load=True) as pe:
         opt = pe.OPTIONAL_HEADER
@@ -95,9 +95,9 @@ def emit(image, output):
         for module in pe.DIRECTORY_ENTRY_IMPORT:
             for imp in module.imports:
                 key = module.dll.decode("ascii").lower(), imp.name
-                if key not in IMPORTS:
+                if key not in bindings:
                     raise ValueError(f"unbound shim fixture import {key}")
-                imports[imp.address - opt.ImageBase] = IMPORTS[key]
+                imports[imp.address - opt.ImageBase] = bindings[key]
         program = Program(pe, imports=imports, image_data=True)
         entry = opt.AddressOfEntryPoint
         if entry not in program.entries:
@@ -105,7 +105,7 @@ def emit(image, output):
         source, root = program.lift(entry, "process_entry", ())
         functions = [root, *program.callees.values()]
         used = {call for fn in functions for call in fn.host_calls.values()}
-        if root.return_width is None or root.return_width < 4 or used != set(IMPORTS.values()):
+        if root.return_width is None or root.return_width < 4 or used != set(bindings.values()):
             raise ValueError("incomplete shim startup import path")
         # Only the identity argument to finish_exe is relocated to the AOT process.
         # No original image bytes are mapped in the generated executable.
@@ -115,7 +115,7 @@ def emit(image, output):
                     if ins.mnemonic != M.LEA or ins.ip_rel_memory_address != 0:
                         raise ValueError(f"unsupported image access at {ip:#x}")
     digest = hashlib.sha256(data).hexdigest()
-    output.write_text("\n".join([PRELUDE, HOST, *program.sources, source,
+    output.write_text("\n".join([PRELUDE, host, *program.sources, source,
                                 f'extern "C" __declspec(dllexport) const char aot_source_sha256[] = "{digest}";',
                                 "int main() { return static_cast<int>(process_entry()); }", ""]), encoding="ascii")
 

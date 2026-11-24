@@ -14,8 +14,22 @@
 //   * Live shared-page views use xmem.dll XMemAllocatePhysicalPages +
 //     XMemMapPhysicalPages / XMemMapPhysicalPagesScatter over caller-owned
 //     Windows placeholders (MEM_MAPPED), with per-view VirtualProtect.
-//   * Unsupported XMemVirtualAlloc second-commit combinations are refused with
-//     ERROR_INVALID_PARAMETER without disturbing existing state.
+//   * XMemVirtualAlloc on the desktop shim accepts the #888 reserve-only
+//     profile (null address, 16 or 24 GiB, type 0x20402000, attribute/protection
+//     0x21/PAGE_READWRITE or 3/0x801) and the startup commit profile (null address,
+//     type 0x20003000 with 0x183/0x22004, 0x283/0x2404 or 0x283/0x2004, or type 0x20403000 with
+//     0x181/PAGE_READWRITE), which commits a fresh block
+//     (cpu_native_xmem_pool_commit). The 0x21 commit variant below stays refused.
+//     No accepted argument set
+//     names an existing address, so a second commit of an existing range through
+//     XMemVirtualAlloc is not reachable through the current shim. The cases below
+//     prove that each refusal comes from argument validation (a paired call that
+//     differs only in the variable under test succeeds) instead of claiming a
+//     state-dependent refusal.
+//
+// Mutation controls: `--mutate <name>` flips exactly one expected value. Each
+// mutation must be reported as `check_failed: <check>` by the check that owns
+// that expectation (registered as xmem_commit_protection_mutate_* in CMake).
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -47,6 +61,50 @@ namespace {
 constexpr SIZE_T page_bytes = static_cast<SIZE_T>(era_physical::page_bytes);
 constexpr ULONG_PTR mem_64k_pages = static_cast<ULONG_PTR>(era_physical::mem_64k_pages);
 constexpr SIZE_T probe_offsets[] = {0, 4096, page_bytes / 2, page_bytes - sizeof(std::uint32_t)};
+
+constexpr SIZE_T gib = SIZE_T{1} << 30;
+constexpr DWORD startup_reserve_type = 0x20402000;
+
+const char* const known_mutations[] = {
+    "xva_positive_refused",      // expect the accepted reserve-only call to be refused
+    "xva_commit_accepted",       // expect the MEM_COMMIT variant to be accepted
+    "xva_readonly_accepted",     // expect the PAGE_READONLY variant to be accepted
+    "xva_state_dependent",       // expect live and free target addresses to be refused differently
+    "private_second_va_aliases", // expect a second private commit to show the first page's bytes
+    "private_type_mapped",       // expect ordinary committed pages to report MEM_MAPPED
+    "mapped_decommit_succeeds",  // expect MEM_DECOMMIT on a live mapped view to succeed
+};
+const char* active_mutation = nullptr;
+
+bool mutated(const char* name) noexcept
+{
+    return active_mutation && std::strcmp(active_mutation, name) == 0;
+}
+
+// Reports a named check. Every failing check prints one `check_failed:` line so a
+// mutation run can show which check caught it.
+bool record(bool pass, const char* name) noexcept
+{
+    if (!pass) std::printf("check_failed: %s\n", name);
+    return pass;
+}
+
+// Values measured for the first_observable_discrepancy line. Each field is valid
+// only when the check that measured it passed.
+struct Discrepancy {
+    bool private_type_ok = false;
+    DWORD private_type = 0;
+    bool private_decommit_ok = false;
+    bool private_second_va_ok = false;
+    bool private_second_va_aliases = true;
+    bool mapped_type_ok = false;
+    DWORD mapped_type = 0;
+    bool mapped_decommit_ok = false;
+    DWORD mapped_decommit_error = ERROR_SUCCESS;
+    bool mapped_alias_ok = false;
+    bool mapped_isolation_ok = false;
+    bool mapped_persistence_ok = false;
+};
 
 struct QueryBuffer {
     MEMORY_BASIC_INFORMATION info;
@@ -158,7 +216,52 @@ struct TwoPlaceholders {
     }
 };
 
-bool check_ordinary_commit_protection()
+// A second commit of ordinary pages at another VA. Win32 aliases memory only through
+// section objects (MapViewOfFile*); no call takes an existing MEM_PRIVATE range as a
+// mapping source, so this does not try to alias page0 directly. It measures what a
+// second private commit does: a placeholder replaced with VirtualAlloc2 gets its own
+// zero-filled bytes, and writes through either VA stay invisible to the other.
+bool check_private_second_va(void* page0, std::uint32_t page0_seed, Discrepancy& d)
+{
+    void* placeholder = VirtualAlloc2(GetCurrentProcess(), nullptr, page_bytes,
+                                      MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+    if (!record(placeholder != nullptr, "private_second_va_placeholder")) return false;
+    void* second = VirtualAlloc2(GetCurrentProcess(), placeholder, page_bytes,
+                                 MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+    if (!record(second == placeholder && check_query(second, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE),
+                "private_second_va_commit")) {
+        VirtualFree(second ? second : placeholder, 0, MEM_RELEASE);
+        return false;
+    }
+
+    bool zero_filled = true;
+    for (SIZE_T offset : probe_offsets) {
+        std::uint32_t value = 1;
+        if (probe_read_u32(word_at(second, offset), &value).faulted || value != 0) zero_filled = false;
+    }
+    // Aliasing would show page0's pattern at the second VA, and a write through the
+    // second VA would change page0.
+    const bool sees_page0 = check_pattern(second, page0_seed);
+    constexpr std::uint32_t seed_second = 0x0f1e2d3cu;
+    const bool wrote_second = write_pattern(second, seed_second);
+    const bool page0_unchanged = check_pattern(page0, page0_seed);
+    const bool page0_sees_second = check_pattern(page0, seed_second);
+    const bool aliases = sees_page0 || page0_sees_second;
+    VirtualFree(second, 0, MEM_RELEASE);
+
+    const bool expect_alias = mutated("private_second_va_aliases");
+    const bool pass = record(zero_filled && wrote_second && (aliases == expect_alias) &&
+                                 (expect_alias || page0_unchanged),
+                             "private_second_va_independent");
+    d.private_second_va_ok = pass;
+    d.private_second_va_aliases = aliases;
+    std::printf("private_second_va: %s (zero_filled=%d sees_page0=%d page0_sees_second=%d page0_unchanged=%d)\n",
+                pass ? "PASS" : "FAIL", zero_filled ? 1 : 0, sees_page0 ? 1 : 0, page0_sees_second ? 1 : 0,
+                page0_unchanged ? 1 : 0);
+    return pass;
+}
+
+bool check_ordinary_commit_protection(Discrepancy& d)
 {
     // Reserve 2 pages, commit page 0, leave page 1 reserved (uncommitted).
     void* base = VirtualAlloc(nullptr, 2 * page_bytes, MEM_RESERVE, PAGE_NOACCESS);
@@ -185,6 +288,15 @@ bool check_ordinary_commit_protection()
         VirtualFree(base, 0, MEM_RELEASE);
         return false;
     }
+
+    MEMORY_BASIC_INFORMATION type_info{};
+    const bool type_queried = VirtualQuery(page0, &type_info, sizeof(type_info)) == sizeof(type_info);
+    const DWORD expected_private_type = mutated("private_type_mapped") ? MEM_MAPPED : MEM_PRIVATE;
+    d.private_type = type_queried ? type_info.Type : 0;
+    d.private_type_ok = record(type_queried && type_info.Type == expected_private_type, "private_type");
+    ok = d.private_type_ok && ok;
+
+    if (!check_private_second_va(page0, seed_a, d)) ok = false;
 
     // Transition PAGE_READWRITE -> PAGE_READONLY.
     DWORD old_protect = 0;
@@ -269,8 +381,13 @@ bool check_ordinary_commit_protection()
         std::printf("ordinary: idempotent recommit failed err=%lu\n", GetLastError());
         ok = false;
     }
-    if (!VirtualFree(page0, page_bytes, MEM_DECOMMIT) || !check_query(page0, MEM_RESERVE, 0, MEM_PRIVATE)) {
-        std::printf("ordinary: MEM_DECOMMIT failed err=%lu\n", GetLastError());
+    SetLastError(ERROR_SUCCESS);
+    const BOOL private_decommit = VirtualFree(page0, page_bytes, MEM_DECOMMIT);
+    const DWORD err_private_decommit = GetLastError();
+    d.private_decommit_ok =
+        record(private_decommit && check_query(page0, MEM_RESERVE, 0, MEM_PRIVATE), "private_decommit");
+    if (!d.private_decommit_ok) {
+        std::printf("ordinary: MEM_DECOMMIT failed err=%lu\n", err_private_decommit);
         ok = false;
     }
 
@@ -280,9 +397,8 @@ bool check_ordinary_commit_protection()
     return ok;
 }
 
-bool check_shared_view_protection(DWORD& out_mapped_decommit_error)
+bool check_shared_view_protection(Discrepancy& d)
 {
-    out_mapped_decommit_error = ERROR_SUCCESS;
 
     ULONG_PTR count = 1;
     ULONG_PTR token = 0;
@@ -315,15 +431,22 @@ bool check_shared_view_protection(DWORD& out_mapped_decommit_error)
         std::printf("shared: initial VirtualQuery/XMemVirtualQuery mismatch\n");
         ok = false;
     }
+    MEMORY_BASIC_INFORMATION type_info{};
+    const bool type_queried = VirtualQuery(view1, &type_info, sizeof(type_info)) == sizeof(type_info);
+    d.mapped_type = type_queried ? type_info.Type : 0;
+    d.mapped_type_ok = record(type_queried && type_info.Type == MEM_MAPPED, "mapped_type");
+    ok = d.mapped_type_ok && ok;
 
     // Live shared-page aliasing: write via view1, observe immediately via view2.
     constexpr std::uint32_t seed_1 = 0x55aa33ccu;
     constexpr std::uint32_t seed_2 = 0x9966a55au;
     constexpr std::uint32_t seed_3 = 0x71234567u;
-    if (!write_pattern(view1, seed_1) || !check_pattern(view2, seed_1)) {
+    d.mapped_alias_ok = record(write_pattern(view1, seed_1) && check_pattern(view2, seed_1), "mapped_alias");
+    if (!d.mapped_alias_ok) {
         std::printf("shared: initial alias visibility failed\n");
         ok = false;
     }
+    bool isolation = true;
 
     // Protect view1 to PAGE_READONLY; view2 must remain PAGE_READWRITE (per-view protection).
     DWORD old_protect = 0;
@@ -340,6 +463,7 @@ bool check_shared_view_protection(DWORD& out_mapped_decommit_error)
         ro_write.fault_address != reinterpret_cast<ULONG_PTR>(word_at(view1, probe_offsets[2])) ||
         !check_pattern(view1, seed_1) || !check_pattern(view2, seed_1)) {
         std::printf("shared: view1 PAGE_READONLY write control mismatch\n");
+        isolation = false;
         ok = false;
     }
 
@@ -347,6 +471,7 @@ bool check_shared_view_protection(DWORD& out_mapped_decommit_error)
     // what PAGE_READONLY view1 reads.
     if (!write_pattern(view2, seed_2) || !check_pattern(view1, seed_2)) {
         std::printf("shared: write through view2 not observed through RO view1\n");
+        isolation = false;
         ok = false;
     }
 
@@ -365,8 +490,10 @@ bool check_shared_view_protection(DWORD& out_mapped_decommit_error)
         !na_write.faulted || na_write.code != EXCEPTION_ACCESS_VIOLATION || na_write.access_type != 1 ||
         !check_pattern(view2, seed_2) || !write_pattern(view2, seed_3)) {
         std::printf("shared: PAGE_NOACCESS isolation control mismatch\n");
+        isolation = false;
         ok = false;
     }
+    d.mapped_isolation_ok = record(isolation, "mapped_isolation");
 
     // Restore view1 to PAGE_READWRITE and confirm it observes seed_3 written via view2.
     if (!VirtualProtect(view1, page_bytes, PAGE_READWRITE, &old_protect) || old_protect != PAGE_NOACCESS ||
@@ -405,44 +532,47 @@ bool check_shared_view_protection(DWORD& out_mapped_decommit_error)
     }
     SetLastError(ERROR_SUCCESS);
     const BOOL mapped_decommit = VirtualFree(view1, page_bytes, MEM_DECOMMIT);
-    out_mapped_decommit_error = GetLastError();
-    if (mapped_decommit || out_mapped_decommit_error != ERROR_INVALID_PARAMETER ||
-        !check_query(view1, MEM_COMMIT, PAGE_READWRITE, MEM_MAPPED) ||
-        !check_query(view2, MEM_COMMIT, PAGE_READWRITE, MEM_MAPPED) || !check_pattern(view1, seed_3) ||
-        !check_pattern(view2, seed_3)) {
+    d.mapped_decommit_error = GetLastError();
+    const bool expect_decommit = mutated("mapped_decommit_succeeds");
+    const bool decommit_as_expected =
+        expect_decommit ? mapped_decommit != FALSE
+                        : (!mapped_decommit && d.mapped_decommit_error == ERROR_INVALID_PARAMETER);
+    d.mapped_decommit_ok =
+        record(decommit_as_expected && check_query(view1, MEM_COMMIT, PAGE_READWRITE, MEM_MAPPED) &&
+                   check_query(view2, MEM_COMMIT, PAGE_READWRITE, MEM_MAPPED) && check_pattern(view1, seed_3) &&
+                   check_pattern(view2, seed_3),
+               "mapped_decommit");
+    if (!d.mapped_decommit_ok) {
         std::printf("shared: VirtualFree(MEM_DECOMMIT) on mapped view control mismatch ok=%d err=%lu\n",
-                    mapped_decommit ? 1 : 0, out_mapped_decommit_error);
+                    mapped_decommit ? 1 : 0, d.mapped_decommit_error);
         ok = false;
     }
 
-    // Failed XMemVirtualAlloc (unsupported second-commit combinations) and failed xmem
-    // remap/free while mapped must fail and leave both live views intact.
-    SetLastError(ERROR_SUCCESS);
-    void* refused_commit = XMemVirtualAlloc(nullptr, page_bytes, MEM_RESERVE | MEM_COMMIT, 0x21, PAGE_READWRITE);
-    const DWORD err_xva_commit = GetLastError();
-    SetLastError(ERROR_SUCCESS);
-    void* refused_ro = XMemVirtualAlloc(view1, page_bytes, MEM_COMMIT, 0x21, PAGE_READONLY);
-    const DWORD err_xva_ro = GetLastError();
+    // Remap over a live view and free while mapped are refused because of the shim's
+    // page state (the same calls succeed once the views are unmapped, below) and must
+    // leave both live views intact.
     SetLastError(ERROR_SUCCESS);
     void* refused_remap = XMemMapPhysicalPages(view1, 1, &token);
     const DWORD err_remap = GetLastError();
     SetLastError(ERROR_SUCCESS);
     const BOOL refused_free = XMemFreePhysicalPages(1, &token);
     const DWORD err_free = GetLastError();
-    if (refused_commit != nullptr || err_xva_commit != ERROR_INVALID_PARAMETER || refused_ro != nullptr ||
-        err_xva_ro != ERROR_INVALID_PARAMETER || refused_remap != nullptr || err_remap != ERROR_INVALID_PARAMETER ||
+    if (refused_remap != nullptr || err_remap != ERROR_INVALID_PARAMETER ||
         refused_free || err_free != ERROR_INVALID_PARAMETER ||
         !check_query(view1, MEM_COMMIT, PAGE_READWRITE, MEM_MAPPED) ||
         !check_query(view2, MEM_COMMIT, PAGE_READWRITE, MEM_MAPPED) || !check_pattern(view1, seed_3) ||
         !check_pattern(view2, seed_3)) {
-        std::printf("shared: failed xmem allocation/free preservation mismatch errs=(%lu,%lu,%lu,%lu)\n",
-                    err_xva_commit, err_xva_ro, err_remap, err_free);
+        std::printf("shared: failed xmem remap/free preservation mismatch errs=(%lu,%lu)\n", err_remap, err_free);
         ok = false;
     }
 
     // Unmap both views, remap view1, and confirm bytes survive unmap/remap while the grant lives.
-    if (XMemMapPhysicalPages(view1, 1, nullptr) != view1 || !XMemMapPhysicalPagesScatter(&view2, 1, nullptr) ||
-        XMemMapPhysicalPages(view1, 1, &token) != view1 || !check_pattern(view1, seed_3)) {
+    d.mapped_persistence_ok = record(XMemMapPhysicalPages(view1, 1, nullptr) == view1 &&
+                                         XMemMapPhysicalPagesScatter(&view2, 1, nullptr) &&
+                                         XMemMapPhysicalPages(view1, 1, &token) == view1 &&
+                                         check_pattern(view1, seed_3),
+                                     "mapped_persistence");
+    if (!d.mapped_persistence_ok) {
         std::printf("shared: unmap/remap persistence check failed err=%lu\n", GetLastError());
         ok = false;
     }
@@ -452,25 +582,165 @@ bool check_shared_view_protection(DWORD& out_mapped_decommit_error)
         ok = false;
     }
 
-    std::printf(
-        "shared_view_protection: %s (bad_zero=%lu bad_span=%lu mapped_decommit=%lu xva_commit=%lu xva_ro=%lu)\n",
-        ok ? "PASS" : "FAIL", err_zero, err_span, out_mapped_decommit_error, err_xva_commit, err_xva_ro);
+    std::printf("shared_view_protection: %s (bad_zero=%lu bad_span=%lu mapped_decommit=%lu remap=%lu free=%lu)\n",
+                ok ? "PASS" : "FAIL", err_zero, err_span, d.mapped_decommit_error, err_remap, err_free);
     return ok;
+}
+struct XvaCall {
+    void* result = nullptr;
+    DWORD error = ERROR_SUCCESS;
+};
+
+XvaCall call_xva(void* address, DWORD type, ULONGLONG attributes, DWORD protection) noexcept
+{
+    XvaCall call{};
+    SetLastError(ERROR_SUCCESS);
+    call.result = XMemVirtualAlloc(address, 16 * gib, type, attributes, protection);
+    call.error = GetLastError();
+    return call;
+}
+
+void release_if_allocated(const XvaCall& call) noexcept
+{
+    if (call.result) VirtualFree(call.result, 0, MEM_RELEASE);
+}
+
+bool refused_with_invalid_parameter(const XvaCall& call) noexcept
+{
+    return call.result == nullptr && call.error == ERROR_INVALID_PARAMETER;
+}
+
+// Can a second commit be reached through XMemVirtualAlloc on the desktop shim?
+// Each case starts from the accepted #888 reserve-only call (null address, 16 GiB,
+// type 0x20402000, attribute 0x21, PAGE_READWRITE) and changes exactly one variable.
+// The accepted call must succeed in the same run, so a refusal of the variant is
+// caused by that variable alone. A refusal caused by argument validation is not a
+// second-commit result, so the verdict is "not reachable through the current shim".
+bool check_xmem_virtual_alloc_second_commit()
+{
+    bool ok = true;
+
+    // Paired positive: the accepted reserve-only call reserves address space.
+    const XvaCall accepted = call_xva(nullptr, startup_reserve_type, 0x21, PAGE_READWRITE);
+    MEMORY_BASIC_INFORMATION info{};
+    const bool accepted_reserved = accepted.result &&
+                                   VirtualQuery(accepted.result, &info, sizeof(info)) == sizeof(info) &&
+                                   info.State == MEM_RESERVE && info.RegionSize >= 16 * gib;
+    const bool expect_accepted = !mutated("xva_positive_refused");
+    ok = record(accepted_reserved == expect_accepted, "xva_accepted_pair") && ok;
+
+    // Variable: allocation type gains MEM_COMMIT (the only way to ask for a commit).
+    const XvaCall commit = call_xva(nullptr, startup_reserve_type | MEM_COMMIT, 0x21, PAGE_READWRITE);
+    release_if_allocated(commit);
+    const bool expect_commit_refused = !mutated("xva_commit_accepted");
+    ok = record(refused_with_invalid_parameter(commit) == expect_commit_refused, "xva_commit_bit") && ok;
+
+    // Variable: protection PAGE_READWRITE -> PAGE_READONLY with attribute 0x21.
+    const XvaCall readonly = call_xva(nullptr, startup_reserve_type, 0x21, PAGE_READONLY);
+    release_if_allocated(readonly);
+    const bool expect_readonly_refused = !mutated("xva_readonly_accepted");
+    ok = record(refused_with_invalid_parameter(readonly) == expect_readonly_refused, "xva_protection") && ok;
+
+    // Variable: address. Target the live reservation from the accepted call, then the
+    // same address after it is released. A refusal that depends on memory state would
+    // differ between the two; argument validation refuses both the same way.
+    XvaCall address_live{};
+    XvaCall address_free{};
+    bool target_was_free = false;
+    if (accepted.result) {
+        address_live = call_xva(accepted.result, startup_reserve_type, 0x21, PAGE_READWRITE);
+        release_if_allocated(address_live);
+        VirtualFree(accepted.result, 0, MEM_RELEASE);
+        MEMORY_BASIC_INFORMATION freed{};
+        target_was_free = VirtualQuery(accepted.result, &freed, sizeof(freed)) == sizeof(freed) &&
+                          freed.State == MEM_FREE;
+        address_free = call_xva(accepted.result, startup_reserve_type, 0x21, PAGE_READWRITE);
+        release_if_allocated(address_free);
+    }
+    const bool state_independent = accepted.result && target_was_free &&
+                                   refused_with_invalid_parameter(address_live) &&
+                                   refused_with_invalid_parameter(address_free) &&
+                                   address_live.error == address_free.error;
+    const bool expect_state_independent = !mutated("xva_state_dependent");
+    ok = record(state_independent == expect_state_independent, "xva_address_state_independent") && ok;
+
+    if (ok) {
+        std::printf("xmem_virtual_alloc_second_commit: NOT REACHABLE through the current shim "
+                    "(accepted=reserved commit_bit_err=%lu readonly_err=%lu address_live_err=%lu "
+                    "address_free_err=%lu; each refusal is argument validation, not memory state)\n",
+                    commit.error, readonly.error, address_live.error, address_free.error);
+    } else {
+        std::printf("xmem_virtual_alloc_second_commit: FAIL (accepted=%p/%lu commit=%p/%lu readonly=%p/%lu "
+                    "address_live=%p/%lu address_free=%p/%lu target_was_free=%d)\n",
+                    accepted.result, accepted.error, commit.result, commit.error, readonly.result, readonly.error,
+                    address_live.result, address_live.error, address_free.result, address_free.error,
+                    target_was_free ? 1 : 0);
+    }
+    return ok;
+}
+
+// Prints the discrepancy line only from measured values whose checks passed;
+// otherwise names every field that could not be established.
+bool print_discrepancy(const Discrepancy& d)
+{
+    struct Field {
+        const char* name;
+        bool ok;
+    };
+    const Field fields[] = {
+        {"private_type", d.private_type_ok},
+        {"private_decommit", d.private_decommit_ok},
+        {"private_second_va", d.private_second_va_ok},
+        {"mapped_type", d.mapped_type_ok},
+        {"mapped_decommit", d.mapped_decommit_ok},
+        {"mapped_alias", d.mapped_alias_ok},
+        {"mapped_isolation", d.mapped_isolation_ok},
+        {"mapped_persistence", d.mapped_persistence_ok},
+    };
+    bool all_ok = true;
+    for (const Field& field : fields) all_ok = all_ok && field.ok;
+    if (!all_ok) {
+        std::printf("first_observable_discrepancy: not printed; failing_fields=");
+        const char* separator = "";
+        for (const Field& field : fields) {
+            if (field.ok) continue;
+            std::printf("%s%s", separator, field.name);
+            separator = ",";
+        }
+        std::printf("\n");
+        return false;
+    }
+    std::printf("first_observable_discrepancy: ordinary_commit=type 0x%lx, MEM_DECOMMIT succeeded, second-VA "
+                "commit %s vs live_shared_view=type 0x%lx, MEM_DECOMMIT refused err=%lu, second view aliased "
+                "live, per-view VirtualProtect isolation observed, bytes persisted across unmap/remap\n",
+                d.private_type, d.private_second_va_aliases ? "aliased" : "independent", d.mapped_type,
+                d.mapped_decommit_error);
+    return true;
 }
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    const bool ordinary_ok = check_ordinary_commit_protection();
-    DWORD mapped_decommit_error = ERROR_SUCCESS;
-    const bool shared_ok = check_shared_view_protection(mapped_decommit_error);
-    const bool passed = ordinary_ok && shared_ok;
+    if (argc == 3 && std::strcmp(argv[1], "--mutate") == 0) {
+        for (const char* name : known_mutations)
+            if (std::strcmp(argv[2], name) == 0) active_mutation = name;
+        if (!active_mutation) {
+            std::printf("unknown mutation: %s\n", argv[2]);
+            return 2;
+        }
+        std::printf("mutation=%s\n", active_mutation);
+    } else if (argc != 1) {
+        std::printf("usage: xmem_commit_protection_check [--mutate <name>]\n");
+        return 2;
+    }
 
-    std::printf(
-        "first_observable_discrepancy: ordinary_commit=MEM_PRIVATE(0x20000, MEM_DECOMMIT succeeds, no VA aliasing) "
-        "vs live_shared_view=MEM_MAPPED(0x40000, MEM_DECOMMIT refused err=%lu, live VA aliasing with per-view "
-        "VirtualProtect isolation and byte persistence across unmap/remap)\n",
-        mapped_decommit_error);
+    Discrepancy discrepancy{};
+    const bool ordinary_ok = check_ordinary_commit_protection(discrepancy);
+    const bool shared_ok = check_shared_view_protection(discrepancy);
+    const bool xva_ok = check_xmem_virtual_alloc_second_commit();
+    const bool discrepancy_ok = print_discrepancy(discrepancy);
+    const bool passed = ordinary_ok && shared_ok && xva_ok && discrepancy_ok;
+
     std::printf("xmem_commit_protection: %s\n", passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }

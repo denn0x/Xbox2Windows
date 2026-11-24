@@ -193,8 +193,8 @@ def eval_generated(shader, init):
         mul_high=lambda a, b: ((a & 0xffffffff) * (b & 0xffffffff)) >> 32,
         cvt_i32_f32=lambda bits: truncate_word(bits, -(1 << 31), (1 << 31) - 1),
         cvt_u32_f32=lambda bits: truncate_word(bits, 0, (1 << 32) - 1),
-        **init,
     )
+    env.update(init)
     for raw in shader.splitlines():
         if not raw.startswith("    "):
             continue
@@ -505,12 +505,14 @@ def check_modifiers(assembler, objcopy, library):
 
     mul2 = assemble_and_translate("v_mul_f32_e64 v0, v1, v2 mul:2")
     assert "2.0*(" in mul2
+    assert "4.0*(" in assemble_and_translate("v_mul_f32_e64 v0, v1, v2 mul:4")
+    assert "0.5*(" in assemble_and_translate("v_mul_f32_e64 v0, v1, v2 div:2")
     pk_clamp = assemble_and_translate("v_pk_add_f16 v0, v1, v2 op_sel:[1,0] clamp")
     assert "saturate(" in pk_clamp
+    assert "saturate(" in assemble_and_translate("v_add_f32_e64 v0, v1, v2 clamp")
     for bad_asm in (
-        "v_add_f32_e64 v0, v1, v2 clamp",
-        "v_mul_f32_e64 v0, v1, v2 mul:4",
-        "v_mul_f32_e64 v0, v1, v2 div:2",
+        "v_mul_f32_e64 v0, v1, v2 clamp mul:4",
+        "v_mul_f32_e64 v0, v1, v2 clamp div:2",
         "v_mul_f32_e64 v0, v1, v2 clamp mul:2",
         "v_add_nc_u32_e64 v0, v1, v2 clamp",
         "v_pk_add_u16 v0, v1, v2 clamp",
@@ -532,6 +534,382 @@ def check_modifiers(assembler, objcopy, library):
             pass
         else:
             raise AssertionError(f"Expected packed modifier rejection for: {bad_line}")
+
+
+
+# Rows are (v1 word, v2 word, expected v0 word). The expected binary32 words were
+# tabulated once, outside the lowering, from inputs whose results are exactly
+# representable, so no row depends on how a backend rounds. NaN, signed-zero and
+# subnormal inputs are not covered.
+FLOAT_MATH = (
+    ("v_subrev_f32_e32 v0, v1, v2", (
+        (0x3f800000, 0x40600000, 0x40200000),  # 1.0, 3.5 -> 2.5
+        (0x40600000, 0x3f800000, 0xc0200000),  # 3.5, 1.0 -> -2.5
+        (0x3f000000, 0x3f000000, 0x00000000),  # 0.5, 0.5 -> 0.0
+        (0x40000000, 0xc0800000, 0xc0c00000),  # 2.0, -4.0 -> -6.0
+    )),
+    ("v_subrev_f32_e64 v0, v1, v2 clamp", (
+        (0x3f800000, 0x40600000, 0x3f800000),  # 1.0, 3.5 -> 1.0
+        (0x40600000, 0x3f800000, 0x00000000),  # 3.5, 1.0 -> 0.0
+        (0x3f000000, 0x3f400000, 0x3e800000),  # 0.5, 0.75 -> 0.25
+        (0x40000000, 0xc0800000, 0x00000000),  # 2.0, -4.0 -> 0.0
+    )),
+    ("v_sqrt_f32_e32 v0, v1", (
+        (0x40800000, 0x00000000, 0x40000000),  # 4.0, 0 -> 2.0
+        (0x3e800000, 0x00000000, 0x3f000000),  # 0.25, 0 -> 0.5
+        (0x00000000, 0x00000000, 0x00000000),  # 0.0, 0 -> 0.0
+        (0x3f800000, 0x00000000, 0x3f800000),  # 1.0, 0 -> 1.0
+        (0x40100000, 0x00000000, 0x3fc00000),  # 2.25, 0 -> 1.5
+        (0x41800000, 0x00000000, 0x40800000),  # 16.0, 0 -> 4.0
+    )),
+    ("v_sqrt_f32_e64 v0, v1 clamp", (
+        (0x40800000, 0x00000000, 0x3f800000),  # 4.0, 0 -> 1.0
+        (0x3e800000, 0x00000000, 0x3f000000),  # 0.25, 0 -> 0.5
+        (0x00000000, 0x00000000, 0x00000000),  # 0.0, 0 -> 0.0
+        (0x3f800000, 0x00000000, 0x3f800000),  # 1.0, 0 -> 1.0
+        (0x3f100000, 0x00000000, 0x3f400000),  # 0.5625, 0 -> 0.75
+    )),
+    ("v_rsq_f32_e32 v0, v1", (
+        (0x40800000, 0x00000000, 0x3f000000),  # 4.0, 0 -> 0.5
+        (0x3e800000, 0x00000000, 0x40000000),  # 0.25, 0 -> 2.0
+        (0x3f800000, 0x00000000, 0x3f800000),  # 1.0, 0 -> 1.0
+        (0x41800000, 0x00000000, 0x3e800000),  # 16.0, 0 -> 0.25
+    )),
+    ("v_rsq_f32_e64 v0, v1 clamp", (
+        (0x40800000, 0x00000000, 0x3f000000),  # 4.0, 0 -> 0.5
+        (0x3e800000, 0x00000000, 0x3f800000),  # 0.25, 0 -> 1.0
+        (0x3f800000, 0x00000000, 0x3f800000),  # 1.0, 0 -> 1.0
+        (0x41800000, 0x00000000, 0x3e800000),  # 16.0, 0 -> 0.25
+    )),
+    ("v_floor_f32_e32 v0, v1", (
+        (0x40300000, 0x00000000, 0x40000000),  # 2.75, 0 -> 2.0
+        (0xc0300000, 0x00000000, 0xc0400000),  # -2.75, 0 -> -3.0
+        (0xbe800000, 0x00000000, 0xbf800000),  # -0.25, 0 -> -1.0
+        (0x40400000, 0x00000000, 0x40400000),  # 3.0, 0 -> 3.0
+        (0x3f000000, 0x00000000, 0x00000000),  # 0.5, 0 -> 0.0
+    )),
+    ("v_floor_f32_e64 v0, v1 clamp", (
+        (0x40300000, 0x00000000, 0x3f800000),  # 2.75, 0 -> 1.0
+        (0xc0300000, 0x00000000, 0x00000000),  # -2.75, 0 -> 0.0
+        (0x3f000000, 0x00000000, 0x00000000),  # 0.5, 0 -> 0.0
+        (0x3f800000, 0x00000000, 0x3f800000),  # 1.0, 0 -> 1.0
+    )),
+    # ceil rows avoid inputs in (-1, 0): the result there is -0.0, whose sign the integer-valued Python model does not carry.
+    # The scaled forms use power-of-two factors on normal values only: the hardware output modifier also flushes
+    # denormals and quiets NaN differently from a multiply, and the lowering (a plain multiply) does not model that.
+    ("v_ceil_f32_e32 v0, v1", (
+        (0x40300000, 0x00000000, 0x40400000),  # 2.75, 0 -> 3
+        (0xc0300000, 0x00000000, 0xc0000000),  # -2.75, 0 -> -2
+        (0xbfc00000, 0x00000000, 0xbf800000),  # -1.5, 0 -> -1
+        (0x40400000, 0x00000000, 0x40400000),  # 3.0, 0 -> 3
+        (0x3f000000, 0x00000000, 0x3f800000),  # 0.5, 0 -> 1
+        (0x3fa00000, 0x00000000, 0x40000000),  # 1.25, 0 -> 2
+        (0xc0400000, 0x00000000, 0xc0400000),  # -3.0, 0 -> -3
+    )),
+    ("v_ceil_f32_e64 v0, v1 clamp", (
+        (0x40300000, 0x00000000, 0x3f800000),  # 2.75, 0 -> 1.0
+        (0xc0300000, 0x00000000, 0x00000000),  # -2.75, 0 -> 0.0
+        (0xbfc00000, 0x00000000, 0x00000000),  # -1.5, 0 -> 0.0
+        (0x40400000, 0x00000000, 0x3f800000),  # 3.0, 0 -> 1.0
+        (0x3f000000, 0x00000000, 0x3f800000),  # 0.5, 0 -> 1
+        (0x3fa00000, 0x00000000, 0x3f800000),  # 1.25, 0 -> 1.0
+        (0xc0400000, 0x00000000, 0x00000000),  # -3.0, 0 -> 0.0
+    )),
+    ("v_ceil_f32_e64 v0, v1 mul:2", (
+        (0x40300000, 0x00000000, 0x40c00000),  # 2.75, 0 -> 6
+        (0xc0300000, 0x00000000, 0xc0800000),  # -2.75, 0 -> -4
+        (0xbfc00000, 0x00000000, 0xc0000000),  # -1.5, 0 -> -2
+        (0x40400000, 0x00000000, 0x40c00000),  # 3.0, 0 -> 6
+        (0x3f000000, 0x00000000, 0x40000000),  # 0.5, 0 -> 2
+        (0x3fa00000, 0x00000000, 0x40800000),  # 1.25, 0 -> 4
+        (0xc0400000, 0x00000000, 0xc0c00000),  # -3.0, 0 -> -6
+    )),
+    ("v_ceil_f32_e64 v0, v1 mul:4", (
+        (0x40300000, 0x00000000, 0x41400000),  # 2.75, 0 -> 12
+        (0xc0300000, 0x00000000, 0xc1000000),  # -2.75, 0 -> -8
+        (0xbfc00000, 0x00000000, 0xc0800000),  # -1.5, 0 -> -4
+        (0x40400000, 0x00000000, 0x41400000),  # 3.0, 0 -> 12
+        (0x3f000000, 0x00000000, 0x40800000),  # 0.5, 0 -> 4
+        (0x3fa00000, 0x00000000, 0x41000000),  # 1.25, 0 -> 8
+        (0xc0400000, 0x00000000, 0xc1400000),  # -3.0, 0 -> -12
+    )),
+    ("v_ceil_f32_e64 v0, v1 div:2", (
+        (0x40300000, 0x00000000, 0x3fc00000),  # 2.75, 0 -> 1.5
+        (0xc0300000, 0x00000000, 0xbf800000),  # -2.75, 0 -> -1.0
+        (0xbfc00000, 0x00000000, 0xbf000000),  # -1.5, 0 -> -0.5
+        (0x40400000, 0x00000000, 0x3fc00000),  # 3.0, 0 -> 1.5
+        (0x3f000000, 0x00000000, 0x3f000000),  # 0.5, 0 -> 0.5
+        (0x3fa00000, 0x00000000, 0x3f800000),  # 1.25, 0 -> 1.0
+        (0xc0400000, 0x00000000, 0xbfc00000),  # -3.0, 0 -> -1.5
+    )),
+    ("v_add_f32_e64 v0, v1, v2 mul:4", (
+        (0x3f000000, 0x3e800000, 0x40400000),  # 0.5, 0.25 -> 3.0
+        (0xc0000000, 0x3f000000, 0xc0c00000),  # -2.0, 0.5 -> -6.0
+        (0x3f800000, 0x3f800000, 0x41000000),  # 1.0, 1.0 -> 8.0
+        (0x3e800000, 0x3e000000, 0x3fc00000),  # 0.25, 0.125 -> 1.5
+        (0xc0800000, 0x3f800000, 0xc1400000),  # -4.0, 1.0 -> -12.0
+    )),
+    ("v_mul_f32_e64 v0, v1, v2 div:2", (
+        (0x40400000, 0x40a00000, 0x40f00000),  # 3.0, 5.0 -> 7.5
+        (0xc0000000, 0x3f000000, 0xbf000000),  # -2.0, 0.5 -> -0.5
+        (0x3fc00000, 0x40000000, 0x3fc00000),  # 1.5, 2.0 -> 1.5
+        (0xc0c00000, 0x40400000, 0xc1100000),  # -6.0, 3.0 -> -9.0
+    )),
+    ("v_trunc_f32_e32 v0, v1", (
+        (0x40300000, 0x00000000, 0x40000000),  # 2.75, 0 -> 2.0
+        (0xc0300000, 0x00000000, 0xc0000000),  # -2.75, 0 -> -2.0
+        (0x40400000, 0x00000000, 0x40400000),  # 3.0, 0 -> 3.0
+        (0xbfc00000, 0x00000000, 0xbf800000),  # -1.5, 0 -> -1.0
+        (0x3f000000, 0x00000000, 0x00000000),  # 0.5, 0 -> 0.0
+    )),
+    ("v_trunc_f32_e64 v0, v1 clamp", (
+        (0x40300000, 0x00000000, 0x3f800000),  # 2.75, 0 -> 1.0
+        (0xbfc00000, 0x00000000, 0x00000000),  # -1.5, 0 -> 0.0
+        (0x3f000000, 0x00000000, 0x00000000),  # 0.5, 0 -> 0.0
+        (0x3f800000, 0x00000000, 0x3f800000),  # 1.0, 0 -> 1.0
+    )),
+    ("v_fract_f32_e32 v0, v1", (
+        (0x40300000, 0x00000000, 0x3f400000),  # 2.75, 0 -> 0.75
+        (0xc0300000, 0x00000000, 0x3e800000),  # -2.75, 0 -> 0.25
+        (0x40400000, 0x00000000, 0x00000000),  # 3.0, 0 -> 0.0
+        (0x3f000000, 0x00000000, 0x3f000000),  # 0.5, 0 -> 0.5
+        (0xbe800000, 0x00000000, 0x3f400000),  # -0.25, 0 -> 0.75
+        (0xb0800000, 0x00000000, 0x3f7fffff),  # -2^-30, 0 -> largest binary32 below 1.0, not 1.0
+    )),
+    ("v_fract_f32_e64 v0, v1 clamp", (
+        (0x40300000, 0x00000000, 0x3f400000),  # 2.75, 0 -> 0.75
+        (0xc0300000, 0x00000000, 0x3e800000),  # -2.75, 0 -> 0.25
+        (0x3f000000, 0x00000000, 0x3f000000),  # 0.5, 0 -> 0.5
+        (0xb0800000, 0x00000000, 0x3f7fffff),  # -2^-30, 0 -> largest binary32 below 1.0, not 1.0
+    )),
+    ("v_add_f32_e64 v0, v1, v2 clamp", (
+        (0x3f000000, 0x3f400000, 0x3f800000),  # 0.5, 0.75 -> 1.0
+        (0xc0000000, 0x3f000000, 0x00000000),  # -2.0, 0.5 -> 0.0
+        (0x3e800000, 0x3e800000, 0x3f000000),  # 0.25, 0.25 -> 0.5
+        (0x3f000000, 0x3f000000, 0x3f800000),  # 0.5, 0.5 -> 1.0
+    )),
+    ("v_mul_f32_e64 v0, v1, v2 clamp", (
+        (0x40000000, 0x40400000, 0x3f800000),  # 2.0, 3.0 -> 1.0
+        (0xc0000000, 0x40400000, 0x00000000),  # -2.0, 3.0 -> 0.0
+        (0x3f000000, 0x3f000000, 0x3e800000),  # 0.5, 0.5 -> 0.25
+    )),)
+
+
+# Python model of the HLSL intrinsics used by the generated float lines, evaluated at
+# binary32 precision with IEEE results for the exact inputs tabulated above.
+def _bits_to_float(word):
+    return struct.unpack("<f", struct.pack("<I", word & 0xffffffff))[0]
+
+
+def _to_f32(value):
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+FLOAT_MODEL = dict(
+    asfloat=_bits_to_float,
+    asuint=lambda x: struct.unpack("<I", struct.pack("<f", x))[0],
+    sqrt=math.sqrt,
+    rsqrt=lambda x: math.inf if x == 0 else 1.0 / math.sqrt(x),
+    floor=lambda x: float(math.floor(x)),
+    ceil=lambda x: float(math.ceil(x)),
+    trunc=lambda x: float(math.trunc(x)),
+    frac=lambda x: _to_f32(x - math.floor(x)) if math.isfinite(x) else math.nan,
+    saturate=lambda x: min(max(x, 0.0), 1.0),
+    # D3D min returns its other operand when one is a NaN (Python's min keeps the first).
+    min=lambda a, b: b if math.isnan(a) else a if math.isnan(b) else min(a, b),
+    # The emitted cap, as a comparison: a NaN fails it and passes through.
+    fract_cap=lambda f: _bits_to_float(0x3f7fffff) if f >= 1.0 else f,
+)
+
+
+def lower_float_line(line):
+    mnemonic, _, rest = line.partition(" ")
+    pieces = re.split(r" (?=\w+:|clamp(?: |$))", rest, maxsplit=1)
+    return alu(mnemonic, pieces[0].split(", "), pieces[1] if len(pieces) == 2 else "")
+
+
+def float_row_mismatches(shader, rows):
+    bad = []
+    for index, (v1, v2, expected) in enumerate(rows):
+        env = eval_generated(shader, dict(v1=v1, v2=v2, **FLOAT_MODEL))
+        if env["v0"] != expected:
+            bad.append(index)
+    return bad
+
+
+def drop_saturate(text):
+    return text.replace("saturate(", "(")
+
+
+def upper_only(text):
+    return re.sub(r"asuint\(saturate\((.*)\)\);", r"asuint(min(\1,1.0));", text)
+
+
+def lower_only(text):
+    return re.sub(r"asuint\(saturate\((.*)\)\);", r"asuint(max(\1,0.0));", text)
+
+
+# The emitted cap on a fraction: group 1 is the frac call. The checks rename it to fract_cap(<frac call>) so that the
+# mutations below can replace the call or the cap and the evaluator needs no ternary.
+FRACT_CAP = r"\((frac\(([^;]*?)\)) >= 1\.0f \? asfloat\(0x3f7fffffu\) : \1\)"
+
+
+def name_fract_cap(text):
+    return re.sub(FRACT_CAP, r"fract_cap(\1)", text)
+
+
+def fract_without_upper_bound(text):
+    return re.sub(r"fract_cap\((frac\(asfloat\(v1\)\))\)", r"\1", text)
+
+
+def fract_cap_as_min(text):
+    # The old cap. D3D min returns the cap for a NaN fraction, so a NaN input would not stay a NaN.
+    return re.sub(r"fract_cap\((frac\(asfloat\(v1\)\))\)", r"min(\1,asfloat(0x3f7fffffu))", text)
+
+
+def frac_as_x_minus_trunc(text):
+    return re.sub(r"frac\((asfloat\(v1\))\)", r"(\1-trunc(\1))", text)
+
+
+# (assembly, mutation of the generated statement, rows that must then disagree)
+FLOAT_MUTATIONS = (
+    ("v_subrev_f32_e32 v0, v1, v2", lambda s: s.replace("asfloat(v2)-asfloat(v1)", "asfloat(v1)-asfloat(v2)"), [0, 1, 3]),
+    ("v_subrev_f32_e64 v0, v1, v2 clamp", drop_saturate, [0, 1, 3]),
+    ("v_subrev_f32_e64 v0, v1, v2 clamp", lambda s: s.replace("asfloat(v2)-asfloat(v1)", "asfloat(v1)-asfloat(v2)"), [0, 1, 2, 3]),
+    ("v_sqrt_f32_e32 v0, v1", lambda s: s.replace("sqrt(", "rsqrt("), [0, 1, 2, 4, 5]),
+    ("v_sqrt_f32_e64 v0, v1 clamp", drop_saturate, [0]),
+    ("v_rsq_f32_e32 v0, v1", lambda s: s.replace("rsqrt(", "sqrt("), [0, 1, 3]),
+    ("v_rsq_f32_e64 v0, v1 clamp", drop_saturate, [1]),
+    ("v_floor_f32_e32 v0, v1", lambda s: s.replace("floor(", "trunc("), [1, 2]),
+    ("v_floor_f32_e64 v0, v1 clamp", drop_saturate, [0, 1]),
+    ("v_ceil_f32_e32 v0, v1", lambda s: s.replace("ceil(", "floor("), [0, 1, 2, 4, 5]),
+    ("v_ceil_f32_e32 v0, v1", lambda s: s.replace("ceil(", "trunc("), [0, 4, 5]),
+    ("v_ceil_f32_e64 v0, v1 clamp", drop_saturate, [0, 1, 2, 3, 5, 6]),
+    ("v_ceil_f32_e64 v0, v1 mul:2", lambda s: s.replace("2.0*(", "4.0*("), [0, 1, 2, 3, 4, 5, 6]),
+    ("v_ceil_f32_e64 v0, v1 mul:4", lambda s: s.replace("4.0*(", "2.0*("), [0, 1, 2, 3, 4, 5, 6]),
+    ("v_ceil_f32_e64 v0, v1 mul:4", lambda s: s.replace("4.0*(", "0.5*("), [0, 1, 2, 3, 4, 5, 6]),
+    ("v_ceil_f32_e64 v0, v1 mul:4", lambda s: s.replace("ceil(", "floor("), [0, 1, 2, 4, 5]),
+    ("v_ceil_f32_e64 v0, v1 div:2", lambda s: s.replace("0.5*(", "4.0*("), [0, 1, 2, 3, 4, 5, 6]),
+    ("v_ceil_f32_e64 v0, v1 div:2", lambda s: s.replace("0.5*(", "2.0*("), [0, 1, 2, 3, 4, 5, 6]),
+    ("v_ceil_f32_e64 v0, v1 div:2", lambda s: s.replace("0.5*(", "1.0*("), [0, 1, 2, 3, 4, 5, 6]),
+    ("v_add_f32_e64 v0, v1, v2 mul:4", lambda s: s.replace("4.0*(", "0.5*("), [0, 1, 2, 3, 4]),
+    ("v_mul_f32_e64 v0, v1, v2 div:2", lambda s: s.replace("0.5*(", "4.0*("), [0, 1, 2, 3]),
+    ("v_trunc_f32_e32 v0, v1", lambda s: s.replace("trunc(", "floor("), [1, 3]),
+    ("v_trunc_f32_e64 v0, v1 clamp", drop_saturate, [0, 1]),
+    ("v_fract_f32_e32 v0, v1", frac_as_x_minus_trunc, [1, 4, 5]),
+    ("v_fract_f32_e64 v0, v1 clamp", frac_as_x_minus_trunc, [1, 3]),
+    ("v_fract_f32_e32 v0, v1", fract_without_upper_bound, [5]),
+    ("v_fract_f32_e64 v0, v1 clamp", fract_without_upper_bound, [3]),
+    ("v_add_f32_e64 v0, v1, v2 clamp", drop_saturate, [0, 1]),
+    ("v_add_f32_e64 v0, v1, v2 clamp", upper_only, [1]),
+    ("v_add_f32_e64 v0, v1, v2 clamp", lower_only, [0]),
+    ("v_mul_f32_e64 v0, v1, v2 clamp", drop_saturate, [0, 1]),
+)
+
+
+def check_float_math(assembler, objcopy, library):
+    shaders = {}
+    for asm, rows in FLOAT_MATH:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, obj, binary = (root / ("fm." + ext) for ext in ("s", "o", "bin"))
+            source.write_text(f"{asm}\ns_endpgm\n", encoding="ascii")
+            subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj",
+                            source, "-o", obj], check=True)
+            subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+            code = binary.read_bytes()
+        instructions = disassemble(code, library, offsets=True)
+        # The decoder must print the same spelling that the table (and LLVM 15) uses.
+        assert instructions[0][1] == asm, (instructions[0][1], asm)
+        shader = translate("consumer", instructions, code)
+        assert ("saturate(" in shader) == asm.endswith(" clamp"), asm
+        if asm.startswith("v_fract_f32"):
+            assert len(re.findall(FRACT_CAP, shader)) == 1 and "min(" not in shader, shader
+            shader = name_fract_cap(shader)
+        assert float_row_mismatches(shader, rows) == [], asm
+        shaders[asm] = (shader, rows)
+    # Each wrong lowering must disagree with the tabulated words on exactly these rows.
+    for asm, mutate, expected_rows in FLOAT_MUTATIONS:
+        shader, rows = shaders[asm]
+        mutated = mutate(shader)
+        assert mutated != shader, asm
+        assert float_row_mismatches(mutated, rows) == expected_rows, (asm, expected_rows)
+    # A NaN input must stay a NaN (any NaN word is accepted). The cap written as min turns it into 0x3f7fffff.
+    shader, _ = shaders["v_fract_f32_e32 v0, v1"]
+    for nan in (0x7fc00000, 0x7fc00001, 0xffc00000):
+        out = eval_generated(shader, dict(v1=nan, v2=0, **FLOAT_MODEL))["v0"]
+        assert (out & 0x7f800000) == 0x7f800000 and out & 0x7fffff, hex(out)
+        old = eval_generated(fract_cap_as_min(shader), dict(v1=nan, v2=0, **FLOAT_MODEL))["v0"]
+        assert old == 0x3f7fffff, hex(old)
+    for bad_tokens, bad_mods, bad_mnemonic in (
+        (["v0", "v1", "v2"], "", "v_sqrt_f32_e64"),      # one source too many
+        (["v0", "v1"], "", "v_subrev_f32_e32"),          # one source missing
+        (["v0", "v1", "v2"], "clamp", "v_add_f32_e32"),  # VOP2 has no clamp bit
+        (["v0", "v1"], "clamp mul:2", "v_sqrt_f32_e64"),
+        (["v0", "v1"], "mul:2 clamp", "v_floor_f32_e64"),
+        (["v0", "v1"], "clamp clamp", "v_trunc_f32_e64"),
+        # mul:4 and div:2 are VOP3-only (mul:2 on an e32 spelling stays accepted as before).
+        (["v0", "v1"], "mul:4", "v_ceil_f32_e32"),
+        (["v0", "v1"], "div:2", "v_ceil_f32_e32"),
+        (["v0", "v1", "v2"], "mul:4", "v_add_f32_e32"),
+        (["v0", "v1", "v2"], "div:2", "v_mul_f32_e32"),
+        (["v0", "v1"], "clamp", "v_ceil_f32_e32"),
+        # An output multiplier and clamp together are not supported, in either order.
+        (["v0", "v1"], "mul:4 clamp", "v_ceil_f32_e64"),
+        (["v0", "v1"], "clamp mul:4", "v_ceil_f32_e64"),
+        (["v0", "v1"], "div:2 clamp", "v_ceil_f32_e64"),
+        (["v0", "v1"], "clamp div:2", "v_ceil_f32_e64"),
+        (["v0", "v1"], "mul:4 mul:2", "v_ceil_f32_e64"),
+        # Only the three omod values exist; anything else is refused.
+        (["v0", "v1"], "mul:8", "v_ceil_f32_e64"),
+        (["v0", "v1"], "div:4", "v_ceil_f32_e64"),
+        (["v0", "v1"], "mul:3", "v_ceil_f32_e64"),
+        (["v0", "v1"], "div:1", "v_ceil_f32_e64"),
+        (["v0", "v1"], "omod(2)", "v_ceil_f32_e64"),
+        (["v0", "v1", "v2"], "", "v_ceil_f32_e32"),      # one source too many
+    ):
+        try:
+            alu(bad_mnemonic, bad_tokens, bad_mods)
+        except ValueError:
+            continue
+        raise AssertionError(f"Accepted {bad_mnemonic} {bad_tokens} {bad_mods!r}")
+    # The existing multiplier is unchanged next to the new modifier.
+    assert "2.0*(" in alu("v_sqrt_f32_e64", ["v0", "v1"], "mul:2")
+    assert "4.0*(" in alu("v_sqrt_f32_e64", ["v0", "v1"], "mul:4")
+    assert "0.5*(" in alu("v_sqrt_f32_e64", ["v0", "v1"], "div:2")
+    # The multiplier applies to the result and no clamp is emitted next to it.
+    assert alu("v_ceil_f32_e64", ["v0", "v1"], "mul:4") == "v0 = asuint(4.0*(ceil(asfloat(v1))));"
+    assert alu("v_ceil_f32_e64", ["v0", "v1"], "div:2") == "v0 = asuint(0.5*(ceil(asfloat(v1))));"
+    assert alu("v_ceil_f32_e32", ["v0", "v1"], "") == "v0 = asuint(ceil(asfloat(v1)));"
+
+
+def check_float_math_readback(host, backend):
+    for asm, rows in FLOAT_MATH:
+        statement = lower_float_line(asm)
+        first = ", ".join(f"0x{v1:08x}u" for v1, _, _ in rows)
+        second = ", ".join(f"0x{v2:08x}u" for _, v2, _ in rows)
+        shader = f"""RWStructuredBuffer<uint> outWords : register(u0);
+static const uint inputA[{len(rows)}] = {{{first}}};
+static const uint inputB[{len(rows)}] = {{{second}}};
+[numthreads(1,1,1)] void main(uint3 group : SV_GroupID) {{
+    uint v0 = 0, v1 = inputA[group.x], v2 = inputB[group.x];
+    {statement}
+    outWords[group.x] = v0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "float_math.hlsl"
+            source.write_text(shader, encoding="ascii")
+            output = subprocess.check_output([host, source, backend, str(len(rows)), "1"], text=True)
+        adapter, *lines = output.splitlines()
+        assert len(lines) == len(rows), asm
+        # Hardware square root and reciprocal square root are approximations; allow one ulp.
+        tolerance = 1 if ("sqrt" in asm or "rsq" in asm) else 0
+        for (v1, v2, expected), line in zip(rows, lines):
+            actual = int(line)
+            assert abs(actual - expected) <= tolerance, (asm, hex(v1), hex(v2), hex(actual), hex(expected))
+    print(adapter)
+    print(f"{len(FLOAT_MATH)} float-math lowerings matched")
 
 
 def main(assembler, objcopy, library):
@@ -576,11 +954,14 @@ def main(assembler, objcopy, library):
     check_bfe(assembler, objcopy, library)
     check_salu_sopk_and_scc(assembler, objcopy, library)
     check_modifiers(assembler, objcopy, library)
+    check_float_math(assembler, objcopy, library)
 
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--immediate"]:
         check_immediate_conversion(*sys.argv[2:])
+    elif sys.argv[1:2] == ["--readback-float-math"]:
+        check_float_math_readback(*sys.argv[2:])
     elif sys.argv[1:2] == ["--readback"]:
         check_conversion_readback(*sys.argv[2:])
     else:

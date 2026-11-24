@@ -15,4 +15,6 @@ EXPORTS
     cw_branch
     cw_writes
     cw_fninit
+    cw_fnstsw
+    cw_finit_fnstsw
     cw_finit

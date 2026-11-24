@@ -1,0 +1,13 @@
+EXPORTS
+    pf_ucomiss
+    pf_comiss
+    pf_ucomisd
+    pf_comisd
+    pf_equal
+    pf_fucomi
+    pf_fault
+    pf_fault_p
+    pf_lahf
+    pf_after_add
+    pf_join
+    pf_undefined

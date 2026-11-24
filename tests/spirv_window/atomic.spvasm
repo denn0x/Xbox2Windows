@@ -1,0 +1,52 @@
+OpCapability Shader
+OpCapability Int64
+OpCapability PhysicalStorageBufferAddresses
+OpExtension "SPV_KHR_physical_storage_buffer"
+OpMemoryModel PhysicalStorageBuffer64 GLSL450
+OpEntryPoint GLCompute %main "main" %user_data
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %rt_uint ArrayStride 4
+OpDecorate %words ArrayStride 4
+OpDecorate %UserData Block
+OpMemberDecorate %UserData 0 Offset 0
+%void = OpTypeVoid
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%ulong = OpTypeInt 64 0
+%fn = OpTypeFunction %void
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%c2 = OpConstant %uint 2
+%c3 = OpConstant %uint 3
+%c4 = OpConstant %uint 4
+%shift32 = OpConstant %uint 32
+%rt_uint = OpTypeRuntimeArray %uint
+%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint
+%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint
+%words = OpTypeArray %uint %c4
+%UserData = OpTypeStruct %words
+%_ptr_PC_UserData = OpTypePointer PushConstant %UserData
+%_ptr_PC_uint = OpTypePointer PushConstant %uint
+%user_data = OpVariable %_ptr_PC_UserData PushConstant
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%base_low_ptr = OpAccessChain %_ptr_PC_uint %user_data %c0 %c0
+%base_low = OpLoad %uint %base_low_ptr
+%low64 = OpUConvert %ulong %base_low
+%base_high_ptr = OpAccessChain %_ptr_PC_uint %user_data %c0 %c3
+%base_high = OpLoad %uint %base_high_ptr
+%high64 = OpUConvert %ulong %base_high
+%shifted = OpShiftLeftLogical %ulong %high64 %shift32
+%base = OpBitwiseOr %ulong %low64 %shifted
+%array = OpConvertUToPtr %_ptr_PSB_arr %base
+%target = OpAccessChain %_ptr_PSB_uint %array %c1
+%addend_ptr = OpAccessChain %_ptr_PC_uint %user_data %c0 %c1
+%addend = OpLoad %uint %addend_ptr
+%output_ptr = OpAccessChain %_ptr_PC_uint %user_data %c0 %c2
+%output_low = OpLoad %uint %output_ptr
+%output_address = OpUConvert %ulong %output_low
+%output = OpConvertUToPtr %_ptr_PSB_uint %output_address
+%old = OpAtomicIAdd %uint %target %c1 %c0 %addend
+OpStore %output %old Aligned 4
+OpReturn
+OpFunctionEnd

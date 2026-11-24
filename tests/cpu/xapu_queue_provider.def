@@ -1,0 +1,19 @@
+LIBRARY xapu
+EXPORTS
+    XApuConnect
+    XApuEnqueueCommand
+    XApuGetResultCount
+    XApuDequeueResult
+    XApuDisconnect
+    get_xapu_connect_count
+    get_xapu_disconnect_count
+    get_xapu_live_client_count
+    get_xapu_enqueued_count
+    get_xapu_dequeued_count
+    get_xapu_refused_count
+    get_xapu_call_count
+    get_xapu_enqueued_id
+    get_xapu_dequeued_id
+    get_xapu_refused_output_count
+    get_xapu_refused_output
+    reset_xapu_records

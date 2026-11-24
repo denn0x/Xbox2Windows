@@ -1,0 +1,20 @@
+EXPORTS
+    rdfsbase_32
+    rdfsbase_64
+    rdgsbase_32
+    rdgsbase_64
+    read_host_nonvolatile
+    rdpid_64
+    rdpid_twice
+    flag_preserve_fsgsbase_rdpid
+    unused_host_reads
+    native_host_features
+    native_rdtscp_aux
+    native_with_fsbase
+    neg_wrfsbase_32
+    neg_wrfsbase_64
+    neg_wrgsbase_32
+    neg_wrgsbase_64
+    neg_rsp_rdfsbase
+    neg_rsp_rdgsbase
+    neg_rsp_rdpid

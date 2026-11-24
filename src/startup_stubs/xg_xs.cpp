@@ -1,28 +1,31 @@
 // Desktop xg_xs.dll trap stubs.
-// Every export traps; see trap.h. Local scaffolding, not an ABI claim.
+// Every export traps; see trap.h. Scaffolding, not an ABI claim.
 #define X2W_TRAP_MODULE "xg_xs.dll"
 #define X2W_TRAP_MODULE_ID 5
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/bc7_4k_s.h"
 
-#include <d3d12.h>
+#include "startup_stubs/slice_footprints.h"
 
+#include <algorithm>
 #include <array>
+#include "startup_stubs/bc64_chain.h"
+#include "startup_stubs/tile64_plan.h"
 #include <cstdio>
 #include <cstring>
 #include <utility>
-#include <vector>
 
-// LOCAL EXPERIMENT ONLY (local/startup-v2, never pushed). With X2W_D3D12_PERMISSIVE=1 the exports
+// Experimental (docs/startup-runtime.md). With X2W_D3D12_PERMISSIVE=1 the exports
 // stand in for the console texture-layout library; otherwise they trap.
 //
 // The title describes a texture with a D3D12_RESOURCE_DESC-shaped block (0x38 bytes; the Layout
-// field holds a console swizzle mode) and asks a "texture computer" for its memory layout. The
-// console layouts are swizzled; this stand-in answers with the desktop's linear layout instead, so
-// the sizes and offsets the title uses are consistent with each other, but texel data it copies or
-// reads through them is not in the console arrangement.
+// field holds a console swizzle mode) and asks a "texture computer" for its memory layout.
+// The default layout uses desktop copyable footprints. A separate BC7 diagnostic profile reports
+// standard 4 KiB tiled geometry for layout queries.
 namespace {
 using u64 = std::uint64_t;
+using x2w_startup::Bc16Surface;
 
 bool permissive() noexcept { return x2w_local::env_on("X2W_D3D12_PERMISSIVE"); }
 
@@ -65,6 +68,7 @@ struct Computer {
     void* const* vtable;
     D3D12_RESOURCE_DESC desc;
     LONG refs;
+    bool bc7_4k_s_layout;
 };
 
 // Slot 2: (layout*) -> HRESULT. Layout as the title reads it: a 0x18-byte header (taken as total
@@ -72,14 +76,89 @@ struct Computer {
 // multiplied by the array slice index (a per-slice stride), and mip records of 0x70 bytes start at
 // +0x38 with size at +0x00, offset at +0x08, slice size at +0x10 and row pitch in bytes at +0x1c.
 // The remaining mip fields follow the usual order (pitch in pixels, alignment, padded and plain
-// dimensions, sample count) as a guess. Only plane 0 is filled.
+// dimensions, sample count) as a guess. NV12 additionally describes its interleaved chroma plane.
 constexpr std::size_t layout_header = 0x18, plane_bytes = 0x6c8, mip_base = 0x38, mip_bytes = 0x70;
 constexpr int max_mips = 15;
+
+bool use_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc)
+{
+    return x2w_local::env_on("X2W_XG_BC7_4K_S_LAYOUT") &&
+           x2w_startup::supports_bc7_4k_s(desc);
+}
+
+void put64(unsigned char* at, u64 value) { std::memcpy(at, &value, sizeof(value)); }
+void put32(unsigned char* at, std::uint32_t value) { std::memcpy(at, &value, sizeof(value)); }
+
+void notify_texture_write(void* base, u64 bytes)
+{
+    using Notify = void (*)(void*, unsigned long long);
+    const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
+    const auto notify = d3d ? reinterpret_cast<Notify>(GetProcAddress(d3d, "x2w_d3d12_texture_written")) : nullptr;
+    if (notify) notify(base, bytes);
+}
+
+#include "startup_stubs/xg_bc64.inl"
+
+void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layout)
+{
+    const Bc16Surface surface(desc);
+    const u64 bytes = surface.size();
+
+    put64(layout + 0x00, bytes);
+    put64(layout + 0x08, Bc16Surface::tile_bytes);
+    put32(layout + 0x10, 1);
+    put32(layout + 0x14, 1);
+    auto* plane = layout + layout_header;
+    put64(plane + 0x08, bytes);
+    put64(plane + 0x18, Bc16Surface::tile_bytes);
+    auto* mip = plane + mip_base;
+    put64(mip + 0x00, bytes);
+    put64(mip + 0x10, bytes);
+    put32(mip + 0x18, surface.padded_width());
+    put32(mip + 0x1c, surface.padded_row_bytes());
+    put32(mip + 0x20, Bc16Surface::tile_bytes);
+    put32(mip + 0x24, surface.padded_width());
+    put32(mip + 0x28, surface.padded_height());
+    put32(mip + 0x2c, 1);
+    put32(mip + 0x30, static_cast<UINT>(desc.Width));
+    put32(mip + 0x34, desc.Height);
+    put32(mip + 0x38, 1);
+    put32(mip + 0x3c, 1);
+}
+
+HRESULT copy_bc7_4k_s(const D3D12_RESOURCE_DESC& desc, unsigned char* dest, const unsigned char* source,
+                     UINT row_pitch, UINT slice_pitch)
+{
+    const Bc16Surface surface(desc);
+    const UINT row_bytes = surface.columns * Bc16Surface::block_bytes;
+    const u64 source_bytes = u64{surface.rows - 1} * row_pitch + row_bytes;
+    if (!dest || !source || row_pitch < row_bytes || (slice_pitch && slice_pitch < source_bytes))
+        return E_INVALIDARG;
+
+    const auto dest_begin = reinterpret_cast<std::uintptr_t>(dest);
+    const auto source_begin = reinterpret_cast<std::uintptr_t>(source);
+    const bool overlap = dest_begin <= source_begin ? source_begin - dest_begin < surface.size()
+                                                    : dest_begin - source_begin < source_bytes;
+    if (overlap) return E_INVALIDARG;
+    if (!x2w_local::readable(source, source_bytes) || !x2w_local::writable(dest, surface.size()))
+        return E_FAIL;
+
+    for (UINT y = 0; y < surface.rows; ++y) {
+        const auto* row = source + u64{y} * row_pitch;
+        for (UINT x = 0; x < surface.columns; ++x)
+            std::memcpy(dest + surface.block_offset(x, y), row + x * Bc16Surface::block_bytes, Bc16Surface::block_bytes);
+    }
+    return S_OK;
+}
 
 long __stdcall computer_layout(Computer* self, unsigned char* layout)
 {
     if (!layout) return static_cast<long>(0x80004003);
     std::memset(layout, 0, layout_header + 4 * plane_bytes + 8);
+    if (self->bc7_4k_s_layout) {
+        write_bc7_4k_s_layout(self->desc, layout);
+        return S_OK;
+    }
     ID3D12Device* device = layout_device();
     if (!device) return static_cast<long>(0x80004005);
     const D3D12_RESOURCE_DESC desc = desktop_desc(self->desc);
@@ -87,43 +166,43 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     const unsigned slices = volume ? 1 : desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
     unsigned mips = desc.MipLevels ? desc.MipLevels : 1;
     if (mips > max_mips) mips = max_mips;
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mips);
-    std::vector<UINT> rows(mips);
-    std::vector<UINT64> row_bytes(mips);
-    UINT64 slice_total = 0;
-    device->GetCopyableFootprints(&desc, 0, mips, 0, footprints.data(), rows.data(), row_bytes.data(), &slice_total);
+    const x2w_startup::SliceFootprints plan(device, desc, mips);
+    const auto& footprints = plan.placed;
+    const auto& rows = plan.rows;
+    UINT64 slice_total = plan.size;
     const bool valid = slice_total != ~0ull && slice_total != 0;
     if (!valid) slice_total = 0x10000;
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const u64 total = stride * slices;
 
-    auto put64 = [](unsigned char* at, u64 value) { std::memcpy(at, &value, 8); };
-    auto put32 = [](unsigned char* at, std::uint32_t value) { std::memcpy(at, &value, 4); };
     put64(layout + 0x00, total);
     put64(layout + 0x08, 0x10000);
     put32(layout + 0x10, mips);
-    put32(layout + 0x14, 1);
-    unsigned char* plane = layout + layout_header;
-    put64(plane + 0x08, total);
-    put64(plane + 0x10, slices > 1 ? stride : 0);
-    put64(plane + 0x18, 0x10000);
-    for (unsigned i = 0; valid && i < mips; ++i) {
-        unsigned char* mip = plane + mip_base + i * mip_bytes;
-        const auto& fp = footprints[i].Footprint;
-        const u64 slice_size = u64{fp.RowPitch} * rows[i];
-        put64(mip + 0x00, slice_size * fp.Depth);
-        put64(mip + 0x08, footprints[i].Offset);
-        put64(mip + 0x10, slice_size);
-        put32(mip + 0x18, fp.Width);
-        put32(mip + 0x1c, fp.RowPitch);
-        put32(mip + 0x20, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-        put32(mip + 0x24, fp.Width);
-        put32(mip + 0x28, fp.Height);
-        put32(mip + 0x2c, volume ? fp.Depth : slices);
-        put32(mip + 0x30, fp.Width);
-        put32(mip + 0x34, fp.Height);
-        put32(mip + 0x38, volume ? fp.Depth : slices);
-        put32(mip + 0x3c, desc.SampleDesc.Count);
+    put32(layout + 0x14, plan.planes);
+    for (unsigned p = 0; p < plan.planes; ++p) {
+        unsigned char* plane = layout + layout_header + p * plane_bytes;
+        put64(plane + 0x08, total);
+        put64(plane + 0x10, slices > 1 ? stride : 0);
+        put64(plane + 0x18, 0x10000);
+        for (unsigned m = 0; valid && m < mips; ++m) {
+            const unsigned i = p * mips + m;
+            unsigned char* mip = plane + mip_base + m * mip_bytes;
+            const auto& fp = footprints[i].Footprint;
+            const u64 slice_size = u64{fp.RowPitch} * rows[i];
+            put64(mip + 0x00, slice_size * fp.Depth);
+            put64(mip + 0x08, footprints[i].Offset);
+            put64(mip + 0x10, slice_size);
+            put32(mip + 0x18, fp.Width);
+            put32(mip + 0x1c, fp.RowPitch);
+            put32(mip + 0x20, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            put32(mip + 0x24, fp.Width);
+            put32(mip + 0x28, fp.Height);
+            put32(mip + 0x2c, volume ? fp.Depth : slices);
+            put32(mip + 0x30, fp.Width);
+            put32(mip + 0x34, fp.Height);
+            put32(mip + 0x38, volume ? fp.Depth : slices);
+            put32(mip + 0x3c, desc.SampleDesc.Count);
+        }
     }
     static LONG calls, failures;
     static const bool verbose = [] { char v[8] = {}; return GetEnvironmentVariableA("X2W_XG_VERBOSE", v, sizeof v) > 0 && v[0] == '1'; }();
@@ -143,7 +222,9 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
 
 // Slot 10: the desktop ID3D12Device::GetResourceTiling shape without the resource:
 // (tile count*, packed mip info*, tile shape*, tiling count in/out*, first subresource, tilings*).
-// Answered from a desktop reserved resource with the same description.
+// A two-dimensional texture with the 64 KiB standard layout 0x10a and a format with a known
+// tile shape is answered from tile64_plan.h. Anything else is answered from a desktop reserved
+// resource with the same description.
 void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INFO* packed, D3D12_TILE_SHAPE* shape,
                                UINT* count, UINT first, D3D12_SUBRESOURCE_TILING* tilings)
 {
@@ -152,6 +233,34 @@ void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INF
     if (shape) *shape = {};
     const UINT capacity = count ? *count : 0;
     if (count) *count = 0;
+    if (x2w_startup::tile64::Plan::supports(self->desc)) {
+        // A 64 KiB standard layout: the shared tile comes first in each slice, then the mips from
+        // the smallest to the largest. Entries keep their position in the requested range; the
+        // returned count covers the standard mips only.
+        const x2w_startup::tile64::Plan plan(self->desc);
+        if (tiles) *tiles = plan.slice_tiles * plan.slices;
+        if (packed)
+            *packed = {static_cast<UINT8>(plan.standard), static_cast<UINT8>(plan.mips - plan.standard), plan.shared_tiles, 0};
+        if (shape) *shape = {plan.tile_width, plan.tile_height, 1};
+        const UINT subresources = plan.mips * plan.slices;
+        const UINT available = first < subresources ? subresources - first : 0;
+        UINT written = 0;
+        for (UINT i = 0; i < (std::min)(capacity, available); ++i) {
+            const UINT mip = (first + i) % plan.mips, slice = (first + i) / plan.mips;
+            if (mip >= plan.standard) continue;
+            if (tilings)
+                tilings[i] = {plan.wide[mip], static_cast<UINT16>(plan.high[mip]), 1, slice * plan.slice_tiles + plan.start[mip]};
+            ++written;
+        }
+        if (count) *count = written;
+        static LONG planned;
+        if (x2w_local::first_calls(planned, 6))
+            x2w_local::logf("x2w-xg TextureComputer::slot10(tiling) dim=%d %llux%ux%u mips=%u fmt=%d layout=0x%x -> 64 KiB plan: tiles=%u "
+                            "standard=%u packed=%u", self->desc.Dimension, self->desc.Width, self->desc.Height,
+                            self->desc.DepthOrArraySize, self->desc.MipLevels, self->desc.Format, static_cast<UINT>(self->desc.Layout),
+                            plan.slice_tiles * plan.slices, plan.standard, plan.mips - plan.standard);
+        return;
+    }
     ID3D12Device* device = layout_device();
     HRESULT hr = E_FAIL;
     if (device) {
@@ -177,12 +286,21 @@ void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INF
 
 // Slot 1: called when the title is done with the computer.
 // Slot 8, CopyIntoSubresource(tiled base, plane, subresource, linear data, row pitch, slice pitch)
-// (argument order as in DirectXTex's use of the public XG header). The stand-in's layout is the
-// desktop copyable-footprint layout reported by slot 2, so the "tiled" memory is filled row by row
-// at those offsets; the D3D12 stand-in is told so that it can refresh its desktop texture.
+// The default path uses desktop copyable footprints and notifies the D3D12
+// stand-in. The opt-in BC7 path announces the tiled backing separately.
 long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned plane, unsigned subresource,
                                   const unsigned char* linear, unsigned row_pitch, unsigned slice_pitch)
 {
+    if (self->bc7_4k_s_layout) {
+        if (plane || subresource) return E_INVALIDARG;
+        using NotifyBc7 = void (*)(void*, UINT, UINT);
+        const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
+        const auto notify = d3d ? reinterpret_cast<NotifyBc7>(GetProcAddress(d3d, "x2w_d3d12_bc7_4k_s_written")) : nullptr;
+        if (!notify && x2w_local::env_on("X2W_D3D12_RENDER")) return E_NOTIMPL;
+        const HRESULT hr = copy_bc7_4k_s(self->desc, base, linear, row_pitch, slice_pitch);
+        if (SUCCEEDED(hr) && notify) notify(base, static_cast<UINT>(self->desc.Width), self->desc.Height);
+        return hr;
+    }
     static LONG calls, refused;
     ID3D12Device* device = layout_device();
     const D3D12_RESOURCE_DESC desc = desktop_desc(self->desc);
@@ -191,40 +309,37 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
     unsigned mips = desc.MipLevels ? desc.MipLevels : 1;
     if (mips > max_mips) mips = max_mips;
     const unsigned mip = subresource % mips, slice = subresource / mips;
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mips);
-    std::vector<UINT> rows(mips);
-    std::vector<UINT64> row_bytes(mips);
-    UINT64 slice_total = ~0ull;
-    if (device) device->GetCopyableFootprints(&desc, 0, mips, 0, footprints.data(), rows.data(), row_bytes.data(), &slice_total);
-    if (!device || !base || !linear || plane != 0 || slice >= slices || slice_total == ~0ull || !slice_total || !row_pitch) {
+    const x2w_startup::SliceFootprints plan(device, desc, mips);
+    const UINT i = plane * mips + mip;
+    const auto& footprints = plan.placed;
+    const auto& rows = plan.rows;
+    const auto& row_bytes = plan.row_bytes;
+    const UINT64 slice_total = plan.size;
+    if (!device || !base || !linear || plane >= plan.planes || slice >= slices || slice_total == ~0ull || !slice_total || !row_pitch ||
+        (desc.Format == DXGI_FORMAT_NV12 && row_pitch < row_bytes[i])) {
         if (x2w_local::first_calls(refused, 8))
             x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) refused: base=%p plane=%u subresource=%u linear=%p pitch=%u/%u",
                             static_cast<void*>(base), plane, subresource, static_cast<const void*>(linear), row_pitch, slice_pitch);
         return static_cast<long>(0x80070057);
     }
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
-    const auto& fp = footprints[mip].Footprint;
-    const u64 used = row_bytes[mip] < row_pitch ? row_bytes[mip] : row_pitch;
-    unsigned char* target = base + stride * slice + footprints[mip].Offset;
-    const u64 target_bytes = u64{fp.RowPitch} * rows[mip] * fp.Depth;
-    const u64 source_slice = slice_pitch ? slice_pitch : u64{row_pitch} * rows[mip];
+    const auto& fp = footprints[i].Footprint;
+    const u64 used = row_bytes[i] < row_pitch ? row_bytes[i] : row_pitch;
+    unsigned char* target = base + stride * slice + footprints[i].Offset;
+    const u64 target_bytes = plan.bytes(i);
+    const u64 source_slice = slice_pitch ? slice_pitch : u64{row_pitch} * rows[i];
     const bool ok = x2w_local::writable(target, target_bytes) &&
-                    x2w_local::readable(linear, source_slice * (fp.Depth - 1) + u64{row_pitch} * (rows[mip] - 1) + used);
+                    x2w_local::readable(linear, source_slice * (fp.Depth - 1) + u64{row_pitch} * (rows[i] - 1) + used);
     if (ok) {
         for (unsigned z = 0; z < fp.Depth; ++z)
-            for (unsigned y = 0; y < rows[mip]; ++y)
-                std::memcpy(target + (u64{z} * rows[mip] + y) * fp.RowPitch, linear + z * source_slice + u64{y} * row_pitch, used);
-        using Notify = void (*)(void*, unsigned long long);
-        static const Notify notify = [] {
-            const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
-            return d3d ? reinterpret_cast<Notify>(GetProcAddress(d3d, "x2w_d3d12_texture_written")) : nullptr;
-        }();
-        if (notify) notify(base, stride * slices);
+            for (unsigned y = 0; y < rows[i]; ++y)
+                std::memcpy(target + (u64{z} * rows[i] + y) * fp.RowPitch, linear + z * source_slice + u64{y} * row_pitch, used);
+        notify_texture_write(base, stride * slices);
     }
     if (x2w_local::first_calls(calls, 12) || !ok)
         x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) base=%p subresource=%u (mip %u slice %u) %ux%u fmt=%d rows=%u "
                         "pitch %u->%u -> %s", static_cast<void*>(base), subresource, mip, slice, fp.Width, fp.Height, desc.Format,
-                        rows[mip], row_pitch, fp.RowPitch, ok ? "copied" : "MEMORY NOT ACCESSIBLE");
+                        rows[i], row_pitch, fp.RowPitch, ok ? "copied" : "MEMORY NOT ACCESSIBLE");
     return ok ? 0 : static_cast<long>(0x80004005);
 }
 
@@ -259,17 +374,34 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
 {
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XGCreateTextureComputer", 0, rcx, rdx, r8, r9, _ReturnAddress());
-    static auto table = computer_table(std::make_index_sequence<32>{});
-    static bool ready = false;
-    if (!ready) {
-        table[1] = reinterpret_cast<void*>(&computer_release);
-        table[2] = reinterpret_cast<void*>(&computer_layout);
-        table[8] = reinterpret_cast<void*>(&computer_copy_into);
-        table[10] = reinterpret_cast<void*>(&computer_tiling);
-        ready = true;
-    }
+    static const auto table = [] {
+        auto slots = computer_table(std::make_index_sequence<32>{});
+        slots[1] = reinterpret_cast<void*>(&computer_release);
+        slots[2] = reinterpret_cast<void*>(&computer_layout);
+        slots[8] = reinterpret_cast<void*>(&computer_copy_into);
+        slots[10] = reinterpret_cast<void*>(&computer_tiling);
+        return slots;
+    }();
     if (!rcx || !rdx) return static_cast<long>(0x80004003);
-    auto* computer = new Computer{table.data(), *reinterpret_cast<const D3D12_RESOURCE_DESC*>(rcx), 1};
+    const auto& desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(rcx);
+    if (!x2w_startup::SliceFootprints::supports(desc)) {
+        *reinterpret_cast<Computer**>(rdx) = nullptr;
+        return E_NOTIMPL;
+    }
+    static const auto bc_table = [] {
+        auto slots = table;
+        slots[0] = reinterpret_cast<void*>(&bc64_add_ref);
+        slots[2] = reinterpret_cast<void*>(&bc64_layout);
+        slots[3] = reinterpret_cast<void*>(&bc64_size);
+        slots[4] = reinterpret_cast<void*>(&bc64_alignment);
+        slots[5] = reinterpret_cast<void*>(&bc64_offset);
+        slots[6] = reinterpret_cast<void*>(&bc64_element);
+        slots[8] = reinterpret_cast<void*>(&bc64_copy<true>);
+        slots[9] = reinterpret_cast<void*>(&bc64_copy<false>);
+        slots[10] = reinterpret_cast<void*>(&bc64_tiling);
+        return slots;
+    }();
+    auto* computer = new Computer{bc64::supports(desc) ? bc_table.data() : table.data(), desc, 1, use_bc7_4k_s_layout(desc)};
     *reinterpret_cast<Computer**>(rdx) = computer;
     static LONG calls;
     if (InterlockedIncrement(&calls) <= 3)

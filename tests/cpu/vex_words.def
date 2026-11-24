@@ -5,3 +5,12 @@ EXPORTS
     store_reload
     aligned_ops
     byte_pack_reload
+    sat_words
+    mul_minmax_words
+    cmp_words
+    sraw_count_reg
+    sraw_count_mem
+    sllw_count_reg
+    sllw_count_mem
+    srlw_count_reg
+    srlw_count_mem

@@ -1,0 +1,17 @@
+EXPORTS
+    op_andpd_mem128
+    op_andps_mem128
+    op_andnpd_mem128
+    op_andnps_mem128
+    op_orpd_mem128
+    op_orps_mem128
+    op_xorpd_mem128
+    op_xorps_mem128
+    op_andpd_mem256
+    op_andps_mem256
+    op_andnpd_mem256
+    op_andnps_mem256
+    op_orpd_mem256
+    op_orps_mem256
+    op_xorpd_mem256
+    op_xorps_mem256

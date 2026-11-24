@@ -16,4 +16,5 @@ EXPORTS
     fild_fistp_i64
     fild_fisttp_i16
     fistp_two
+    fist_fisttp_depth2
     fild_depth8

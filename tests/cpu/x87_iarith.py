@@ -41,6 +41,8 @@ SEQUENCES = {
     "fimul_i32_m64": ("f64i32", [("fld", "m64", 0), ("fimul", "i32", 16), ("fstp", "m64", 0)]),
     # Two integer operations in a row: an m32 integer at 16 and an m16 integer at 20.
     "fiadd_fisub": ("i32i16", [("fld", "m80", 0), ("fiadd", "i32", 16), ("fisub", "i16", 20), ("fstp", "m80", 0)]),
+    "fisub_i16_depth2": ("iarith_depth2", [("fld", "m80", 0), ("fld", "m80", 16), ("fisub", "i16", 32),
+                                           ("fstp", "m80", 0), ("fstp", "m80", 16)]),
     # The eighth register; the integer is the low half of the m64 value loaded last.
     "fidivr_depth8": ("m64x8", [("fld", "m64", 8 * k) for k in range(8)] + [("fidivr", "i32", 56)]
                       + [("fstp", "m64", 8 * k) for k in range(8)]),
@@ -205,6 +207,8 @@ def cases():
     blocks["i32i16"] = [m80_bytes(rng.choice(st0)) + integer_bytes("i32", rng.choice(ints["i32"]), rng)[:4]
                         + integer_bytes("i16", rng.choice(ints["i16"]), rng) for _ in range(600)]
     blocks["m64x8"] = [b"".join(rng.choice(f64).to_bytes(8, "little") for _ in range(8)) for _ in range(300)]
+    blocks["iarith_depth2"] = [m80_bytes((0xA000000000000000, 0x4002)) + m80_bytes((0xC000000000000000, 0x4000))
+                               + b"\x02\x00"]
     for name, (kind, _) in SEQUENCES.items():
         for block in blocks[kind]:
             yield name, bytes(block).ljust(INPUT, b"\0")

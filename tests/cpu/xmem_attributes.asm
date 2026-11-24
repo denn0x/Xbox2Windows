@@ -1,13 +1,17 @@
-; Source-built fixture for tools/xmem_attribute_scan.py: one XMemAlloc or XMemFree call site per
-; attribute-word form the scanner handles. The image is only read; none of this code runs.
+; Source-built fixture for tools/xmem_attribute_scan.py: one xmem call site per attribute-word
+; form and route the scanner handles, including the XMemAllocDefault and XMemFreeDefault alias
+; names. The image is only read; none of this code runs.
 EXTERN __imp_XMemAlloc:QWORD
 EXTERN __imp_XMemFree:QWORD
+EXTERN __imp_XMemAllocDefault:QWORD
+EXTERN __imp_XMemFreeDefault:QWORD
 EXTERN XMemAlloc:PROC
 
 .data
 unwritten_word QWORD 0A8004000h  ; writable, no RIP-relative write: still not a constant
 varying_word QWORD 05E50000h     ; written by set_word: not a constant
 pointer_word DWORD 0A8004000h    ; written through a register in pointer_written: not a constant
+guard_flag BYTE 0                ; writable byte the cmove-guarded site tests
 
 CONST SEGMENT
 read_only_word QWORD 020004000h  ; read-only section: a constant
@@ -210,6 +214,23 @@ partial_write PROC
     ret
 partial_write ENDP
 
+; A byte xor of a register with itself clears only the low 8 bits: the word stays 05E50000h, so
+; the site must not be reported as the constant 0 that xor edx, edx gives.
+partial_xor_byte PROC
+    mov edx, 05E50007h
+    xor dl, dl
+    call QWORD PTR __imp_XMemAlloc
+    ret
+partial_xor_byte ENDP
+
+; The same with a 16-bit xor, which clears only the low 16 bits.
+partial_xor_word PROC
+    mov edx, 05E51234h
+    xor dx, dx
+    call QWORD PTR __imp_XMemAlloc
+    ret
+partial_xor_word ENDP
+
 ; Internal pass-through: not exported, so its one caller in the image decides the word.
 forward_alloc PROC
     mov edx, 05E50000h
@@ -258,4 +279,31 @@ entry_copy_low PROC
     call QWORD PTR __imp_XMemAlloc
     ret
 entry_copy_low ENDP
+
+; Direct call through the Default alias. The two allocation names have separate IAT slots even
+; though they reach the same allocator, so the site must record the name it imported:
+; XMemAllocDefault here, never XMemAlloc.
+default_alloc PROC
+    mov ecx, 40h
+    mov edx, 05E50000h
+    call QWORD PTR __imp_XMemAllocDefault
+    ret
+default_alloc ENDP
+
+; Tail jump through the free alias, with a constant word.
+default_free_tail PROC
+    mov edx, 0A8004000h
+    jmp QWORD PTR __imp_XMemFreeDefault
+default_free_tail ENDP
+
+; The shape released images use to choose the word at run time: an immediate, then a conditional
+; move from another register guarded by a writable byte. The scanner has no constant for the
+; conditional move, so it must report the site as computed rather than report the immediate.
+cmove_guarded PROC
+    mov edx, 04000000h
+    cmp BYTE PTR [guard_flag], 0
+    cmove rdx, rbx
+    call QWORD PTR __imp_XMemAlloc
+    ret
+cmove_guarded ENDP
 END

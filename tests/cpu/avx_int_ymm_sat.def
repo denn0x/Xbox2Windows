@@ -1,0 +1,19 @@
+EXPORTS
+    op_vpaddsb_ymm
+    op_vpaddsw_ymm
+    op_vpaddusb_ymm
+    op_vpaddusw_ymm
+    op_vpsubsb_ymm
+    op_vpsubsw_ymm
+    op_vpsubusb_ymm
+    op_vpsubusw_ymm
+    op_vpsubsb_ymm_dst_src1
+    op_vpsubsw_ymm_dst_src1
+    op_vpsubusb_ymm_dst_src1
+    op_vpsubusw_ymm_dst_src1
+    op_vpsubsb_ymm_dst_src2
+    op_vpsubsw_ymm_dst_src2
+    op_vpsubusb_ymm_dst_src2
+    op_vpsubusw_ymm_dst_src2
+    op_vpaddsb_ymm_all
+    op_vpaddusb_ymm_then_xmm_subsb

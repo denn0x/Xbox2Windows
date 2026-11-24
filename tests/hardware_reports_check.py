@@ -198,6 +198,32 @@ class HardwareReportChecks(unittest.TestCase):
         self.assertEqual([item["notes"] for item in summary["unrecorded"]],
                          [[], ["same text as comment 602"]])
 
+    def test_duplicate_test_section_goes_to_manual_review(self):
+        # A corrected rerun pasted into the same report has no reliable winner.
+        # Keep the separate, unambiguous WARP report from the same comment.
+        hardware, warp = report(), report(backend="warp", adapter="Microsoft Basic Render Driver",
+                                          lanes=4, lane_range="4..4")
+        # The existing behavior for a partial paste plus a valid report is unchanged.
+        partial = hardware.replace("Source commit", "Commit")
+        comments = [comment(699, partial + "\n\n" + warp)]
+        summary = hardware_reports.summarize(comments, README)
+        self.assertEqual([(item["comment_id"], item["backend"]) for item in summary["unrecorded"]], [(699, "warp")])
+        self.assertEqual(summary["review"], [])
+        # A WARP section without a new report header also shares the same
+        # result key, so it cannot be attributed to a separate WARP run.
+        for backend, status in (("hardware", "FAIL"), ("hardware", "PASS"), ("warp", "PASS")):
+            with self.subTest(backend=backend, status=status):
+                name = f"bvh_differential_{backend}"
+                duplicate = f"### {name} - {status}\n\n```text\ncomparisons=999\n```"
+                malformed = hardware.replace("### Submit this report", duplicate + "\n\n### Submit this report")
+                comments = [comment(700, "\n\n".join((partial, malformed, warp))), comment(701, hardware)]
+                summary = hardware_reports.summarize(comments, README)
+                self.assertEqual([(item["comment_id"], item["backend"]) for item in summary["unrecorded"]],
+                                 [(700, "warp"), (701, "hardware")])
+                self.assertEqual(summary["unrecorded"][1]["cells"]["bvh"], PASSED)
+                self.assertEqual([(item["comment_id"], item["reason"]) for item in summary["review"]],
+                                 [(700, f"duplicate test section: {name}")])
+
     def test_edited_reports_are_read_with_a_note(self):
         edited = report().replace(f"Source commit: {COMMIT}", "**Source commit:** `0123456`")
         parsed = only_report(edited.replace(" - SKIP", " \u2014 SKIP"))

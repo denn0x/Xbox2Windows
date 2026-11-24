@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: windows-checks-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -21,6 +25,10 @@ jobs:
           persist-credentials: false
       - name: Check the GPU report summary and submit path
         run: python3 -B tests/gpu_report_format_check.py
+      - name: Check the opt-in compiler cache arguments in dev.ps1
+        run: python3 -B tests/dev_ps1_sccache_check.py
+      - name: Check the required SPIR-V bridge WARP test list
+        run: python3 -B tests/spirv_window/require_warp_results_check.py
       - name: Check machine-code inputs with LLVM 15
         run: |
           sudo apt-get update -q
@@ -32,14 +40,30 @@ jobs:
           python3 -B tests/sampled_coverage_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/pixel_sample_offset_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/pixel_compare_sample_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/pixel_compare_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/pixel_compare_gather_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/pixel_gather_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/compute_mimg_msaa_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_indexed_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_descriptor_swap_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/mesh_lit_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/pixel_get_lod_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/pixel_sample_gradient_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
           python3 -B tests/mesh_shadow_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/ffx_dispatch_aot_check.py llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/startup_sampler_heap_check.py binary llvm-mc-15
+          python3 -B tests/startup_image_sample_l_check.py binary llvm-mc-15
+          python3 -B tests/startup_image_sample_c_check.py binary llvm-mc-15
+          python3 -B tests/startup_image_3d_check.py binary llvm-mc-15
+          python3 -B tests/startup_image_load_mip_check.py --llvm-mc llvm-mc-15
+          python3 -B tests/startup_image_2d_array_check.py binary llvm-mc-15
+          python3 -B tests/startup_flat_param_check.py binary llvm-mc-15
+          python3 -B tests/startup_gfx2hlsl_bit_alu_check.py binary llvm-mc-15
+          python3 -B tests/startup_inline_sampler_check.py binary llvm-mc-15
           LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 python3 -B tests/rdna2_tools_check.py
   python-linux:
     name: Run platform-independent Python checks on Linux
@@ -56,32 +80,57 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
       - name: Run Python checks
         run: |
-          python -B tests/script_state_check.py
-          python -B tests/resource_root_check.py
-          python -B tests/bcpack_check.py
-          python -B tests/bcpack_symbols_check.py
-          python -B tests/bc7_blocks_check.py
-          python -B tests/bc7_tiles_check.py
-          python -B tests/form_coverage_check.py
-          python -B tests/resource_ranges_check.py
-          python -B tests/ttpf_batch_export_check.py
-          python -B tests/awc_metadata_check.py
-          python -B tests/sgd5_effects_check.py
-          python -B tests/dxcontainer_part_offsets_check.py
-          python -B tests/layout_chunks_check.py
-          python -B tests/dependency_paths_check.py
-          python -B tests/pe_package_preflight_check.py
-          python -B tests/pe_package_ordinal_plan_check.py
-          python -B tests/intake/paths_check.py
-          python -B tests/shader_probe_check.py
-          python -B tests/shader_census_check.py
-          python -B tests/dxil_retarget_check.py
-          python -B tests/rdna2_tools_check.py
-          python -B tests/pso_readiness_check.py
-          python -B tests/xmem_attribute_scan_check.py
-          python -B tests/docs_links_check.py
-          python -B tests/bidi_controls_check.py
-          python -B tests/hardware_reports_check.py
+          python -B tools/run_checks_parallel.py \
+            tests/script_state_check.py \
+            tests/resource_root_check.py \
+            tests/bcpack_check.py \
+            tests/bcpack_symbols_check.py \
+            tests/bcpack_tables_check.py \
+            tests/bc7_blocks_check.py \
+            tests/bc7_tiles_check.py \
+            tests/gfx10_texture_roundtrip_check.py \
+            tests/texture_bc_volume_check.py \
+            tests/form_coverage_check.py \
+            tests/resource_ranges_check.py \
+            tests/ttpf_batch_export_check.py \
+            tests/awc_metadata_check.py \
+            tests/sgd5_effects_check.py \
+            tests/dxcontainer_part_offsets_check.py \
+            tests/layout_chunks_check.py \
+            tests/dependency_paths_check.py \
+            tests/pe_package_preflight_check.py \
+            tests/host_commit_check.py \
+            tests/pe_package_ordinal_plan_check.py \
+            tests/compat_report_check.py \
+            tests/intake/paths_check.py \
+            tests/intake/routing_check.py \
+            tests/intake/import_forms_check.py \
+            tests/shader_probe_check.py \
+            tests/shader_census_check.py \
+            tests/shader_corpus_report_check.py \
+            tests/dxil_retarget_check.py \
+            tests/rdna2_tools_check.py \
+            tests/pso_readiness_check.py \
+            tests/xmem_attribute_scan_check.py \
+            tests/xgameruntime_table_check.py \
+            tests/docs_links_check.py \
+            tests/bidi_controls_check.py \
+            tests/gpu_report_format_check.py \
+            tests/hardware_reports_check.py \
+            tests/rectlist_topology_check.py \
+            tests/startup_sampler_heap_check.py \
+            tests/startup_image_sample_l_check.py \
+            tests/startup_image_sample_c_check.py \
+            tests/startup_image_3d_check.py \
+            tests/startup_image_load_mip_check.py \
+            tests/startup_image_2d_array_check.py \
+            tests/startup_host_cpu_check.py \
+            tests/startup_translator_check.py \
+            tests/startup_triage_run_check.py \
+            tests/startup_flat_param_check.py \
+            tests/startup_gfx2hlsl_bit_alu_check.py \
+            tests/startup_inline_sampler_check.py \
+            tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
@@ -122,14 +171,22 @@ jobs:
           .\tools\dev.ps1
           cmake --preset dev
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build --preset dev
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            cmake --build --preset pr
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            ctest --preset pr --no-tests=error --output-junit "$PWD/out/test-results.xml"
+          } else {
+            cmake --build --preset dev
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
+          }
+          exit $LASTEXITCODE
       - name: Require the SPIR-V bridge WARP tests
         if: ${{ !cancelled() }}
         shell: pwsh
         run: ./out/pe-env/Scripts/python.exe -B tests/spirv_window/require_warp_results.py out/test-results.xml
       - name: Draw the coverage dashboard
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           ./out/pe-env/Scripts/python.exe -B tools/form_coverage.py out/test-results.xml --json out/coverage/coverage.json
@@ -137,6 +194,7 @@ jobs:
           ./out/pe-env/Scripts/python.exe -B tools/coverage_svg.py out/coverage/coverage.json out/coverage/dashboard.svg `
             --source "$($env:GITHUB_SHA.Substring(0, 7)), Windows CI run $env:GITHUB_RUN_ID, WARP"
       - name: Upload coverage dashboard
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-dashboard
@@ -144,6 +202,7 @@ jobs:
           if-no-files-found: error
           overwrite: true
       - name: Build and smoke-test the standalone GPU check
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: .\tools\package-gpu-check.ps1
       - name: Upload verified GPU check
@@ -157,6 +216,7 @@ jobs:
           if-no-files-found: error
   build-and-test-release:
     name: Build and test on Windows at /O2
+    if: github.event_name != 'pull_request'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:

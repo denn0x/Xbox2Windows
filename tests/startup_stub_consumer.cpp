@@ -1,23 +1,1607 @@
-// Source-built consumer for the startup trap stubs. Imports by name from chad.dll, xg_xs.dll,
-// xmem.dll and d3d12_xs.dll and calls the export the first argument selects.
+// Source-built consumer for the startup trap stubs. Imports by name from chad.dll, xg_xs.dll and
+// xmem.dll and calls the export the first argument selects. (XMemTransferMemory and
+// D3D12ConfigureVirtualMemoryX have real implementations in the shims and their own tests.)
 //   none     -> returns 0 without calling a stub (control)
 //   chad     -> XDspActivate(0x11, 0x22, 0x33, 0x44)
 //   xg_xs    -> XGSuggestSwizzleMode(0x55, 0, 0, 0)
-//   xmem     -> XMemTransferMemory(0, 0x10000, 0x3000, 4)
-//   d3d12    -> D3D12ConfigureVirtualMemoryX(0x66, 0x77, 0, 0)
 //   physical -> XMemAllocatePhysicalPages/XMemFreePhysicalPages round trip (no trap expected)
+//   dstorage -> DirectStorage multi-page RFC 1950 zlib request, BCPack decode and failure controls (Refs #1139, #1144)
+//   dstorage-pages -> page-array entries replaced, or made unreadable, between EnqueueRequest and Submit
+//   store    -> XStoreCreateContext for the local user, a mutated provider, and a non-local user (Refs #1147)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <cstdint>
 #include <cstdio>
+#include <array>
+#include <fstream>
 #include <cstring>
+#include <vector>
 
 using u64 = std::uint64_t;
 
 extern "C" __declspec(dllimport) u64 XDspActivate(u64, u64, u64, u64);
 extern "C" __declspec(dllimport) u64 XGSuggestSwizzleMode(u64, u64, u64, u64);
-extern "C" __declspec(dllimport) u64 XMemTransferMemory(u64, u64, u64, u64);
-extern "C" __declspec(dllimport) u64 D3D12ConfigureVirtualMemoryX(u64, u64, u64, u64);
 extern "C" __declspec(dllimport) int XMemAllocatePhysicalPages(u64 flags, std::size_t* count, u64* pages);
 extern "C" __declspec(dllimport) int XMemFreePhysicalPages(std::size_t count, u64* pages);
+extern "C" __declspec(dllimport) void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_type,
+                                                              ULONGLONG attributes, DWORD protection);
+extern "C" __declspec(dllimport) void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count,
+                                                                   const ULONG_PTR* tokens);
+int x2w_store_method3_check();
+
+namespace {
+
+uint32_t adler32_calc(const unsigned char* data, size_t size) {
+    uint32_t a = 1, b = 0;
+    while (size) {
+        size_t chunk = size < 5552 ? size : 5552;
+        size -= chunk;
+        while (chunk--) {
+            a += *data++;
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    return (b << 16) | a;
+}
+
+std::vector<unsigned char> make_stored_zlib(const unsigned char* data, size_t size) {
+    std::vector<unsigned char> out;
+    out.push_back(0x78);
+    out.push_back(0x01);
+    size_t pos = 0;
+    while (pos < size) {
+        size_t chunk = (size - pos > 32768) ? 32768 : (size - pos);
+        bool last = (pos + chunk == size);
+        out.push_back(last ? 0x01 : 0x00);
+        out.push_back(static_cast<unsigned char>(chunk & 0xFF));
+        out.push_back(static_cast<unsigned char>((chunk >> 8) & 0xFF));
+        unsigned short check = static_cast<unsigned short>(chunk ^ 0xFFFF);
+        out.push_back(static_cast<unsigned char>(check & 0xFF));
+        out.push_back(static_cast<unsigned char>((check >> 8) & 0xFF));
+        out.insert(out.end(), data + pos, data + pos + chunk);
+        pos += chunk;
+    }
+    uint32_t adler = adler32_calc(data, size);
+    out.push_back(static_cast<unsigned char>((adler >> 24) & 0xFF));
+    out.push_back(static_cast<unsigned char>((adler >> 16) & 0xFF));
+    out.push_back(static_cast<unsigned char>((adler >> 8) & 0xFF));
+    out.push_back(static_cast<unsigned char>(adler & 0xFF));
+    return out;
+}
+
+struct BitWriter {
+    std::vector<unsigned char> bytes;
+    unsigned bit_buf = 0;
+    int bit_cnt = 0;
+
+    void put_bit(int b) {
+        bit_buf |= (b & 1) << bit_cnt++;
+        if (bit_cnt == 8) {
+            bytes.push_back(static_cast<unsigned char>(bit_buf));
+            bit_buf = 0;
+            bit_cnt = 0;
+        }
+    }
+
+    void put_code_msb(unsigned code, int bits) {
+        for (int i = bits - 1; i >= 0; --i) {
+            put_bit((code >> i) & 1);
+        }
+    }
+
+    void flush() {
+        if (bit_cnt > 0) {
+            bytes.push_back(static_cast<unsigned char>(bit_buf));
+            bit_buf = 0;
+            bit_cnt = 0;
+        }
+    }
+};
+
+std::vector<unsigned char> make_fixed_deflate_zlib(unsigned char val, size_t count) {
+    BitWriter bw;
+    bw.bytes.push_back(0x78);
+    bw.bytes.push_back(0x01);
+    bw.put_bit(1);
+    bw.put_bit(1);
+    bw.put_bit(0);
+    bw.put_code_msb(48 + val, 8);
+
+    size_t remaining = count - 1;
+    while (remaining >= 258) {
+        bw.put_code_msb(197, 8); // symbol 285 = length 258
+        bw.put_code_msb(0, 5);   // distance 1
+        remaining -= 258;
+    }
+    while (remaining >= 3) {
+        size_t len = remaining > 10 ? 10 : remaining;
+        unsigned sym = static_cast<unsigned>(257 + (len - 3));
+        bw.put_code_msb(sym - 256, 7);
+        bw.put_code_msb(0, 5);
+        remaining -= len;
+    }
+    while (remaining > 0) {
+        bw.put_code_msb(48 + val, 8);
+        --remaining;
+    }
+    bw.put_code_msb(0, 7); // end of block
+    bw.flush();
+
+    std::vector<unsigned char> plain(count, val);
+    uint32_t a = adler32_calc(plain.data(), count);
+    bw.bytes.push_back(static_cast<unsigned char>((a >> 24) & 0xFF));
+    bw.bytes.push_back(static_cast<unsigned char>((a >> 16) & 0xFF));
+    bw.bytes.push_back(static_cast<unsigned char>((a >> 8) & 0xFF));
+    bw.bytes.push_back(static_cast<unsigned char>(a & 0xFF));
+    return bw.bytes;
+}
+
+struct Object {
+    void** vtable;
+};
+
+using DStorageGetFactoryFn = long(__stdcall*)(const void*, void**);
+using CreateStatusArrayFn = long(__stdcall*)(void*, unsigned, const char*, const void*, void**);
+using CreateQueueFn = long(__stdcall*)(void*, const void*, const void*, void**);
+using EnqueueRequestFn = void(__stdcall*)(void*, const void*);
+using EnqueueStatusFn = void(__stdcall*)(void*, void*, unsigned);
+using EnqueueSignalFn = void(__stdcall*)(void*, void*, u64);
+using SubmitFn = void(__stdcall*)(void*);
+using IsCompleteFn = bool(__stdcall*)(void*, unsigned);
+using GetHResultFn = long(__stdcall*)(void*, unsigned);
+using OpenFileFn = long(__stdcall*)(void*, const wchar_t*, const void*, void**);
+using CloseFileFn = void(__stdcall*)(void*);
+
+struct SubmitGate {
+    void** vtable = nullptr;
+    HANDLE entered = nullptr;
+    HANDLE resume = nullptr;
+    volatile LONG resumed = 0;
+};
+
+long __stdcall hold_worker(void* fence, u64) {
+    auto& gate = *static_cast<SubmitGate*>(fence);
+    SetEvent(gate.entered);
+    if (WaitForSingleObject(gate.resume, 5000) != WAIT_OBJECT_0) return E_FAIL;
+    InterlockedExchange(&gate.resumed, 1);
+    return S_OK;
+}
+
+// Page-destination requests whose page array changes between EnqueueRequest and Submit:
+//   replaced:   a non-zero entry is replaced; the new page receives the data and the old page keeps
+//               its sentinel.
+//   unreadable: the array becomes unreadable; that request fails without writing any page, and a
+//               valid request queued after it on the same queue still completes.
+// Prints one line per case; returns false on the first mismatch.
+bool dstorage_page_array_checks() {
+    _putenv("X2W_XMEM_PERMISSIVE=1");
+    HMODULE xcrdapi = LoadLibraryA("XCRDAPI.dll");
+    if (!xcrdapi) return false;
+    auto get_factory = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(xcrdapi, "DStorageGetFactory"));
+    void* factory_ptr = nullptr;
+    if (!get_factory || get_factory(nullptr, &factory_ptr) != 0 || !factory_ptr) return false;
+    auto* factory = static_cast<Object*>(factory_ptr);
+
+    const size_t page = 64 * 1024;
+    std::vector<unsigned char> plain(2 * page);
+    for (size_t i = 0; i < plain.size(); ++i) plain[i] = static_cast<unsigned char>((i % 251) ^ 0x5a);
+    const auto two_pages = make_stored_zlib(plain.data(), plain.size());
+    const auto one_page = make_stored_zlib(plain.data(), page);
+
+    size_t page_count = 3;
+    u64 pages[3] = {};
+    if (!XMemAllocatePhysicalPages(0x20400000ull, &page_count, pages) || page_count != 3) return false;
+    // Each physical page gets its own view, so every page can be checked after a request.
+    void* view[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        const ULONG_PTR token = pages[i];
+        view[i] = XMemVirtualAlloc(nullptr, page, 0x20402000, 0x21, PAGE_READWRITE);
+        if (!view[i] || XMemMapPhysicalPages(view[i], 1, &token) != view[i]) return false;
+    }
+    auto fill = [&](unsigned char value) {
+        for (void* v : view) std::memset(v, value, page);
+    };
+    auto untouched = [&](int i, unsigned char value) {
+        const auto* bytes = static_cast<const unsigned char*>(view[i]);
+        for (size_t k = 0; k < page; ++k)
+            if (bytes[k] != value) return false;
+        return true;
+    };
+    auto request_for = [](unsigned char* request, const ULONG_PTR* tokens, unsigned size, const std::vector<unsigned char>& data,
+                          unsigned decoded) {
+        std::memset(request, 0, 0x48);
+        *reinterpret_cast<u64*>(request + 0x00) = 1 | (1ull << 21) | 0x400000;  // zlib, page destination, memory source
+        *reinterpret_cast<const ULONG_PTR**>(request + 0x08) = tokens;
+        *reinterpret_cast<unsigned*>(request + 0x18) = size;
+        *reinterpret_cast<const unsigned char**>(request + 0x20) = data.data();
+        *reinterpret_cast<unsigned*>(request + 0x30) = static_cast<unsigned>(data.size());
+        *reinterpret_cast<unsigned*>(request + 0x38) = decoded;
+    };
+    auto make_queue = [&](unsigned statuses, Object** queue, Object** status) {
+        void* status_ptr = nullptr;
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, statuses, "Status", nullptr, &status_ptr) != 0 ||
+            !status_ptr || reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr)
+            return false;
+        *queue = static_cast<Object*>(queue_ptr);
+        *status = static_cast<Object*>(status_ptr);
+        return true;
+    };
+    auto result_of = [](Object* status, unsigned index, long* hr) {
+        for (int i = 0; i < 200 && !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, index); ++i) Sleep(10);
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, index)) return false;
+        *hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, index);
+        return true;
+    };
+
+    // replaced: enqueue with {page 0, page 1}, then replace entry 1 with page 2 before Submit.
+    {
+        Object *queue = nullptr, *status = nullptr;
+        if (!make_queue(1, &queue, &status)) return false;
+        fill(0xAA);
+        ULONG_PTR tokens[2] = {pages[0], pages[1]};
+        unsigned char request[0x48];
+        request_for(request, tokens, static_cast<unsigned>(2 * page), two_pages, static_cast<unsigned>(2 * page));
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, request);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        tokens[1] = pages[2];
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        long hr = -1;
+        const bool done = result_of(status, 0, &hr);
+        const bool first = done && std::memcmp(view[0], plain.data(), page) == 0;
+        const bool moved = done && std::memcmp(view[2], plain.data() + page, page) == 0;
+        const bool old_kept = done && untouched(1, 0xAA);
+        std::printf("replaced: hr=0x%08lx first page %s, new page %s, old page %s\n", static_cast<unsigned long>(hr),
+                    first ? "ok" : "WRONG", moved ? "ok" : "WRONG", old_kept ? "kept" : "WRITTEN");
+        if (!done || hr != 0 || !first || !moved || !old_kept) return false;
+    }
+
+    // unreadable: the first request's array is made no-access before Submit; a valid one follows.
+    {
+        Object *queue = nullptr, *status = nullptr;
+        if (!make_queue(2, &queue, &status)) return false;
+        fill(0xAA);
+        auto* tokens = static_cast<ULONG_PTR*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!tokens) return false;
+        tokens[0] = pages[0];
+        tokens[1] = pages[1];
+        unsigned char bad[0x48];
+        request_for(bad, tokens, static_cast<unsigned>(2 * page), two_pages, static_cast<unsigned>(2 * page));
+        const ULONG_PTR good_tokens[1] = {pages[2]};
+        unsigned char good[0x48];
+        request_for(good, good_tokens, static_cast<unsigned>(page), one_page, static_cast<unsigned>(page));
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, bad);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, good);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        DWORD old_protection = 0;
+        if (!VirtualProtect(tokens, 4096, PAGE_NOACCESS, &old_protection)) return false;
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        long bad_hr = 0, good_hr = -1;
+        const bool done = result_of(status, 0, &bad_hr) && result_of(status, 1, &good_hr);
+        const bool kept = done && untouched(0, 0xAA) && untouched(1, 0xAA);
+        const bool good_written = done && std::memcmp(view[2], plain.data(), page) == 0;
+        std::printf("unreadable: failed request hr=0x%08lx, pages %s; following request hr=0x%08lx, page %s\n",
+                    static_cast<unsigned long>(bad_hr), kept ? "kept" : "WRITTEN", static_cast<unsigned long>(good_hr),
+                    good_written ? "ok" : "WRONG");
+        VirtualFree(tokens, 0, MEM_RELEASE);
+        if (!done || bad_hr == 0 || !kept || good_hr != 0 || !good_written) return false;
+    }
+
+    for (void* v : view) {
+        XMemMapPhysicalPages(v, 1, nullptr);
+        VirtualFree(v, 0, MEM_RELEASE);
+    }
+    XMemFreePhysicalPages(3, pages);
+    return true;
+}
+
+bool dstorage_checks() {
+    _putenv("X2W_XMEM_PERMISSIVE=1");
+
+    HMODULE xcrdapi = LoadLibraryA("XCRDAPI.dll");
+    if (!xcrdapi) return false;
+    auto get_factory = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(xcrdapi, "DStorageGetFactory"));
+    if (!get_factory) return false;
+
+    void* factory_ptr = nullptr;
+    if (get_factory(nullptr, &factory_ptr) != 0 || !factory_ptr) return false;
+    auto* factory = static_cast<Object*>(factory_ptr);
+
+    const size_t plain_size = 128 * 1024;
+    std::vector<unsigned char> plain(plain_size);
+    for (size_t i = 0; i < plain_size; ++i) plain[i] = static_cast<unsigned char>((i % 251) ^ 0x5a);
+    const auto comp = make_stored_zlib(plain.data(), plain_size);
+
+    const char* cases[] = { "multipage", "short", "missing_grant", "linear_short" };
+    for (const char* mode : cases) {
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "Status", nullptr, &status_ptr) != 0 || !status_ptr)
+            return false;
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr)
+            return false;
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        if (std::strcmp(mode, "linear_short") == 0) {
+            std::vector<unsigned char> dest(64 * 1024, 0xAA);
+            unsigned char request[0x48] = {};
+            *reinterpret_cast<u64*>(request + 0x00) = 1 | 0x400000;
+            *reinterpret_cast<void**>(request + 0x08) = dest.data();
+            *reinterpret_cast<u64*>(request + 0x10) = 0;
+            *reinterpret_cast<unsigned*>(request + 0x18) = static_cast<unsigned>(dest.size());
+            *reinterpret_cast<const unsigned char**>(request + 0x20) = comp.data();
+            *reinterpret_cast<u64*>(request + 0x28) = 0;
+            *reinterpret_cast<unsigned*>(request + 0x30) = static_cast<unsigned>(comp.size());
+            *reinterpret_cast<unsigned*>(request + 0x38) = static_cast<unsigned>(plain_size);
+
+            reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, request);
+            reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+            reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+            for (int i = 0; i < 200; ++i) {
+                if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0)) break;
+                Sleep(10);
+            }
+            if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0)) return false;
+            long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+            if (hr == 0) return false;
+            for (unsigned char b : dest) {
+                if (b != 0xAA) return false;
+            }
+        } else {
+            size_t page_count = 2;
+            u64 pages[2] = {};
+            if (!XMemAllocatePhysicalPages(0x20400000ull, &page_count, pages) || page_count != 2) return false;
+
+            ULONG_PTR tokens[2] = { pages[0], pages[1] };
+            unsigned destination_size = 128 * 1024;
+
+            void* va = XMemVirtualAlloc(nullptr, 2 * 65536, 0x20402000, 0x21, PAGE_READWRITE);
+            if (!va) return false;
+            if (XMemMapPhysicalPages(va, 2, tokens) != va) return false;
+            std::memset(va, 0xAA, 128 * 1024);
+
+            if (std::strcmp(mode, "short") == 0) {
+                destination_size = 64 * 1024;
+            } else if (std::strcmp(mode, "missing_grant") == 0) {
+                tokens[1] = 0;
+            }
+
+            unsigned char request[0x48] = {};
+            *reinterpret_cast<u64*>(request + 0x00) = 1 | (1ull << 21) | 0x400000;
+            *reinterpret_cast<ULONG_PTR**>(request + 0x08) = tokens;
+            *reinterpret_cast<u64*>(request + 0x10) = 0;
+            *reinterpret_cast<unsigned*>(request + 0x18) = destination_size;
+            *reinterpret_cast<const unsigned char**>(request + 0x20) = comp.data();
+            *reinterpret_cast<u64*>(request + 0x28) = 0;
+            *reinterpret_cast<unsigned*>(request + 0x30) = static_cast<unsigned>(comp.size());
+            *reinterpret_cast<unsigned*>(request + 0x38) = static_cast<unsigned>(plain_size);
+
+            reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, request);
+            reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+            reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+            for (int i = 0; i < 200; ++i) {
+                if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0)) break;
+                Sleep(10);
+            }
+            if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0)) return false;
+            long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+
+            if (std::strcmp(mode, "multipage") == 0) {
+                if (hr != 0) return false;
+                if (std::memcmp(va, plain.data(), plain_size) != 0) return false;
+            } else {
+                if (hr == 0) return false;
+                const auto* bytes = static_cast<const unsigned char*>(va);
+                for (size_t i = 0; i < 128 * 1024; ++i) {
+                    if (bytes[i] != 0xAA) return false;
+                }
+            }
+
+            XMemMapPhysicalPages(va, 2, nullptr);
+            VirtualFree(va, 0, MEM_RELEASE);
+            XMemFreePhysicalPages(2, pages);
+        }
+    }
+
+    // Test chunked streaming reads across 4 requests on a file source (Refs #1136)
+    {
+        const size_t total_chunks = 4;
+        const size_t chunk_dest_size = 64 * 1024;
+        const size_t total_plain_size = total_chunks * chunk_dest_size; // 256 KiB
+        std::vector<unsigned char> full_plain(total_plain_size);
+        for (size_t i = 0; i < total_plain_size; ++i) full_plain[i] = static_cast<unsigned char>((i % 239) ^ 0xa5);
+        const auto full_comp = make_stored_zlib(full_plain.data(), total_plain_size);
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        // Padded to 600 KiB so offset 500 KiB can read zeroes from file and test zlib continuation bounds
+        std::vector<unsigned char> file_bytes(600 * 1024, 0);
+        std::memcpy(file_bytes.data(), full_comp.data(), full_comp.size());
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, static_cast<unsigned>(total_chunks), "ChunkedStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        // The last four bytes are zero padding. Only the first request writes;
+        // the short read fails, and the existing empty-request path succeeds.
+        const u64 offsets[]{file_bytes.size() - 4, file_bytes.size() - 3, UINT64_MAX};
+        const unsigned counts[]{4, 4, 0};
+        unsigned char destinations[3][6];
+        std::memset(destinations, 0xa5, sizeof(destinations));
+        for (unsigned i = 0; i < 3; ++i) {
+            alignas(8) unsigned char req[0x48]{};
+            *reinterpret_cast<void**>(req + 0x08) = destinations[i] + 1;
+            *reinterpret_cast<unsigned*>(req + 0x18) = 4;
+            *reinterpret_cast<void**>(req + 0x20) = file_obj;
+            *reinterpret_cast<u64*>(req + 0x28) = offsets[i];
+            *reinterpret_cast<unsigned*>(req + 0x30) = counts[i];
+            reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req);
+            reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, i);
+        }
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        for (int i = 0; i < 200 && !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2); ++i) Sleep(10);
+        bool bounds_ok = true;
+        for (unsigned i = 0; i < 3; ++i) {
+            const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
+            bounds_ok &= hr == (i == 1 ? E_FAIL : S_OK);
+            for (unsigned j = 0; j < 6; ++j)
+                bounds_ok &= destinations[i][j] == (i == 0 && j >= 1 && j <= 4 ? 0 : 0xa5);
+        }
+        if (!bounds_ok) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+
+        std::vector<std::vector<unsigned char>> chunks(total_chunks, std::vector<unsigned char>(chunk_dest_size, 0));
+        for (size_t k = 0; k < total_chunks; ++k) {
+            unsigned char req[0x48] = {};
+            *reinterpret_cast<u64*>(req + 0x00) = 1; // zlib file request
+            *reinterpret_cast<void**>(req + 0x08) = chunks[k].data();
+            *reinterpret_cast<u64*>(req + 0x10) = 0;
+            *reinterpret_cast<unsigned*>(req + 0x18) = static_cast<unsigned>(chunk_dest_size);
+            *reinterpret_cast<void**>(req + 0x20) = file_obj;
+            *reinterpret_cast<u64*>(req + 0x28) = k * chunk_dest_size; // offset stepped by destination size
+            *reinterpret_cast<unsigned*>(req + 0x30) = static_cast<unsigned>(full_comp.size());
+            *reinterpret_cast<unsigned*>(req + 0x38) = static_cast<unsigned>(total_plain_size);
+
+            reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req);
+            reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, static_cast<unsigned>(k));
+        }
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, static_cast<unsigned>(total_chunks - 1))) break;
+            Sleep(10);
+        }
+        bool ok = true;
+        for (size_t k = 0; k < total_chunks; ++k) {
+            if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, static_cast<unsigned>(k))) ok = false;
+            long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, static_cast<unsigned>(k));
+            if (hr != 0) ok = false;
+            if (std::memcmp(chunks[k].data(), full_plain.data() + k * chunk_dest_size, chunk_dest_size) != 0) ok = false;
+        }
+        if (!ok) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+
+        // Negative control: chunk request with out-of-bounds or wrapping offset must fail and leave destination untouched
+        void* neg_status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "ChunkNegStatus", nullptr, &neg_status_ptr) != 0 || !neg_status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* neg_status = static_cast<Object*>(neg_status_ptr);
+
+        std::vector<unsigned char> dest1(64 * 1024, 0xEE); // sentinel
+        std::vector<unsigned char> dest2(64 * 1024, 0xDD); // sentinel for wrap test
+
+        // Piece 1 with invalid offset (500 KiB > 256 KiB)
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1 + 0x08) = dest1.data();
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1 + 0x28) = 500 * 1024;
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        // Piece 2 with near-wrapping offset (UINT64_MAX - 0xFFFF)
+        unsigned char req2[0x48] = {};
+        *reinterpret_cast<u64*>(req2 + 0x00) = 1;
+        *reinterpret_cast<void**>(req2 + 0x08) = dest2.data();
+        *reinterpret_cast<unsigned*>(req2 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req2 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req2 + 0x28) = 0xFFFFFFFFFFFF0000ull;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req2 + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, neg_status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, neg_status, 1);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 1)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 1)) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        long hr1 = reinterpret_cast<GetHResultFn>(neg_status->vtable[4])(neg_status, 0);
+        long hr2 = reinterpret_cast<GetHResultFn>(neg_status->vtable[4])(neg_status, 1);
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        if (hr1 == 0 || hr2 == 0) return false;
+        for (unsigned char b : dest1) {
+            if (b != 0xEE) return false;
+        }
+        for (unsigned char b : dest2) {
+            if (b != 0xDD) return false;
+        }
+    }
+
+    // Control: standalone valid stream sharing cache-key fields decodes its own bytes (Refs #1214)
+    {
+        const size_t stream1_plain_size = 64 * 1024;
+        const size_t stream2_plain_size = 64 * 1024;
+        std::vector<unsigned char> plain1(stream1_plain_size, 0x33);
+        std::vector<unsigned char> plain2(stream2_plain_size, 0x77);
+        const auto comp1 = make_stored_zlib(plain1.data(), stream1_plain_size);
+        const auto comp2 = make_stored_zlib(plain2.data(), stream2_plain_size);
+        const unsigned shared_compressed_size = static_cast<unsigned>(comp1.size());
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        const size_t offset2 = 128 * 1024;
+        std::vector<unsigned char> file_bytes(offset2 + comp2.size(), 0);
+        std::memcpy(file_bytes.data(), comp1.data(), comp1.size());
+        std::memcpy(file_bytes.data() + offset2, comp2.data(), comp2.size());
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "SharedStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest1_0(32 * 1024, 0);
+        std::vector<unsigned char> dest1_1(32 * 1024, 0);
+        std::vector<unsigned char> dest2(64 * 1024, 0);
+
+        // Stream 1 piece 0: offset 0, compressed size S, destination 32 KiB
+        unsigned char req1_0[0x48] = {};
+        *reinterpret_cast<u64*>(req1_0 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_0 + 0x08) = dest1_0.data();
+        *reinterpret_cast<unsigned*>(req1_0 + 0x18) = 32 * 1024;
+        *reinterpret_cast<void**>(req1_0 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1_0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req1_0 + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req1_0 + 0x38) = static_cast<unsigned>(stream1_plain_size);
+
+        // Stream 1 piece 1: offset 32 KiB, compressed size S, destination 32 KiB
+        unsigned char req1_1[0x48] = {};
+        *reinterpret_cast<u64*>(req1_1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_1 + 0x08) = dest1_1.data();
+        *reinterpret_cast<unsigned*>(req1_1 + 0x18) = 32 * 1024;
+        *reinterpret_cast<void**>(req1_1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1_1 + 0x28) = 32 * 1024;
+        *reinterpret_cast<unsigned*>(req1_1 + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req1_1 + 0x38) = static_cast<unsigned>(stream1_plain_size);
+
+        // Stream 2: offset 128 KiB, exact same compressed size S, destination 64 KiB
+        unsigned char req2[0x48] = {};
+        *reinterpret_cast<u64*>(req2 + 0x00) = 1;
+        *reinterpret_cast<void**>(req2 + 0x08) = dest2.data();
+        *reinterpret_cast<unsigned*>(req2 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req2 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req2 + 0x28) = offset2;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req2 + 0x38) = static_cast<unsigned>(stream2_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+        long hr2 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        if (hr0 != 0 || hr1 != 0 || hr2 != 0) return false;
+        for (unsigned char b : dest1_0) {
+            if (b != 0x33) return false;
+        }
+        for (unsigned char b : dest1_1) {
+            if (b != 0x33) return false;
+        }
+        for (unsigned char b : dest2) {
+            if (b != 0x77) return false;
+        }
+    }
+
+    // Control: standalone stream with damaged checksum at matching offset fails and leaves destination unchanged (Refs #1214)
+    {
+        const size_t stream_plain_size = 128 * 1024;
+        const auto comp1 = make_fixed_deflate_zlib(0x33, stream_plain_size);
+        auto comp_bad = make_fixed_deflate_zlib(0x77, stream_plain_size);
+        // Corrupt the Adler-32 checksum in comp_bad:
+        comp_bad.back() ^= 0xFF;
+        const unsigned shared_compressed_size = static_cast<unsigned>(comp1.size());
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        const size_t offset_bad = 64 * 1024; // Matching continuation offset (0 + 64 KiB)
+        std::vector<unsigned char> file_bytes(offset_bad + comp_bad.size(), 0);
+        std::memcpy(file_bytes.data(), comp1.data(), comp1.size());
+        std::memcpy(file_bytes.data() + offset_bad, comp_bad.data(), comp_bad.size());
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "DamagedStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest1(64 * 1024, 0);
+        std::vector<unsigned char> dest_bad(64 * 1024, 0xBB); // Sentinel
+
+        // Stream 1 piece 0: offset 0, compressed size S, destination 64 KiB (inflates 128 KiB of 0x33, caches stream)
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1 + 0x08) = dest1.data();
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        // Standalone stream at matching continuation offset 64 KiB with damaged checksum
+        unsigned char req_bad[0x48] = {};
+        *reinterpret_cast<u64*>(req_bad + 0x00) = 1;
+        *reinterpret_cast<void**>(req_bad + 0x08) = dest_bad.data();
+        *reinterpret_cast<unsigned*>(req_bad + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_bad + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_bad + 0x28) = offset_bad;
+        *reinterpret_cast<unsigned*>(req_bad + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req_bad + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_bad);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr_bad = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        // Stream 1 piece 0 must succeed; the damaged standalone stream must fail with non-zero HRESULT
+        if (hr0 != 0 || hr_bad == 0) return false;
+        for (unsigned char b : dest1) {
+            if (b != 0x33) return false;
+        }
+        // Destination buffer of the damaged stream must remain completely unchanged (sentinel 0xBB)
+        for (unsigned char b : dest_bad) {
+            if (b != 0xBB) return false;
+        }
+    }
+
+    // Test short final destination in a multi-piece stream vs invalid oversized decode targeting physical pages (Refs #1144)
+    {
+        // Multi-piece stream: total plain size = 100 KiB (piece 0 = 64 KiB, piece 1 = 36 KiB short final piece)
+        const size_t total_plain_size = 100 * 1024;
+        std::vector<unsigned char> full_plain(total_plain_size);
+        for (size_t i = 0; i < total_plain_size; ++i) full_plain[i] = static_cast<unsigned char>((i % 251) ^ 0x3c);
+        const auto full_comp = make_stored_zlib(full_plain.data(), total_plain_size);
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        std::vector<unsigned char> file_bytes(256 * 1024, 0);
+        std::memcpy(file_bytes.data(), full_comp.data(), full_comp.size());
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        // Allocate 2 physical pages for the valid multi-piece stream: page 0 (piece 0) and page 1 (piece 1)
+        size_t page_count = 2;
+        u64 pages[2] = {};
+        if (!XMemAllocatePhysicalPages(0x20400000ull, &page_count, pages) || page_count != 2) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+
+        ULONG_PTR tokens_all[2] = { pages[0], pages[1] };
+        void* va = XMemVirtualAlloc(nullptr, 2 * 65536, 0x20402000, 0x21, PAGE_READWRITE);
+        if (!va || XMemMapPhysicalPages(va, 2, tokens_all) != va) {
+            XMemFreePhysicalPages(2, pages);
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        // Prefill both physical pages with guard byte 0xAA
+        std::memset(va, 0xAA, 2 * 65536);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "ShortFinalStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            XMemMapPhysicalPages(va, 2, nullptr);
+            VirtualFree(va, 0, MEM_RELEASE);
+            XMemFreePhysicalPages(2, pages);
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            XMemMapPhysicalPages(va, 2, nullptr);
+            VirtualFree(va, 0, MEM_RELEASE);
+            XMemFreePhysicalPages(2, pages);
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        // Piece 0: full 64 KiB physical page destination
+        ULONG_PTR tokens0[1] = { pages[0] };
+        unsigned char req0[0x48] = {};
+        *reinterpret_cast<u64*>(req0 + 0x00) = 1 | (1ull << 21); // zlib | page_destination
+        *reinterpret_cast<ULONG_PTR**>(req0 + 0x08) = tokens0;
+        *reinterpret_cast<u64*>(req0 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req0 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req0 + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        // Piece 1: short final destination below 64 KiB (36 KiB) with 1 page grant; neighboring token left null
+        ULONG_PTR tokens1[2] = { pages[1], 0 };
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = 1 | (1ull << 21); // zlib | page_destination
+        *reinterpret_cast<ULONG_PTR**>(req1 + 0x08) = tokens1;
+        *reinterpret_cast<u64*>(req1 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 36 * 1024; // Short destination capacity (< 64 KiB)
+        *reinterpret_cast<void**>(req1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1 + 0x28) = 64 * 1024; // Stepped by previous chunk size
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) break;
+            Sleep(10);
+        }
+        bool valid_complete = reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) &&
+                              reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1);
+        long hr0 = valid_complete ? reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0) : -1;
+        long hr1 = valid_complete ? reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1) : -1;
+
+        bool valid_ok = valid_complete && hr0 == 0 && hr1 == 0;
+        const auto* page0_bytes = static_cast<const unsigned char*>(va);
+        const auto* page1_bytes = static_cast<const unsigned char*>(va) + 65536;
+
+        // Check piece 0 exact match
+        if (valid_ok && std::memcmp(page0_bytes, full_plain.data(), 64 * 1024) != 0) valid_ok = false;
+        // Check piece 1 exact 36 KiB match
+        if (valid_ok && std::memcmp(page1_bytes, full_plain.data() + 64 * 1024, 36 * 1024) != 0) valid_ok = false;
+        // Check guard bytes in page 1 beyond 36 KiB remain intact (0xAA)
+        if (valid_ok) {
+            for (size_t i = 36 * 1024; i < 65536; ++i) {
+                if (page1_bytes[i] != 0xAA) {
+                    valid_ok = false;
+                    break;
+                }
+            }
+        }
+        // Neighboring token in tokens1 must have remained untouched (0)
+        if (valid_ok && tokens1[1] != 0) valid_ok = false;
+
+        // Negative control: invalid oversized decode targeting short physical page destination
+        // (100 KiB standalone stream into 36 KiB destination with only 1 page grant)
+        void* neg_status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "OversizedNegStatus", nullptr, &neg_status_ptr) != 0 || !neg_status_ptr) {
+            valid_ok = false;
+        }
+        auto* neg_status = static_cast<Object*>(neg_status_ptr);
+
+        // Reset page 1 to guard byte 0x55
+        std::memset(static_cast<unsigned char*>(va) + 65536, 0x55, 65536);
+        ULONG_PTR tokens_neg[2] = { pages[1], 0 }; // Neighboring grant is 0
+
+        unsigned char req_oversized[0x48] = {};
+        *reinterpret_cast<u64*>(req_oversized + 0x00) = 1 | (1ull << 21) | 0x400000; // zlib | page_destination | memory_source
+        *reinterpret_cast<ULONG_PTR**>(req_oversized + 0x08) = tokens_neg;
+        *reinterpret_cast<u64*>(req_oversized + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req_oversized + 0x18) = 36 * 1024; // Capacity 36 KiB < 100 KiB decode
+        *reinterpret_cast<const unsigned char**>(req_oversized + 0x20) = full_comp.data();
+        *reinterpret_cast<u64*>(req_oversized + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req_oversized + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req_oversized + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_oversized);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, neg_status, 0);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 0)) break;
+            Sleep(10);
+        }
+        bool neg_complete = reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 0);
+        long hr_neg = neg_complete ? reinterpret_cast<GetHResultFn>(neg_status->vtable[4])(neg_status, 0) : 0;
+
+        // Oversized decode must fail with non-zero HRESULT
+        bool neg_ok = neg_complete && hr_neg != 0;
+        // All 64 KiB of destination page must remain completely untouched (guard byte 0x55)
+        for (size_t i = 0; i < 65536; ++i) {
+            if (page1_bytes[i] != 0x55) {
+                neg_ok = false;
+                break;
+            }
+        }
+        // Neighboring token must remain untouched (0)
+        if (tokens_neg[1] != 0) neg_ok = false;
+
+        XMemMapPhysicalPages(va, 2, nullptr);
+        VirtualFree(va, 0, MEM_RELEASE);
+        XMemFreePhysicalPages(2, pages);
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        if (!valid_ok || !neg_ok) return false;
+    }
+
+    // Control: valid chunked submission followed by a separate Submit with same-size non-zlib read at matching offset fails cleanly (Refs #1214)
+    {
+        const size_t stream_plain_size = 128 * 1024;
+        const auto comp = make_fixed_deflate_zlib(0x44, stream_plain_size);
+        const unsigned comp_size = static_cast<unsigned>(comp.size());
+        const size_t offset_cont = 64 * 1024; // Matching continuation offset (0 + 64 KiB)
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        // File layout:
+        // Offset 0: valid compressed stream (size comp_size)
+        // Offset 64 KiB: non-zlib bytes (0xEE), size comp_size
+        std::vector<unsigned char> file_bytes(offset_cont + comp_size, 0xEE);
+        std::memcpy(file_bytes.data(), comp.data(), comp_size);
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr1 = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "ChunkedStatus1", nullptr, &status_ptr1) != 0 || !status_ptr1) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status1 = static_cast<Object*>(status_ptr1);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest0(64 * 1024, 0);
+        std::vector<unsigned char> dest1(64 * 1024, 0);
+
+        // Piece 0: offset 0, compressed size S, destination 64 KiB
+        unsigned char req0[0x48] = {};
+        *reinterpret_cast<u64*>(req0 + 0x00) = 1;
+        *reinterpret_cast<void**>(req0 + 0x08) = dest0.data();
+        *reinterpret_cast<unsigned*>(req0 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req0 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x30) = comp_size;
+        *reinterpret_cast<unsigned*>(req0 + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        // Piece 1: offset 64 KiB, compressed size S, destination 64 KiB
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1 + 0x08) = dest1.data();
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1 + 0x28) = offset_cont;
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = comp_size;
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        // First Submit: valid 2-slice chunked submission
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status1, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status1, 1);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 1)) break;
+            Sleep(10);
+        }
+        bool comp1_ok = reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 0) &&
+                        reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 1);
+        long hr0 = comp1_ok ? reinterpret_cast<GetHResultFn>(status1->vtable[4])(status1, 0) : -1;
+        long hr1 = comp1_ok ? reinterpret_cast<GetHResultFn>(status1->vtable[4])(status1, 1) : -1;
+
+        if (hr0 != 0 || hr1 != 0) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        for (unsigned char b : dest0) if (b != 0x44) return false;
+        for (unsigned char b : dest1) if (b != 0x44) return false;
+
+        // Separate Submit: same queue and same live file, same-size non-zlib read at matching offset 64 KiB
+        void* status_ptr2 = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "SeparateStatus", nullptr, &status_ptr2) != 0 || !status_ptr2) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status2 = static_cast<Object*>(status_ptr2);
+
+        std::vector<unsigned char> dest_unrelated(64 * 1024, 0x99); // Sentinel
+
+        unsigned char req_unrelated[0x48] = {};
+        *reinterpret_cast<u64*>(req_unrelated + 0x00) = 1; // zlib decompression requested
+        *reinterpret_cast<void**>(req_unrelated + 0x08) = dest_unrelated.data();
+        *reinterpret_cast<unsigned*>(req_unrelated + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_unrelated + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_unrelated + 0x28) = offset_cont; // Matching continuation offset
+        *reinterpret_cast<unsigned*>(req_unrelated + 0x30) = comp_size; // Same size
+        *reinterpret_cast<unsigned*>(req_unrelated + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_unrelated);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status2, 0);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status2->vtable[3])(status2, 0)) break;
+            Sleep(10);
+        }
+        bool comp2_ok = reinterpret_cast<IsCompleteFn>(status2->vtable[3])(status2, 0);
+        long hr_unrelated = comp2_ok ? reinterpret_cast<GetHResultFn>(status2->vtable[4])(status2, 0) : 0;
+
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        // The separate read must fail with non-zero HRESULT and leave its sentinel untouched
+        if (!comp2_ok || hr_unrelated == 0) return false;
+        for (unsigned char b : dest_unrelated) {
+            if (b != 0x99) return false;
+        }
+    }
+
+    // Control: deterministic boundary test across two Submit() calls (Refs #1214, #1235)
+    // First Submit(): compressed stream into undersized destination buffer (no continuation in this batch).
+    // Second Submit(): matching non-zlib request at the continuation offset, queued while the first batch is gated.
+    // Both requests must fail cleanly, and both destination sentinel buffers must remain untouched.
+    {
+        const size_t stream_plain_size = 128 * 1024;
+        const auto comp = make_fixed_deflate_zlib(0x5A, stream_plain_size);
+        const unsigned comp_size = static_cast<unsigned>(comp.size());
+        const size_t offset_cont = 64 * 1024; // Matching continuation offset (0 + 64 KiB)
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        // File layout:
+        // Offset 0: valid compressed stream (size comp_size)
+        // Offset 64 KiB: non-zlib bytes (0xEE), size comp_size
+        std::vector<unsigned char> file_bytes(offset_cont + comp_size, 0xEE);
+        std::memcpy(file_bytes.data(), comp.data(), comp_size);
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr1 = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "UndersizedStatus", nullptr, &status_ptr1) != 0 || !status_ptr1) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status1 = static_cast<Object*>(status_ptr1);
+
+        void* status_ptr2 = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "MatchingStatus", nullptr, &status_ptr2) != 0 || !status_ptr2) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status2 = static_cast<Object*>(status_ptr2);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest_undersized(64 * 1024, 0xA5); // Sentinel 0xA5
+        std::vector<unsigned char> dest_matching(64 * 1024, 0xB6);   // Sentinel 0xB6
+
+        // First Submit: compressed stream into undersized destination buffer (64 KiB < 128 KiB uncompressed)
+        // with NO continuation requests queued in this batch.
+        unsigned char req_undersized[0x48] = {};
+        *reinterpret_cast<u64*>(req_undersized + 0x00) = 1;
+        *reinterpret_cast<void**>(req_undersized + 0x08) = dest_undersized.data();
+        *reinterpret_cast<unsigned*>(req_undersized + 0x18) = 64 * 1024; // Undersized capacity
+        *reinterpret_cast<void**>(req_undersized + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_undersized + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req_undersized + 0x30) = comp_size;
+        *reinterpret_cast<unsigned*>(req_undersized + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        // The signal callback holds the worker at the head of the first batch. It uses static
+        // storage so even a failed test can exit without abandoning a pointer to the stack.
+        static SubmitGate gate;
+        static void* fence_vtable[11] = {};
+        fence_vtable[10] = reinterpret_cast<void*>(&hold_worker);
+        gate.vtable = fence_vtable;
+        gate.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        gate.resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!gate.entered || !gate.resume) return false;
+        reinterpret_cast<EnqueueSignalFn>(queue->vtable[5])(queue, &gate, 1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_undersized);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status1, 0);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        if (WaitForSingleObject(gate.entered, 3000) != WAIT_OBJECT_0) {
+            SetEvent(gate.resume);
+            return false;
+        }
+
+        // Immediately in second Submit: matching non-zlib request at continuation offset
+        unsigned char req_matching[0x48] = {};
+        *reinterpret_cast<u64*>(req_matching + 0x00) = 1; // zlib decompression requested
+        *reinterpret_cast<void**>(req_matching + 0x08) = dest_matching.data();
+        *reinterpret_cast<unsigned*>(req_matching + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_matching + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_matching + 0x28) = offset_cont; // Matching continuation offset
+        *reinterpret_cast<unsigned*>(req_matching + 0x30) = comp_size;
+        *reinterpret_cast<unsigned*>(req_matching + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_matching);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status2, 0);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        SetEvent(gate.resume);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 0) &&
+                reinterpret_cast<IsCompleteFn>(status2->vtable[3])(status2, 0)) break;
+            Sleep(10);
+        }
+        bool complete1 = reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 0);
+        bool complete2 = reinterpret_cast<IsCompleteFn>(status2->vtable[3])(status2, 0);
+        long hr1 = complete1 ? reinterpret_cast<GetHResultFn>(status1->vtable[4])(status1, 0) : 0;
+        long hr2 = complete2 ? reinterpret_cast<GetHResultFn>(status2->vtable[4])(status2, 0) : 0;
+        if (complete1 && complete2) {
+            CloseHandle(gate.resume);
+            CloseHandle(gate.entered);
+        }
+
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        // Both requests must fail cleanly
+        if (!complete1 || hr1 == 0 || !InterlockedCompareExchange(&gate.resumed, 0, 0)) return false;
+        if (!complete2 || hr2 == 0) return false;
+
+        // Both sentinels must remain completely untouched
+        for (unsigned char b : dest_undersized) {
+            if (b != 0xA5) return false;
+        }
+        for (unsigned char b : dest_matching) {
+            if (b != 0xB6) return false;
+        }
+    }
+
+    // Test: BCPack DirectStorage requests decode into destination memory and malformed streams fail (Refs #1139)
+    {
+        // 2-block BC7 Mode 6 stream from tests/bc7_mode6_multiblock_check.py (104 bytes)
+        const unsigned char bc7_mode6_packed[] = {
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x05, 0x05, 0x05, 0x05,
+            0x05, 0x05, 0x06, 0x06, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x20, 0x02, 0x02, 0x75, 0x46,
+            0x28, 0x18, 0x00, 0x00, 0x03, 0x03, 0xdf, 0x5f, 0x4b, 0x7c, 0x05, 0x21,
+            0x03, 0x03, 0x50, 0x78, 0x23, 0x37, 0x04, 0x31, 0x10, 0x10, 0x10, 0x10,
+            0x10, 0x10, 0x10, 0x10, 0x06, 0x05, 0x06, 0x05, 0x05, 0x05, 0x05, 0x05,
+            0x10, 0x10, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10, 0x20, 0x08, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x08, 0xe4, 0xdb, 0x27, 0xa4,
+            0x21, 0x09, 0x02, 0x94, 0xfe, 0x6b, 0x02, 0x04, 0x31, 0x33, 0x04, 0x04,
+            0xc4, 0xfb, 0x37, 0x25, 0x02, 0x02, 0xbd, 0x19, 0x50, 0x0f, 0x03, 0x41,
+            0x41, 0x05, 0x09, 0x34, 0xf4, 0xcb, 0x07, 0x05, 0x02, 0x41, 0x41, 0x11
+        };
+        const unsigned char bc7_mode6_expected[32] = {
+            0x40, 0x31, 0x72, 0x04, 0xa5, 0x68, 0x19, 0xbe,
+            0x02, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x40, 0x0a, 0x94, 0x37, 0x77, 0xa3, 0xc8, 0x78,
+            0x11, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe
+        };
+
+        // 1-block BC7 Mode 1 stream (172 bytes) exercising 2 subsets, shared p-bit,
+        // dictionary lookup and non-zero endpoint residual delta
+        const unsigned char bc7_mode1_packed[172] = {
+            0x15, 0x13, 0x1a, 0x18, 0x18, 0x1e, 0x10, 0x12, 0x04, 0x03, 0x03, 0x03, 0x04, 0x03, 0x03, 0x03,
+            0x02, 0x09, 0x20, 0x40, 0x10, 0x06, 0x01, 0x73, 0x70, 0x97, 0x1c, 0x30, 0x18, 0xe7, 0x00, 0xc9,
+            0xfe, 0x4f, 0xa1, 0x88, 0x90, 0x6a, 0xeb, 0x89, 0x66, 0xd3, 0x19, 0x74, 0xb2, 0x82, 0x00, 0xc4,
+            0x18, 0x71, 0x19, 0x11, 0x1a, 0x18, 0x13, 0x14, 0x13, 0x1a, 0x18, 0x10, 0x12, 0x03, 0x03, 0x03,
+            0x03, 0x03, 0x03, 0x03, 0x03, 0x0a, 0x27, 0x13, 0x06, 0x14, 0x40, 0x01, 0x57, 0xbd, 0x2c, 0xd5,
+            0xb4, 0x2e, 0x30, 0x00, 0x9d, 0x30, 0xac, 0xc3, 0x21, 0x6b, 0x94, 0xf8, 0x45, 0x56, 0x7f, 0x38,
+            0x11, 0xa8, 0x6b, 0x00, 0x34, 0x03, 0x05, 0x03, 0x19, 0x11, 0x1a, 0x1c, 0x01, 0x8a, 0x18, 0x15,
+            0x03, 0x03, 0x03, 0x7e, 0xe7, 0x8d, 0x03, 0x03, 0x11, 0x27, 0x08, 0x17, 0xee, 0x64, 0x28, 0x99,
+            0x77, 0x2c, 0x07, 0x6c, 0xc5, 0xf1, 0x81, 0xd7, 0x71, 0xcd, 0x99, 0xba, 0x65, 0xfe, 0x78, 0x2c,
+            0x20, 0x18, 0x70, 0x14, 0xa8, 0x90, 0x03, 0x03, 0x40, 0x03, 0x18, 0x15, 0x30, 0x03, 0x03, 0x03,
+            0x90, 0xfd, 0x40, 0x08, 0x6e, 0x59, 0x30, 0xf5, 0x94, 0x38, 0x6b, 0xf4
+        };
+        const unsigned char bc7_mode1_expected[16] = {
+            0xc2, 0x5b, 0x48, 0x7a, 0xea, 0x84, 0xa4, 0x4b, 0xfd, 0xf7, 0x15, 0x87, 0x90, 0xc4, 0x49, 0xac
+        };
+
+        // 64-block BC1 stream from tools/_bcpack_rans/vectors/synthetic_11.json (515 bytes)
+        const unsigned char bc1_packed[515] = {
+            0x15, 0x14, 0x1b, 0x1b, 0xdf, 0x10, 0x13, 0x14, 0x3d, 0x3e, 0x09, 0x11, 0x03, 0x28, 0x14, 0x03,
+            0x01, 0x01, 0xf5, 0x1c, 0x01, 0x10, 0x05, 0x11, 0x71, 0x17, 0xb7, 0xaf, 0x00, 0x0f, 0xfd, 0x54,
+            0x6c, 0xd2, 0xea, 0xa4, 0x74, 0x68, 0xdc, 0x76, 0x6c, 0x10, 0x2b, 0xed, 0x1d, 0x65, 0x01, 0xf4,
+            0x1b, 0x18, 0x91, 0xe3, 0xc1, 0x74, 0x1b, 0x18, 0x1c, 0x27, 0x03, 0x1c, 0xd5, 0x05, 0x49, 0x28,
+            0x21, 0x23, 0xf3, 0xa6, 0x81, 0x06, 0x1d, 0x6b, 0xab, 0x65, 0xdb, 0x8a, 0x93, 0xdc, 0xa8, 0x3d,
+            0xa8, 0x04, 0x66, 0xf5, 0x1a, 0x54, 0x3d, 0xdf, 0x1a, 0x93, 0x4a, 0x77, 0x1b, 0x36, 0x3c, 0x93,
+            0x60, 0x22, 0x31, 0x2a, 0xc4, 0xa3, 0x25, 0x9f, 0x97, 0xe1, 0xfc, 0xa1, 0x79, 0x66, 0xd0, 0xbb,
+            0xa1, 0x18, 0x28, 0xc4, 0xc7, 0x27, 0xae, 0x63, 0xd6, 0xdc, 0x02, 0xed, 0xbb, 0x72, 0x0a, 0x0a,
+            0x2f, 0xae, 0xf4, 0x2a, 0xe4, 0xec, 0x11, 0xa7, 0x91, 0xd6, 0xc2, 0x3d, 0x1f, 0x5f, 0xe9, 0xe9,
+            0xf5, 0x71, 0x34, 0xc7, 0x52, 0x1a, 0xcb, 0x80, 0xd4, 0x0a, 0x22, 0xfd, 0x09, 0x5b, 0xf9, 0x64,
+            0xef, 0x54, 0x3a, 0xaa, 0x20, 0x93, 0x06, 0x39, 0x84, 0x15, 0x01, 0xff, 0x6d, 0xc7, 0x4c, 0xba,
+            0x23, 0x5d, 0x2b, 0x5d, 0x25, 0x5e, 0x3d, 0xb2, 0x45, 0x19, 0x15, 0x49, 0x8b, 0xe6, 0x5e, 0xb9,
+            0x08, 0x2a, 0x45, 0x0c, 0x74, 0xda, 0x1a, 0xf0, 0xd7, 0x16, 0x01, 0xbc, 0xce, 0x47, 0xf0, 0x79,
+            0xf3, 0x1a, 0x58, 0xe9, 0x6a, 0xdf, 0x03, 0x77, 0x27, 0x11, 0x73, 0x85, 0x0d, 0xe4, 0x83, 0x01,
+            0x00, 0x63, 0x6b, 0xbf, 0x67, 0x43, 0x85, 0xcd, 0x75, 0x22, 0x3f, 0x3b, 0x0c, 0x4d, 0x0b, 0xea,
+            0xdc, 0xf7, 0x09, 0x03, 0x01, 0x0c, 0xf5, 0x0b, 0xa3, 0x16, 0x88, 0x3d, 0x93, 0x20, 0x25, 0x16,
+            0xb7, 0xd8, 0x2c, 0x59, 0xe8, 0x9f, 0x04, 0x87, 0x2e, 0x7e, 0x04, 0xc1, 0x6b, 0x42, 0xfc, 0x15,
+            0x97, 0xb5, 0x15, 0x13, 0x2b, 0x18, 0x60, 0x01, 0x72, 0x07, 0xc4, 0x56, 0xe0, 0x12, 0xa7, 0xf4,
+            0xc7, 0x9c, 0x8e, 0x7b, 0xfb, 0xfb, 0xa0, 0x11, 0x96, 0x07, 0x7c, 0x34, 0x7d, 0x05, 0xdb, 0x97,
+            0x0b, 0x32, 0x99, 0xdf, 0xf6, 0x2c, 0xde, 0xf0, 0x5d, 0x21, 0x49, 0x64, 0x3d, 0x6a, 0x7e, 0x20,
+            0x6b, 0xf9, 0xb1, 0x79, 0x22, 0x20, 0xb6, 0x94, 0x64, 0x4f, 0xa3, 0xd2, 0x0d, 0x84, 0x1e, 0x44,
+            0x70, 0x09, 0x51, 0x8b, 0x3e, 0x67, 0x36, 0x07, 0x7a, 0x9a, 0xbb, 0x35, 0x79, 0x94, 0x03, 0x0f,
+            0x24, 0x8f, 0x77, 0x11, 0xaf, 0xcd, 0x1d, 0x05, 0x34, 0xdf, 0x39, 0x85, 0x57, 0x89, 0x86, 0xc5,
+            0xa2, 0x7a, 0xd4, 0x13, 0x9a, 0xed, 0x76, 0x52, 0x6f, 0x2c, 0x25, 0x3d, 0xe0, 0x23, 0x1d, 0xf3,
+            0xa2, 0xee, 0x66, 0xb8, 0x4e, 0x33, 0x3a, 0xf3, 0xca, 0xa4, 0x42, 0x2c, 0x88, 0x2b, 0xb4, 0x3f,
+            0xd1, 0x91, 0x6a, 0xf1, 0x27, 0x50, 0x04, 0x5d, 0x96, 0xb6, 0xc4, 0x1f, 0xeb, 0x95, 0xca, 0xf6,
+            0x03, 0x01, 0x04, 0x48, 0x11, 0x9f, 0x6d, 0x23, 0xf6, 0x1e, 0x50, 0x81, 0x7e, 0xfb, 0x91, 0x18,
+            0x0e, 0xb7, 0xa8, 0x4e, 0x56, 0x09, 0xf6, 0xe8, 0x35, 0xe1, 0xf3, 0x52, 0x17, 0x0a, 0x01, 0xae,
+            0x4b, 0x3d, 0xef, 0xff, 0x85, 0xa5, 0x59, 0xda, 0x2e, 0x66, 0x06, 0x6f, 0xf6, 0x30, 0x36, 0x2d,
+            0x99, 0xb0, 0x5f, 0x86, 0x25, 0xd5, 0xb3, 0x46, 0x27, 0x62, 0xf2, 0xd0, 0xd2, 0x87, 0xf7, 0x96,
+            0x00, 0x9c, 0x35, 0xd2, 0x2b, 0x88, 0x14, 0x85, 0x6b, 0x20, 0x88, 0x87, 0x60, 0xf0, 0xc1, 0x0c,
+            0x77, 0x72, 0xd3, 0xd3, 0x20, 0x03, 0xe5, 0x3d, 0x97, 0x20, 0x46, 0x31, 0x94, 0xe0, 0xa4, 0xc0,
+            0x80, 0xf6, 0x4c
+        };
+
+        // Negative control: valid BC1 stream with non-zero trailing byte
+        unsigned char bc1_packed_trailing[516];
+        std::memcpy(bc1_packed_trailing, bc1_packed, sizeof(bc1_packed));
+        bc1_packed_trailing[515] = 0x01;
+
+        const unsigned char bc1_expected[512] = {
+            0x85, 0x31, 0x64, 0xd5, 0xaf, 0xbe, 0xff, 0xbf, 0x50, 0x84, 0xc7, 0x6b, 0xba, 0xa5, 0xbf, 0xbf,
+            0x50, 0x84, 0x27, 0xc9, 0x56, 0x06, 0x5e, 0x5f, 0x25, 0x6a, 0x43, 0xaa, 0x5e, 0xee, 0xf5, 0xf5,
+            0xe8, 0x72, 0xa0, 0x91, 0x5e, 0x5e, 0xfb, 0xfb, 0x2a, 0x3b, 0x83, 0xf1, 0x9a, 0xa5, 0x7a, 0xfa,
+            0x81, 0x08, 0xcc, 0xa2, 0x9a, 0x9d, 0xbb, 0xff, 0x28, 0x73, 0x20, 0xbe, 0x8a, 0x8f, 0x05, 0x05,
+            0x41, 0x00, 0x8c, 0xda, 0xfa, 0x5f, 0xfa, 0xdb, 0xfe, 0x8a, 0x7a, 0x5a, 0x72, 0x3a, 0xfa, 0xba,
+            0x41, 0xf8, 0x8c, 0x32, 0x0f, 0xff, 0xfa, 0xba, 0xec, 0x5a, 0xa6, 0xa9, 0x6b, 0x5f, 0xaf, 0xaf,
+            0x50, 0x84, 0x26, 0x89, 0x5a, 0x5f, 0x5f, 0x5f, 0x44, 0x21, 0x23, 0xb1, 0xaf, 0x5d, 0xaf, 0xab,
+            0x0d, 0x6b, 0x24, 0x52, 0xaf, 0xf7, 0xbf, 0xfd, 0x0c, 0x5b, 0x26, 0x7c, 0xbe, 0x9e, 0x05, 0x05,
+            0x3e, 0x83, 0x7a, 0x39, 0xd5, 0x95, 0xaa, 0x5a, 0x61, 0x10, 0x6e, 0x68, 0x5b, 0x0f, 0xff, 0xbd,
+            0x8a, 0x9b, 0x65, 0x51, 0x2f, 0xaa, 0xaa, 0x5a, 0xb8, 0xc6, 0xd3, 0x4a, 0x4f, 0x45, 0xf0, 0xb0,
+            0x1e, 0xb6, 0x1e, 0x6d, 0x5b, 0x5f, 0xba, 0xba, 0x50, 0x84, 0x27, 0xe4, 0xfa, 0x5a, 0xaa, 0xaf,
+            0x65, 0x52, 0x45, 0xd2, 0x5e, 0x0f, 0xaf, 0xef, 0xaf, 0x73, 0x06, 0x55, 0xae, 0x8f, 0xae, 0x5f,
+            0x89, 0x52, 0xa1, 0x80, 0x0f, 0x0b, 0xa5, 0xa5, 0x03, 0x21, 0xe2, 0xe8, 0x7b, 0x5f, 0x0a, 0x0a,
+            0xa5, 0x39, 0x23, 0x99, 0xd0, 0xd0, 0xaa, 0xff, 0x2c, 0x8b, 0xca, 0x0a, 0x20, 0xa0, 0xaf, 0xfb,
+            0x28, 0x6b, 0xc1, 0x08, 0x0a, 0x5a, 0xff, 0xaa, 0x4a, 0x4a, 0x45, 0x09, 0xba, 0xab, 0x5e, 0x5e,
+            0x0c, 0x7a, 0x40, 0xaa, 0x7f, 0x7e, 0x0e, 0x0f, 0x20, 0x48, 0x9d, 0x3b, 0x5f, 0x5f, 0x00, 0x00,
+            0x4b, 0xd6, 0xc4, 0xd4, 0x60, 0x60, 0xfb, 0xef, 0x45, 0x3a, 0x41, 0xa9, 0xba, 0x9f, 0xa7, 0xf7,
+            0x0d, 0x5b, 0x37, 0x4a, 0xdb, 0x2b, 0xef, 0xaa, 0x20, 0x48, 0x8e, 0x0b, 0x8e, 0xaa, 0xaf, 0xaf,
+            0xd8, 0xcd, 0x75, 0x6d, 0x0e, 0x0a, 0xba, 0xff, 0xbc, 0xa3, 0xf8, 0x3e, 0xbf, 0xdf, 0x5a, 0xfa,
+            0x9f, 0x08, 0xd2, 0x9a, 0x25, 0x5f, 0xff, 0xba, 0x09, 0x94, 0xc3, 0x82, 0xff, 0xfe, 0xba, 0xba,
+            0x21, 0x79, 0x3c, 0x31, 0xaf, 0xfe, 0xaf, 0x5a, 0xbf, 0x53, 0xe1, 0xd1, 0xbf, 0xab, 0x5f, 0x5b,
+            0x26, 0x6b, 0xc3, 0xd8, 0x2a, 0xb5, 0xfb, 0xbf, 0x89, 0x42, 0x5f, 0xe1, 0xaf, 0xff, 0xb5, 0xb5,
+            0x0a, 0x94, 0x8b, 0xfb, 0xa5, 0xd5, 0x0f, 0x0f, 0xa8, 0x52, 0xc7, 0x01, 0x9f, 0xab, 0x55, 0x55,
+            0x29, 0xf8, 0x86, 0x7a, 0xfa, 0xfa, 0xff, 0xaa, 0x40, 0x00, 0x9a, 0x7a, 0xbe, 0xfe, 0xfa, 0xfa,
+            0x54, 0x8c, 0x29, 0xc4, 0x0a, 0x0a, 0xaf, 0xab, 0x6c, 0x6b, 0x08, 0x0a, 0xa0, 0xd0, 0xf0, 0xf0,
+            0x6b, 0x7c, 0xd9, 0x51, 0xa5, 0xd5, 0xf5, 0xe5, 0x82, 0x21, 0x00, 0x32, 0x00, 0x50, 0xa0, 0xa0,
+            0x42, 0x19, 0x35, 0x99, 0xbf, 0xe7, 0xaf, 0xff, 0x46, 0x7b, 0x60, 0x42, 0x60, 0x45, 0x0f, 0x0f,
+            0xd4, 0x31, 0x33, 0x99, 0xda, 0xaa, 0xa5, 0xaf, 0x1a, 0xd7, 0xe9, 0x80, 0xba, 0xba, 0x0a, 0x0f,
+            0xc6, 0x08, 0x97, 0xe0, 0xff, 0xfa, 0xba, 0xba, 0x51, 0xd6, 0xdf, 0xec, 0x65, 0x65, 0x5f, 0x5a,
+            0xbb, 0xbe, 0xda, 0x22, 0x2e, 0xaa, 0xf0, 0xf0, 0x6c, 0x63, 0x1d, 0x72, 0xeb, 0xeb, 0x5f, 0x5f,
+            0xce, 0x31, 0x36, 0x91, 0x70, 0x70, 0xaa, 0xf2, 0x57, 0x8c, 0x27, 0xb4, 0x8f, 0xab, 0xf0, 0xb0,
+            0x49, 0x7b, 0x6a, 0x42, 0xef, 0xfb, 0xa5, 0xb5, 0x7f, 0x6b, 0x2a, 0x3a, 0x75, 0x75, 0x5a, 0x5f
+        };
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 6, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest_bc7_mode6(32, 0xAA);
+        std::vector<unsigned char> dest_wrong_size(16, 0xBB);
+        std::vector<unsigned char> dest_bc7_mode1(16, 0xAA);
+        std::vector<unsigned char> dest_truncated(32, 0xCC);
+        std::vector<unsigned char> dest_bc1_valid(512, 0xEE);
+        std::vector<unsigned char> dest_bc1_trailing(512, 0xDD);
+
+        // Request 0: valid BC7 Mode 6 memory request (32 bytes destination, 2 blocks)
+        unsigned char req0[0x48] = {};
+        *reinterpret_cast<u64*>(req0 + 0x00) = (7ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req0 + 0x08) = dest_bc7_mode6.data();
+        *reinterpret_cast<u64*>(req0 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x18) = 32;
+        *reinterpret_cast<const unsigned char**>(req0 + 0x20) = bc7_mode6_packed;
+        *reinterpret_cast<u64*>(req0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x30) = sizeof(bc7_mode6_packed);
+        *reinterpret_cast<unsigned*>(req0 + 0x38) = 32;
+
+        // Request 1: wrong destination size (negative control: 16 bytes destination for 32-byte stream)
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = (7ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req1 + 0x08) = dest_wrong_size.data();
+        *reinterpret_cast<u64*>(req1 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 16;
+        *reinterpret_cast<const unsigned char**>(req1 + 0x20) = bc7_mode6_packed;
+        *reinterpret_cast<u64*>(req1 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = sizeof(bc7_mode6_packed);
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = 16;
+
+        // Request 2: valid BC7 Mode 1 memory request (subsequent valid request after rejection)
+        unsigned char req2[0x48] = {};
+        *reinterpret_cast<u64*>(req2 + 0x00) = (7ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req2 + 0x08) = dest_bc7_mode1.data();
+        *reinterpret_cast<u64*>(req2 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req2 + 0x18) = 16;
+        *reinterpret_cast<const unsigned char**>(req2 + 0x20) = bc7_mode1_packed;
+        *reinterpret_cast<u64*>(req2 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = sizeof(bc7_mode1_packed);
+        *reinterpret_cast<unsigned*>(req2 + 0x38) = 16;
+
+        // Request 3: truncated BC7 memory request (negative control: 32 bytes instead of 104)
+        unsigned char req3[0x48] = {};
+        *reinterpret_cast<u64*>(req3 + 0x00) = (7ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req3 + 0x08) = dest_truncated.data();
+        *reinterpret_cast<u64*>(req3 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req3 + 0x18) = 32;
+        *reinterpret_cast<const unsigned char**>(req3 + 0x20) = bc7_mode6_packed;
+        *reinterpret_cast<u64*>(req3 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req3 + 0x30) = 32;
+        *reinterpret_cast<unsigned*>(req3 + 0x38) = 32;
+
+        // Request 4: valid BC1 memory request (64 blocks / 512 bytes, subsequent valid request)
+        unsigned char req4[0x48] = {};
+        *reinterpret_cast<u64*>(req4 + 0x00) = (1ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req4 + 0x08) = dest_bc1_valid.data();
+        *reinterpret_cast<u64*>(req4 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req4 + 0x18) = 512;
+        *reinterpret_cast<const unsigned char**>(req4 + 0x20) = bc1_packed;
+        *reinterpret_cast<u64*>(req4 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req4 + 0x30) = sizeof(bc1_packed);
+        *reinterpret_cast<unsigned*>(req4 + 0x38) = 512;
+
+        // Request 5: malformed BC1 memory request with trailing non-zero byte (negative control)
+        unsigned char req5[0x48] = {};
+        *reinterpret_cast<u64*>(req5 + 0x00) = (1ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req5 + 0x08) = dest_bc1_trailing.data();
+        *reinterpret_cast<u64*>(req5 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req5 + 0x18) = 512;
+        *reinterpret_cast<const unsigned char**>(req5 + 0x20) = bc1_packed_trailing;
+        *reinterpret_cast<u64*>(req5 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req5 + 0x30) = sizeof(bc1_packed_trailing);
+        *reinterpret_cast<unsigned*>(req5 + 0x38) = 512;
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req3);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 3);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req4);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 4);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req5);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 5);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 3) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 4) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5)) {
+            return false;
+        }
+
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+        long hr2 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
+        long hr3 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 3);
+        long hr4 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 4);
+        long hr5 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 5);
+
+        if (hr0 != 0 || std::memcmp(dest_bc7_mode6.data(), bc7_mode6_expected, 32) != 0) return false;
+        if (hr1 == 0) return false;
+        for (unsigned char b : dest_wrong_size) {
+            if (b != 0xBB) return false;
+        }
+        if (hr2 != 0 || std::memcmp(dest_bc7_mode1.data(), bc7_mode1_expected, 16) != 0) return false;
+        if (hr3 == 0) return false;
+        for (unsigned char b : dest_truncated) {
+            if (b != 0xCC) return false;
+        }
+        if (hr4 != 0 || std::memcmp(dest_bc1_valid.data(), bc1_expected, 512) != 0) return false;
+        if (hr5 == 0) return false;
+        for (unsigned char b : dest_bc1_trailing) {
+            if (b != 0xDD) return false;
+        }
+    }
+
+    return true;
+}
+
+// The Python fixture supplies absolute ranges from each synthetic file's RDS5
+// directory. Keep one real queue and one open file object per input for all batches.
+bool dstorage_directory_batches()
+{
+    struct Request { unsigned batch, file; unsigned long long offset; unsigned length; };
+    std::vector<Request> requests;
+    Request r{};
+    while (std::scanf("%u%u%llu%u", &r.batch, &r.file, &r.offset, &r.length) == 4) {
+        if (r.file >= 2 || !r.length || requests.size() >= 32) return false;
+        requests.push_back(r);
+    }
+    if (requests.empty() || !std::feof(stdin)) return false;
+    HMODULE library = LoadLibraryW(L"XCRDAPI.dll");
+    if (!library) return false;
+    auto factory_export = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(library, "DStorageGetFactory"));
+    void* object = nullptr;
+    if (!factory_export || factory_export(nullptr, &object) || !object) return false;
+    auto* factory = static_cast<Object*>(object);
+    void* files[2]{};
+    const wchar_t* names[]{L"small.ttpf", L"large.ttpf"};
+    for (unsigned i = 0; i < 2; ++i)
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, names[i], nullptr, &files[i])) return false;
+    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, nullptr, nullptr, &object)) return false;
+    auto* queue = static_cast<Object*>(object);
+    const unsigned count = static_cast<unsigned>(requests.size());
+    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, count, "directory", nullptr, &object)) return false;
+    auto* status = static_cast<Object*>(object);
+
+    constexpr unsigned page = 4096, guard = 16;
+    std::vector<std::array<unsigned char, page + 2 * guard>> output(count);
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& request = requests[i];
+        output[i].fill(0xa5);
+        alignas(8) unsigned char record[0x48]{};
+        const u64 fields[]{1, reinterpret_cast<u64>(output[i].data() + guard), 0, page,
+                           reinterpret_cast<u64>(files[request.file]), request.offset, request.length};
+        std::memcpy(record, fields, sizeof(fields));
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, record);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, i);
+        if (i + 1 == count || requests[i + 1].batch != request.batch)
+            reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+    }
+    const auto deadline = GetTickCount64() + 5000;
+    while (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, count - 1)) {
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(1);
+    }
+    std::ofstream readback("readback.bin", std::ios::binary);
+    for (unsigned i = 0; i < count; ++i) {
+        const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
+        std::printf("%08lx\n", static_cast<unsigned long>(hr));
+        readback.write(reinterpret_cast<const char*>(output[i].data()), output[i].size());
+    }
+    for (void* file : files)
+        reinterpret_cast<CloseFileFn>(static_cast<Object*>(file)->vtable[3])(file);
+    readback.close();
+    return readback.good();
+}
+
+} // namespace
 
 int main(int argc, char** argv)
 {
@@ -26,8 +1610,6 @@ int main(int argc, char** argv)
     if (!std::strcmp(which, "none")) return 0;
     if (!std::strcmp(which, "chad")) return static_cast<int>(XDspActivate(0x11, 0x22, 0x33, 0x44));
     if (!std::strcmp(which, "xg_xs")) return static_cast<int>(XGSuggestSwizzleMode(0x55, 0, 0, 0));
-    if (!std::strcmp(which, "xmem")) return static_cast<int>(XMemTransferMemory(0, 0x10000, 0x3000, 4));
-    if (!std::strcmp(which, "d3d12")) return static_cast<int>(D3D12ConfigureVirtualMemoryX(0x66, 0x77, 0, 0));
     if (!std::strcmp(which, "physical")) {
         std::size_t count = 4;
         u64 pages[4] = {};
@@ -39,5 +1621,17 @@ int main(int argc, char** argv)
         std::puts("physical ok");
         return 0;
     }
+    if (!std::strcmp(which, "dstorage-directory")) return dstorage_directory_batches() ? 0 : 8;
+    if (!std::strcmp(which, "dstorage-pages")) {
+        if (!dstorage_page_array_checks()) return 9;
+        std::puts("dstorage-pages ok");
+        return 0;
+    }
+    if (!std::strcmp(which, "dstorage")) {
+        if (!dstorage_checks()) return 7;
+        std::puts("dstorage ok");
+        return 0;
+    }
+    if (!std::strcmp(which, "store")) return x2w_store_method3_check();
     return 2;
 }

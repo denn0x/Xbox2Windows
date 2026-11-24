@@ -82,7 +82,16 @@ FLOAT = {
     "log_f32": "log2({0})", "rndne_f32": "round({0})", "rcp_f32": "rcp({0})",
     "min_f32": "min({0},{1})", "max_f32": "max({0},{1})", "med3_f32": "median_f({0},{1},{2})",
     "fma_f32": "mad({0},{1},{2})", "fmamk_f32": "mad({0},{1},{2})", "fmac_f32": "mad({0},{1},{d})",
+    "subrev_f32": "{1}-{0}", "sqrt_f32": "sqrt({0})", "rsq_f32": "rsqrt({0})",
+    "floor_f32": "floor({0})", "ceil_f32": "ceil({0})", "trunc_f32": "trunc({0})", "fract_f32": "(frac({0}) >= 1.0f ? asfloat(0x3f7fffffu) : frac({0}))",
 }
+# Source count of the operations added with the clamp modifier. A wrong count is refused
+# instead of silently dropping or inventing a source.
+FLOAT_SOURCES = {"subrev_f32": 2, "sqrt_f32": 1, "rsq_f32": 1, "floor_f32": 1, "ceil_f32": 1, "trunc_f32": 1, "fract_f32": 1}
+# VOP3 output multipliers, as the factor applied to the binary32 result. The translation is a plain
+# multiply by a power of two, which is exact for normal results. The hardware output modifier also
+# flushes denormals and quiets NaN differently from a multiply; neither is modelled here.
+OMOD = {"mul:2": "2.0", "mul:4": "4.0", "div:2": "0.5"}
 
 
 def packed_op(op, dest, inputs, mods):
@@ -173,11 +182,20 @@ def alu(mn, tokens, mods):
     if op in ("bfe_u32", "bfe_i32"):
         args = [args[0], args[1], f"(({args[1]}>>16)&127u)" if mn.startswith("s_") else f"({args[2]}&31u)"]
     if op in FLOAT:
-        if mods not in ("", "mul:2"):
+        # clamp is a VOP3 output modifier; it saturates the binary32 result to [0, 1]
+        # (NaN results are not modelled) and excludes the output multiplier.
+        if mods not in ("", "clamp", *OMOD) or (mods == "clamp" and mn.endswith("_e32")):
             raise ValueError(f"Unsupported float modifier for {mn}: {mods}")
+        # mul:2 on an e32 spelling stays accepted as before; mul:4 and div:2 are VOP3-only.
+        if mods in ("mul:4", "div:2") and mn.endswith("_e32"):
+            raise ValueError(f"Unsupported float modifier for {mn}: {mods}")
+        if len(args) != FLOAT_SOURCES.get(op, len(args)):
+            raise ValueError(f"Expected {FLOAT_SOURCES[op]} sources for {mn}")
         expr = FLOAT[op].format(*[f"asfloat({a})" for a in args], d=f"asfloat({dest})")
-        if mods == "mul:2":
-            expr = f"2.0*({expr})"
+        if mods in OMOD:
+            expr = f"{OMOD[mods]}*({expr})"
+        elif mods == "clamp":
+            expr = f"saturate({expr})"
         return f"{dest} = asuint({expr});"
     if mods and op != "dot4_i32_i8":
         raise ValueError(f"Unsupported modifier for {mn}: {mods}")

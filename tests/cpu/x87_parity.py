@@ -374,7 +374,8 @@ def check_rejections():
             attempt(f"{two} df e0 9e {fcmovu} {pop2} 31 c0 {ret}"), unknown),
         "FCMOVU ST(2) with two values": (attempt(f"{two} {fucomi} da da {pop2} {ret}"), "x87 stack underflow"),
         "FCMOVNU ST(1) with one value": (attempt(f"{fld} db e8 {fcmovnu} dd d8 {ret}"), "x87 stack underflow"),
-        "SETP after FUCOMI": (attempt(f"{two} {fucomi} 0f 9a c0 {pop2} {ret}"), "unsupported query operation"),
+        # SETP after FUCOMI is lowered (#1153); after an INC that writes PF last it is refused.
+        "SETP after FUCOMI and INC": (attempt(f"{two} {fucomi} ff c0 0f 9a c0 {pop2} {ret}"), parity),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:

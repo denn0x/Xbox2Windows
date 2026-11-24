@@ -1,0 +1,10 @@
+LIBRARY xg_xs.dll
+EXPORTS
+    XGSuggestSwizzleMode
+    XGCreateTextureComputer
+    get_xg_suggest_calls
+    get_xg_create_computer_calls
+    get_xg_copy_into_calls
+    get_xg_copy_from_calls
+    get_xg_invalid_refusals
+    get_xg_last_suggested_mode

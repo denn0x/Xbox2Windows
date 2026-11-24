@@ -1,7 +1,8 @@
 ; coverage: source cpu_aot_sse_fp
-; Source-built MASM fixture exercising 5 legacy SSE forms from docs/coverage/x64_zen2.tsv
-; group SSE: cmpps, cmpss, movlps, movhps and movntps, along with aligned and
-; unaligned transport moves (movaps, movdqa, movdqu).
+; Source-built MASM fixture exercising 12 legacy SSE forms from docs/coverage/x64_zen2.tsv
+; group SSE: addps, subps, mulps, divps, minps, maxps, sqrtps, cmpps, cmpss, movlps,
+; movhps and movntps, along with aligned and unaligned transport moves (movaps,
+; movdqa, movdqu).
 ; Every export uses the Windows x64 leaf ABI:
 ;   RCX = const void* input_a (32 bytes, 16-byte aligned)
 ;   RDX = const void* input_b (32 bytes, 16-byte aligned; second vector at +16)
@@ -340,5 +341,383 @@ op_pipeline PROC FRAME
     movlps QWORD PTR [r8+24], xmm2
     ret
 op_pipeline ENDP
+
+; --- Packed float arithmetic: reg, aligned m128, m128 at +16 and self sources ---
+; ALTER_IMM swaps each register-form operation (add/sub, mul/div, min/max; sqrt becomes
+; add), moves each memory source by 16 bytes and replaces each self source by xmm1, so
+; every lowering has a build that must differ on known words.
+
+op_addps PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    subps xmm0, xmm1
+ELSE
+    addps xmm0, xmm1
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_addps ENDP
+
+op_addps_mem PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    addps xmm0, XMMWORD PTR [rdx+16]
+ELSE
+    addps xmm0, XMMWORD PTR [rdx]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_addps_mem ENDP
+
+op_addps_mem_disp PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    addps xmm0, XMMWORD PTR [rdx]
+ELSE
+    addps xmm0, XMMWORD PTR [rdx+16]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_addps_mem_disp ENDP
+
+op_addps_self PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    addps xmm0, xmm1
+ELSE
+    addps xmm0, xmm0
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_addps_self ENDP
+
+op_subps PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    addps xmm0, xmm1
+ELSE
+    subps xmm0, xmm1
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_subps ENDP
+
+op_subps_mem PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    subps xmm0, XMMWORD PTR [rdx+16]
+ELSE
+    subps xmm0, XMMWORD PTR [rdx]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_subps_mem ENDP
+
+op_subps_mem_disp PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    subps xmm0, XMMWORD PTR [rdx]
+ELSE
+    subps xmm0, XMMWORD PTR [rdx+16]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_subps_mem_disp ENDP
+
+op_subps_self PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    subps xmm0, xmm1
+ELSE
+    subps xmm0, xmm0
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_subps_self ENDP
+
+op_mulps PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    divps xmm0, xmm1
+ELSE
+    mulps xmm0, xmm1
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_mulps ENDP
+
+op_mulps_mem PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    mulps xmm0, XMMWORD PTR [rdx+16]
+ELSE
+    mulps xmm0, XMMWORD PTR [rdx]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_mulps_mem ENDP
+
+op_mulps_mem_disp PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    mulps xmm0, XMMWORD PTR [rdx]
+ELSE
+    mulps xmm0, XMMWORD PTR [rdx+16]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_mulps_mem_disp ENDP
+
+op_mulps_self PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    mulps xmm0, xmm1
+ELSE
+    mulps xmm0, xmm0
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_mulps_self ENDP
+
+op_divps PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    mulps xmm0, xmm1
+ELSE
+    divps xmm0, xmm1
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_divps ENDP
+
+op_divps_mem PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    divps xmm0, XMMWORD PTR [rdx+16]
+ELSE
+    divps xmm0, XMMWORD PTR [rdx]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_divps_mem ENDP
+
+op_divps_mem_disp PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    divps xmm0, XMMWORD PTR [rdx]
+ELSE
+    divps xmm0, XMMWORD PTR [rdx+16]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_divps_mem_disp ENDP
+
+op_divps_self PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    divps xmm0, xmm1
+ELSE
+    divps xmm0, xmm0
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_divps_self ENDP
+
+op_minps PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    maxps xmm0, xmm1
+ELSE
+    minps xmm0, xmm1
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_minps ENDP
+
+op_minps_mem PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    minps xmm0, XMMWORD PTR [rdx+16]
+ELSE
+    minps xmm0, XMMWORD PTR [rdx]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_minps_mem ENDP
+
+op_minps_mem_disp PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    minps xmm0, XMMWORD PTR [rdx]
+ELSE
+    minps xmm0, XMMWORD PTR [rdx+16]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_minps_mem_disp ENDP
+
+op_minps_self PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    minps xmm0, xmm1
+ELSE
+    minps xmm0, xmm0
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_minps_self ENDP
+
+op_maxps PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    minps xmm0, xmm1
+ELSE
+    maxps xmm0, xmm1
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_maxps ENDP
+
+op_maxps_mem PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    maxps xmm0, XMMWORD PTR [rdx+16]
+ELSE
+    maxps xmm0, XMMWORD PTR [rdx]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_maxps_mem ENDP
+
+op_maxps_mem_disp PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    maxps xmm0, XMMWORD PTR [rdx]
+ELSE
+    maxps xmm0, XMMWORD PTR [rdx+16]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_maxps_mem_disp ENDP
+
+op_maxps_self PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    maxps xmm0, xmm1
+ELSE
+    maxps xmm0, xmm0
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_maxps_self ENDP
+
+op_sqrtps PROC FRAME
+    .endprolog
+    movaps xmm1, XMMWORD PTR [rdx]
+    movaps xmm2, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    addps xmm2, xmm1
+ELSE
+    sqrtps xmm2, xmm1
+ENDIF
+    movaps XMMWORD PTR [r8], xmm2
+    ret
+op_sqrtps ENDP
+
+op_sqrtps_mem PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    sqrtps xmm0, XMMWORD PTR [rdx+16]
+ELSE
+    sqrtps xmm0, XMMWORD PTR [rdx]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_sqrtps_mem ENDP
+
+op_sqrtps_mem_disp PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+IFDEF ALTER_IMM
+    sqrtps xmm0, XMMWORD PTR [rdx]
+ELSE
+    sqrtps xmm0, XMMWORD PTR [rdx+16]
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_sqrtps_mem_disp ENDP
+
+op_sqrtps_self PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    addps xmm0, xmm1
+ELSE
+    sqrtps xmm0, xmm0
+ENDIF
+    movaps XMMWORD PTR [r8], xmm0
+    ret
+op_sqrtps_self ENDP
+
+; Chained arithmetic: every operation feeds the next through registers, with a memory
+; source at +16 and a destination reused across instructions.
+op_arith_pipeline PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movaps xmm1, XMMWORD PTR [rdx]
+    addps xmm0, xmm1
+IFDEF ALTER_IMM
+    divps xmm0, XMMWORD PTR [rdx+16]
+ELSE
+    mulps xmm0, XMMWORD PTR [rdx+16]
+ENDIF
+    subps xmm0, xmm1
+    movaps xmm2, XMMWORD PTR [rcx+16]
+    divps xmm2, xmm0
+    minps xmm2, xmm1
+    maxps xmm0, xmm2
+    sqrtps xmm3, xmm0
+    movaps XMMWORD PTR [r8], xmm3
+    movaps XMMWORD PTR [r8+16], xmm2
+    ret
+op_arith_pipeline ENDP
 
 END

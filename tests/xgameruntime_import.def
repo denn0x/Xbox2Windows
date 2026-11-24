@@ -1,0 +1,5 @@
+; Import-only fixture: names the public test import without building or copying
+; the fixture-only xgameruntime.dll into a synthetic package.
+LIBRARY xgameruntime
+EXPORTS
+    XUserAddAsync

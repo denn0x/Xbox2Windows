@@ -42,6 +42,8 @@ SEQUENCES = {
     "fild_fistp_i64": ("i64", [("fild", "i64", 0), ("fistp", "i64", 0)]),
     "fild_fisttp_i16": ("i16", [("fild", "i16", 0), ("fisttp", "i16", 0)]),
     "fistp_two": ("pair80", [("fld", "m80", 0), ("fld", "m80", 16), ("fistp", "i32", 0), ("fistp", "i64", 8)]),
+    "fist_fisttp_depth2": ("store_depth2", [("fld", "m80", 0), ("fld", "m80", 16), ("fist", "i16", 0),
+                                         ("fisttp", "i16", 2), ("fstp", "m80", 16)]),
     "fild_depth8": ("m64x7i16", [("fld", "m64", 8 * k) for k in range(7)] + [("fild", "i16", 56)]
                     + [("fstp", "m64", 8 * k) for k in range(8)]),
 }
@@ -233,6 +235,7 @@ def cases():
                    for n in ints["i32"][::4] for v in floats[::40]],
         "m80": [m80_bytes(v) for v in floats],
         "pair80": [m80_bytes(a) + m80_bytes(b) for a, b in zip(floats, reversed(floats))],
+        "store_depth2": [m80_bytes((0xA000000000000000, 0xBFFF)) + m80_bytes((0xB000000000000000, 0x4000))],
         "m64x7i16": [b"".join(rng.choice(f64).to_bytes(8, "little") for _ in range(7))
                      + int_bytes("i16", rng.choice(ints["i16"])) for _ in range(300)],
     }

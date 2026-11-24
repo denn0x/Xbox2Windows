@@ -194,11 +194,69 @@ bool short_checks()
     return written == 0 && error == ERROR_BAD_LENGTH && untouched &&
            exact_written == sizeof(MEMORY_BASIC_INFORMATION) && exact.back() == 0x5a;
 }
+
+// A buffer holding 0xff everywhere, as left by an earlier result or by a caller that does not zero it.
+std::size_t ask_stale(const void* address, QueryBuffer& buffer, HANDLE process)
+{
+    std::memset(&buffer, 0xff, sizeof(buffer));
+    return era_query::query(process, address, &buffer, sizeof(buffer));
+}
+
+// A clear flag is written as 0x00, not left as found, and registration applies only to queries of
+// this process: a page at a registered address in another process has a clear flag. The child is
+// created suspended and never runs. With mutate, the other process is expected to report 0x01.
+bool clear_checks(bool mutate)
+{
+    const auto page = page_size();
+    Region local(static_cast<Byte*>(VirtualAlloc(nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)));
+    if (!local) return false;
+
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+    wchar_t command[] = L"era_query_check child";
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION child{};
+    if (!CreateProcessW(path, command, nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &startup, &child))
+        return false;
+    const auto end_child = [&child] {
+        TerminateProcess(child.hProcess, 0);
+        WaitForSingleObject(child.hProcess, INFINITE);
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+    };
+    Byte* remote = static_cast<Byte*>(
+        VirtualAllocEx(child.hProcess, nullptr, page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!remote || !era_query::register_gpu_region(remote, page)) {
+        end_child();
+        return false;
+    }
+
+    QueryBuffer buffer;
+    // This process, unregistered committed read/write page: 0xff becomes 0x00.
+    const bool local_clear = ask_stale(local.get(), buffer, GetCurrentProcess()) == 0x30 &&
+                             buffer.info.State == MEM_COMMIT && buffer.tail[0] == 0x00 && buffer.tail[1] == 0xff;
+    // This process, registered address: 0x01, whatever this process has mapped there.
+    const bool local_set = ask_stale(remote + page / 2, buffer, GetCurrentProcess()) == 0x30 &&
+                           buffer.tail[0] == 0x01 && buffer.tail[1] == 0xff;
+    // The child, committed read/write page at the registered address: 0x00, so the callers reject it.
+    const auto written = ask_stale(remote + page / 2, buffer, child.hProcess);
+    const Byte expected = mutate ? 0x01 : 0x00;
+    const bool remote_clear = written == 0x30 && buffer.info.State == MEM_COMMIT &&
+                              buffer.info.Protect == PAGE_READWRITE && buffer.tail[0] == expected &&
+                              buffer.tail[1] == 0xff && caller_accepts(buffer, written, false) == mutate;
+
+    const bool unregistered = era_query::unregister_gpu_region(remote);
+    end_child();
+    std::printf("local_clear=%d local_set=%d remote_clear=%d\n", local_clear, local_set, remote_clear);
+    return local_clear && local_set && remote_clear && unregistered;
+}
 }
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) {
+    // clear_checks starts this program suspended as "child"; it is terminated before it runs.
+    const bool mutate = argc == 4 && argv[1] == "clear"sv && argv[2] == "--mutate"sv && argv[3] == "foreign"sv;
+    if (argc != 2 && !mutate) {
         return 2;
     }
     const std::string_view scenario = argv[1];
@@ -211,6 +269,8 @@ int main(int argc, char** argv)
         passed = registry_checks();
     } else if (scenario == "short"sv) {
         passed = short_checks();
+    } else if (scenario == "clear"sv) {
+        passed = clear_checks(mutate);
     } else {
         return 2;
     }

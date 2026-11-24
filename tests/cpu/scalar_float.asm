@@ -318,4 +318,202 @@ ENDIF
     ret
 cmovcc_mix ENDP
 
+; float min_ss(float a, float b, uint8_t* c)
+; c[0..8) seeds the destination registers and is not written. c+8 gets the register form on a and b, c+17
+; and c+21 get a and b, c+28 gets the memory form (an unaligned dword source). The result is the register form.
+min_ss PROC FRAME
+    .endprolog
+    movss DWORD PTR [r8+17], xmm0
+    movss DWORD PTR [r8+21], xmm1
+    movq xmm2, QWORD PTR [r8]
+    movq xmm3, QWORD PTR [r8]
+IFDEF SWAP_OPERANDS
+    movss xmm2, xmm1
+    minss xmm2, xmm0
+    movss xmm3, xmm1
+    minss xmm3, DWORD PTR [r8+17]
+ELSE
+    movss xmm2, xmm0
+    minss xmm2, xmm1
+    movss xmm3, xmm0
+    minss xmm3, DWORD PTR [r8+21]
+ENDIF
+    movq QWORD PTR [r8+8], xmm2
+    movq QWORD PTR [r8+28], xmm3
+    movaps xmm0, xmm2
+    ret
+min_ss ENDP
+
+; float max_ss(float a, float b, uint8_t* c)
+; c[0..8) seeds the destination registers and is not written. c+8 gets the register form on a and b, c+17
+; and c+21 get a and b, c+28 gets the memory form (an unaligned dword source). The result is the register form.
+max_ss PROC FRAME
+    .endprolog
+    movss DWORD PTR [r8+17], xmm0
+    movss DWORD PTR [r8+21], xmm1
+    movq xmm2, QWORD PTR [r8]
+    movq xmm3, QWORD PTR [r8]
+IFDEF SWAP_OPERANDS
+    movss xmm2, xmm1
+    maxss xmm2, xmm0
+    movss xmm3, xmm1
+    maxss xmm3, DWORD PTR [r8+17]
+ELSE
+    movss xmm2, xmm0
+    maxss xmm2, xmm1
+    movss xmm3, xmm0
+    maxss xmm3, DWORD PTR [r8+21]
+ENDIF
+    movq QWORD PTR [r8+8], xmm2
+    movq QWORD PTR [r8+28], xmm3
+    movaps xmm0, xmm2
+    ret
+max_ss ENDP
+
+; double min_sd(double a, double b, uint8_t* c)
+; c+8 gets the register form on a and b, c+17 and c+25 get a and b, c+36 gets the memory form (an unaligned
+; qword source). The result is the register form.
+min_sd PROC FRAME
+    .endprolog
+    movsd QWORD PTR [r8+17], xmm0
+    movsd QWORD PTR [r8+25], xmm1
+IFDEF SWAP_OPERANDS
+    movsd xmm2, xmm1
+    minsd xmm2, xmm0
+    movsd xmm3, xmm1
+    minsd xmm3, QWORD PTR [r8+17]
+ELSE
+    movsd xmm2, xmm0
+    minsd xmm2, xmm1
+    movsd xmm3, xmm0
+    minsd xmm3, QWORD PTR [r8+25]
+ENDIF
+    movsd QWORD PTR [r8+8], xmm2
+    movsd QWORD PTR [r8+36], xmm3
+    movsd xmm0, xmm2
+    ret
+min_sd ENDP
+
+; double max_sd(double a, double b, uint8_t* c)
+; c+8 gets the register form on a and b, c+17 and c+25 get a and b, c+36 gets the memory form (an unaligned
+; qword source). The result is the register form.
+max_sd PROC FRAME
+    .endprolog
+    movsd QWORD PTR [r8+17], xmm0
+    movsd QWORD PTR [r8+25], xmm1
+IFDEF SWAP_OPERANDS
+    movsd xmm2, xmm1
+    maxsd xmm2, xmm0
+    movsd xmm3, xmm1
+    maxsd xmm3, QWORD PTR [r8+17]
+ELSE
+    movsd xmm2, xmm0
+    maxsd xmm2, xmm1
+    movsd xmm3, xmm0
+    maxsd xmm3, QWORD PTR [r8+25]
+ENDIF
+    movsd QWORD PTR [r8+8], xmm2
+    movsd QWORD PTR [r8+36], xmm3
+    movsd xmm0, xmm2
+    ret
+max_sd ENDP
+
+; float root_ss(float a, uint8_t* c)
+; c[0..8) seeds the destination registers and is not written. c+8 gets the register form, c+17 gets a and c+24
+; gets the memory form (an unaligned dword source). The result is the register form. The control zeroes the
+; seed first, so the bits above the result differ.
+root_ss PROC FRAME
+    .endprolog
+    movss DWORD PTR [rdx+17], xmm0
+    movq xmm2, QWORD PTR [rdx]
+    movq xmm3, QWORD PTR [rdx]
+IFDEF SWAP_OPERANDS
+    xorps xmm2, xmm2
+ENDIF
+    sqrtss xmm2, xmm0
+    sqrtss xmm3, DWORD PTR [rdx+17]
+    movq QWORD PTR [rdx+8], xmm2
+    movq QWORD PTR [rdx+24], xmm3
+    movaps xmm0, xmm2
+    ret
+root_ss ENDP
+
+; double root_sd(double a, uint8_t* c)
+; c+8 gets the register form, c+17 gets a and c+32 gets the memory form (an unaligned qword source). The result
+; is the register form. The control copies a instead of taking its root.
+root_sd PROC FRAME
+    .endprolog
+    movsd QWORD PTR [rdx+17], xmm0
+IFDEF SWAP_OPERANDS
+    movsd xmm2, xmm0
+ELSE
+    sqrtsd xmm2, xmm0
+ENDIF
+    sqrtsd xmm3, QWORD PTR [rdx+17]
+    movsd QWORD PTR [rdx+8], xmm2
+    movsd QWORD PTR [rdx+32], xmm3
+    movsd xmm0, xmm2
+    ret
+root_sd ENDP
+
+; float root_const_ss(void) is the square root of 2 and double root_const_sd(void) is the square root of 3.
+; The operand is built from an integer constant, so a translation that lets the compiler evaluate the root
+; would use the default rounding and not the rounding of the host MXCSR. The control copies the operand.
+root_const_ss PROC FRAME
+    .endprolog
+    mov eax, 2
+    xorps xmm0, xmm0
+    cvtsi2ss xmm0, eax
+IFNDEF SWAP_OPERANDS
+    sqrtss xmm0, xmm0
+ENDIF
+    ret
+root_const_ss ENDP
+
+root_const_sd PROC FRAME
+    .endprolog
+    mov eax, 3
+    xorpd xmm0, xmm0
+    cvtsi2sd xmm0, eax
+IFNDEF SWAP_OPERANDS
+    sqrtsd xmm0, xmm0
+ENDIF
+    ret
+root_const_sd ENDP
+
+; uint64_t round_cvt(float f, double d, uint8_t* out)
+; CVTSS2SI and CVTSD2SI into 32-bit and 64-bit registers from a register and from memory; the 32-bit forms start from
+; all ones, so a destination that keeps its upper half shows. The words of out hold the results; f and d sit at +40
+; and +48. SWAP_OPERANDS converts d where the first conversion converts f.
+round_cvt PROC FRAME
+    .endprolog
+    mov rax, -1
+    mov rcx, -1
+    mov r9, -1
+    mov r10, -1
+    movss DWORD PTR [r8+40], xmm0
+    movsd QWORD PTR [r8+48], xmm1
+IFDEF SWAP_OPERANDS
+    cvtsd2si eax, xmm1
+ELSE
+    cvtss2si eax, xmm0
+ENDIF
+    cvtsd2si ecx, xmm1
+    cvtss2si rdx, xmm0
+    cvtsd2si r11, xmm1
+    cvtss2si r9d, DWORD PTR [r8+40]
+    cvtsd2si r10d, QWORD PTR [r8+48]
+    mov QWORD PTR [r8], rax
+    mov QWORD PTR [r8+8], rcx
+    mov QWORD PTR [r8+16], rdx
+    mov QWORD PTR [r8+24], r11
+    mov QWORD PTR [r8+32], r9
+    mov QWORD PTR [r8+56], r10
+    cvtss2si rdx, DWORD PTR [r8+40]
+    mov QWORD PTR [r8+64], rdx
+    cvtsd2si rdx, QWORD PTR [r8+48]
+    mov QWORD PTR [r8+72], rdx
+    ret
+round_cvt ENDP
+
 END

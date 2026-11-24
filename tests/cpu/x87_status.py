@@ -532,7 +532,7 @@ def check_rejections():
         "SAHF in a function without x87": (attempt(f"b4 01 9e 72 00 {clear}"), "unsupported query operation"),
         "LAHF": (attempt(f"{two} {fcom} 9f {pop2} {clear}"), "unsupported query operation"),
         # Forms outside the profile.
-        "FNSTSW m16": (attempt(f"{two} {fcom} dd 3a {pop2} {clear}"), "unsupported x87 operand"),
+        "FNSTSW m16": (attempt(f"{two} {fcom} dd 3a {pop2} {clear}"), "stores status-word bits"),
         "FCOM alias DC D1": (attempt(f"{two} dc d1 {pop2} {clear}"), "unsupported x87 encoding"),
         "FCOMP alias DC D9": (attempt(f"{two} dc d9 dd d8 {clear}"), "unsupported x87 encoding"),
         "FCOMP alias DE D1": (attempt(f"{two} de d1 dd d8 {clear}"), "unsupported x87 encoding"),

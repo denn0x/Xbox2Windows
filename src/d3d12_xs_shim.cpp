@@ -5,12 +5,16 @@
 //   D3D12CreateRootSignatureDeserializer: amd_fidelityfx_upscaler_xbox.dll (0x4f88) reads a
 //     serialized root signature from an embedded container and retrieves the descriptor interface.
 // The main executable also imports D3D12XboxCreateDevice and D3D12ConfigureVirtualMemoryX (#874).
+// Device creation consults the source-owned creation-IID inventory in d3d12x_device_slots.h.
 #include <d3d12.h>
 #include <dxgi.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+
+#include "d3d12x_device_slots.h"
 
 namespace {
 // Observed console root-signature flag bits set by XboxBvhBuilder.dll.
@@ -83,11 +87,15 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     *device = nullptr;
     // This entry supports an explicit desktop consumer of the returned interface.
     // The Xbox parameter block and the Xbox device vtable require their own implementation.
-    // LOCAL (local/startup-v2): opt-in recording wrapper, src/startup_stubs/d3d12_xs_device.cpp.
+    // Experimental: opt-in recording wrapper, src/startup_stubs/d3d12_xs_device.cpp.
     if (parameters && x2w_d3d12_permissive())
         return x2w_d3d12_permissive_create_device(adapter, parameters, iid, device);
     if (parameters) return E_INVALIDARG;
-    if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
+    if (!d3d12x_device_slots::accepts_creation_iid(iid)) {
+        const auto text = d3d12x_device_slots::format_iid(iid);
+        std::fprintf(stderr, "D3D12XboxCreateDevice: unsupported IID %s\n", text.data());
+        return E_NOINTERFACE;
+    }
     AcquireSRWLockExclusive(&vm_state.lock);
     const HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, device);
     if (SUCCEEDED(hr)) vm_state.device_created = true;

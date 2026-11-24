@@ -1,0 +1,6 @@
+LIBRARY GameInput
+EXPORTS
+    GameInputCreate @2 NONAME
+    get_gameinput_outstanding_refs
+    get_gameinput_create_calls
+    reset_gameinput_records

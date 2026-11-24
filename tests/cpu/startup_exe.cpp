@@ -1,10 +1,12 @@
 // CRT-free EXE importing both DLLs and kernel32. Its TLS callback and entry point log into the first
 // DLL; the entry point then runs two worker threads in turn. A's TLS callback observes the explicit
 // TLS slot before and after each worker runs. The EXE writes both logs to standard output.
-// Exit code: b_value() | first worker's value << 8 | second worker's << 16 | main thread's << 24.
+// Exit code: b_value() | first worker's value << 8 | second worker's << 16 | main thread's << 24. A native launch
+// ends the process with that code (exe_exit.h); a host mapping gets it back as the entry's return value.
 // A failure ends the process with 0xE0000001 (TlsAlloc), 0xE0000002 (CreateThread), 0xE0000003 (wait timed out),
 // 0xE0000004 (wait failed) or 0xE0000005 (unexpected wait result).
 #include "startup_tls.h"
+#include "exe_exit.h"
 #include <intrin.h>
 
 #pragma runtime_checks("", off)
@@ -37,6 +39,13 @@ constexpr SIZE_T STACK_SIZE = static_cast<SIZE_T>(1) << 62;  // control: larger 
                                                            // fails with ERROR_INVALID_PARAMETER whatever the free memory
 #else
 constexpr SIZE_T STACK_SIZE = 0;
+#endif
+
+#ifdef LINGER_CONTROL
+DWORD WINAPI linger_forever(void*) {
+    Sleep(INFINITE);
+    return 0;
+}
 #endif
 
 DWORD WINAPI worker(void*) {
@@ -119,5 +128,11 @@ extern "C" DWORD WINAPI exe_entry(void*) {
     }
     // Keep the joined threads' IDs from being reused before we finish recording.
     for (HANDLE thread : threads) CloseHandle(thread);
-    return b_value() | (worker_values[0] << 8) | (worker_values[1] << 16) | (mine << 24);
+#ifdef LINGER_CONTROL
+    // Control: a thread that outlives the entry point. Only exe_finish ends the process while it is alive.
+    if (HANDLE lingering = CreateThread(nullptr, 0, linger_forever, nullptr, 0, nullptr)) CloseHandle(lingering);
+    else ExitProcess(CREATE_FAILED);
+#endif
+    // A native process ends here with the result, so a lingering loader or pool worker cannot hold it open.
+    return exe_finish(b_value() | (worker_values[0] << 8) | (worker_values[1] << 16) | (mine << 24));
 }

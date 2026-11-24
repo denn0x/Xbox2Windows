@@ -13,4 +13,5 @@ EXPORTS
     fidivr_i32
     fimul_i32_m64
     fiadd_fisub
+    fisub_i16_depth2
     fidivr_depth8

@@ -1,4 +1,8 @@
-"""Differential checks, mutation controls and rejection controls for legacy SSE FP AOT."""
+"""Differential checks, mutation controls and rejection controls for legacy SSE FP AOT.
+
+The packed arithmetic (ADDPS, SUBPS, MULPS, DIVPS, MINPS, MAXPS, SQRTPS) is also run under all
+sixteen combinations of MXCSR rounding mode, DAZ and FTZ, each against the exact reference in
+sse_fp_ref.py and against the original processor code."""
 
 import ctypes
 from pathlib import Path
@@ -13,6 +17,7 @@ from iced_x86 import Code, Decoder, Encoder, Instruction, MemoryOperand, Registe
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import export_rva
 from cpu_sse_fp_aot import lift_code, translate
+import sse_fp_ref as ref
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -38,6 +43,15 @@ EXPORTS = (
     # Transport & chained pipeline (2)
     "op_movaps_reg", "op_pipeline",
 )
+
+ARITH_OPS = ("add", "sub", "mul", "div", "min", "max", "sqrt")
+ARITH_SUFFIXES = ("", "_mem", "_mem_disp", "_self")
+ARITH_EXPORTS = tuple(f"op_{op}ps{suffix}" for op in ARITH_OPS for suffix in ARITH_SUFFIXES) + (
+    "op_arith_pipeline",)
+EXPORTS = EXPORTS + ARITH_EXPORTS
+# The ALTER_IMM build assembles these register forms with another operation.
+ALTERED_OP = {"add": "sub", "sub": "add", "mul": "div", "div": "mul", "min": "max", "max": "min",
+              "sqrt": "add"}
 
 ALTERED_PREDICATES = {
     "op_cmpps_1": (1, 5),
@@ -111,8 +125,34 @@ def ref_cmpss(a_vec, b_bits, pred):
     return pk_d(*ad)
 
 
+def arith_reference(name, a, b, mode=ref.DEFAULT_MODE, altered=False, quirk=None):
+    """(expected 32-byte output, wildcard mask) of a packed arithmetic export under an MXCSR mode.
+
+    A wildcard byte marks a lane sse_fp_ref cannot decide; it is zero everywhere in the default mode."""
+    out, wild = bytearray(FILL), bytearray(32)
+    if name == "op_arith_pipeline":
+        low, high = ref.chain(a, b, mode, quirk, multiply="div" if altered else "mul")
+        out[0:16], wild[0:16] = ref.pack(low)
+        out[16:32], wild[16:32] = ref.pack(high)
+        return bytes(out), bytes(wild)
+    op, suffix = name[3:].split("ps", 1)
+    first, source = a[0:16], {"": b[0:16], "_mem": b[0:16], "_mem_disp": b[16:32], "_self": a[0:16]}[suffix]
+    if altered and suffix == "":
+        op = ALTERED_OP[op]
+    elif altered and suffix == "_self":
+        op, source = ("add" if op == "sqrt" else op), b[0:16]
+    elif altered:
+        source = b[16:32] if suffix == "_mem" else b[0:16]
+    out[0:16], wild[0:16] = ref.pack(ref.apply(op, first, source, mode, quirk))
+    return bytes(out), bytes(wild)
+
+
 def reference(name, a, b, altered=False):
     """Expected 32-byte output region; unwritten bytes keep the FILL pattern."""
+    if name in ARITH_EXPORTS:
+        out, wild = arith_reference(name, a, b, altered=altered)
+        assert not any(wild), name
+        return out
     out = bytearray(FILL)
     aq0, aq1 = u64s(a[:16])
     bq0, _ = u64s(b[:16])
@@ -245,7 +285,33 @@ def move_pairs():
     return pairs
 
 
+ARITH_SPECIAL = (
+    0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x3FC00000, 0xC0100000, 0x40000000, 0x3EAAAAAB,
+    0x33800000, 0x3F800001, 0x4B800001, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7F800001, 0xFFC00001,
+    0x00000001, 0x80000003, 0x007FFFFF, 0x00800000, 0x00800001, 0x7F7FFFFF, 0xFF7FFFFF, 0x7F000000,
+    0x5F800000, 0x1F800000, 0x3F000000, 0x00400000,
+)
+
+
+def arith_pairs():
+    """Every ordered pair of special values (8 lanes per case), then random biased exponents."""
+    lane_pairs = [(x, y) for x in ARITH_SPECIAL for y in ARITH_SPECIAL]
+    pairs = []
+    for start in range(0, len(lane_pairs), 8):
+        chunk = lane_pairs[start:start + 8]
+        pairs.append((pk_d(*(x for x, _ in chunk)), pk_d(*(y for _, y in chunk))))
+    rng = random.Random(0x5A11)
+    exponents = (0, 1, 2, 63, 126, 127, 128, 190, 253, 254)
+    def lane():
+        return (rng.getrandbits(1) << 31) | (rng.choice(exponents) << 23) | rng.getrandbits(23)
+    for _ in range(30):
+        pairs.append((pk_d(*(lane() for _ in range(8))), pk_d(*(lane() for _ in range(8)))))
+    return pairs
+
+
 def inputs_for(name):
+    if name in ARITH_EXPORTS:
+        return arith_pairs()
     if name.startswith(("op_cmpps", "op_cmpss")) or name == "op_pipeline":
         return float_pairs()
     return move_pairs()
@@ -286,8 +352,8 @@ def invoke(fn, a, b):
     return check_guards_and_read(buf_out, o_pre, o_off, o_post, "output")
 
 
-def assert_equal_output(label, name, idx, got, want):
-    if got != want:
+def assert_equal_output(label, name, idx, got, want, wild=bytes(32)):
+    if any((g ^ w) & ~m & 0xFF for g, w, m in zip(got, want, wild)):
         raise AssertionError(
             f"{label} {name} case {idx}: got {got.hex()} != expected {want.hex()}")
 
@@ -338,7 +404,7 @@ def check_differential(native_path, lifted_path, altered_path):
 
     # Altered-immediate divergence controls for both cmpps and cmpss.
     changed = {}
-    for name in ALTERED_PREDICATES:
+    for name in (*ALTERED_PREDICATES, *ARITH_EXPORTS):
         diffs = 0
         for idx, (a, b) in enumerate(inputs_for(name)):
             want_alt = reference(name, a, b, altered=True)
@@ -364,7 +430,105 @@ def check_differential(native_path, lifted_path, altered_path):
         raise AssertionError("mutated output was not caught by comparator")
 
     print(f"{total} native/lifted/reference SSE FP cases across {len(EXPORTS)} exports matched "
-          f"bit-for-bit; altered controls diverged on {changed}; output mutation control caught")
+          f"bit-for-bit; altered controls diverged on all {len(changed)} exports "
+          f"(fewest differing cases {min(changed.values())}); output mutation control caught")
+
+
+# --- Packed arithmetic under every MXCSR rounding mode, DAZ and FTZ ---
+
+def function_address(fn):
+    return ctypes.cast(fn, ctypes.c_void_p).value
+
+
+def bind_mxcsr_driver(harness_path):
+    """op_call_with_mxcsr(fn, a, b, out, mxcsr): the native-only harness image (never translated) that
+    runs fn under a control word."""
+    driver = ctypes.CDLL(str(Path(harness_path).resolve())).op_call_with_mxcsr
+    driver.argtypes = [ctypes.c_uint64] * 4 + [ctypes.c_uint32]
+    driver.restype = None
+    return driver
+
+
+def invoke_under(driver, fn, mxcsr, a, b):
+    buf_a, ptr_a, a_pre, a_off, a_post = alloc_aligned_buffer(a)
+    buf_b, ptr_b, b_pre, b_off, b_post = alloc_aligned_buffer(b)
+    buf_out, ptr_out, o_pre, o_off, o_post = alloc_aligned_buffer(FILL)
+    driver(function_address(fn), ptr_a, ptr_b, ptr_out, mxcsr)
+    check_guards_and_read(buf_a, a_pre, a_off, a_post, "input_a")
+    check_guards_and_read(buf_b, b_pre, b_off, b_post, "input_b")
+    return check_guards_and_read(buf_out, o_pre, o_off, o_post, "output")
+
+
+# Each wrong rule must disagree with the processor on some decided lane in the given mode.
+REFERENCE_QUIRKS = (
+    ("nan_second_source", "op_addps", ref.DEFAULT_MODE),
+    ("no_quieting", "op_mulps", ref.DEFAULT_MODE),
+    ("mixed_zero_negative", "op_addps", ref.DEFAULT_MODE),
+    ("divide_zero_nan", "op_divps", ref.DEFAULT_MODE),
+    ("zero_returns_first", "op_minps", ref.DEFAULT_MODE),
+    ("zero_returns_first", "op_maxps", ref.DEFAULT_MODE),
+    ("min_as_max", "op_minps", ref.DEFAULT_MODE),
+    ("nan_first_operand", "op_maxps", ref.DEFAULT_MODE),
+    ("sqrt_negative_zero_positive", "op_sqrtps", ref.DEFAULT_MODE),
+    ("sqrt_default_nan_positive", "op_sqrtps", ref.DEFAULT_MODE),
+    ("ignore_rounding_mode", "op_addps", ref.Mode(ref.RU)),
+    ("ignore_rounding_mode", "op_divps", ref.Mode(ref.RZ)),
+    ("ignore_rounding_mode", "op_sqrtps", ref.Mode(ref.RU)),
+    ("ignore_daz", "op_mulps", ref.Mode(ref.RN, True, False)),
+    ("ignore_ftz", "op_mulps", ref.Mode(ref.RN, False, True)),
+)
+
+
+def check_arithmetic_modes(native_path, lifted_path, harness_path):
+    driver = bind_mxcsr_driver(harness_path)
+    native = bind_exports(native_path, "", ARITH_EXPORTS)
+    lifted = bind_exports(lifted_path, "lifted_", ARITH_EXPORTS)
+    pairs = arith_pairs()
+    seen = {}
+    decided = wildcards = 0
+    for mode in ref.ALL_MODES + tuple(ref.Mode(rc, daz, ftz) for rc in range(4)
+                                      for daz, ftz in ((True, False), (False, True))):
+        for name in ARITH_EXPORTS:
+            for idx, (a, b) in enumerate(pairs):
+                label = f"{name} [{mode.label()}]"
+                got_n = invoke_under(driver, native[name], mode.mxcsr(), a, b)
+                got_l = invoke_under(driver, lifted[name], mode.mxcsr(), a, b)
+                want, wild = arith_reference(name, a, b, mode)
+                assert_equal_output("native", label, idx, got_n, want, wild)
+                # Where the reference abstains, the lifted code must still equal the processor.
+                assert_equal_output("lifted", label, idx, got_l, got_n)
+                seen[(name, mode.mxcsr(), idx)] = got_n
+                wildcards += sum(1 for byte in wild if byte) // 4
+                decided += 8 - sum(1 for byte in wild if byte) // 4
+    # The control word must change results: each mode differs from the default on some call.
+    default = ref.DEFAULT_MODE.mxcsr()
+    for mode in (ref.Mode(ref.RD), ref.Mode(ref.RU), ref.Mode(ref.RZ), ref.Mode(ref.RN, True, False),
+                 ref.Mode(ref.RN, False, True)):
+        moved = [key for key, got in seen.items() if key[1] == mode.mxcsr() and got != seen[(key[0], default, key[2])]]
+        if not moved:
+            raise AssertionError(f"MXCSR {mode.label()} did not change any result: the harness is not applying it")
+    # Wrong reference rules must be caught, so the inputs reach the rule being checked.
+    for quirk, name, mode in REFERENCE_QUIRKS:
+        caught = 0
+        for idx, (a, b) in enumerate(pairs):
+            want, wild = arith_reference(name, a, b, mode, quirk=quirk)
+            got = seen[(name, mode.mxcsr(), idx)]
+            if any((g ^ w) & ~m & 0xFF for g, w, m in zip(got, want, wild)):
+                caught += 1
+        if not caught:
+            raise AssertionError(f"reference quirk {quirk} on {name} [{mode.label()}] was never detected")
+    # The driver restores the caller's control word.
+    for name in ("op_addps", "op_divps", "op_sqrtps"):
+        for idx, (a, b) in enumerate(pairs):
+            invoke_under(driver, native[name], ref.Mode(ref.RZ, True, True).mxcsr(), a, b)
+            want, wild = arith_reference(name, a, b)
+            assert_equal_output("restored", name, idx, invoke(native[name], a, b), want, wild)
+            assert_equal_output("restored lifted", name, idx, invoke(lifted[name], a, b), want, wild)
+    states = len({key[1] for key in seen})
+    print(f"{len(seen)} packed arithmetic runs in {states} MXCSR states: native, lifted and reference agree on "
+          f"{decided} lanes ({wildcards} lanes left undecided by the reference, native equals lifted there); "
+          f"each non-default state moved a result; {len(REFERENCE_QUIRKS)} wrong reference rules detected; "
+          f"driver restored the control word")
 
 
 # --- Alternative-encoding acceptance & translator rejection controls ---
@@ -410,6 +574,19 @@ def check_alt_encodings_and_rejections(original_path):
             Code.MOVDQA_XMMM128_XMM, R.XMM3, R.XMM0),
             Instruction.create_mem_reg(Code.MOVDQU_XMMM128_XMM, MemoryOperand(R.R8, displ=1, displ_size=1), R.XMM3),
             ret_ins)),
+        ("addps_xmm4_xmm5", (ld_xmm4, ld_xmm5, Instruction.create_reg_reg(
+            Code.ADDPS_XMM_XMMM128, R.XMM4, R.XMM5),
+            Instruction.create_mem_reg(Code.MOVNTPS_M128_XMM, MemoryOperand(R.R8), R.XMM4), ret_ins)),
+        ("divps_neg_disp", (ld_xmm0, Instruction.create_reg_mem(
+            Code.DIVPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RDX, displ=-32, displ_size=1)), st_xmm0, ret_ins)),
+        ("maxps_r8_source", (ld_xmm0, Instruction.create_reg_mem(
+            Code.MAXPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.R8, displ=0x10, displ_size=1)), st_xmm0, ret_ins)),
+        ("sqrtps_undefined_dest", (ld_xmm1, Instruction.create_reg_reg(
+            Code.SQRTPS_XMM_XMMM128, R.XMM5, R.XMM1),
+            Instruction.create_mem_reg(Code.MOVAPS_XMMM128_XMM, MemoryOperand(R.R8), R.XMM5), ret_ins)),
+        ("sqrtps_mem_xmm4", (Instruction.create_reg_mem(
+            Code.SQRTPS_XMM_XMMM128, R.XMM4, MemoryOperand(R.RCX, displ=0x20, displ_size=1)),
+            Instruction.create_mem_reg(Code.MOVAPS_XMMM128_XMM, MemoryOperand(R.R8), R.XMM4), ret_ins)),
     ]
     alt_expected = {
         "cmpps_xmm4_xmm5": "xmm4 = op_cmpps(xmm4, xmm5, 0x6u);",
@@ -419,6 +596,11 @@ def check_alt_encodings_and_rejections(original_path):
         "movhps_store_disp": "store64((r8 + 0x18ull), xmm0.q[1]);",
         "movaps_alt_reg_reg": "xmm2 = xmm0;",
         "movdqa_alt_reg_reg": "store128((r8 + 0x1ull), xmm3);",
+        "addps_xmm4_xmm5": "xmm4 = op_addps(xmm4, xmm5);",
+        "divps_neg_disp": "xmm0 = op_divps(xmm0, load128((rdx + 0xffffffffffffffe0ull)));",
+        "maxps_r8_source": "xmm0 = op_maxps(xmm0, load128((r8 + 0x10ull)));",
+        "sqrtps_undefined_dest": "xmm5 = op_sqrtps(xmm1);",
+        "sqrtps_mem_xmm4": "xmm4 = op_sqrtps(load128((rcx + 0x20ull)));",
     }
     for label, seq in alt_accept:
         raw = encode_seq(*seq)
@@ -450,6 +632,14 @@ def check_alt_encodings_and_rejections(original_path):
             Code.EVEX_VMOVNTPS_M128_XMM, MemoryOperand(R.R8), R.XMM0), ret_ins), "non-legacy encoding"),
         ("vmovaps_evex", (Instruction.create_reg_mem(
             Code.EVEX_VMOVAPS_XMM_K1Z_XMMM128, R.XMM0, MemoryOperand(R.RCX)), ret_ins), "non-legacy encoding"),
+        ("vaddps_vex", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg_reg(
+            Code.VEX_VADDPS_XMM_XMM_XMMM128, R.XMM2, R.XMM0, R.XMM1), ret_ins), "non-legacy encoding"),
+        ("vminps_vex", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg_reg(
+            Code.VEX_VMINPS_XMM_XMM_XMMM128, R.XMM2, R.XMM0, R.XMM1), ret_ins), "non-legacy encoding"),
+        ("vsqrtps_vex", (ld_xmm1, Instruction.create_reg_reg(
+            Code.VEX_VSQRTPS_XMM_XMMM128, R.XMM2, R.XMM1), ret_ins), "non-legacy encoding"),
+        ("vaddps_evex", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg_reg(
+            Code.EVEX_VADDPS_XMM_K1Z_XMM_XMMM128B32, R.XMM2, R.XMM0, R.XMM1), ret_ins), "non-legacy encoding"),
     ]
 
     # 2) Reserved immediate predicates >= 8 reject.
@@ -466,9 +656,15 @@ def check_alt_encodings_and_rejections(original_path):
 
     # 3) Unsupported instructions (other SSE/SSE2/GPR ops).
     unsupported_insns = [
-        ("addps", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.ADDPS_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins)),
+        ("rsqrtps", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.RSQRTPS_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins)),
+        ("rcpps", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.RCPPS_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins)),
+        ("haddpd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.HADDPD_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins)),
+        ("cvtps2pd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.CVTPS2PD_XMM_XMMM64, R.XMM0, R.XMM1), ret_ins)),
+        ("andpd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.ANDPD_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins)),
+        ("sqrtss", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.SQRTSS_XMM_XMMM32, R.XMM0, R.XMM1), ret_ins)),
+        ("maxss", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.MAXSS_XMM_XMMM32, R.XMM0, R.XMM1), ret_ins)),
         ("addss", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.ADDSS_XMM_XMMM32, R.XMM0, R.XMM1), ret_ins)),
-        ("cmppd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg_u32(Code.CMPPD_XMM_XMMM128_IMM8, R.XMM0, R.XMM1, 0), ret_ins)),
+        ("cvtpd2ps", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg(Code.CVTPD2PS_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins)),
         ("cmpsd", (ld_xmm0, ld_xmm1, Instruction.create_reg_reg_u32(Code.CMPSD_XMM_XMMM64_IMM8, R.XMM0, R.XMM1, 0), ret_ins)),
         ("movlpd", (ld_xmm0, Instruction.create_reg_mem(Code.MOVLPD_XMM_M64, R.XMM0, MemoryOperand(R.RDX)), ret_ins)),
         ("movhpd", (ld_xmm0, Instruction.create_reg_mem(Code.MOVHPD_XMM_M64, R.XMM0, MemoryOperand(R.RDX)), ret_ins)),
@@ -541,6 +737,34 @@ def check_alt_encodings_and_rejections(original_path):
         ("indexed_mem", (Instruction.create_reg_mem(
             Code.MOVAPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, R.RDX, 4)), ret_ins),
             "unsupported memory operand"),
+        ("nonvolatile_xmm7_addps_dst", (Instruction.create_reg_reg(
+            Code.ADDPS_XMM_XMMM128, R.XMM7, R.XMM1), ret_ins), "nonvolatile vector register"),
+        ("nonvolatile_xmm9_sqrtps_dst", (ld_xmm1, Instruction.create_reg_reg(
+            Code.SQRTPS_XMM_XMMM128, R.XMM9, R.XMM1), ret_ins), "nonvolatile vector register"),
+        ("undefined_addps_dst", (ld_xmm1, Instruction.create_reg_reg(
+            Code.ADDPS_XMM_XMMM128, R.XMM0, R.XMM1), ret_ins), "undefined vector register xmm0"),
+        ("undefined_mulps_src", (ld_xmm0, Instruction.create_reg_reg(
+            Code.MULPS_XMM_XMMM128, R.XMM0, R.XMM3), ret_ins), "undefined vector register xmm3"),
+        ("undefined_minps_src", (ld_xmm0, Instruction.create_reg_reg(
+            Code.MINPS_XMM_XMMM128, R.XMM0, R.XMM2), ret_ins), "undefined vector register xmm2"),
+        ("undefined_sqrtps_src", (Instruction.create_reg_reg(
+            Code.SQRTPS_XMM_XMMM128, R.XMM0, R.XMM2), ret_ins), "undefined vector register xmm2"),
+        ("unaligned_divps_m128", (ld_xmm0, Instruction.create_reg_mem(
+            Code.DIVPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RDX, displ=8, displ_size=1)), ret_ins),
+            "unaligned 16-byte memory operand"),
+        ("unaligned_subps_m128", (ld_xmm0, Instruction.create_reg_mem(
+            Code.SUBPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, displ=-4, displ_size=1)), ret_ins),
+            "unaligned 16-byte memory operand"),
+        ("unaligned_sqrtps_m128", (Instruction.create_reg_mem(
+            Code.SQRTPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, displ=4, displ_size=1)), ret_ins),
+            "unaligned 16-byte memory operand"),
+        ("non_arg_base_maxps", (ld_xmm0, Instruction.create_reg_mem(
+            Code.MAXPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RAX)), ret_ins), "unsupported memory base"),
+        ("indexed_mulps", (ld_xmm0, Instruction.create_reg_mem(
+            Code.MULPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RCX, R.RDX, 4)), ret_ins),
+            "unsupported memory operand"),
+        ("nonvolatile_base_sqrtps", (Instruction.create_reg_mem(
+            Code.SQRTPS_XMM_XMMM128, R.XMM0, MemoryOperand(R.RBX)), ret_ins), "nonvolatile GPR base"),
         ("segment_prefix", (seg_load, ret_ins), "unsupported instruction prefix"),
         ("missing_ret", (ld_xmm0,), "missing terminal ret"),
         ("after_ret", (ret_ins, ld_xmm0), "unreachable instruction after ret"),
@@ -598,7 +822,7 @@ def check_alt_encodings_and_rejections(original_path):
         ("pe_vcmpps_vex", encode_seq(*nonlegacy_cases[0][1]), "non-legacy encoding"),
         ("pe_cmpps_imm8", encode_seq(*imm_cases[0][1]), "unsupported cmpps predicate"),
         ("pe_cmpss_imm8", encode_seq(*imm_cases[2][1]), "unsupported cmpss predicate"),
-        ("pe_addps", encode_seq(*unsupported_insns[0][1]), "unsupported instruction"),
+        ("pe_rsqrtps", encode_seq(*unsupported_insns[0][1]), "unsupported instruction"),
         ("pe_nonvolatile_xmm6", encode_seq(*other_sequences["nonvolatile_xmm6_dst"]), "nonvolatile vector register"),
         ("pe_undef_movlps", encode_seq(*other_sequences["undefined_movlps_dst"]), "undefined vector register xmm0"),
         ("pe_non_r8_movntps", encode_seq(*other_sequences["non_r8_store_movntps_rcx"]), "non-r8 store memory operand"),
@@ -633,4 +857,5 @@ def check_alt_encodings_and_rejections(original_path):
 if __name__ == "__main__":
     check_discarded_read(*sys.argv[1:3])
     check_differential(*sys.argv[1:4])
+    check_arithmetic_modes(*sys.argv[1:3], sys.argv[4])
     check_alt_encodings_and_rejections(sys.argv[1])

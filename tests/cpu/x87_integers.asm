@@ -130,6 +130,16 @@ fistp_two PROC FRAME
     ret
 fistp_two ENDP
 
+fist_fisttp_depth2 PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+0]
+    fld tbyte ptr [rcx+16]
+    fist word ptr [rdx+0]
+    fisttp word ptr [rdx+2]
+    fstp tbyte ptr [rdx+16]
+    ret
+fist_fisttp_depth2 ENDP
+
 fild_depth8 PROC FRAME
     .endprolog
     fld qword ptr [rcx+0]

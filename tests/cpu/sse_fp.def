@@ -34,3 +34,32 @@ EXPORTS
     op_movaps_reg
     op_discarded_read
     op_pipeline
+    op_addps
+    op_addps_mem
+    op_addps_mem_disp
+    op_addps_self
+    op_subps
+    op_subps_mem
+    op_subps_mem_disp
+    op_subps_self
+    op_mulps
+    op_mulps_mem
+    op_mulps_mem_disp
+    op_mulps_self
+    op_divps
+    op_divps_mem
+    op_divps_mem_disp
+    op_divps_self
+    op_minps
+    op_minps_mem
+    op_minps_mem_disp
+    op_minps_self
+    op_maxps
+    op_maxps_mem
+    op_maxps_mem_disp
+    op_maxps_self
+    op_sqrtps
+    op_sqrtps_mem
+    op_sqrtps_mem_disp
+    op_sqrtps_self
+    op_arith_pipeline

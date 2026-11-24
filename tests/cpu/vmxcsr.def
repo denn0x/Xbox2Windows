@@ -1,0 +1,8 @@
+EXPORTS
+    mxcsr_round
+    mxcsr_leak
+    mxcsr_after
+    mxcsr_badload
+    mxcsr_fault
+    mix_ld_vst
+    mix_vld_st

@@ -5,6 +5,13 @@ letter is `f` (float), `d` (double) or `q` (a 64-bit integer or pointer). Slot N
 XMM0-XMM3 when it is floating point and in RCX, RDX, R8 or R9 otherwise; the result leaves in
 XMM0 or RAX. Control flow and the integer instructions are those of cpu_switch_aot.
 
+Scalar SQRT, MIN and MAX are lifted too. CVTSS2SI and CVTSD2SI (rounded by the MXCSR rounding control, DAZ read
+at run time, FTZ not involved) are lifted next to the truncating CVTTSS2SI and CVTTSD2SI; the invalid and precision
+exception flags they set are not observed. The generated code runs under the host MXCSR: a guest MXCSR write is not
+lifted, so the rounding mode, DAZ and FTZ are the host's and the exception flags are not observed. SQRT, MIN and
+MAX read their operands at run time, so a constant operand is not folded with the default environment; ADD, SUB,
+MUL and DIV have no such barrier.
+
 Only the low quadword of an XMM register is modelled. Every supported instruction computes
 that quadword from low quadwords alone, so the upper half never reaches a result. The two
 dwords of the low quadword are tracked separately as defined or undefined: a float argument
@@ -34,10 +41,15 @@ ARITHMETIC = {M.ADDSS: ("+", 4), M.SUBSS: ("-", 4), M.MULSS: ("*", 4), M.DIVSS: 
               M.ADDSD: ("+", 8), M.SUBSD: ("-", 8), M.MULSD: ("*", 8), M.DIVSD: ("/", 8)}
 FROM_INTEGER = {M.CVTSI2SS: 4, M.CVTSI2SD: 8}
 TRUNCATIONS = {M.CVTTSS2SI: 4, M.CVTTSD2SI: 8}
+ROUNDINGS = {M.CVTSS2SI: 4, M.CVTSD2SI: 8}
 RESIZES = {M.CVTSS2SD: 4, M.CVTSD2SS: 8}
 COMPARES = {M.UCOMISS: 4, M.COMISS: 4, M.UCOMISD: 8, M.COMISD: 8}
+ROOTS = {M.SQRTSS: 4, M.SQRTSD: 8}
+# MIN and MAX with the comparison that keeps the destination operand.
+EXTREMA = {M.MINSS: ("<", 4), M.MAXSS: (">", 4), M.MINSD: ("<", 8), M.MAXSD: (">", 8)}
 ZEROING = {M.XORPS, M.XORPD, M.PXOR}
-SCALAR = {*MOVES, *COPIES, *ARITHMETIC, *FROM_INTEGER, *TRUNCATIONS, *RESIZES, *COMPARES, *ZEROING, M.MOVD, M.MOVQ}
+SCALAR = {*MOVES, *COPIES, *ARITHMETIC, *ROOTS, *EXTREMA, *FROM_INTEGER, *TRUNCATIONS, *ROUNDINGS, *RESIZES, *COMPARES, *ZEROING,
+          M.MOVD, M.MOVQ}
 # fc holds ZF, PF and CF of the last compare as bits 2, 1 and 0. An unordered compare sets all three.
 CONDITIONS = {CC.E: "(fc & 4u) != 0", CC.NE: "(fc & 4u) == 0", CC.B: "(fc & 1u) != 0", CC.AE: "(fc & 1u) == 0",
               CC.BE: "(fc & 5u) != 0", CC.A: "(fc & 5u) == 0", CC.P: "(fc & 2u) != 0", CC.NP: "(fc & 2u) == 0"}
@@ -153,14 +165,15 @@ class ScalarLifter(Lifter):
             # Loads, MOVD, MOVQ and MOVSD between registers define the whole low quadword.
             writes.update(parts(destination, 8))
             return f"{XMM[destination]} = {bits};", reads, writes
-        if mnemonic in TRUNCATIONS:
+        if mnemonic in TRUNCATIONS or mnemonic in ROUNDINGS:
             width = RegisterExt.size(ins.op0_register) if ins.op0_kind == OpKind.REGISTER else 0
             if width not in (4, 8) or not RegisterExt.is_gpr(ins.op0_register):
                 raise unsupported
-            source = TRUNCATIONS[mnemonic]
+            source = {**TRUNCATIONS, **ROUNDINGS}[mnemonic]
             bits = self.source(ins, 1, source, reads)
             writes.add(full(ins.op0_register))
-            value = f"truncate<{signed(width)}>(cast<{TYPES[source]}>({bits}))"
+            convert = "truncate" if mnemonic in TRUNCATIONS else "round_to_integer"
+            value = f"{convert}<{signed(width)}>(cast<{TYPES[source]}>({bits}))"
             return self.write(ins, width, value), reads, writes
 
         destination = self.xmm(ins, 0)
@@ -182,6 +195,18 @@ class ScalarLifter(Lifter):
             a = name if width == 8 else f"static_cast<std::uint32_t>({name})"
             b = self.source(ins, 1, width, reads)
             return self.assign(destination, width, f"arith<{TYPES[width]}>({a}, {b}, '{operator}')"), reads, writes
+        if mnemonic in ROOTS:
+            # The source alone is read. The destination keeps every bit above the result.
+            width = ROOTS[mnemonic]
+            bits = self.source(ins, 1, width, reads)
+            writes.update(parts(destination, width))
+            return self.assign(destination, width, f"root<{TYPES[width]}>({bits})"), reads, writes
+        if mnemonic in EXTREMA:
+            operator, width = EXTREMA[mnemonic]
+            reads.update(parts(destination, width))
+            a = name if width == 8 else f"static_cast<std::uint32_t>({name})"
+            b = self.source(ins, 1, width, reads)
+            return self.assign(destination, width, f"extreme<{TYPES[width]}>({a}, {b}, '{operator}')"), reads, writes
         if mnemonic in FROM_INTEGER:
             width = FROM_INTEGER[mnemonic]
             if ins.op1_kind == OpKind.REGISTER:
@@ -338,7 +363,9 @@ def lift(pe, name, result, slots):
     return "\n".join(source), function
 
 
-FLOAT_PRELUDE = PRELUDE + """#include <limits>
+FLOAT_PRELUDE = PRELUDE + """#include <cmath>
+#include <emmintrin.h>
+#include <limits>
 // One host instruction per guest operation: no fused multiply-add.
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma fp_contract(off)
@@ -366,11 +393,57 @@ template <class Float, class Bits> static Bits arith(Bits a, Bits b, char op) {
     const Float r = op == '+' ? x + y : op == '-' ? x - y : op == '*' ? x * y : x / y;
     return r != r ? static_cast<Bits>(~(quiet - 1)) : cast<Bits>(r);
 }
+// The host reads a value from a volatile so that no operation on it is evaluated by the compiler: a constant
+// operand would otherwise be folded with the default rounding and without DAZ instead of under the host MXCSR.
+template <class Float> static Float runtime(Float value) {
+    volatile Float input = value;
+    return input;
+}
+// With DAZ set a denormal source operand is read as a zero of its sign, also when it is returned unchanged
+// as the result of MIN or MAX. The host compare of a denormal with zero shows whether DAZ is set.
+template <class Float, class Bits> static Bits daz(Bits bits) {
+    const Bits sign = static_cast<Bits>(1) << (8 * sizeof(Bits) - 1);
+    const Bits fraction = (static_cast<Bits>(1) << (std::numeric_limits<Float>::digits - 1)) - 1;
+    const Bits magnitude = bits & ~sign;
+    if (magnitude == 0 || magnitude > fraction) return bits;
+    return runtime(cast<Float>(static_cast<Bits>(1))) == static_cast<Float>(0) ? bits & sign : bits;
+}
+// SQRTSS and SQRTSD run on the processor itself, through the intrinsics, and not through the host library
+// function: the processor reads a denormal operand as a zero of its sign under DAZ, returns -0 for -0, quiets a
+// NaN operand, gives the default NaN for any other negative operand and rounds as the MXCSR says. A C library
+// root decides those cases on its own (a runtime that tests the sign of the bits returns a NaN for a negative
+// denormal under DAZ, where the processor returns -0).
+static float hardware_root(float value) { return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(value))); }
+static double hardware_root(double value) {
+    const __m128d operand = _mm_set_sd(value);
+    return _mm_cvtsd_f64(_mm_sqrt_sd(operand, operand));
+}
+template <class Float, class Bits> static Bits root(Bits b) {
+    return cast<Bits>(hardware_root(runtime(cast<Float>(b))));
+}
+// MINSS, MAXSS, MINSD and MAXSD return the destination only when the comparison is true. Equal values
+// (so zeros of either sign) and any NaN, which compares false, give the source operand unchanged.
+template <class Float, class Bits> static Bits extreme(Bits a, Bits b, char op) {
+    const Float x = runtime(cast<Float>(a)), y = runtime(cast<Float>(b));
+    return daz<Float>((op == '<' ? x < y : x > y) ? a : b);
+}
 // CVTTSS2SI and CVTTSD2SI: a NaN or a value outside the destination range gives the integer
 // indefinite, which is the sign bit alone.
 template <class Integer, class Float> static Integer truncate(Float value) {
     const Float limit = -static_cast<Float>(std::numeric_limits<Integer>::min());
     return value >= -limit && value < limit ? static_cast<Integer>(value) : std::numeric_limits<Integer>::min();
+}
+// CVTSS2SI and CVTSD2SI round by the MXCSR rounding control and read a denormal as a zero under DAZ. They run on
+// the processor, through the intrinsics, and not through lrint or llrint of the host C library: that library does
+// not follow the instruction for a NaN or a value out of range and, on Windows, for a rounding control other than
+// the default. The processor gives the integer indefinite, the sign bit alone, for a NaN, an infinity or a result
+// that does not fit. The operand is read at run time, so a constant is not rounded by the compiler.
+static std::int32_t hardware_round(float value, std::int32_t) { return _mm_cvtss_si32(_mm_set_ss(value)); }
+static std::int64_t hardware_round(float value, std::int64_t) { return _mm_cvtss_si64(_mm_set_ss(value)); }
+static std::int32_t hardware_round(double value, std::int32_t) { return _mm_cvtsd_si32(_mm_set_sd(value)); }
+static std::int64_t hardware_round(double value, std::int64_t) { return _mm_cvtsd_si64(_mm_set_sd(value)); }
+template <class Integer, class Float> static Integer round_to_integer(Float value) {
+    return hardware_round(runtime(value), Integer());
 }
 // CVTSS2SD and CVTSD2SS: the volatile input keeps every conversion, so a pair is not folded to an
 // identity. Each one quiets a signalling NaN and, with DAZ or FTZ set, flushes denormals, as on hardware.

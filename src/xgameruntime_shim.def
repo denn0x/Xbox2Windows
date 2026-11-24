@@ -1,0 +1,5 @@
+; Fixture-only module. The exported thunk names are generated from XGAMERUNTIME_THUNK_TABLE in
+; xgameruntime_shim.cpp with __declspec(dllexport). Listing them here as well
+; would create a second source of truth, so this file only fixes the DLL name.
+; No export ordinals are declared: this fixture does not guess Xbox ordinals.
+LIBRARY xgameruntime

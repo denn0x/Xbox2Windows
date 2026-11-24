@@ -1,6 +1,8 @@
 """Exercise the production shim using Windows placeholders and shared page views."""
 import ctypes as C
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 PAGE_BYTES = 65536
@@ -18,7 +20,35 @@ def bind(library, name, args, result):
     return function
 
 
+def permissive_count(path, count):
+    """Child process: one permissive XMemMapPhysicalPages call with a huge count, with array and without."""
+    library = C.WinDLL(str(Path(path).resolve()), use_last_error=True, winmode=0x900)
+    function = library.XMemMapPhysicalPages
+    function.argtypes, function.restype = [C.c_void_p, C.c_size_t, C.c_void_p], C.c_void_p
+    scatter = library.XMemMapPhysicalPagesScatter
+    scatter.argtypes, scatter.restype = [C.c_void_p, C.c_size_t, C.c_void_p], C.c_int
+    tokens = (C.c_size_t * 1)(0)
+    print("control", function(0x10000, 0, None), flush=True)  # a null array with no pages is a plain success
+    for args in ((None,), (tokens,)):
+        C.set_last_error(0)
+        result = function(0x10000, count, *args)
+        print("map", result, C.get_last_error(), flush=True)
+    C.set_last_error(0)
+    result = scatter((C.c_void_p * 1)(0x10000), count, tokens)
+    print("scatter", result, C.get_last_error(), flush=True)
+
+
+def check_permissive_count(path):
+    """A huge count must fail with ERROR_INVALID_PARAMETER, not abort the process on an allocation."""
+    environment = dict(os.environ, X2W_XMEM_PERMISSIVE="1")
+    done = subprocess.run([sys.executable, "-B", __file__, path, "--permissive-count", str(1 << 40)],
+                          env=environment, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, f"huge permissive count ended the process: {done.returncode:#x} {done.stderr}"
+    assert done.stdout.split() == ["control", "65536", "map", "None", "87", "map", "None", "87", "scatter", "0", "87"], done.stdout
+
+
 def main(path):
+    check_permissive_count(path)
     library = C.WinDLL(str(Path(path).resolve()), use_last_error=True, winmode=0x900)
     kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
     pointer, number = C.c_void_p, C.c_size_t
@@ -101,4 +131,7 @@ def main(path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if len(sys.argv) == 4 and sys.argv[2] == "--permissive-count":
+        permissive_count(sys.argv[1], int(sys.argv[3]))
+    else:
+        main(sys.argv[1])

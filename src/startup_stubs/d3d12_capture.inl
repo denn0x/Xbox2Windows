@@ -1,4 +1,4 @@
-// Local experiment (never upstream): frame capture for offline translation work.
+// Experimental (docs/startup-runtime.md): frame capture for offline translation work.
 // Included inside d3d12_xs_device.cpp's anonymous namespace.
 //
 //   X2W_D3D12_CAPTURE=<first frame>[,<count>]   X2W_D3D12_CAPTURE_DIR=<directory>
@@ -8,7 +8,14 @@
 // an argument points at), PSO / ROOT / RES / HEAP (objects, once each), VIEW (descriptor contents),
 // TABL (descriptor table binds), PRES (present). tools read it with out/gamerun/capture.py.
 
+struct Translation;
 struct PipelineInfo {
+    Translation* stream_translation = nullptr;
+    bool has_stream_blend = false;
+    D3D12_BLEND_DESC stream_blend{};
+    bool has_stream_depth_stencil = false;
+    D3D12_DEPTH_STENCIL_DESC stream_depth_stencil{};
+    DXGI_FORMAT stream_dsv_format = DXGI_FORMAT_UNKNOWN;
     int path = 0;                    // creating device slot: 57, 67, 55, 86, 62
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
     std::vector<unsigned char> desc;
@@ -23,13 +30,23 @@ struct ViewRecord {
 };
 struct HeapInfo {
     u64 wrapper;
-    std::uint32_t type, count, increment, pad;
+    std::uint32_t type, count, increment, logical_count;
     u64 title_cpu, desktop_cpu, desktop_gpu;
+    u64 title_sampler_cpu;
     std::uint32_t* shadow;           // per descriptor: view id + 1 (0: nothing known)
+};
+enum class Placement { none, aliased_buffer, copied_buffer };
+struct PlacedVertexView {
+    const Wrapper* owner{};
+    ID3D12Resource* alias{};
+    bool reject{};
 };
 struct ResourceInfo {
     D3D12_RESOURCE_DESC console;     // the description as the title passed it
     u64 bytes;                       // allocation size when known, else 0
+    Placement placement{};
+    const Wrapper* placement_device{};
+    D3D12_RESOURCE_STATES initial_state{};
 };
 
 SRWLOCK note_lock = SRWLOCK_INIT;
@@ -68,14 +85,27 @@ bool title_backed(u64 title_handle, u64 bytes)
     bool inside = false;
     AcquireSRWLockShared(&descriptor_lock);
     for (const auto& r : descriptor_ranges)
-        if (title_handle >= r.title && title_handle + bytes <= r.title + r.bytes) inside = true;
+        if (title_handle >= r.title && bytes <= r.bytes && title_handle - r.title <= r.bytes - bytes) inside = true;
     ReleaseSRWLockShared(&descriptor_lock);
     return inside;
 }
 
-void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes)
+void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
+                   Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr,
+                   const D3D12_DEPTH_STENCIL_DESC* depth_stencil = nullptr,
+                   DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN)
 {
     PipelineInfo info;
+    info.stream_translation = translation;
+    if (blend) {
+        info.stream_blend = *blend;
+        info.has_stream_blend = true;
+    }
+    if (depth_stencil) {
+        info.stream_depth_stencil = *depth_stencil;
+        info.has_stream_depth_stencil = true;
+    }
+    info.stream_dsv_format = dsv_format;
     info.path = path;
     info.base = as_wrapper(base);
     const std::size_t have = desc ? readable_window(reinterpret_cast<u64>(desc), bytes) : 0;
@@ -107,12 +137,72 @@ void note_root_blob(Wrapper* w, const void* blob, std::size_t bytes)
     root_blobs()[w].assign(static_cast<const unsigned char*>(blob), static_cast<const unsigned char*>(blob) + bytes);
     ReleaseSRWLockExclusive(&note_lock);
 }
+// This index only lists active slot-133 wrappers. The existing resource record
+// owns the extent and backing. Large resources must not widen the search
+// window for thousands of small vertex buffers.
+struct PlacementIndex {
+    std::multimap<u64, const Wrapper*> by_start;
+    u64 max_width{};
+};
+std::array<PlacementIndex, 2> placement_index;
+PlacementIndex& placement_group(u64 width)
+{
+    return placement_index[width > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT];
+}
+
 void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
 {
     if (!w || !console) return;
-    AcquireSRWLockExclusive(&note_lock);
+    x2w_startup::ExclusiveNoteLock guard(note_lock);
     resource_infos()[w] = ResourceInfo{*console, bytes};
+}
+void retire_placement(Wrapper* w)
+{
+    // Keep immutable capture data available to resource_info() readers.
+    AcquireSRWLockExclusive(&note_lock);
+    const auto found = resource_infos().find(w);
+    if (found != resource_infos().end() && found->second.placement != Placement::none) {
+        auto& group = placement_group(found->second.bytes);
+        const auto [first, last] = group.by_start.equal_range(reinterpret_cast<u64>(w->own().title_memory));
+        for (auto it = first; it != last; ++it) {
+            if (it->second == w) {
+                group.by_start.erase(it);
+                break;
+            }
+        }
+        found->second.placement = Placement::none;
+    }
     ReleaseSRWLockExclusive(&note_lock);
+}
+
+PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes)
+{
+    PlacedVertexView result{};
+    if (!start || !bytes) return result;
+    if (bytes > ~u64{} - start) return {nullptr, nullptr, true};
+    AcquireSRWLockShared(&note_lock);
+    const u64 end = start + bytes;
+    for (const auto& group : placement_index) {
+        if (group.by_start.empty()) continue;
+        const u64 earliest = start >= group.max_width ? start - group.max_width + 1 : 0;
+        for (auto it = group.by_start.lower_bound(earliest); it != group.by_start.end() && it->first < end; ++it) {
+            const auto* owner = it->second;
+            const auto& info = resource_infos().at(owner);
+            if (info.placement_device != device) continue;
+            const u64 base = it->first;
+            if (base <= start && start - base >= info.bytes) continue;
+            if (result.owner || start < base || bytes > info.bytes - (start - base)) {
+                result = {nullptr, nullptr, true}; // Ambiguous or crossing an allocation.
+                break;
+            }
+            result.owner = owner;
+            if (info.placement == Placement::aliased_buffer)
+                result.alias = static_cast<ID3D12Resource*>(owner->own().real);
+        }
+        if (result.reject) break;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return result;
 }
 const ResourceInfo* resource_info(const Wrapper* w)
 {
@@ -122,10 +212,11 @@ const ResourceInfo* resource_info(const Wrapper* w)
     ReleaseSRWLockShared(&note_lock);
     return info;
 }
-void note_heap(Wrapper* w, UINT type, UINT count, UINT increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu)
+void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu,
+               u64 title_sampler_cpu)
 {
     AcquireSRWLockExclusive(&note_lock);
-    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, 0, title_cpu, desktop_cpu, desktop_gpu,
+    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, logical_count, title_cpu, desktop_cpu, desktop_gpu, title_sampler_cpu,
         static_cast<std::uint32_t*>(VirtualAlloc(nullptr, (u64{count} + 1) * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))});
     ReleaseSRWLockExclusive(&note_lock);
 }
@@ -162,10 +253,12 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     }
     if (std::uint32_t* slot = shadow_slot(dest_desktop)) *slot = record.id + 1;
     ReleaseSRWLockExclusive(&note_lock);
-    if (dest_title != dest_desktop && title_backed(dest_title, 32) && x2w_local::writable(reinterpret_cast<void*>(dest_title), 32)) {
+    const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
+    if (dest_title != dest_desktop && title_backed(dest_title, token_bytes) &&
+        x2w_local::writable(reinterpret_cast<void*>(dest_title), token_bytes)) {
         std::uint32_t token[8] = {view_token_magic, record.id, static_cast<std::uint32_t>(slot), 0,
                                   static_cast<std::uint32_t>(resource), static_cast<std::uint32_t>(resource >> 32), 0, 0};
-        std::memcpy(reinterpret_cast<void*>(dest_title), token, sizeof(token));
+        std::memcpy(reinterpret_cast<void*>(dest_title), token, token_bytes);
     }
 }
 void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop, UINT count, UINT increment)
@@ -180,8 +273,10 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
         else std::memset(to, 0, u64{count} * 4);
     }
     ReleaseSRWLockExclusive(&note_lock);
-    const u64 bytes = u64{count} * increment;
-    if (dest_title != dest_desktop && src_title != src_desktop && title_backed(dest_title, bytes) && title_backed(src_title, bytes))
+    const UINT stride = title_descriptor_stride(dest_title, increment);
+    const u64 bytes = u64{count} * stride;
+    if (dest_title != dest_desktop && src_title != src_desktop &&
+        stride == title_descriptor_stride(src_title, increment) && title_backed(dest_title, bytes) && title_backed(src_title, bytes))
         std::memmove(reinterpret_cast<void*>(dest_title), reinterpret_cast<const void*>(src_title), bytes);
 }
 
@@ -381,13 +476,15 @@ void table(int slot, UINT parameter, u64 gpu_handle, std::uint32_t entries)
     std::vector<std::uint32_t> ids(entries * 2);  // [shadow ids + 1][token ids + 1]
     for (std::uint32_t i = 0; i < entries; ++i) ids[i] = heap.shadow ? heap.shadow[index + i] : 0;
     if (heap.title_cpu) {
+        const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
+        const u64 title_start = heap.title_cpu + index * stride;
         for (std::uint32_t i = 0; i < entries; ++i) {
             std::uint32_t token[2]{};
             SIZE_T got = 0;
-            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(heap.title_cpu + offset + u64{i} * heap.increment), token, sizeof(token), &got);
+            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(title_start + u64{i} * stride), token, sizeof(token), &got);
             ids[entries + i] = token[0] == view_token_magic ? token[1] + 1 : 0;
         }
-        memory(heap.title_cpu + offset, u64{entries} * heap.increment, 0, 0x4c4254);
+        memory(title_start, u64{entries} * stride, 0, 0x4c4254);
     }
     struct { std::uint32_t sequence, slot, parameter, entries; u64 gpu_handle, heap, index; } header{
         static_cast<std::uint32_t>(sequence), static_cast<std::uint32_t>(slot), parameter, entries, gpu_handle, heap.wrapper, index};

@@ -65,15 +65,10 @@ struct Span {
     std::uint32_t words[SPAN_WORDS];
 };
 
-constexpr Span make_span() {
-    Span span{};
-    for (std::uint32_t i = 0; i < SPAN_WORDS; ++i) span.words[i] = span_word(i);
-    return span;
-}
 }  // namespace
 
 __declspec(thread) int g_tls = 7;
-__declspec(thread) Span g_span = make_span();
+extern "C" __declspec(thread) Span g_span;  // Initialized bytes in exe_tls_template.asm.
 
 namespace {
 constexpr UINT CREATE_FAILED = 0xE0000002u, WAIT_FAILED_CODE = 0xE0000003u, LOG_FULL = 0xE0000006u;

@@ -1,0 +1,19 @@
+LIBRARY cpu_pcmpstr64
+EXPORTS
+    pcmpestri64_ub_eqany_pos_lsb
+    pcmpestri64_sw_ranges_neg_msb
+    pcmpestri64_mem_sb_eqeach_mpos_msb
+    pcmpestri64_alias_xmm0
+    pcmpestrm64_ub_eqany_pos_bit
+    pcmpestrm64_sb_ranges_neg_exp
+    pcmpestrm64_mem_uw_eqord_mneg_exp
+    pcmpestrm64_xmm0_self
+    vpcmpestri64_ub_eqany_pos_lsb
+    vpcmpestri64_uw_eqord_mneg_lsb
+    vpcmpestri64_mem_sw_ranges_neg_msb
+    vpcmpestri64_alias_xmm0
+    vpcmpestrm64_ub_eqany_pos_bit
+    vpcmpestrm64_uw_eqeach_mpos_exp
+    vpcmpestrm64_mem_ub_eqany_exp
+    vpcmpestrm64_xmm0_self
+    vpcmpestrm64_discarded_read

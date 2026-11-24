@@ -45,7 +45,7 @@ constexpr UINT32 gpu_usage_selector = 0x20000001;
 constexpr std::size_t gpu_usage_offset = 8;
 }
 
-// LOCAL EXPERIMENT ONLY (local/startup-v2, never pushed). With X2W_XMEM_PERMISSIVE=1, attribute
+// Experimental (docs/startup-runtime.md). With X2W_XMEM_PERMISSIVE=1, attribute
 // words the allocator refuses (seen: 0xf0814000, memory type 7, a physical type, 0x60000 bytes for
 // the audio stream queue) are served from committed process memory at 64 KiB granularity.
 namespace {

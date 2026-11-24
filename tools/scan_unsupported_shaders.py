@@ -39,6 +39,27 @@ except ImportError:
     SCRATCH_OPS = {}
     disasm_rdna2 = None
 
+# Entry bindings passed to pixel_aot.lower() for every record. The scan carries no per-record binding contract,
+# so translator acceptance is measured under these bindings only. A read of a register lower() holds no value for
+# under these inputs is reported as an unbound operand rather than as an instruction the translator refuses.
+SCAN_BINDINGS = {"texture_sgpr": 20, "interp_sgpr": 24, "sampler": (1, 2, 3, 4), "constant_descriptor": None}
+SCAN_BINDINGS_TEXT = ("texture descriptor table at s20, interpolation base at s24, sampler words 1 2 3 4, "
+                      "no constant buffers")
+
+
+def lower_rejection_causes(results: list[dict]) -> dict:
+    """Split the records lower() rejected by cause: unbound scalar or vector operand, translator rejection
+    (any other ValueError) or an unexpected exception (a translator fault, never counted as a missing binding)."""
+    causes = {"unbound_scalar_operand": 0, "unbound_vector_operand": 0,
+              "translator_rejection": 0, "unexpected_error": 0}
+    for r in results:
+        kind = r.get("lower_error_kind")
+        if kind == "unbound_operand":
+            causes[f"unbound_{r['lower_unbound']['bank']}_operand"] += 1
+        elif kind in causes:
+            causes[kind] += 1
+    return causes
+
 
 # Known supported instructions and patterns in pixel_aot.py
 # Tables are imported from pixel_aot so the scanner stays aligned with the translator.
@@ -54,6 +75,10 @@ PIXEL_INT_COMPARE = tuple(pixel_aot.INT_COMPARE) if pixel_aot is not None else (
 PIXEL_VOP3P_F16 = pixel_aot.VOP3P_F16 if pixel_aot is not None else {}
 PIXEL_VOP3P_INT16 = pixel_aot.VOP3P_INT16 if pixel_aot is not None else {}
 PIXEL_VOP3_INT16 = pixel_aot.VOP3_INT16 if pixel_aot is not None else {}
+PIXEL_VOP2_F16 = tuple(pixel_aot.VOP2_F16) if pixel_aot is not None else ()
+PIXEL_VOP1_F16_ROUND = tuple(pixel_aot.VOP1_F16_ROUND) if pixel_aot is not None else ()
+PIXEL_VOP2_F16_FUSED_SCALE = tuple(pixel_aot.VOP2_F16_FUSED_SCALE) if pixel_aot is not None else ()
+PIXEL_INLINE_F16 = tuple(pixel_aot.INLINE_F16) if pixel_aot is not None else ()
 PIXEL_VCC = r"(?:vcc(?:_lo)?)"
 PIXEL_VOP3_INT16_TERNARY = pixel_aot.VOP3_INT16_TERNARY if pixel_aot is not None else {}
 PIXEL_LANE_MASK = pixel_aot.LANE_MASK if pixel_aot is not None else r"(?:vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
@@ -67,6 +92,12 @@ INT16_VGPR = r"v(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])"
 INT16_SOURCE = (
     rf"(?:{INT16_VGPR}|s(?:[0-9]|[1-9][0-9]|10[0-5])|0x0{{0,4}}[0-9a-f]{{1,4}}"
     r"|-?(?:[0-9]|1[0-6])|(?:1[7-9]|[2-5][0-9]|6[0-4]))"
+)
+# Source of the plain binary16 e32 arithmetic and rounding forms as pixel_aot.half16_arith_source reads it: a binary16 inline
+# constant, 0, a 16-bit literal or a register. Integer inline constants other than 0 and every modifier are refused.
+F16_ARITH_SOURCE = (
+    r"(?:" + "|".join(map(re.escape, PIXEL_INLINE_F16 + ("0",)))
+    + r"|0x0*[0-9a-f]{1,4}|v(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])|s(?:[0-9]|[1-9][0-9]|10[0-5]))"
 )
 SCALAR32_SOURCE = r"(?:s\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
@@ -197,6 +228,31 @@ if PIXEL_INT_COMPARE:
     )
 else:
     INT64_COMPARE_PATTERN = None
+# Plain binary16 e32 and e64 forms whose result keeps only the low half (pixel_aot proves finite sources and results).
+# The e32 src1 must be a VGPR; the e64 spelling takes any source that the e32 src0 accepts. Neither takes a modifier.
+if PIXEL_VOP2_F16:
+    _vop2_f16 = "|".join(map(re.escape, PIXEL_VOP2_F16))
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{_vop2_f16})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{_vop2_f16})_f16_e64\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{F16_ARITH_SOURCE}"
+    )
+# The accumulating v_fmac_f16 and the scaling v_ldexp_f16 have the same e32 shape; pixel_aot additionally needs the accumulator
+# and the exponent to be statically proven.
+if PIXEL_VOP2_F16_FUSED_SCALE:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP2_F16_FUSED_SCALE))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
+    )
+if PIXEL_VOP1_F16_ROUND:
+    _vop1_f16_round = "|".join(map(re.escape, PIXEL_VOP1_F16_ROUND))
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{_vop1_f16_round})_f16_(?:e32|e64)\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE}"
+    )
+if pixel_aot is not None:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cvt_f16_(?:i16|u16)_e32\s+{INT16_VGPR},\s+{INT16_SOURCE}"
+    )
 if PIXEL_VOP3P_F16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_pk_(?:{'|'.join(map(re.escape, PIXEL_VOP3P_F16))})_f16\s+v\d+,\s+.+"
@@ -246,7 +302,7 @@ COMPILED_SUPPORTED_PATTERNS = [re.compile(f"^{p}$") for p in SUPPORTED_INSTRUCTI
 
 KNOWN_RDNA2_BASE_OPCODES = {
     # SOPP
-    "s_nop", "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1",
+    "s_nop", "s_endpgm", "s_code_end", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1",
     "s_cbranch_vccz", "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz",
     "s_barrier", "s_waitcnt", "s_inst_prefetch", "s_clause", "s_waitcnt_vscnt",
     "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_trap", "s_round_mode",
@@ -265,6 +321,8 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_quadmask_b32", "s_quadmask_b64", "s_abs_i32",
     "s_andn1_saveexec_b64", "s_orn1_saveexec_b64", "s_andn1_wrexec_b64", "s_andn2_wrexec_b64",
     "s_bitreplicate_b64_b32",
+    # Relative scalar moves: decoded by tools/disasm_rdna2.py, recognition only, no lowering.
+    "s_movrels_b32", "s_movrels_b64", "s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32",
     # SOP2
     "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_absdiff_i32", "s_addc_u32", "s_subb_u32",
     "s_min_i32", "s_min_u32", "s_max_i32", "s_max_u32", "s_cselect_b32", "s_cselect_b64",
@@ -304,7 +362,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "v_pk_add_f16", "v_pk_mul_f16", "v_pk_min_f16", "v_pk_max_f16",
     "v_dot2_f32_f16", "v_dot2_i32_i16", "v_dot2_u32_u16",
     "v_dot4_i32_i8", "v_dot4_u32_u8", "v_dot8_i32_i4", "v_dot8_u32_u4",
-        "v_mad_legacy_f32", "v_mad_i32_i24", "v_mad_u32_u24", "v_fma_f64", "v_lerp_u8", "v_alignbit_b32", "v_alignbyte_b32", "v_mullit_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32", "v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_cvt_pk_u8_f32", "v_div_fixup_f32", "v_div_fixup_f64", "v_add_f64", "v_mul_f64", "v_min_f64", "v_max_f64", "v_ldexp_f64", "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_hi_i32", "v_div_scale_f32", "v_div_scale_f64", "v_div_fmas_f32", "v_div_fmas_f64", "v_msad_u8", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_trig_preop_f64", "v_mqsad_u32_u8", "v_mad_u64_u32", "v_mad_i64_i32", "v_xor3_b32", "v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64", "v_add_nc_u16", "v_sub_nc_u16", "v_mul_lo_u16", "v_lshrrev_b16", "v_ashrrev_i16", "v_max_u16", "v_max_i16", "v_min_u16", "v_min_i16", "v_add_nc_i16", "v_sub_nc_i16", "v_add_co_u32", "v_sub_co_u32", "v_pack_b32_f16", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16", "v_lshlrev_b16", "v_subrev_co_u32", "v_mad_u16", "v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_perm_b32", "v_xad_u32", "v_lshl_add_u32", "v_add_lshl_u32", "v_fma_f16", "v_min3_f16", "v_min3_i16", "v_min3_u16", "v_max3_f16", "v_max3_i16", "v_max3_u16", "v_med3_f16", "v_med3_i16", "v_med3_u16", "v_interp_p2_f16", "v_mad_i16", "v_div_fixup_f16", "v_readlane_b32", "v_writelane_b32", "v_bfm_b32", "v_bcnt_u32_b32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32", "v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32", "v_add3_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_mad_u32_u16", "v_mad_i32_i16", "v_sub_nc_i32", "v_permlane16_b32", "v_permlanex16_b32", "v_add_nc_i32", "v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
+        "v_mad_legacy_f32", "v_mad_i32_i24", "v_mad_u32_u24", "v_fma_f64", "v_lerp_u8", "v_alignbit_b32", "v_alignbyte_b32", "v_mullit_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32", "v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_cvt_pk_u8_f32", "v_div_fixup_f32", "v_div_fixup_f64", "v_add_f64", "v_mul_f64", "v_min_f64", "v_max_f64", "v_ldexp_f64", "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_lo_i32", "v_mul_hi_i32", "v_div_scale_f32", "v_div_scale_f64", "v_div_fmas_f32", "v_div_fmas_f64", "v_msad_u8", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_trig_preop_f64", "v_mqsad_u32_u8", "v_mad_u64_u32", "v_mad_i64_i32", "v_xor3_b32", "v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64", "v_add_nc_u16", "v_sub_nc_u16", "v_mul_lo_u16", "v_lshrrev_b16", "v_ashrrev_i16", "v_max_u16", "v_max_i16", "v_min_u16", "v_min_i16", "v_add_nc_i16", "v_sub_nc_i16", "v_add_co_u32", "v_sub_co_u32", "v_pack_b32_f16", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16", "v_lshlrev_b16", "v_subrev_co_u32", "v_mad_u16", "v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_perm_b32", "v_xad_u32", "v_lshl_add_u32", "v_add_lshl_u32", "v_fma_f16", "v_min3_f16", "v_min3_i16", "v_min3_u16", "v_max3_f16", "v_max3_i16", "v_max3_u16", "v_med3_f16", "v_med3_i16", "v_med3_u16", "v_interp_p2_f16", "v_mad_i16", "v_div_fixup_f16", "v_readlane_b32", "v_writelane_b32", "v_bfm_b32", "v_bcnt_u32_b32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32", "v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32", "v_add3_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_mad_u32_u16", "v_mad_i32_i16", "v_sub_nc_i32", "v_permlane16_b32", "v_permlanex16_b32", "v_add_nc_i32", "v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
     "v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16",
     # VINTRP
     "v_interp_p1_f32", "v_interp_p2_f32", "v_interp_mov_f32",
@@ -318,6 +376,19 @@ KNOWN_RDNA2_BASE_OPCODES = {
 }
 
 
+# Scalar-memory store, cache-control, timer and probe forms the disassembler decodes: recognition only, no lowering.
+KNOWN_RDNA2_BASE_OPCODES |= {
+    "s_buffer_store_dword", "s_buffer_store_dwordx2", "s_buffer_store_dwordx4", "s_gl1_inv", "s_dcache_inv",
+    "s_dcache_wb", "s_memtime", "s_memrealtime", "s_atc_probe", "s_atc_probe_buffer",
+}
+
+# Scalar program-control and compare-immediate forms the disassembler decodes: recognition only, no lowering.
+KNOWN_RDNA2_BASE_OPCODES |= {
+    "s_wakeup", "s_setkill", "s_sethalt", "s_sendmsg", "s_sendmsghalt", "s_icache_inv", "s_incperflevel",
+    "s_decperflevel", "s_ttracedata", "s_ttracedata_imm", "s_endpgm_saved", "s_endpgm_ordered_ps_done",
+    "s_wait_idle", "s_waitcnt_depctr", "s_denorm_mode", "s_call_b64",
+}
+
 KNOWN_RDNA2_BASE_OPCODES |= (
     SUPPORTED_ALU
     | {f"v_{name}" for name in PIXEL_INTEGER}
@@ -327,6 +398,14 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16_TERNARY}
+    | {f"v_{name}_f16" for name in PIXEL_VOP2_F16 + PIXEL_VOP2_F16_FUSED_SCALE + PIXEL_VOP1_F16_ROUND}
+    | {"v_cvt_f16_i16", "v_cvt_f16_u16"}
+    | {
+        # Decoding only: no translator lowers these binary16 VOP1/VOP2 forms.
+        "v_cvt_u16_f16", "v_cvt_i16_f16", "v_fract_f16",
+        "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
+        "v_fmac_f16", "v_max_f16", "v_min_f16", "v_ldexp_f16", "v_pk_fmac_f16",
+    }
     | {name for name, _, _ in MUBUF_OPS.values()}
     | {name for name, _, _ in MTBUF_OPS.values()}
     | {entry[0] for entry in FLAT_OPS.values()}
@@ -409,15 +488,33 @@ def classify_isa_category(opcode: str) -> str:
     return "Other / Unknown"
 
 
+_STAGE_TAGS = (
+    ("pixel", "pixel", "ps"),
+    ("compute", "compute", "cs"),
+    ("vertex", "vertex", "vs"),
+)
+_STAGE_DELIMITERS = re.compile(r"[_.\-]")
+
+
 def detect_shader_stage(name_or_path: str) -> str:
-    """Classify shader stage from path or filename."""
-    lower = name_or_path.lower().replace("\\", "/")
-    if "/pixel/" in lower or "/ps/" in lower or "ps_" in lower or lower.startswith("ps_") or "_ps" in lower:
-        return "pixel"
-    if "/compute/" in lower or "/cs/" in lower or "cs_" in lower or lower.startswith("cs_") or "_cs" in lower:
-        return "compute"
-    if "/vertex/" in lower or "/vs/" in lower or "vs_" in lower or lower.startswith("vs_") or "_vs" in lower:
-        return "vertex"
+    """Classify shader stage from path or filename.
+
+    A stage tag (`ps`, `cs`, `vs`) matches only as a whole token of a path
+    component, where tokens are delimited by `_`, `.` or `-` (`ps_draw.bin`,
+    `blur_cs.s`, `a/vs/x.s`), so a tag inside another word (`loops_cs`,
+    `bumps_vs`, `ps5`) does not match. The long names (`pixel`, `compute`,
+    `vertex`) match only as a whole directory component. Matching is case
+    insensitive. If one path carries tags of several stages, the first stage
+    in the order pixel, compute, vertex wins.
+    """
+    parts = [p for p in name_or_path.lower().replace("\\", "/").split("/") if p]
+    directories = set(parts[:-1])
+    tokens = set()
+    for part in parts:
+        tokens.update(t for t in _STAGE_DELIMITERS.split(part) if t)
+    for stage, long_name, short_name in _STAGE_TAGS:
+        if long_name in directories or short_name in tokens:
+            return stage
     return "other"
 
 
@@ -449,6 +546,9 @@ def make_failed_shader_record(shader_name: str, error_message: str) -> dict:
         "is_fully_supported": False,
         "lower_status": "decode_failed",
         "lower_error": error_message,
+        "lower_error_kind": None,
+        "lower_error_type": None,
+        "lower_unbound": None,
         "unsupported_opcodes": {"<decode_error>": 1},
         "unsupported_details": [{
             "line_number": 0,
@@ -511,6 +611,8 @@ def is_instruction_supported(instruction_line: str) -> bool:
         return True
     if clean.startswith("v_cmp_") and re.search(r"_[iu]64(?:_e32|_e64)?\s", clean):
         return supports_int64_compare(clean)
+    if re.match(r"v_cmp_\w+_f32_sdwa\s", clean) and re.search(r"\bneg\(-?\d+\)", clean):
+        return False
     if not any(pattern.match(clean) for pattern in COMPILED_SUPPORTED_PATTERNS):
         return False
     if wait := re.fullmatch(r"s_waitcnt\s+(.*)", clean):
@@ -559,23 +661,30 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str], *,
     supported_count = total - len(unsupported_translator_items)
     support_ratio = (supported_count / total * 100.0) if total > 0 else 0.0
 
-    # Test pixel_aot.lower() to determine translator acceptance
+    # Test pixel_aot.lower() to determine translator acceptance under the scan's fixed bindings
     lower_status = "untested"
     lower_error = None
+    lower_error_kind = None
+    lower_error_type = None
+    lower_unbound = None
     if pixel_aot is not None:
         try:
-            pixel_aot.lower(
-                instructions=instructions,
-                texture_sgpr=20,
-                interp_sgpr=24,
-                sampler=[1, 2, 3, 4],
-                constant_descriptor=None,
-                wave_size=wave_size,
-            )
+            pixel_aot.lower(instructions=instructions, wave_size=wave_size, **SCAN_BINDINGS)
             lower_status = "passed"
         except Exception as e:
             lower_status = "rejected"
             lower_error = str(e)
+            lower_error_type = type(e).__name__
+            if isinstance(e, pixel_aot.UnboundOperand):
+                # A register with no tracked value under the scanned inputs, not an instruction the translator refuses.
+                lower_error_kind = "unbound_operand"
+                lower_unbound = {"bank": e.bank, "register": e.register, "instruction_index": e.index,
+                                 "byte_offset": e.offset, "instruction": e.instruction}
+            elif isinstance(e, ValueError):
+                lower_error_kind = "translator_rejection"
+            else:
+                # Any other exception (a bare KeyError included) is a translator fault, not a missing binding.
+                lower_error_kind = "unexpected_error"
 
     opcodes_recognized = (len(unrecognized_opcodes) == 0)
     translator_accepted = (lower_status == "passed")
@@ -602,6 +711,9 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str], *,
         "is_fully_supported": opcodes_recognized and translator_accepted,
         "lower_status": lower_status,
         "lower_error": lower_error,
+        "lower_error_kind": lower_error_kind,
+        "lower_error_type": lower_error_type,
+        "lower_unbound": lower_unbound,
         "unsupported_opcodes": dict(unrecognized_opcodes),
         "unsupported_details": unsupported_translator_items,
         "opcode_distribution": dict(opcode_distribution),
@@ -924,6 +1036,7 @@ def generate_progress_dashboard(results: list[dict], output_dir: Path) -> tuple[
         f.write("### Methodology Notes\n\n")
         f.write("- **Shaders Blocked**: Count of distinct shaders that cannot be fully lowered because they contain this opcode.\n")
         f.write("- **Blocker Impact %**: Percentage of total scanned shaders unblocked or partially enabled by implementing this opcode.\n")
+        f.write(f"- **Fully Supported / Accepted**: Conditional on the fixed entry bindings the scan supplies to `pixel_aot.lower()` ({SCAN_BINDINGS_TEXT}).\n")
         f.write("- **Pure Python Pipeline**: Instruction disassembly is executed natively via `tools/disasm_rdna2.py` without requiring external toolchains.\n")
 
     return json_file, md_file
@@ -949,6 +1062,7 @@ def generate_reports(results: list[dict], output_dir: Path):
     unsupported_opcodes_count = sum(1 for r in results if r["compatibility_category"] == "unsupported_opcodes")
     partially_supported = sum(1 for r in results if not r["is_fully_supported"] and r["supported_instructions"] > 0)
     unsupported_completely = sum(1 for r in results if not r["translator_accepted"] and r["supported_instructions"] == 0)
+    rejection_causes = lower_rejection_causes(results)
 
     # Aggregate all unsupported opcodes across all shaders
     global_unsupported_opcodes = Counter()
@@ -969,6 +1083,11 @@ def generate_reports(results: list[dict], output_dir: Path):
             "partially_supported": partially_supported,
             "completely_unsupported": unsupported_completely,
             "unique_unsupported_opcodes_count": len(global_unsupported_opcodes),
+            # Every record lower() rejected, by cause; the unbound counts are reads of registers with no tracked value
+            # under the scanned inputs, not instructions the translator refuses.
+            "translator_rejections_by_cause": rejection_causes,
+            # translator_accepted and the rejection counts hold only under these fixed entry bindings.
+            "translator_bindings": dict(SCAN_BINDINGS, sampler=list(SCAN_BINDINGS["sampler"])),
         },
         "top_unsupported_opcodes": global_unsupported_opcodes.most_common(),
         "unsupported_by_category": dict(global_categories),
@@ -988,6 +1107,12 @@ def generate_reports(results: list[dict], output_dir: Path):
         f.write(f"- **Full Shaders Accepted by Translator (`pixel_aot.py`):** {translator_accepted} ({round(translator_accepted/total_shaders*100, 1) if total_shaders else 0}%)\n")
         f.write(f"- **Opcodes Recognized by Scanner, but Rejected by Translator:** {opcodes_recognized_only}\n")
         f.write("  *(Valid RDNA 2 opcodes whose program structure, preamble, or bindings differ from `pixel_aot` straight-line single-texture template)*\n")
+        f.write("- **Translator Rejections by Cause** (every record `lower()` rejected):\n")
+        f.write(f"  - Unbound scalar operand under the scanned inputs: {rejection_causes['unbound_scalar_operand']}\n")
+        f.write(f"  - Unbound vector operand under the scanned inputs: {rejection_causes['unbound_vector_operand']}\n")
+        f.write(f"  - Other translator rejection: {rejection_causes['translator_rejection']}\n")
+        f.write(f"  - Unexpected translator error: {rejection_causes['unexpected_error']}\n")
+        f.write(f"  *(Acceptance and rejection totals are conditional on the fixed entry bindings this scan supplies to every record: {SCAN_BINDINGS_TEXT}.)*\n")
         f.write(f"- **Contains Unrecognized Opcodes:** {unsupported_opcodes_count}\n")
         f.write(f"- **Unique Missing Opcodes:** {len(global_unsupported_opcodes)}\n\n")
 
@@ -1067,6 +1192,10 @@ def main():
     print(f"Total Shaders Scanned:                     {total:,}")
     print(f"Full Shaders Accepted by Translator:       {accepted:,} ({(accepted/total)*100:.1f}%)")
     print(f"Opcodes Recognized, Translator-Rejected:   {recognized_only:,}")
+    causes = lower_rejection_causes(results)
+    print(f"Rejections, Unbound Scalar/Vector Operand: {causes['unbound_scalar_operand']:,} / {causes['unbound_vector_operand']:,}")
+    print(f"Rejections, Other Translator / Unexpected: {causes['translator_rejection']:,} / {causes['unexpected_error']:,}")
+    print(f"  (translator totals hold only under the scan's fixed bindings: {SCAN_BINDINGS_TEXT})")
     print(f"Contains Unrecognized Opcodes:             {unsupported_opcodes:,}")
     print(f"Total Decoded Instructions:                {total_insns:,}")
     print(f"Supported Instructions:                    {total_supp_insns:,}")

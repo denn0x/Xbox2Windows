@@ -21,6 +21,21 @@ constexpr UINT alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 static_assert(constants_offset % alignment == 0);
 constexpr UINT sentinel = 0xc5c5c5c5u;
 constexpr std::array<UINT, 16> constants{count, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 23, 29};
+constexpr UINT uavs = 13, srvs = 21;
+// The image case header packs the dispatch count and a format/capability selector. The payload
+// carries raw texels, one word each for RGBA8 and scalar R32, or four for RGBA32.
+constexpr UINT texture_rgba8_flag = 1u << 24;
+constexpr UINT texture_atomic_uint_flag = 1u << 25;
+constexpr UINT texture_atomic_sint_minmax_flag = 1u << 26;
+constexpr UINT texture_atomic_uint_minmax_flag = 1u << 27;
+constexpr UINT texture_atomic_exchange_flag = 1u << 28;
+constexpr UINT texture_atomic_cas_flag = 1u << 29;
+constexpr UINT texture_atomic_mask = texture_atomic_uint_flag | texture_atomic_sint_minmax_flag |
+                                     texture_atomic_uint_minmax_flag | texture_atomic_exchange_flag |
+                                     texture_atomic_cas_flag;
+constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask;
+constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
+constexpr UINT texture_mip_levels = 3;
 }
 
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
@@ -42,10 +57,62 @@ static void fill_upload(ID3D12Resource* upload)
     upload->Unmap(0, nullptr);
 }
 
-static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
-                                         ID3D12Resource* input, ID3D12Resource* output)
+// Upload the source texture and leave it in the compute read state. The caller keeps the staging
+// buffer alive until the command list has executed.
+static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                             const std::vector<UINT>& texels,
+                                             DXGI_FORMAT format, ComPtr<ID3D12Resource>& staging, bool writable = false)
 {
-    constexpr UINT uavs = 13, srvs = 21;
+    const UINT words_per_texel = format == DXGI_FORMAT_R32G32B32A32_UINT ? texture_channels : 1;
+    const UINT base_words = texture_width * texture_height * words_per_texel;
+    const UINT mips = texels.size() == base_words ? 1 : texture_mip_levels;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = texture_width;
+    desc.Height = texture_height;
+    desc.DepthOrArraySize = desc.SampleDesc.Count = 1;
+    desc.MipLevels = static_cast<UINT16>(mips);
+    desc.Format = format;
+    if (writable) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    auto texture = resource(device, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, texture_mip_levels> layouts{};
+    UINT64 upload_bytes = 0;
+    device->GetCopyableFootprints(&desc, 0, mips, 0, layouts.data(), nullptr, nullptr, &upload_bytes);
+    staging = make_buffer(device, upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* mapped = nullptr;
+    const D3D12_RANGE no_reads{};
+    check(staging->Map(0, &no_reads, &mapped), "Map texture upload");
+    std::memset(mapped, 0, static_cast<std::size_t>(upload_bytes));
+    std::size_t word = 0;
+    for (UINT level = 0; level < mips; ++level) {
+        const auto& layout = layouts[level];
+        const UINT row_words = (texture_width >> level) * words_per_texel;
+        for (UINT y = 0; y < (texture_height >> level); ++y) {
+            auto* row = static_cast<unsigned char*>(mapped) + layout.Offset + y * layout.Footprint.RowPitch;
+            std::memcpy(row, texels.data() + word, row_words * sizeof(UINT));
+            word += row_words;
+        }
+    }
+    staging->Unmap(0, nullptr);
+    D3D12_TEXTURE_COPY_LOCATION dest{}, src{};
+    dest.pResource = texture.Get();
+    dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = staging.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    for (UINT level = 0; level < mips; ++level) {
+        dest.SubresourceIndex = level;
+        src.PlacedFootprint = layouts[level];
+        list->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
+    }
+    transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               writable ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return texture;
+}
+
+static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                         ID3D12Resource* input, ID3D12Resource* output,
+                                         ID3D12Resource* texture = nullptr, UINT output_register = uavs - 1, UINT output_mip = 0)
+{
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
     desc.NumDescriptors = uavs + srvs;
     desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -59,16 +126,31 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     uav.Buffer.NumElements = capacity;
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    for (UINT i = 0; i < uavs; ++i, cpu.ptr += stride)
-        device->CreateUnorderedAccessView(i == uavs - 1 ? output : nullptr, nullptr, &uav, cpu);
+    if (output_register >= uavs) throw std::runtime_error("Invalid output register");
+    for (UINT i = 0; i < uavs; ++i, cpu.ptr += stride) {
+        if (i == output_register && output->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC image{};
+            image.Format = output->GetDesc().Format;
+            image.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            image.Texture2D.MipSlice = output_mip;
+            device->CreateUnorderedAccessView(output, nullptr, &image, cpu);
+        } else {
+            device->CreateUnorderedAccessView(i == output_register ? output : nullptr, nullptr, &uav, cpu);
+        }
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = DXGI_FORMAT_R32_TYPELESS;
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Buffer.NumElements = capacity;
     srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-    for (UINT i = 0; i < srvs; ++i, cpu.ptr += stride)
-        device->CreateShaderResourceView(i == srvs - 1 ? input : nullptr, &srv, cpu);
+    for (UINT i = 0; i < srvs; ++i, cpu.ptr += stride) {
+        // A texture SRV at t0 selects its own format; every other slot stays a raw buffer or null.
+        if (texture && i == 0)
+            device->CreateShaderResourceView(texture, nullptr, cpu);
+        else
+            device->CreateShaderResourceView(!texture && i == srvs - 1 ? input : nullptr, &srv, cpu);
+    }
     ID3D12DescriptorHeap* heaps[]{heap.Get()};
     list->SetDescriptorHeaps(1, heaps);
     auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
@@ -94,8 +176,10 @@ struct StoreCase {
 
 static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
                         D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
-                        const StoreCase* store = nullptr)
+                        const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr,
+                        DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN, ID3D12Resource* rendered_texture = nullptr)
 {
+    if ((texels || rendered_texture) && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
     ComPtr<ID3D12RootSignature> signature;
     check(device->CreateRootSignature(0, rootBytes.pShaderBytecode, rootBytes.BytecodeLength, IID_PPV_ARGS(&signature)),
           "Create compute root signature");
@@ -112,13 +196,18 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     fill_upload(input.Get());
     ComputeCommands commands(device, pipeline.Get());
     auto& list = commands.list;
+    ComPtr<ID3D12Resource> texture_upload, texture;
+    if (texels) texture = upload_texture(device, list.Get(), *texels, texture_format, texture_upload);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(output.Get(), 0, input.Get(), bytes, bytes);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->SetComputeRootSignature(signature.Get());
     ComPtr<ID3D12DescriptorHeap> heap;
     if (tables) {
-        heap = bind_tables(device, list.Get(), input.Get(), output.Get());
+        // An image-load case binds its output at u0 and the source texture at t0; the table
+        // signature's UAV range starts at u0, while the root-descriptor path keeps u12.
+        auto* image = rendered_texture ? rendered_texture : texture.Get();
+        heap = bind_tables(device, list.Get(), input.Get(), output.Get(), image, image ? 0 : uavs - 1);
     } else {
         list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
@@ -194,6 +283,254 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
     } else {
         run_compute(device, false, shader, shader, conversion_pair);
     }
+}
+
+static std::vector<char> read_texture_shader(const char* path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) throw std::runtime_error(std::string("Could not open compute shader: ") + path);
+    const auto size = file.tellg();
+    if (size <= 0) throw std::runtime_error(std::string("Empty compute shader: ") + path);
+    std::vector<char> bytes(static_cast<std::size_t>(size));
+    file.seekg(0);
+    if (!file.read(bytes.data(), static_cast<std::streamsize>(bytes.size())))
+        throw std::runtime_error(std::string("Could not read compute shader: ") + path);
+    return bytes;
+}
+
+// The image load uses a descriptor-table signature. Its case file appends the source texels.
+void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference)
+{
+    const auto code = read_texture_shader(path);
+    const D3D12_SHADER_BYTECODE shader{code.data(), code.size()};
+    StoreCase store{};
+    std::ifstream source(reference, std::ios::binary);
+    if (!source) throw std::runtime_error(std::string("Could not open compute reference: ") + reference);
+    source.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
+    source.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
+    const bool rgba8 = (store.groups & texture_rgba8_flag) != 0;
+    store.groups &= ~texture_rgba8_flag;
+    const UINT base_words = texture_width * texture_height * (rgba8 ? 1 : texture_channels);
+    std::vector<UINT> texels(base_words);
+    source.read(reinterpret_cast<char*>(texels.data()), static_cast<std::streamsize>(texels.size() * sizeof(UINT)));
+    // Older cases stop after the base image. A mip case appends levels one and two.
+    if (source && source.peek() != std::char_traits<char>::eof()) {
+        const UINT extra_words = base_words / 4 + base_words / 16;
+        texels.resize(base_words + extra_words);
+        source.read(reinterpret_cast<char*>(texels.data() + base_words), extra_words * sizeof(UINT));
+    }
+    if (!source || source.peek() != std::char_traits<char>::eof() || store.groups >> 24 || !store.axis(0) ||
+        store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5)
+        throw std::runtime_error("Invalid compute image load reference");
+    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT : DXGI_FORMAT_R32G32B32A32_UINT;
+    run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels, format);
+}
+
+static ComPtr<ID3D12Resource> render_msaa_texture(ID3D12Device* device, D3D12_SHADER_BYTECODE vs,
+                                               D3D12_SHADER_BYTECODE ps)
+{
+    constexpr UINT side = 8;
+    constexpr DXGI_SAMPLE_DESC samples{4, 0};
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT format{DXGI_FORMAT_R32_UINT};
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{format.Format, samples.Count};
+    constexpr UINT required = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
+        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format, sizeof(format))) ||
+        (format.Support1 & required) != required ||
+        FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality, sizeof(quality))) ||
+        !quality.NumQualityLevels)
+        return {};
+
+    D3D12_RESOURCE_DESC image{};
+    image.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    image.Width = image.Height = side;
+    image.DepthOrArraySize = image.MipLevels = 1;
+    image.Format = format.Format;
+    image.SampleDesc = samples;
+    image.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    auto texture = resource(device, image, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap_desc.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "Create MSAA RTV heap");
+    const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(texture.Get(), nullptr, rtv);
+
+    D3D12_ROOT_SIGNATURE_DESC layout{};
+    ComPtr<ID3DBlob> blob;
+    check(D3D12SerializeRootSignature(&layout, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr), "Serialize MSAA draw root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+          "Create MSAA draw root");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root.Get();
+    desc.VS = vs;
+    desc.PS = ps;
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.RasterizerState.MultisampleEnable = TRUE;
+    desc.SampleMask = UINT_MAX;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = format.Format;
+    desc.SampleDesc = samples;
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "Create MSAA input draw pipeline");
+    ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+    auto& list = commands.list;
+    list->SetGraphicsRootSignature(root.Get());
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT viewport{0, 0, side, side, 0, 1};
+    const D3D12_RECT scissor{0, 0, side, side};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->DrawInstanced(3, 1, 0, 0);
+    transition(list.Get(), texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    commands.submit_and_wait(device);
+    return texture;
+}
+
+bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, const char* reference,
+                                     const char* vs_path, const char* ps_path)
+{
+    StoreCase store{};
+    std::ifstream source(reference, std::ios::binary);
+    source.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
+    source.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
+    if (!source || source.peek() != std::char_traits<char>::eof() || store.groups != 1)
+        throw std::runtime_error("Invalid compute MSAA load reference");
+    const auto code = read_texture_shader(path);
+    const auto vs = read_texture_shader(vs_path), ps = read_texture_shader(ps_path);
+    auto texture = render_msaa_texture(device, {vs.data(), vs.size()}, {ps.data(), ps.size()});
+    if (!texture) return false;
+    run_compute(device, true, {code.data(), code.size()}, {compute_tables, sizeof(compute_tables)},
+                false, &store, nullptr, DXGI_FORMAT_UNKNOWN, texture.Get());
+    return true;
+}
+
+bool check_compute_texture_store_file(ID3D12Device* device, const char* path, const char* reference)
+{
+    UINT groups = 0, mip = 0;
+    std::ifstream source(reference, std::ios::binary);
+    source.read(reinterpret_cast<char*>(&groups), sizeof(groups));
+    source.read(reinterpret_cast<char*>(&mip), sizeof(mip));
+    const UINT selector = groups & texture_format_mask;
+    groups &= ~texture_format_mask;
+    DXGI_FORMAT format = DXGI_FORMAT_R32G32B32A32_UINT;
+    UINT required = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+    switch (selector) {
+    case 0: break;
+    case texture_rgba8_flag: format = DXGI_FORMAT_R8G8B8A8_UINT; break;
+    case texture_atomic_uint_flag:
+        format = DXGI_FORMAT_R32_UINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |
+                   D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS;
+        break;
+    case texture_atomic_sint_minmax_flag:
+        format = DXGI_FORMAT_R32_SINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX;
+        break;
+    case texture_atomic_uint_minmax_flag:
+        format = DXGI_FORMAT_R32_UINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+        break;
+    case texture_atomic_exchange_flag:
+        format = DXGI_FORMAT_R32_UINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
+                   D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE;
+        break;
+    case texture_atomic_cas_flag:
+        format = DXGI_FORMAT_R32_UINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE;
+        break;
+    default: throw std::runtime_error("Invalid compute image store format selector");
+    }
+    const UINT words_per_texel = selector ? 1 : texture_channels;
+    const UINT base_words = texture_width * texture_height * words_per_texel;
+    const UINT all_words = base_words + base_words / 4 + base_words / 16;
+    std::vector<UINT> initial(all_words), expected(all_words);
+    source.read(reinterpret_cast<char*>(initial.data()), all_words * sizeof(UINT));
+    source.read(reinterpret_cast<char*>(expected.data()), all_words * sizeof(UINT));
+    if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= texture_mip_levels
+        || ((selector & texture_atomic_mask) && mip != 0))
+        throw std::runtime_error("Invalid compute image store reference");
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+    check(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
+          "Check texture UAV format");
+    if ((support.Support2 & required) != required) {
+        std::printf("format=%u required_support2=0x%x support1=0x%x support2=0x%x\n",
+                    static_cast<UINT>(format), required, static_cast<UINT>(support.Support1),
+                    static_cast<UINT>(support.Support2));
+        return false;
+    }
+
+    const auto code = read_texture_shader(path);
+    ComPtr<ID3D12RootSignature> signature;
+    check(device->CreateRootSignature(0, compute_tables, sizeof(compute_tables), IID_PPV_ARGS(&signature)),
+          "Create image store root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = signature.Get();
+    pso.CS = {code.data(), code.size()};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&pipeline)), "Create image store pipeline");
+    ComputeCommands commands(device, pipeline.Get());
+    auto* list = commands.list.Get();
+    ComPtr<ID3D12Resource> staging;
+    auto texture = upload_texture(device, list, initial, format, staging, true);
+    auto constants_buffer = make_buffer(device, constants_offset + 4 * alignment, D3D12_HEAP_TYPE_UPLOAD,
+                                        D3D12_RESOURCE_STATE_GENERIC_READ);
+    fill_upload(constants_buffer.Get());
+    list->SetComputeRootSignature(signature.Get());
+    auto heap = bind_tables(device, list, constants_buffer.Get(), texture.Get(), nullptr, 0, mip);
+    list->Dispatch(groups, 1, 1);
+
+    transition(list, texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, texture_mip_levels> layouts{};
+    UINT64 readback_bytes = 0;
+    const auto desc = texture->GetDesc();
+    device->GetCopyableFootprints(&desc, 0, texture_mip_levels, 0, layouts.data(), nullptr, nullptr, &readback_bytes);
+    auto readback = make_buffer(device, readback_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dest{};
+    src.pResource = texture.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dest.pResource = readback.Get();
+    dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    for (UINT level = 0; level < texture_mip_levels; ++level) {
+        src.SubresourceIndex = level;
+        dest.PlacedFootprint = layouts[level];
+        list->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
+    }
+    commands.submit_and_wait(device);
+
+    void* mapped = nullptr;
+    const D3D12_RANGE read{0, static_cast<SIZE_T>(readback_bytes)}, no_writes{};
+    check(readback->Map(0, &read, &mapped), "Map image store readback");
+    UINT word = 0, mismatches = 0;
+    for (UINT level = 0; level < texture_mip_levels; ++level) {
+        const auto& layout = layouts[level];
+        const UINT row_words = (texture_width >> level) * words_per_texel;
+        for (UINT y = 0; y < (texture_height >> level); ++y) {
+            const auto* row = reinterpret_cast<const UINT*>(static_cast<const unsigned char*>(mapped) +
+                                                             layout.Offset + y * layout.Footprint.RowPitch);
+            for (UINT x = 0; x < row_words; ++x, ++word) {
+                if (row[x] != expected[word]) {
+                    if (!mismatches)
+                        std::fprintf(stderr, "mip=%u word=%u expected=%08x actual=%08x\n", level, word, expected[word], row[x]);
+                    ++mismatches;
+                }
+            }
+        }
+    }
+    readback->Unmap(0, &no_writes);
+    std::printf("groups=%u view_mip=%u compared_words=%u mismatches=%u\n", groups, mip, word, mismatches);
+    if (mismatches) throw std::runtime_error("Image store readback differs from CPU reference");
+    return true;
 }
 
 void check_bvh_root_roundtrip(ID3D12Device* device)

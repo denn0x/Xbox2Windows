@@ -9,7 +9,8 @@ The tool reads the layout written by tools/gpu-check/Run-GpuCheck.ps1. For each 
 whose comment README.md does not link, it prints the adapter, driver, Windows build,
 source commit, debug-layer status and test results, the coverage row the report
 belongs to and suggested cells. Comments with results in another layout, such as an
-attached report file or a Linux translation-layer run, are listed for manual review.
+attached report file, a Linux translation-layer run, or repeated test sections, are
+listed for manual review.
 The tool makes no network requests and does not edit README.md. A maintainer still
 checks every row against the original report.
 """
@@ -29,6 +30,7 @@ THREAD_URL = "https://github.com/R0Y00/Xbox2Windows/issues/1"
 HEADER = "## Xbox2Windows GPU report"
 TABLE_HEADER = "| Adapter or backend | Default native lanes | Forced wave64 | BVH differential | Evidence |"
 EN_DASH = "\u2013"
+DUPLICATE_SECTION = "duplicate test section: "
 
 # Run-GpuCheck.ps1 reads its summary with these patterns. tests/hardware_reports_check.py
 # keeps both copies equal.
@@ -144,8 +146,11 @@ def parse_segment(comment: dict, text: str) -> tuple[Report | None, str | None]:
     blocks: dict[str, str] = {}
     for number, match in enumerate(sections):
         end = sections[number + 1].start() if number + 1 < len(sections) else len(text)
-        results[match.group(2)] = match.group(5)
-        blocks[match.group(2)] = text_blocks(text[match.end():end])
+        name = match.group(2)
+        if name in results:
+            return None, f"{DUPLICATE_SECTION}{name}_{match.group(3)}"
+        results[name] = match.group(5)
+        blocks[name] = text_blocks(text[match.end():end])
     joined = "\n".join(blocks.values())
     fields = {}
     for key, pattern in FIELD_PATTERNS.items():
@@ -182,7 +187,7 @@ def parse_segment(comment: dict, text: str) -> tuple[Report | None, str | None]:
 
 
 def parse_comment(comment: dict) -> tuple[list[Report], str | None]:
-    """Return the reports in a comment, or a reason to review it by hand."""
+    """Return usable reports and any reason to review the comment by hand."""
     lines = (comment.get("body") or "").replace("\r\n", "\n").split("\n")
     # Quoted lines repeat another comment, so they never count as a report.
     body = "\n".join(line for line in lines if not line.lstrip().startswith(">"))
@@ -207,7 +212,9 @@ def parse_comment(comment: dict) -> tuple[list[Report], str | None]:
             reports.append(report)
         elif reason:
             reasons.append(reason)
-    return reports, None if reports else next(iter(reasons), None)
+    # A duplicate can hide evidence even when another pasted run is usable.
+    duplicate = next((reason for reason in reasons if reason.startswith(DUPLICATE_SECTION)), None)
+    return reports, duplicate if reports else next(iter(reasons), None)
 
 
 def first_int(pattern: str, text: str) -> int | None:

@@ -44,10 +44,14 @@ adapter=Microsoft Basic Render Driver vendor=1414 device=008c
 driver=unavailable via DXGI
 """
 
+VIEW_HEAP_BLOCK = """\
+max_view_descriptor_heap_size=1000000
+"""
+
 
 def field_patterns(script: str) -> dict[str, str]:
     matches = re.findall(
-        r"^\$(adapter|vendor|device|driver|debugLayer|laneRange) = Get-GpuField \$blocks '([^']+)'",
+        r"^\$(adapter|vendor|device|driver|debugLayer|laneRange|viewHeapLimit) = Get-GpuField \$blocks '([^']+)'",
         script,
         flags=re.MULTILINE,
     )
@@ -88,7 +92,7 @@ class GpuReportFormatChecks(unittest.TestCase):
     def test_script_exports_the_expected_field_patterns(self):
         self.assertEqual(
             set(self.patterns),
-            {"adapter", "vendor", "device", "driver", "debugLayer", "laneRange"},
+            {"adapter", "vendor", "device", "driver", "debugLayer", "laneRange", "viewHeapLimit"},
         )
 
     def test_field_patterns_read_published_hardware_output(self):
@@ -108,6 +112,15 @@ class GpuReportFormatChecks(unittest.TestCase):
         self.assertEqual(first_field(self.patterns["debugLayer"], [MISSING_DRIVER_BLOCK]), "enabled")
         self.assertEqual(first_field(self.patterns["adapter"], [MISSING_DRIVER_BLOCK]), "Microsoft Basic Render Driver")
         self.assertIsNone(first_field(self.patterns["laneRange"], [MISSING_DRIVER_BLOCK]))
+
+    def test_view_heap_limit_is_optional(self):
+        pattern = self.patterns["viewHeapLimit"]
+        self.assertEqual(first_field(pattern, [WAVES_BLOCK, VIEW_HEAP_BLOCK]), "1000000")
+        self.assertIsNone(first_field(pattern, [WAVES_BLOCK, WAVE64_BLOCK]))
+        self.assertIn(
+            '$report.Add("- Shader-visible view heap limit: $(Format-GpuValue $viewHeapLimit)")',
+            self.script,
+        )
 
     def test_package_smoke_test_requires_the_submit_path(self):
         text = PACKAGE.read_text(encoding="utf-8")

@@ -4,7 +4,9 @@
 ; maxsd/minsd/sqrtsd, lfence/mfence and the aligned, half-qword and
 ; non-temporal moves. The MMX-operand forms (cvtpd2pi, cvttpd2pi, movdq2q,
 ; movq2dq, cvtpi2pd mm source) and implicit-RDI maskmovdqu are outside the leaf
-; ABI and are lifted as rejections, not exports.
+; ABI and are lifted as rejections, not exports. The scalar compare cmpsd is a
+; further legacy SSE2 form beyond those 23 (the coverage table lists the mnemonic
+; only for the string compare), so it adds exports but no SSE2 group form.
 ; Every export uses the Windows x64 leaf ABI:
 ;   RCX = const void* input_a (32 bytes, 16-byte aligned)
 ;   RDX = const void* input_b (32 bytes, 16-byte aligned; second vector at +16)
@@ -104,6 +106,108 @@ op_cmppd_mem PROC FRAME
     movdqa XMMWORD PTR [r8], xmm0
     ret
 op_cmppd_mem ENDP
+
+; --- cmpsd: all eight predicates on the low double, high qword preserved ---
+
+op_cmpsd_0 PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    movdqa xmm1, XMMWORD PTR [rdx]
+    cmpsd xmm0, xmm1, 0
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_0 ENDP
+
+op_cmpsd_1 PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    movdqa xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    cmpsd xmm0, xmm1, 5
+ELSE
+    cmpsd xmm0, xmm1, 1
+ENDIF
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_1 ENDP
+
+op_cmpsd_2 PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    movdqa xmm1, XMMWORD PTR [rdx]
+    cmpsd xmm0, xmm1, 2
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_2 ENDP
+
+op_cmpsd_3 PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    movdqa xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    cmpsd xmm0, xmm1, 7
+ELSE
+    cmpsd xmm0, xmm1, 3
+ENDIF
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_3 ENDP
+
+op_cmpsd_4 PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    movdqa xmm1, XMMWORD PTR [rdx]
+    cmpsd xmm0, xmm1, 4
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_4 ENDP
+
+op_cmpsd_5 PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    movdqa xmm1, XMMWORD PTR [rdx]
+    cmpsd xmm0, xmm1, 5
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_5 ENDP
+
+op_cmpsd_6 PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    movdqa xmm1, XMMWORD PTR [rdx]
+IFDEF ALTER_IMM
+    cmpsd xmm0, xmm1, 2
+ELSE
+    cmpsd xmm0, xmm1, 6
+ENDIF
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_6 ENDP
+
+op_cmpsd_7 PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    movdqa xmm1, XMMWORD PTR [rdx]
+    cmpsd xmm0, xmm1, 7
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_7 ENDP
+
+op_cmpsd_mem PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    cmpsd xmm0, QWORD PTR [rdx], 6
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_mem ENDP
+
+op_cmpsd_mem_plus1 PROC FRAME
+    .endprolog
+    movdqa xmm0, XMMWORD PTR [rcx]
+    cmpsd xmm0, QWORD PTR [rdx+1], 2
+    movdqa XMMWORD PTR [r8], xmm0
+    ret
+op_cmpsd_mem_plus1 ENDP
 
 ; --- Scalar double ops: low-qword merge, high-qword preserved ---
 

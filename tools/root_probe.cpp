@@ -36,7 +36,8 @@ int inspect_shader(std::vector<char>& bytes, std::string_view mode)
     }
     HMODULE checker = LoadLibraryExW(SDK_DXC_DIR L"dxil.dll", nullptr,
                                     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!checker) return 4;
+    // A DXC without a separate dxil.dll (the SDK's 1.9.2602 is one) validates in dxcompiler.dll.
+    if (!checker) checker = compiler;
     auto create_validator = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(checker, "DxcCreateInstance"));
     ComPtr<IDxcUtils> utils;
     ComPtr<IDxcValidator> validator;

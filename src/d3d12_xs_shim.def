@@ -4,3 +4,33 @@ EXPORTS
     D3D12CreateRootSignatureDeserializer=d3d12_xs_CreateRootSignatureDeserializer
     D3D12XboxCreateDevice=d3d12_xs_XboxCreateDevice
     D3D12ConfigureVirtualMemoryX=d3d12_xs_ConfigureVirtualMemoryX
+    IID_ID3D12CommandAllocator DATA
+    IID_ID3D12CommandList DATA
+    IID_ID3D12CommandQueue DATA
+    IID_ID3D12Debug DATA
+    IID_ID3D12DescriptorHeap DATA
+    IID_ID3D12Device DATA
+    IID_ID3D12DeviceChild DATA
+    IID_ID3D12Fence DATA
+    IID_ID3D12GraphicsCommandList DATA
+    IID_ID3D12Heap DATA
+    IID_ID3D12Object DATA
+    IID_ID3D12Pageable DATA
+    IID_ID3D12PipelineState DATA
+    IID_ID3D12Resource DATA
+    IID_ID3D12RootSignature DATA
+    IID_ID3D12RootSignatureDeserializer DATA
+    IID_IDXGIAdapter DATA
+    IID_IDXGIAdapter1 DATA
+    IID_IDXGIAdapter2 DATA
+    IID_IDXGIDevice DATA
+    IID_IDXGIDevice1 DATA
+    IID_IDXGIDevice2 DATA
+    IID_IDXGIDeviceSubObject DATA
+    IID_IDXGIFactory DATA
+    IID_IDXGIFactory1 DATA
+    IID_IDXGIFactory2 DATA
+    IID_IDXGIObject DATA
+    IID_IDXGISwapChain DATA
+    IID_IDXGISwapChain1 DATA
+    WKPDID_D3DDebugObjectNameW DATA

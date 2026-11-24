@@ -39,11 +39,20 @@ int main()
     return 77;
 }
 #else
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "addrinterface.h"
+#include "../src/startup_stubs/bc64_chain.h"
 
 namespace {
 // Mesa ac_fake_hw_db.h "navi21": family_id AMDGPU_FAMILY_NV, chip_external_rev 0x28, gb_addr_config 0x40 with
@@ -140,6 +149,28 @@ struct Selection {
     UINT_64 surf_size = 0;
 };
 
+ADDR_E_RETURNCODE surface_info(ADDR_HANDLE lib, const XgRequest& r, AddrSwizzleMode mode,
+                              ADDR2_COMPUTE_SURFACE_INFO_OUTPUT& out, ADDR2_MIP_INFO* levels = nullptr)
+{
+    const FormatInfo fi = format_info(r.format);
+    ADDR2_COMPUTE_SURFACE_INFO_INPUT in{};
+    in.size = sizeof in;
+    in.flags = surface_flags(r.bind);
+    in.swizzleMode = mode;
+    in.resourceType = ADDR_RSRC_TEX_2D;
+    in.format = fi.addr;
+    in.bpp = fi.bpp;
+    in.width = r.width;
+    in.height = r.height;
+    in.numSlices = 1;
+    in.numMipLevels = r.mips;
+    in.numSamples = 1;
+    in.numFrags = 1;
+    out.size = sizeof out;
+    out.pMipInfo = levels;
+    return Addr2ComputeSurfaceInfo(lib, &in, &out);
+}
+
 // Test-only XG-style provider: the proposed desktop mapping of an XG request onto addrlib's selector, followed
 // by Addr2ComputeSurfaceInfo for the chosen mode (base alignment and size show the block the mode implies).
 Selection suggest_swizzle_mode(ADDR_HANDLE lib, const XgRequest& r, bool forbid_linear = false)
@@ -172,22 +203,8 @@ Selection suggest_swizzle_mode(ADDR_HANDLE lib, const XgRequest& r, bool forbid_
     if (s.rc != ADDR_OK) return s;
     s.mode = out.swizzleMode;
 
-    ADDR2_COMPUTE_SURFACE_INFO_INPUT si{};
     ADDR2_COMPUTE_SURFACE_INFO_OUTPUT so{};
-    si.size = sizeof si;
-    so.size = sizeof so;
-    si.flags = in.flags;
-    si.swizzleMode = s.mode;
-    si.resourceType = ADDR_RSRC_TEX_2D;
-    si.format = fi.addr;
-    si.bpp = fi.bpp;
-    si.width = r.width;
-    si.height = r.height;
-    si.numSlices = 1;
-    si.numMipLevels = r.mips;
-    si.numSamples = 1;
-    si.numFrags = 1;
-    s.rc = Addr2ComputeSurfaceInfo(lib, &si, &so);
+    s.rc = surface_info(lib, r, s.mode, so);
     s.base_align = so.baseAlign;
     s.surf_size = so.surfSize;
     return s;
@@ -217,9 +234,11 @@ struct Row {
     AddrSwizzleMode mode;
     UINT_32 base_align;
 };
+constexpr Row rgba8_mip_reference{
+    {"128x128 RGBA8 8 mips, shader resource", 128, 128, 8, Format::rgba8, srv, false}, ADDR_SW_64KB_R_X, 65536};
 // clang-format off
 const Row rows[] = {
-    {{"128x128 RGBA8 8 mips, shader resource",            128,  128,  8, Format::rgba8,   srv,           false}, ADDR_SW_64KB_R_X, 65536},
+    rgba8_mip_reference,
     {{"1024x1024 RGBA8 11 mips, shader resource",         1024, 1024, 11, Format::rgba8,  srv,           false}, ADDR_SW_64KB_R_X, 65536},
     {{"64x64 R8 1 mip, shader resource",                  64,   64,   1, Format::r8,      srv,           false}, ADDR_SW_4KB_D_X, 4096},
     {{"16x16 RGBA8 1 mip, shader resource",               16,   16,   1, Format::rgba8,   srv,           false}, ADDR_SW_4KB_D_X, 4096},
@@ -243,6 +262,284 @@ unsigned table_mismatches(ADDR_HANDLE lib, Provider provider)
     unsigned n = 0;
     for (const Row& row : rows) n += !matches(provider(lib, row.request), row);
     return n;
+}
+
+// DirectXTex #498 supplies the call shape. The descriptor and explicit encoding below
+// are fixture-local and carry the chosen PC mode from the selector to the texture computer.
+constexpr UINT_32 unknown_layout = 0;
+constexpr UINT_32 explicit_layout = 0x100;
+constexpr std::uint32_t untouched = 0xffffffffu;
+constexpr std::size_t factory_mips = 8;
+constexpr std::size_t factory_texels = 21845;
+
+struct FactoryDesc {
+    UINT_32 width, height, mips, layout;
+};
+static_assert(sizeof(FactoryDesc) == 4 * sizeof(UINT_32));
+
+XgRequest factory_request(const FactoryDesc& desc)
+{
+    return {"swizzle factory", desc.width, desc.height, desc.mips, Format::rgba8, srv, false};
+}
+
+HRESULT suggest_factory_layout(ADDR_HANDLE lib, const FactoryDesc* desc, UINT_32 selector, UINT_32* output)
+{
+    if (!desc || !output || selector != 0 || desc->width == 0 || desc->height == 0 ||
+        desc->mips != factory_mips || desc->layout != unknown_layout) return E_INVALIDARG;
+    const Selection selection = suggest_swizzle_mode(lib, factory_request(*desc));
+    if (selection.rc != ADDR_OK) return E_FAIL;
+    *output = explicit_layout | unsigned(selection.mode);
+    return S_OK;
+}
+
+struct TextureComputer {
+    UINT_64 size = 0;
+    UINT_32 alignment = 0;
+    AddrSwizzleMode mode = ADDR_SW_MAX_TYPE;
+    std::array<ADDR2_MIP_INFO, factory_mips> levels{};
+    std::vector<std::size_t> word_offsets;
+};
+
+bool create_texture_computer(ADDR_HANDLE lib, const FactoryDesc& desc, TextureComputer& computer)
+{
+    if (desc.width == 0 || desc.height == 0 || desc.mips != factory_mips ||
+        desc.layout < explicit_layout || desc.layout >= explicit_layout + ADDR_SW_MAX_TYPE) return false;
+    TextureComputer next;
+    next.mode = static_cast<AddrSwizzleMode>(desc.layout - explicit_layout);
+    const XgRequest request = factory_request(desc);
+    ADDR2_COMPUTE_SURFACE_INFO_OUTPUT surface{};
+    if (surface_info(lib, request, next.mode, surface, next.levels.data()) != ADDR_OK ||
+        surface.surfSize == 0 || surface.surfSize % sizeof(std::uint32_t) != 0) return false;
+    next.size = surface.surfSize;
+    next.alignment = surface.baseAlign;
+
+    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_INPUT in{};
+    in.size = sizeof in;
+    in.flags = surface_flags(request.bind);
+    in.swizzleMode = next.mode;
+    in.resourceType = ADDR_RSRC_TEX_2D;
+    in.bpp = format_info(request.format).bpp;
+    in.unalignedWidth = desc.width;
+    in.unalignedHeight = desc.height;
+    in.numSlices = 1;
+    in.numMipLevels = desc.mips;
+    in.numSamples = 1;
+    in.numFrags = 1;
+    next.word_offsets.reserve(factory_texels);
+    for (UINT_32 mip = 0; mip < desc.mips; ++mip) {
+        in.mipId = mip;
+        for (in.y = 0; in.y < std::max(1u, desc.height >> mip); ++in.y) {
+            for (in.x = 0; in.x < std::max(1u, desc.width >> mip); ++in.x) {
+                ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_OUTPUT out{};
+                out.size = sizeof out;
+                if (Addr2ComputeSurfaceAddrFromCoord(lib, &in, &out) != ADDR_OK || out.bitPosition != 0 ||
+                    out.addr >= next.size || out.addr % sizeof(std::uint32_t) != 0) return false;
+                next.word_offsets.push_back(static_cast<std::size_t>(out.addr / sizeof(std::uint32_t)));
+            }
+        }
+    }
+    computer = std::move(next);
+    return true;
+}
+
+bool same_layout(const TextureComputer& a, const TextureComputer& b)
+{
+    if (std::tie(a.size, a.alignment, a.mode, a.word_offsets) !=
+        std::tie(b.size, b.alignment, b.mode, b.word_offsets)) return false;
+    for (std::size_t mip = 0; mip < factory_mips; ++mip) {
+        const auto& x = a.levels[mip];
+        const auto& y = b.levels[mip];
+        if (std::tie(x.pitch, x.height, x.offset, x.macroBlockOffset, x.mipTailOffset) !=
+            std::tie(y.pitch, y.height, y.offset, y.macroBlockOffset, y.mipTailOffset)) return false;
+    }
+    return true;
+}
+
+std::uint32_t source_texel(std::size_t index) { return 0xab120000u + static_cast<std::uint32_t>(index); }
+
+bool write_texels(const TextureComputer& computer, std::vector<std::uint32_t>& surface)
+{
+    surface.assign(static_cast<std::size_t>(computer.size / sizeof(std::uint32_t)) + 2, untouched);
+    if (computer.word_offsets.size() != factory_texels) return false;
+    for (std::size_t i = 0; i < computer.word_offsets.size(); ++i) {
+        auto& word = surface[computer.word_offsets[i] + 1];
+        if (word != untouched) return false;
+        word = source_texel(i);
+    }
+    return surface.front() == untouched && surface.back() == untouched;
+}
+
+std::size_t count_mismatches(const TextureComputer& reader, const std::vector<std::uint32_t>& surface)
+{
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < reader.word_offsets.size(); ++i) {
+        const auto offset = reader.word_offsets[i];
+        mismatches += offset >= surface.size() - 2 || surface[offset + 1] != source_texel(i);
+    }
+    return mismatches;
+}
+
+enum class FactoryResult { pass, missing_output, fail };
+
+template <typename Suggest>
+FactoryResult check_factory(ADDR_HANDLE lib, Suggest suggest)
+{
+    const Row& reference = rgba8_mip_reference;
+    const FactoryDesc initial{reference.request.width, reference.request.height, reference.request.mips, unknown_layout};
+    FactoryDesc aliased = initial;
+    FactoryDesc separate = initial;
+    UINT_32 output = untouched;
+    const HRESULT alias_status = suggest(&aliased, 0, &aliased.layout);
+    const HRESULT separate_status = suggest(&separate, 0, &output);
+    if (alias_status != S_OK || separate_status != alias_status ||
+        std::memcmp(&separate, &initial, sizeof initial) != 0) return FactoryResult::fail;
+    if (aliased.layout == unknown_layout || output == untouched) return FactoryResult::missing_output;
+    separate.layout = output;
+    FactoryDesc expected = initial;
+    expected.layout = explicit_layout | unsigned(reference.mode);
+    if (std::memcmp(&aliased, &expected, sizeof expected) != 0 ||
+        std::memcmp(&separate, &expected, sizeof expected) != 0) return FactoryResult::fail;
+
+    TextureComputer alias_computer, separate_computer;
+    if (!create_texture_computer(lib, aliased, alias_computer) ||
+        !create_texture_computer(lib, separate, separate_computer) ||
+        !same_layout(alias_computer, separate_computer) || alias_computer.alignment != reference.base_align) {
+        return FactoryResult::fail;
+    }
+
+    FactoryDesc linear = initial;
+    linear.layout = explicit_layout | unsigned(ADDR_SW_LINEAR);
+    TextureComputer linear_computer;
+    std::vector<std::uint32_t> tiled_surface, linear_surface;
+    if (!create_texture_computer(lib, linear, linear_computer) || linear_computer.alignment != 256 ||
+        !write_texels(alias_computer, tiled_surface) || !write_texels(linear_computer, linear_surface)) {
+        return FactoryResult::fail;
+    }
+    const auto tiled_errors = count_mismatches(separate_computer, tiled_surface);
+    const auto linear_errors = count_mismatches(linear_computer, linear_surface);
+    const auto stale_errors = count_mismatches(linear_computer, tiled_surface);
+    std::printf("  layout 0x%x (%s), %zu mips, %zu texels, tiled %llu bytes align %u, linear %llu bytes align %u\n",
+                output, mode_name(alias_computer.mode), factory_mips, factory_texels,
+                static_cast<unsigned long long>(alias_computer.size), alias_computer.alignment,
+                static_cast<unsigned long long>(linear_computer.size), linear_computer.alignment);
+    std::printf("  tiled mismatches %zu, linear mismatches %zu, stale linear interpretation %zu\n",
+                tiled_errors, linear_errors, stale_errors);
+    if (tiled_errors != 0 || linear_errors != 0 || stale_errors != factory_texels) return FactoryResult::fail;
+
+    FactoryDesc invalid = initial;
+    invalid.width = 0;
+    const FactoryDesc invalid_before = invalid;
+    if (suggest(&invalid, 0, &invalid.layout) != E_INVALIDARG ||
+        std::memcmp(&invalid, &invalid_before, sizeof invalid) != 0) return FactoryResult::fail;
+    output = untouched;
+    TextureComputer rejected;
+    if (suggest(&invalid, 0, &output) != E_INVALIDARG ||
+        output != untouched || std::memcmp(&invalid, &invalid_before, sizeof invalid) != 0 ||
+        create_texture_computer(lib, invalid, rejected) || create_texture_computer(lib, initial, rejected)) {
+        return FactoryResult::fail;
+    }
+    std::puts("  zero width: E_INVALIDARG for both outputs; descriptor and separate sentinel preserved");
+    return FactoryResult::pass;
+}
+
+int run_factory(bool mutate)
+{
+    ADDR_HANDLE lib = create_navi21();
+    if (!lib) return 1;
+    const auto selector = [lib](const FactoryDesc* desc, UINT_32 flags, UINT_32* output) {
+        return suggest_factory_layout(lib, desc, flags, output);
+    };
+    const auto no_write = [](const FactoryDesc*, UINT_32, UINT_32*) -> HRESULT { return S_OK; };
+    const FactoryResult result = mutate ? check_factory(lib, no_write) : check_factory(lib, selector);
+    AddrDestroy(lib);
+    const bool ok = result == (mutate ? FactoryResult::missing_output : FactoryResult::pass);
+    if (mutate && ok) std::puts("  detected S_OK with missing layout output");
+    std::printf("xg_swizzle_factory: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+bool block_addresses_match(ADDR_HANDLE lib, const ADDR2_COMPUTE_SURFACE_INFO_INPUT& surface)
+{
+    D3D12_RESOURCE_DESC desc{};
+    desc.Height = surface.height;
+    desc.MipLevels = static_cast<UINT16>(surface.numMipLevels);
+    desc.DepthOrArraySize = static_cast<UINT16>(surface.numSlices);
+    const x2w_startup::bc64::Chain chain(desc);
+    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_INPUT in{};
+    in.size = sizeof(in);
+    in.flags = surface.flags;
+    in.resourceType = surface.resourceType;
+    in.swizzleMode = surface.swizzleMode;
+    in.bpp = 128;
+    in.unalignedWidth = surface.width / 4;
+    in.unalignedHeight = surface.height / 4;
+    in.numMipLevels = surface.numMipLevels;
+    in.numSlices = surface.numSlices;
+    in.numSamples = in.numFrags = 1;
+    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_OUTPUT out{};
+    out.size = sizeof(out);
+    for (in.slice = 0; in.slice < in.numSlices; ++in.slice) {
+        for (in.mipId = 0; in.mipId < in.numMipLevels; ++in.mipId) {
+            const unsigned columns = ((surface.width >> in.mipId) + 3) / 4;
+            const unsigned rows = ((surface.height >> in.mipId) + 3) / 4;
+            for (in.y = 0; in.y < rows; ++in.y) {
+                for (in.x = 0; in.x < columns; ++in.x) {
+                    const auto expected = chain.address(in.mipId, in.x, in.y, in.slice);
+                    if (Addr2ComputeSurfaceAddrFromCoord(lib, &in, &out) != ADDR_OK ||
+                        out.bitPosition != 0 || out.addr != expected) {
+                        std::printf("BC block mismatch at slice %u mip %u (%u,%u): AddrLib %llu, XG %u\n",
+                                    in.slice, in.mipId, in.x, in.y, static_cast<unsigned long long>(out.addr), expected);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+int bc64_tiling_reference()
+{
+    ADDR_HANDLE lib = create_navi21();
+    if (!lib) return 1;
+    for (auto format : {ADDR_FMT_BC5, ADDR_FMT_BC7}) {
+        for (UINT_32 height : {512u, 1024u}) {
+            for (UINT_32 slices : {1u, 2u}) {
+                ADDR2_COMPUTE_SURFACE_INFO_INPUT in{};
+                ADDR2_COMPUTE_SURFACE_INFO_OUTPUT out{};
+                std::array<ADDR2_MIP_INFO, 9> mips{};
+                in.size = sizeof(in);
+                in.flags.texture = 1;
+                in.format = format;
+                in.swizzleMode = ADDR_SW_64KB_S;
+                in.resourceType = ADDR_RSRC_TEX_2D;
+                in.width = 1024;
+                in.height = height;
+                in.numMipLevels = static_cast<UINT_32>(mips.size());
+                in.numSlices = slices;
+                in.numSamples = in.numFrags = 1;
+                out.size = sizeof(out);
+                out.pMipInfo = mips.data();
+                constexpr unsigned tile = 65536;
+                const unsigned slice_tiles = height == 512 ? 12 : 22;
+                const std::array<unsigned, 3> starts{height == 512 ? 4u : 6u, 2u, 1u};
+                bool matches = Addr2ComputeSurfaceInfo(lib, &in, &out) == ADDR_OK &&
+                    out.sliceSize == slice_tiles * tile && out.surfSize == out.sliceSize * slices &&
+                    out.firstMipIdInTail == starts.size() && out.blockWidth == 64 && out.blockHeight == 64;
+                for (unsigned i = 0; i < mips.size(); ++i) {
+                    const unsigned block_offset = i < starts.size() ? starts[i] * tile : 0;
+                    matches &= mips[i].macroBlockOffset == block_offset;
+                }
+                std::printf("BC surface format=%u, 1024x%u, %u slice(s): %llu bytes per slice, first tail %u\n",
+                            static_cast<unsigned>(format), height, slices,
+                            static_cast<unsigned long long>(out.sliceSize), out.firstMipIdInTail);
+                expect(matches, "64 KiB standard block starts, packed tile and complete array size");
+                expect(block_addresses_match(lib, in), "all visible BC blocks match AddrLib");
+            }
+        }
+    }
+    AddrDestroy(lib);
+    return failures ? 1 : 0;
 }
 
 int run(bool mutate_linear_fallback)
@@ -362,9 +659,12 @@ int run(bool mutate_linear_fallback)
 // The mutation passes only if the comparison detects the expected fallback mismatches.
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::strcmp(argv[1], "--bc64-tiling") == 0) return bc64_tiling_reference();
+    if (argc == 2 && std::strcmp(argv[1], "--factory") == 0) return run_factory(false);
+    if (argc == 2 && std::strcmp(argv[1], "--mutate-factory-no-write") == 0) return run_factory(true);
     const bool mutate = argc == 2 && std::strcmp(argv[1], "--mutate-linear-fallback") == 0;
     if (argc > 2 || (argc == 2 && !mutate)) {
-        std::puts("usage: xg_swizzle_select_check [--mutate-linear-fallback]");
+        std::puts("usage: xg_swizzle_select_check [--mutate-linear-fallback|--factory|--mutate-factory-no-write|--bc64-tiling]");
         return 2;
     }
     const int result = run(mutate);

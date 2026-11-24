@@ -24,7 +24,7 @@ struct Context {
     char before_owner[0x6a8 - 0x11c];
     Word owner;
 };
-static_assert(offsetof(Context, owner) == 0x6a8 && sizeof(Frames) == 264);
+static_assert(offsetof(Context, owner) == 0x6a8 && sizeof(Frames) == 264, "Context and Frames layout");
 
 extern "C" __declspec(dllexport) std::uint32_t frame_allocate(Context* context, Frames* frames,
                                                               std::uint32_t alignment)

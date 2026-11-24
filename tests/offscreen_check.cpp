@@ -17,7 +17,20 @@
 #include "triangle_vs.h"
 #include "triangle_ps.h"
 #include "ffx_provider_loop.h"
+#include "dispatch_index_cs.h"
+#include "group_index_cs.h"
 #include "desktop_gpu.h"
+
+void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_signed(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_float(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_vec4(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_vec4_narrow(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_qword(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_qword_narrow(ID3D12Device* device, const char* shader_path);
+void check_sampler_index_control(ID3D12Device* device,
+                                const unsigned char* dispatch_bytecode, unsigned int dispatch_size,
+                                const unsigned char* group_bytecode, unsigned int group_size);
 
 #ifdef OFFSCREEN_AGILITY_620
 extern "C" {
@@ -28,6 +41,8 @@ __declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
 
 using Microsoft::WRL::ComPtr;
 constexpr UINT side = 64;
+
+void check_descriptor_heap_paging(ID3D12Device* device, bool swapped);
 
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
@@ -490,9 +505,48 @@ OperationResult run_compute_store_case(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// The image-load readback extends the store case with the source texture words and uses the
+// descriptor-table signature, because a texture SRV cannot be a root descriptor.
+OperationResult run_compute_texture_case(const OperationContext& ctx)
+{
+    check_compute_texture_file(ctx.device, ctx.argv[3], ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_compute_texture_msaa_case(const OperationContext& ctx)
+{
+    return skip_if_false(check_compute_texture_msaa_file(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]),
+                         "R32_UINT 4x MSAA render target and load support unavailable");
+}
+
+OperationResult run_compute_texture_store_case(const OperationContext& ctx)
+{
+    return skip_if_false(check_compute_texture_store_file(ctx.device, ctx.argv[3], ctx.argv[4]),
+                         "Required typed UAV operations unavailable for the image case format");
+}
+
 OperationResult run_spirv_sampler_views(const OperationContext& ctx)
 {
     check_sampler_views(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_dynamic_sampler_index(const OperationContext& ctx)
+{
+    check_dynamic_sampler_index(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+// Two builds of one shader that differ only in the sampler descriptor index source (#1115). The
+// SV_DispatchThreadID build must match the shared expected words; the SV_GroupID build is printed
+// for the record, because an adapter that folds the index still matches on some drivers.
+OperationResult run_sampler_index_control(const OperationContext& ctx)
+{
+    (void)ctx;
+    check_sampler_index_control(ctx.device, sampler_index_dispatch_cs,
+                                static_cast<unsigned int>(sizeof(sampler_index_dispatch_cs)),
+                                sampler_index_group_cs,
+                                static_cast<unsigned int>(sizeof(sampler_index_group_cs)));
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -505,6 +559,48 @@ OperationResult run_raw_uav_dump(const OperationContext& ctx)
 OperationResult run_spirv_address_window(const OperationContext& ctx)
 {
     check_spirv_window(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_atomic(const OperationContext& ctx)
+{
+    check_spirv_window_atomic(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_signed(const OperationContext& ctx)
+{
+    check_spirv_window_signed(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_float(const OperationContext& ctx)
+{
+    check_spirv_window_float(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_vec4(const OperationContext& ctx)
+{
+    check_spirv_window_vec4(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_vec4_narrow(const OperationContext& ctx)
+{
+    check_spirv_window_vec4_narrow(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_qword(const OperationContext& ctx)
+{
+    check_spirv_window_qword(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_qword_narrow(const OperationContext& ctx)
+{
+    check_spirv_window_qword_narrow(ctx.device, ctx.argv[3]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -542,6 +638,46 @@ OperationResult run_ffx_recurrent(const OperationContext& ctx)
 OperationResult run_dual_uav(const OperationContext& ctx)
 {
     check_dual_uav(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_stream_root_srv(const OperationContext& ctx)
+{
+    check_stream_root_srv(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_descriptor_window_submissions(const OperationContext& ctx)
+{
+    check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::direct);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_cpu_srv_refresh(const OperationContext& ctx)
+{
+    check_cpu_srv_refresh(ctx.device, std::string_view(ctx.argv[2]) == "--cpu-srv-stale");
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_descriptor_window_stale(const OperationContext& ctx)
+{
+    check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::stale_window);
+    return {OutcomeKind::pass, nullptr};
+}
+
+bool validate_descriptor_record_args(int, char** argv)
+{
+    const std::string_view scenario = argv[3];
+    return scenario == "live" || scenario == "stale" || scenario == "unknown";
+}
+
+OperationResult run_descriptor_record_copy(const OperationContext& ctx)
+{
+    const std::string_view scenario = ctx.argv[3];
+    auto test = DescriptorWindowCase::copied_record;
+    if (scenario == "stale") test = DescriptorWindowCase::stale_record;
+    if (scenario == "unknown") test = DescriptorWindowCase::unknown_record;
+    check_descriptor_window_submissions(ctx.device, test);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -593,9 +729,16 @@ OperationResult run_check_pixel_compare(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_gather(const OperationContext& ctx)
+{
+    check_pixel_gather(ctx.device, ctx.argv[3], ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel_case(const OperationContext& ctx)
 {
-    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4]);
+    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4], D3D12_COLOR_WRITE_ENABLE_ALL,
+                           ctx.argc == 6 ? ctx.argv[5] : nullptr);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -626,7 +769,13 @@ OperationResult run_check_pixel_attribute_rg(const OperationContext& ctx)
 
 OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
 {
-    check_pixel_quad_lod(ctx.device, ctx.argv[3]);
+    check_pixel_quad_lod(ctx.device, ctx.argv[3], ctx.argc == 5 ? ctx.argv[4] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_get_lod_upper(const OperationContext& ctx)
+{
+    check_pixel_quad_lod(ctx.device, ctx.argv[3], ctx.argv[4], true);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -676,6 +825,12 @@ OperationResult run_mesh_entry(const OperationContext& ctx)
     if (ctx.argc == 7)
         binding = ctx.argv[6][0] == 'b' ? MeshConstantBinding::swapped_root_pair : MeshConstantBinding::root_pair;
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false, binding));
+}
+
+OperationResult run_mesh_amplified(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_amplified_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                                   ctx.argv[6]));
 }
 
 OperationResult run_mesh_indexed(const OperationContext& ctx)
@@ -836,6 +991,15 @@ OperationResult run_ray_query(const OperationContext& ctx)
     return skip_if_false(check_dxr_rays(ctx.device, false));
 }
 
+OperationResult run_dxr_address_ranges(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_address_ranges(ctx.device));
+}
+OperationResult run_dxr_placed_build(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_placed_build(ctx.device));
+}
+
 OperationResult run_dxr_pipeline(const OperationContext& ctx)
 {
     return skip_if_false(check_dxr_rays(ctx.device, true));
@@ -844,6 +1008,11 @@ OperationResult run_dxr_pipeline(const OperationContext& ctx)
 OperationResult run_gpu_alias(const OperationContext& ctx)
 {
     return skip_if_false(check_gpu_alias(ctx.device));
+}
+
+OperationResult run_gpu_alias_window(const OperationContext& ctx)
+{
+    return skip_if_false(check_gpu_alias_window(ctx.device));
 }
 
 OperationResult run_gpu_alias_lookup(const OperationContext& ctx)
@@ -880,6 +1049,116 @@ OperationResult run_wave_shuffle(const OperationContext& ctx)
         "skip: wave shuffle fixture requires SM 6.6 and a supported forced wave width");
 }
 
+OperationResult run_shader_wave(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 0),
+                         "skip: shader wave fixture requires SM 6.0 and WaveOps");
+}
+
+OperationResult run_shader_wave32(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 32),
+                         "skip: shader wave32 fixture requires SM 6.6, WaveOps, and a 32-lane wave");
+}
+
+OperationResult run_shader_wave64(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 64),
+                         "skip: shader wave64 fixture requires SM 6.6, WaveOps, and a 64-lane wave");
+}
+
+template<bool Swapped>
+OperationResult run_descriptor_heap_paging(const OperationContext& ctx)
+{
+    check_descriptor_heap_paging(ctx.device, Swapped);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_wave64_emulate(const OperationContext& ctx)
+{
+    check_wave64_emulate(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-cb-blend: decoded colour-blend registers match the model in every draw case.
+// --startup-cb-blend-swapped: with source and destination factors exchanged, at least one differs.
+template<bool Swapped>
+OperationResult run_startup_cb_blend(const OperationContext& ctx)
+{
+    const int mismatches = check_startup_cb_blend(ctx.device, Swapped);
+    if (Swapped ? mismatches == 0 : mismatches != 0)
+        return {OutcomeKind::fail, Swapped ? "swapped factors still matched the model" : "blend differs from the register model"};
+    return {OutcomeKind::pass, nullptr};
+}
+
+template<bool Swapped>
+OperationResult run_startup_sampler_x(const OperationContext& ctx)
+{
+    return skip_if_false(check_startup_sampler_x(ctx.device, Swapped),
+                         "skip: R32_FLOAT does not report filtered sampling with mips");
+}
+
+// --startup-sampler-heap <vs.cso> <ps.cso> <byte offset> <expected red bits>: draws one pixel with a
+// gfx2hlsl pixel shader that indexes its sampler table at run time (tests/startup_sampler_heap.cpp).
+OperationResult run_startup_sampler_heap(const OperationContext& ctx)
+{
+    const auto offset = static_cast<std::uint32_t>(std::stoul(ctx.argv[5], nullptr, 0));
+    const auto expected = static_cast<std::uint32_t>(std::stoul(ctx.argv[6], nullptr, 16));
+    const float red = check_startup_sampler_heap(ctx.device, ctx.argv[3], ctx.argv[4], offset,
+        ctx.argc > 7 ? ctx.argv[7] : nullptr, ctx.argc > 8 ? ctx.argv[8] : nullptr);
+    std::uint32_t bits;
+    std::memcpy(&bits, &red, sizeof(bits));
+    if (bits != expected) {
+        std::fprintf(stderr, "startup_sampler_heap mismatch offset=%u expected=%08x actual=%08x\n", offset, expected, bits);
+        return {OutcomeKind::fail, "sampler heap readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-image-3d <vs.cso> <ps.cso> <z> <expected rgba bits> [sampler manifest line]
+// The expected value is four comma-separated hex words. Omit the sampler line for point wrap.
+// --startup-image-2d-array takes the same arguments: the texels are two slices of a 2D array and the
+// third coordinate is the slice. --startup-image-2d-array-mips uses a 4x4 array of two slices with three
+// mip levels whose cells all differ (tests/startup_image_3d.cpp).
+OperationResult run_startup_image_3d(const OperationContext& ctx)
+{
+    const bool mips = std::strcmp(ctx.argv[2], "--startup-image-2d-array-mips") == 0;
+    const bool array = mips || std::strcmp(ctx.argv[2], "--startup-image-2d-array") == 0;
+    const float z = std::stof(ctx.argv[5]);
+    std::uint32_t expected[4]{};
+    if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    float color[4]{};
+    const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler, array, mips ? 3 : 1);
+    std::uint32_t bits[4];
+    std::memcpy(bits, color, sizeof(bits));
+    if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
+        std::fprintf(stderr, "startup_image mismatch z=%s expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
+                     ctx.argv[5], expected[0], expected[1], expected[2], expected[3], bits[0], bits[1], bits[2], bits[3]);
+        return {OutcomeKind::fail, "image 3D readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
+}
+
+// --startup-flat-param <vs.cso> <ps.cso> <expected words>: draws one pixel with a gfx2hlsl vertex and
+// pixel stage pair (tests/startup_flat_param.cpp). The expected value is four 8-digit hex words,
+// comma separated.
+OperationResult run_startup_flat_param(const OperationContext& ctx)
+{
+    std::uint32_t expected[4]{};
+    if (std::sscanf(ctx.argv[5], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    std::uint32_t words[4]{};
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], words);
+    if (std::memcmp(words, expected, sizeof(words)) != 0) {
+        std::fprintf(stderr, "startup_flat_param mismatch expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
+                     expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
+        return {OutcomeKind::fail, "flat parameter readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -897,6 +1176,18 @@ constexpr CapabilityGate kGateWaveShuffle{
     D3D_SHADER_MODEL_6_5, false, true, 0,
     "skip: wave shuffle fixture requires SM 6.5 and WaveOps",
     CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateShaderWave{
+    D3D_SHADER_MODEL_6_0, false, true, 0,
+    "skip: shader wave fixture requires SM 6.0 and WaveOps",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateShaderWave32{
+    D3D_SHADER_MODEL_6_6, false, true, 32,
+    "skip: shader wave32 fixture requires SM 6.6, WaveOps, and a 32-lane wave",
+    CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateShaderWave64{
+    D3D_SHADER_MODEL_6_6, false, true, 64,
+    "skip: shader wave64 fixture requires SM 6.6, WaveOps, and a 64-lane wave",
+    CapsDiagnostic::wave_6_6};
 constexpr CapabilityGate kGateSm60MeshFallback{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: mesh fallback requires SM 6.0",
@@ -909,13 +1200,19 @@ constexpr CapabilityGate kGateSm60CompareSampler{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: comparison-sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
-constexpr CapabilityGate kGateSm60RawUavDump{
+constexpr CapabilityGate kGateSm60SamplerIndexControl{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: sampler index control requires SM 6.0",
+    CapsDiagnostic::none};constexpr CapabilityGate kGateSm60RawUavDump{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: raw UAV dump requires SM 6.0",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_0, true, false, 0,
     "skip: address window fixture requires SM 6.0 and 64-bit shader integer operations",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateComputeAtomic64{
+    D3D_SHADER_MODEL_6_6, true, false, 0, "skip: 64-bit raw UAV atomics require SM 6.6 and Int64ShaderOps",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66Ballot{
     D3D_SHADER_MODEL_6_6, false, false, 0,
@@ -952,10 +1249,30 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
+    {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},
+    {"--compute-texture-msaa-case", 7, 7, nullptr, kNoGate, run_compute_texture_msaa_case},
+    {"--compute-texture-store-case", 5, 5, nullptr, kNoGate, run_compute_texture_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
+    {"--dynamic-sampler-index", 3, 3, nullptr, kGateSm60SamplerViews, run_dynamic_sampler_index},
+    // Two builds that differ only in the sampler descriptor index source (#1115): the
+    // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
+    {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
+    {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
+    {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
+    {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
+    {"--spirv-address-window-signed", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_signed},
+    {"--spirv-address-window-float", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_float},
+    {"--spirv-address-window-vec4", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_vec4},
+    {"--spirv-address-window-vec4-narrow", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_vec4_narrow},
+    {"--spirv-address-window-qword", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword},
+    {"--spirv-address-window-qword-narrow", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword_narrow},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
@@ -964,6 +1281,12 @@ const OperationSpec kOperations[] = {
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
     {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
+    {"--stream-root-srv", 3, 3, nullptr, kGateSm60BufferOps, run_stream_root_srv},
+    {"--descriptor-window-submissions", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_submissions},
+    {"--cpu-srv-refresh", 3, 3, nullptr, kGateSm60BufferOps, run_cpu_srv_refresh},
+    {"--cpu-srv-stale", 3, 3, nullptr, kGateSm60BufferOps, run_cpu_srv_refresh},
+    {"--descriptor-window-stale", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_stale},
+    {"--descriptor-record-copy", 4, 4, validate_descriptor_record_args, kGateSm60BufferOps, run_descriptor_record_copy},
     {"--texture-mips", 3, 3, nullptr, kNoGate, run_texture_mips},
     {"--check-bc7-tail", 6, kUnboundedArgc, nullptr, kNoGate, run_check_bc7_tail},
     {"--check-bc7-mip1", 6, 6, nullptr, kNoGate, run_check_bc7_mip1},
@@ -972,12 +1295,14 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
-    {"--check-pixel-case", 5, 5, nullptr, kNoGate, run_check_pixel_case},
+    {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
+    {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
     {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},
     {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
-    {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel-quad-lod", 4, 5, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel-get-lod-upper", 5, 5, nullptr, kNoGate, run_check_pixel_get_lod_upper},
     {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm60MinLodSmoke, run_check_pixel_quad_lod},
     // Keep the fractional point-filter fixture on its existing gate (#809).
     {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},
@@ -987,6 +1312,7 @@ const OperationSpec kOperations[] = {
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
+    {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
     {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
@@ -1015,14 +1341,27 @@ const OperationSpec kOperations[] = {
     {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
     {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
+    {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
+    {"--dxr-placed-build", 3, 3, nullptr, kNoGate, run_dxr_placed_build},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
+    {"--gpu-alias-window", 3, 3, nullptr, kNoGate, run_gpu_alias_window},
     {"--gpu-alias-lookup", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup},
     {"--gpu-alias-lookup-writes", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup_writes},
     {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
     {"--gpu-alias-registry", 3, 3, nullptr, kNoGate, run_gpu_alias_registry},
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
+    {"--descriptor-heap-paging", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<false>},
+    {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
+    {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
+    {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
+    {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
+    {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
+    {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
+    {"--shader-wave", 3, 3, nullptr, kGateShaderWave, run_shader_wave},
+    {"--shader-wave32", 3, 3, nullptr, kGateShaderWave32, run_shader_wave32},
+    {"--shader-wave64", 3, 3, nullptr, kGateShaderWave64, run_shader_wave64},
 };
 
 struct DiagnosticTarget {
@@ -1195,10 +1534,15 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --bvh-wave")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--dual-uav", "extra"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --dual-uav")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--descriptor-record-copy", "invalid"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --descriptor-record-copy")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--descriptor-record-copy", "unknown"}, CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--compute-root-file"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --compute-root-file")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-sampler-views"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --spirv-sampler-views")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--sampler-index-control", "extra"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --sampler-index-control")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --spirv-compare-sampler")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin", "baseline", "extra"},
@@ -1210,6 +1554,10 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-entry")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-amplified", "as", "ms", "ps"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-amplified")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-amplified", "as", "ms", "ps", "fixture"},
+                   CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-indexed-fallback")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-depth-pair-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
@@ -1506,6 +1854,14 @@ int main(int argc, char** argv)
         } else {
             std::puts("driver=unavailable via DXGI");
         }
+#if defined(__ID3D12Device12_INTERFACE_DEFINED__)
+        D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19{};
+        if (SUCCEEDED(check_feature(device.Get(), D3D12_FEATURE_D3D12_OPTIONS19,
+                                    &options19, sizeof(options19))) &&
+            options19.MaxViewDescriptorHeapSize) {
+            std::printf("max_view_descriptor_heap_size=%u\n", options19.MaxViewDescriptorHeapSize);
+        }
+#endif
         if (debug) check(device.As(&messages), "Read debug queue");
         const AdapterCaps caps = query_adapter_caps(device.Get());
         if (cli.action == CliAction::draw) {

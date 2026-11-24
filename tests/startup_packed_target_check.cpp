@@ -1,0 +1,188 @@
+// Checks src/startup_stubs/packed_target_format.h without a device, against adapters described
+// by their format-support bits.
+// --mutate stand-in | array | b565 | view: the helper's answer perturbed the way a wrong helper
+// would answer (a stand-in in another format, arrays left alone as before, B5G6R5_UNORM left alone
+// as before, the view format of the stand-in kept packed); each must fail on the rows it concerns.
+#include "startup_stubs/packed_target_format.h"
+
+#include <cstdio>
+#include <cstring>
+#include <initializer_list>
+
+namespace {
+int failures, checks;
+const char* mutation = "";
+constexpr UINT rt = D3D12_FORMAT_SUPPORT1_RENDER_TARGET, uav = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+
+struct Adapter {
+    UINT b5g5r5a1, b4g4r4a4, rgba8, b5g6r5;
+    UINT operator()(DXGI_FORMAT format) const
+    {
+        return format == DXGI_FORMAT_B5G5R5A1_UNORM ? b5g5r5a1 : format == DXGI_FORMAT_B4G4R4A4_UNORM ? b4g4r4a4
+             : format == DXGI_FORMAT_B5G6R5_UNORM ? b5g6r5 : format == DXGI_FORMAT_R8G8B8A8_UNORM ? rgba8 : rt | uav;
+    }
+};
+
+// The helper under test, with the wrong answers a --mutate run substitutes.
+DXGI_FORMAT stand_in(const D3D12_RESOURCE_DESC& desc, const Adapter& adapter)
+{
+    const DXGI_FORMAT got = x2w_startup::packed_target_stand_in(desc, adapter);
+    if (!std::strcmp(mutation, "stand-in") && got == DXGI_FORMAT_R8G8B8A8_UNORM) return DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (!std::strcmp(mutation, "array") && desc.DepthOrArraySize != 1) return desc.Format;
+    if (!std::strcmp(mutation, "b565") && desc.Format == DXGI_FORMAT_B5G6R5_UNORM) return desc.Format;
+    return got;
+}
+
+x2w_startup::PackedView packed_view(DXGI_FORMAT view_format, DXGI_FORMAT resource_format, DXGI_FORMAT stands_in_for)
+{
+    const auto got = x2w_startup::packed_view(view_format, resource_format, stands_in_for);
+    if (!std::strcmp(mutation, "view") && got == x2w_startup::PackedView::stand_in) return x2w_startup::PackedView::unchanged;
+    return got;
+}
+
+D3D12_RESOURCE_DESC texture(DXGI_FORMAT format, UINT flags, D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+{
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = dimension;
+    desc.Width = 2560;
+    desc.Height = 1440;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
+    return desc;
+}
+
+void expect(const char* name, DXGI_FORMAT got, DXGI_FORMAT wanted)
+{
+    ++checks;
+    if (got != wanted) {
+        std::printf("FAIL %s: format %d, expected %d\n", name, got, wanted);
+        ++failures;
+    }
+}
+
+void view(const char* name, x2w_startup::PackedView got, x2w_startup::PackedView wanted)
+{
+    ++checks;
+    if (got != wanted) {
+        std::printf("FAIL %s: verdict %d, expected %d\n", name, static_cast<int>(got), static_cast<int>(wanted));
+        ++failures;
+    }
+}
+}  // namespace
+
+int main(int argc, char** argv)
+{
+    if (argc == 3 && !std::strcmp(argv[1], "--mutate")) mutation = argv[2];
+    else if (argc != 1) {
+        std::printf("usage: startup_packed_target_check [--mutate stand-in|array|b565|view]\n");
+        return 2;
+    }
+    const auto packed_target_stand_in = stand_in;
+    constexpr UINT RT = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, UA = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    constexpr DXGI_FORMAT b5 = DXGI_FORMAT_B5G5R5A1_UNORM, b4 = DXGI_FORMAT_B4G4R4A4_UNORM, rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+    constexpr DXGI_FORMAT b565 = DXGI_FORMAT_B5G6R5_UNORM;
+    const Adapter full{rt | uav, rt | uav, rt | uav, rt | uav};   // supports the packed formats: nothing changes
+    const Adapter none{0, 0, rt | uav, 0};                         // the measured case
+    const Adapter render_only{rt, rt, rt | uav, rt};               // packed formats render but have no typed UAV
+    const Adapter bare{0, 0, 0, 0};                                // no stand-in available either
+
+    // The two descriptions the measured run was refused: render target with unordered access, and render target.
+    expect("b5g5r5a1 RT|UAV, unsupported", packed_target_stand_in(texture(b5, RT | UA), none), rgba);
+    expect("b4g4r4a4 RT, unsupported", packed_target_stand_in(texture(b4, RT), none), rgba);
+    expect("b5g5r5a1 RT|UAV, render only", packed_target_stand_in(texture(b5, RT | UA), render_only), rgba);
+
+    // Controls: the format stays when the adapter supports the use, when the stand-in would not
+    // help, for other formats, and for every role outside the measured ones.
+    expect("b5g5r5a1 RT|UAV, supported", packed_target_stand_in(texture(b5, RT | UA), full), b5);
+    expect("b4g4r4a4 RT, supported", packed_target_stand_in(texture(b4, RT), full), b4);
+    expect("b4g4r4a4 RT, render only", packed_target_stand_in(texture(b4, RT), render_only), b4);
+    expect("b5g5r5a1 RT, no stand-in", packed_target_stand_in(texture(b5, RT), bare), b5);
+    expect("rgba8 RT", packed_target_stand_in(texture(rgba, RT), none), rgba);
+    expect("b5g5r5a1 sampled only", packed_target_stand_in(texture(b5, 0), none), b5);
+    expect("b5g5r5a1 UAV without RT", packed_target_stand_in(texture(b5, UA), none), b5);
+    expect("b4g4r4a4 3D RT", packed_target_stand_in(texture(b4, RT, D3D12_RESOURCE_DIMENSION_TEXTURE3D), none), b4);
+    expect("b4g4r4a4 1D RT", packed_target_stand_in(texture(b4, RT, D3D12_RESOURCE_DIMENSION_TEXTURE1D), none), b4);
+    expect("buffer", packed_target_stand_in(texture(b5, UA, D3D12_RESOURCE_DIMENSION_BUFFER), none), b5);
+    D3D12_RESOURCE_DESC shaped = texture(b5, RT);
+    shaped.SampleDesc.Count = 4;
+    expect("b5g5r5a1 RT multisampled", packed_target_stand_in(shaped, none), b5);
+    shaped = texture(b565, RT);
+    shaped.SampleDesc.Count = 2;
+    expect("b5g6r5 RT multisampled", packed_target_stand_in(shaped, none), b565);
+
+    // B5G6R5_UNORM follows the same rule as the other two packed formats.
+    expect("b5g6r5 RT, unsupported", packed_target_stand_in(texture(b565, RT), none), rgba);
+    expect("b5g6r5 RT|UAV, render only", packed_target_stand_in(texture(b565, RT | UA), render_only), rgba);
+    expect("b5g6r5 RT, supported", packed_target_stand_in(texture(b565, RT), full), b565);
+    expect("b5g6r5 RT|UAV, supported", packed_target_stand_in(texture(b565, RT | UA), full), b565);
+    expect("b5g6r5 RT, no stand-in", packed_target_stand_in(texture(b565, RT), bare), b565);
+    expect("b5g6r5 sampled only", packed_target_stand_in(texture(b565, 0), none), b565);
+    expect("b5g6r5 3D RT", packed_target_stand_in(texture(b565, RT, D3D12_RESOURCE_DIMENSION_TEXTURE3D), none), b565);
+    expect("b5g6r5 depth-stencil", packed_target_stand_in(texture(b565, RT | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL), none), b565);
+
+    // Arrays and cube maps (six slices): the format follows the same rule for 2 to 2048 slices; 0 and
+    // more than the limit keep the format. The slice count is not part of the answer.
+    for (const UINT slices : {2u, 6u, 16u, 2048u}) {
+        shaped = texture(b5, RT);
+        shaped.DepthOrArraySize = static_cast<UINT16>(slices);
+        char name[64];
+        std::snprintf(name, sizeof(name), "b5g5r5a1 RT array of %u, unsupported", slices);
+        expect(name, packed_target_stand_in(shaped, none), rgba);
+        std::snprintf(name, sizeof(name), "b5g5r5a1 RT array of %u, supported", slices);
+        expect(name, packed_target_stand_in(shaped, full), b5);
+        shaped.Format = b565;
+        std::snprintf(name, sizeof(name), "b5g6r5 RT array of %u, unsupported", slices);
+        expect(name, packed_target_stand_in(shaped, none), rgba);
+        shaped.Format = b4;
+        std::snprintf(name, sizeof(name), "b4g4r4a4 RT array of %u, render only", slices);
+        expect(name, packed_target_stand_in(shaped, render_only), b4);
+    }
+    for (const UINT slices : {0u, 2049u, 65535u}) {
+        shaped = texture(b565, RT);
+        shaped.DepthOrArraySize = static_cast<UINT16>(slices);
+        char name[64];
+        std::snprintf(name, sizeof(name), "b5g6r5 RT with %u slices", slices);
+        expect(name, packed_target_stand_in(shaped, none), b565);
+    }
+    shaped = texture(b5, RT | UA);
+    shaped.DepthOrArraySize = 6;
+    shaped.MipLevels = 3;
+    expect("b5g5r5a1 RT|UAV cube with mips", packed_target_stand_in(shaped, none), rgba);
+    shaped.SampleDesc.Count = 4;
+    expect("b5g5r5a1 RT|UAV cube multisampled", packed_target_stand_in(shaped, none), b5);
+    shaped = texture(b5, RT, D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+    shaped.DepthOrArraySize = 6;
+    expect("b5g5r5a1 3D with depth 6", packed_target_stand_in(shaped, none), b5);
+    shaped = texture(rgba, RT);
+    shaped.DepthOrArraySize = 6;
+    expect("rgba8 RT array", packed_target_stand_in(shaped, none), rgba);
+
+    // Views: a packed view becomes RGBA8 only on the stand-in for that very format.
+    using x2w_startup::PackedView;
+    constexpr DXGI_FORMAT plain = DXGI_FORMAT_UNKNOWN;
+    view("b5g5r5a1 view of its stand-in", packed_view(b5, rgba, b5), PackedView::stand_in);
+    view("b4g4r4a4 view of its stand-in", packed_view(b4, rgba, b4), PackedView::stand_in);
+    view("b5g5r5a1 view of a b5g5r5a1 texture", packed_view(b5, b5, plain), PackedView::unchanged);
+    view("srgb view of an rgba8 texture", packed_view(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, rgba, plain), PackedView::unchanged);
+    view("rgba8 view of a stand-in", packed_view(rgba, rgba, b5), PackedView::unchanged);
+    view("b5g5r5a1 view of a plain rgba8 texture", packed_view(b5, rgba, plain), PackedView::refused);
+    view("b5g5r5a1 view of the b4g4r4a4 stand-in", packed_view(b5, rgba, b4), PackedView::refused);
+    view("b5g5r5a1 view of a b4g4r4a4 texture", packed_view(b5, b4, plain), PackedView::refused);
+    view("b5g5r5a1 view of a bgra8 texture", packed_view(b5, DXGI_FORMAT_B8G8R8A8_UNORM, plain), PackedView::refused);
+    view("b5g6r5 view of its stand-in", packed_view(b565, rgba, b565), PackedView::stand_in);
+    view("b5g6r5 view of a b5g6r5 texture", packed_view(b565, b565, plain), PackedView::unchanged);
+    view("b5g6r5 view of a plain rgba8 texture", packed_view(b565, rgba, plain), PackedView::refused);
+    view("b5g6r5 view of the b5g5r5a1 stand-in", packed_view(b565, rgba, b5), PackedView::refused);
+    view("b5g5r5a1 view of the b5g6r5 stand-in", packed_view(b5, rgba, b565), PackedView::refused);
+    view("b5g6r5 view of a b5g5r5a1 texture", packed_view(b565, b5, plain), PackedView::refused);
+
+    if (failures) {
+        std::printf("startup_packed_target: %d FAILED\n", failures);
+        return 1;
+    }
+    std::printf("startup_packed_target: PASS (%d rows)\n", checks);
+    return 0;
+}

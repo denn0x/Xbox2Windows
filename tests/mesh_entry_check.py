@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import json
+import math
+import re
 import struct
 import subprocess
 import sys
@@ -151,6 +153,310 @@ def source():
     return lower(decoded, [0x1003], (3, 1))
 
 
+ALU_PROGRAM = PROGRAM.copy()
+ALU_PROGRAM[-2:-2] = [
+    # Carry out of an add and no borrow from a subtract; multiplies keep SCC.
+    "s_add_u32 s5, 1, 0xffffffff",
+    "s_mul_i32 s6, s5, 7",
+    "s_cselect_b32 s14, 0x3e800000, 0",
+    "s_sub_u32 s9, 11, 3",
+    "s_mul_i32 s6, s9, 0x07800000",
+    "s_cselect_b32 s4, 0, 0x3e000000",
+    "v_mov_b32_e32 v11, 0x3f000000",
+    "v_or_b32_e32 v11, 0x200000, v11",
+    "v_xor_b32_e32 v12, 0x600000, v11",
+    "v_min_u32_e32 v13, v11, v12",
+    "v_max_u32_e32 v14, v11, v12",
+    "v_mov_b32_e32 v16, 0x100000",
+    "v_sub_nc_u32_e32 v15, v14, v16",
+    # The sign bit makes these differ from signed comparisons.
+    "v_max_u32_e32 v17, 0xbfc00000, v13",
+    "v_min_u32_e32 v18, 0xbfc00000, v13",
+    "v_add_f32_e32 v3, s14, v3",
+    "v_add_f32_e32 v3, s4, v3",
+    "v_add_f32_e32 v3, s6, v3",
+    "v_add_f32_e32 v3, v15, v3",
+    # Unequal use counts: a signed min/max would swap the two results and change the depth.
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v17, v3",
+    "v_add_f32_e32 v3, v17, v3",
+]
+# Operands of the float adds above, as bit patterns.
+ALU_OPERANDS = (0x3e800000, 0x3e000000, 0x3c000000, 0x3f300000, 0x3f200000, 0xbfc00000)
+
+
+def alu_draw():
+    # 0.5 + 0.25 + 0.125 + 2**-7 + 0.6875 + 3 * 0.625 - 2 * 1.5, all exact in binary32. Swapping the unsigned
+    # min and max results (a signed comparison) would give 0.5 + ... + 3 * -1.5 + 2 * 0.625, which is -3.2578125.
+    depth = 0.4453125
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    return (
+        lower(enumerate_pcs(ALU_PROGRAM), [4099], (3, 1)),
+        [(triangle_inputs(), positions, True)],
+    )
+
+
+FLOAT_PROGRAM = PROGRAM.copy()
+FLOAT_PROGRAM[-2:-2] = [
+    "v_mov_b32_e32 v10, 0x40800000",
+    "v_mov_b32_e32 v11, 0x3fc00000",
+    "v_mov_b32_e32 v12, 0x3ec00000",
+    "v_mov_b32_e32 v13, 0x3e000000",
+    "v_mov_b32_e32 v14, 0x3d800000",
+    "v_mov_b32_e32 v15, 0x3e800000",
+    "v_mov_b32_e32 v16, 0x3f000000",
+    "v_sub_f32_e32 v3, v10, v3",
+    "v_subrev_f32_e32 v3, v11, v3",
+    "v_mul_f32_e32 v3, v12, v3",
+    "v_add_f32_e64 v3, v3, v13",
+    "v_sub_f32_e64 v3, v3, v14",
+    "v_subrev_f32_e64 v3, v15, v3",
+    "v_mul_f32_e64 v3, v3, v16",
+]
+# Each result below is exact in binary32; the sibling opcode gives a different depth.
+SIBLINGS = {
+    "v_sub_f32_e32": "v_subrev_f32_e32",
+    "v_subrev_f32_e32": "v_sub_f32_e32",
+    "v_mul_f32_e32": "v_add_f32_e32",
+    "v_add_f32_e64": "v_sub_f32_e64",
+    "v_sub_f32_e64": "v_subrev_f32_e64",
+    "v_subrev_f32_e64": "v_sub_f32_e64",
+    "v_mul_f32_e64": "v_add_f32_e64",
+}
+
+
+def float_reference():
+    # Independent of the lowering: plain arithmetic in the order the program runs.
+    z = 0.125 + 0.375  # v3 = pointData y, then plus the matrix value
+    z = 4.0 - z  # v_sub_f32_e32 v3, v10, v3
+    z = z - 1.5  # v_subrev_f32_e32 v3, v11, v3 is v3 - v11
+    z = 0.375 * z  # v_mul_f32_e32
+    z = z + 0.125  # v_add_f32_e64
+    z = z - 0.0625  # v_sub_f32_e64
+    z = z - 0.25  # v_subrev_f32_e64 v3, v15, v3 is v3 - v15
+    return z * 0.5  # v_mul_f32_e64
+
+
+class F32(float):
+    def __new__(cls, x):
+        return super().__new__(cls, struct.unpack("<f", struct.pack("<f", x))[0])
+
+    def __add__(self, o):
+        return F32(float(self) + float(o))
+
+    def __sub__(self, o):
+        return F32(float(self) - float(o))
+
+    def __mul__(self, o):
+        return F32(float(self) * float(o))
+
+
+# Host models of the HLSL intrinsics the unary lowering emits, on exact inputs only. round is half-even.
+HLSL_MATH = {
+    "rcp": lambda x: F32(1 / x),
+    "sqrt": lambda x: F32(math.sqrt(x)),
+    "rsqrt": lambda x: F32(1 / math.sqrt(x)),
+    "floor": lambda x: F32(math.floor(x)),
+    "trunc": lambda x: F32(math.trunc(x)),
+    "round": lambda x: F32(round(float(x))),
+    "frac": lambda x: F32(x - math.floor(x)) if math.isfinite(x) else F32(math.nan),
+    # D3D min returns the other operand when one is a NaN.
+    "min": lambda a, b: b if math.isnan(a) else a if math.isnan(b) else F32(min(a, b)),
+    # The emitted comparison cap: a NaN fails the comparison and passes through.
+    "fract32": lambda x: F32(0.99999994) if HLSL_MATH["frac"](x) >= 1.0 else HLSL_MATH["frac"](x),
+}
+
+
+# The emitted cap on a fraction: group 1 is the frac call, group 2 its argument.
+FRACT_CAP = r"\((frac\(([^;]*?)\)) >= 1\.0f \? asfloat\(0x3f7fffffu\) : \1\)"
+
+
+def evaluate_depth(text, inputs, error=0.0):
+    # Evaluate the emitted float chain in binary32 and return position component z of vertex 0. A nonzero relative
+    # error scales the reciprocal, reciprocal square root and square root results, as an approximate one would.
+    math_ops = {
+        name: (lambda x, fn=fn: F32(float(fn(x)) * (1 + error)))
+        for name, fn in HLSL_MATH.items()
+        if name in ("rcp", "rsqrt", "sqrt")
+    }
+    math_ops = {**HLSL_MATH, **math_ops}
+
+    def word(m):
+        return repr(F32(struct.unpack("<f", struct.pack("<I", int(m[1], 16)))[0]))
+
+    def buffer(m):
+        base = 0 if m[1] == "point" else 512
+        return repr(F32(struct.unpack_from("<f", inputs, base + int(m[2]) * 16 + 4 * "xyzw".index(m[3]))[0]))
+
+    def value(expr):
+        # Integer conversions of an exact word, as the lowering writes them.
+        expr = re.sub(
+            r"(?<!\w)float\(asint\(0x([0-9a-f]+)u\)\)",
+            lambda m: repr(F32(int(m[1], 16) - (2**32 if int(m[1], 16) >> 31 else 0))),
+            expr,
+        )
+        expr = re.sub(r"(?<!\w)float\(0x([0-9a-f]+)u\)", lambda m: repr(F32(int(m[1], 16))), expr)
+        expr = re.sub(r"^\(1\.0f / (.*)\)$", r"rcp(\1)", expr)
+        expr = re.sub(FRACT_CAP, r"fract32(\2)", expr)
+        expr = re.sub(r"asfloat\(0x([0-9a-f]+)u\)", word, expr)
+        expr = re.sub(r"(point|matrix)Data\[(\d+)\]\.([xyzw])", buffer, expr)
+        expr = re.sub(r"(?<![\w.])(-?\d+\.\d+(?:e[+-]?\d+)?)f?", r"F32(\1)", expr)
+        return eval(expr, {"F32": F32, "nan": math.nan, **math_ops}, names)
+
+    names = {}
+    for name, expr in re.findall(r"precise float (f\d+) = (.*);", text):
+        names[name] = value(expr)
+    q = re.search(r"if\(id==0\) \{ float4 q=float4\((.*?)\);", text)[1].split(", ")
+    return value(q[2])
+
+
+def float_draw(program=FLOAT_PROGRAM):
+    depth = float_reference()
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    return lower(enumerate_pcs(program), [4099], (3, 1)), [(triangle_inputs(), positions, True)]
+
+
+def mismatch(dxc, renderer, adapter, tmp, source, positions):
+    # A wrong expected depth word must be reported by the export trace comparison.
+    ps, ms = tmp / "pixel.dxil", tmp / "mesh.dxil"
+    (tmp / "pixel.hlsl").write_text(PIXEL)
+    (tmp / "mesh.hlsl").write_text(source)
+    if not ps.exists():
+        subprocess.run([dxc, "-T", "ps_6_0", "-E", "main", "-Fo", ps, tmp / "pixel.hlsl"], check=True)
+    subprocess.run(
+        [dxc, "-T", "ms_6_5", "-E", "main", "-DTRACE_EXPORTS", "-Fo", ms, tmp / "mesh.hlsl"],
+        check=True,
+    )
+    path = tmp / "draw.bin"
+    path.write_bytes(fixture(triangle_inputs(), positions, True, True))
+    result = subprocess.run(
+        [renderer, adapter, "--mesh-entry", ms, ps, path], capture_output=True, text=True
+    )
+    if result.returncode == 77:
+        return 77
+    if result.returncode != 1 or "Mesh export trace mismatch" not in result.stderr:
+        raise AssertionError("A wrong depth word was not reported")
+    return 0
+
+
+def float_negative_draws(dxc, renderer, adapter, tmp):
+    source, cases = float_draw()
+    expected = cases[0][1]
+    # One unit in the last place of the depth word, and every sibling opcode.
+    word = struct.unpack("<I", struct.pack("<f", expected[0][2]))[0]
+    off_by_one = struct.unpack("<f", struct.pack("<I", word + 1))[0]
+    wrong = [[(x, y, off_by_one, w) for x, y, _, w in TRIANGLE]]
+    for op, other in SIBLINGS.items():
+        program = [line.replace(op, other, 1) if line.startswith(op) else line for line in FLOAT_PROGRAM]
+        wrong.append((float_draw(program)[0], expected))
+    for item in wrong:
+        text, positions = (source, item) if isinstance(item, list) else item
+        if mismatch(dxc, renderer, adapter, tmp, text, positions) == 77:
+            return 77
+    return 0
+
+
+CVT_MINMAX_PROGRAM = PROGRAM.copy()
+CVT_MINMAX_PROGRAM[-2:-2] = [
+    # Each converted value is exact in binary32 and is then clamped by a min or max, so an unsigned or signed
+    # reading of the same word, or a min where a max belongs, moves the depth by many orders of magnitude.
+    "v_cvt_f32_u32_e32 v10, 0xc0000000",
+    "v_cvt_f32_i32_e32 v11, 0xc0000000",
+    "v_cvt_f32_u32_e64 v12, 0x80000000",
+    "v_cvt_f32_i32_e64 v13, 0x80000000",
+    "v_mov_b32_e32 v14, 0x3e000000",
+    "v_mov_b32_e32 v15, 0xbd800000",
+    "v_min_f32_e32 v16, 0.5, v10",
+    "v_max_f32_e32 v17, 0xbe800000, v11",
+    "v_min_f32_e64 v18, v12, v14",
+    "v_max_f32_e64 v19, v13, v15",
+    "v_add_f32_e32 v3, v16, v3",
+    "v_add_f32_e32 v3, v17, v3",
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v19, v3",
+]
+# Swapping any one opcode for its sibling must change the depth.
+CVT_MINMAX_SIBLINGS = {
+    "v_cvt_f32_u32_e32": "v_cvt_f32_i32_e32",
+    "v_cvt_f32_i32_e32": "v_cvt_f32_u32_e32",
+    "v_cvt_f32_u32_e64": "v_cvt_f32_i32_e64",
+    "v_cvt_f32_i32_e64": "v_cvt_f32_u32_e64",
+    "v_min_f32_e32": "v_max_f32_e32",
+    "v_max_f32_e32": "v_min_f32_e32",
+    "v_min_f32_e64": "v_max_f32_e64",
+    "v_max_f32_e64": "v_min_f32_e64",
+}
+
+
+def cvt_minmax_program(swap=None, line=None):
+    # The program with one opcode swapped for its sibling, or with one unsupported line appended before the exports.
+    program = CVT_MINMAX_PROGRAM.copy()
+    if swap:
+        program = [
+            l.replace(swap, CVT_MINMAX_SIBLINGS[swap], 1) if l.startswith(swap) else l for l in program
+        ]
+    if line:
+        program.insert(-2, line)
+    return program
+
+
+def cvt_minmax_reference():
+    # Independent of the lowering: plain arithmetic on exact values, in the order the program runs.
+    word = 3 * 2**30  # 0xc0000000 as unsigned; 0xc0000000 - 2**32 as signed
+    z = 0.125 + 0.375  # pointData y plus the matrix value
+    z += min(0.5, float(word))
+    z += max(-0.25, float(word - 2**32))
+    z += min(float(2**31), 0.125)
+    z += max(float(2**31 - 2**32), -0.0625)
+    return z
+
+
+def cvt_minmax_draw(program=None):
+    depth = cvt_minmax_reference()
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    program = CVT_MINMAX_PROGRAM if program is None else program
+    return lower(enumerate_pcs(program), [4099], (3, 1)), [(triangle_inputs(), positions, True)]
+
+
+def cvt_minmax_negative_draws(dxc, renderer, adapter, tmp):
+    source, cases = cvt_minmax_draw()
+    expected = cases[0][1]
+    # One unit in the last place of the depth word of the last vertex only, then every sibling opcode.
+    word = struct.unpack("<I", struct.pack("<f", expected[2][2]))[0]
+    off_by_one = struct.unpack("<f", struct.pack("<I", word + 1))[0]
+    wrong = [(source, expected[:2] + [(*expected[2][:2], off_by_one, expected[2][3])])]
+    wrong += [(cvt_minmax_draw(cvt_minmax_program(op))[0], expected) for op in CVT_MINMAX_SIBLINGS]
+    for text, positions in wrong:
+        if mismatch(dxc, renderer, adapter, tmp, text, positions) == 77:
+            return 77
+    return 0
+
+
+def cvt_minmax_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), cvt_minmax_reference()
+    text = binary(tmp, *tools, program=CVT_MINMAX_PROGRAM, words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    for op in CVT_MINMAX_SIBLINGS:
+        mutated = evaluate_depth(binary(tmp, *tools, program=cvt_minmax_program(op), words=[4099]), inputs)
+        assert mutated != reference, (op, mutated)
+    # Modifiers change the result, and a float expression is not an integer source: all are refused.
+    for line in (
+        "v_min_f32_e64 v18, -v12, v14",
+        "v_max_f32_e64 v19, |v13|, v15",
+        "v_min_f32_e64 v18, v12, v14 clamp",
+        "v_max_f32_e64 v19, v13, v15 mul:2",
+        "v_cvt_f32_i32_e64 v13, 0x80000000 clamp",
+        "v_cvt_f32_u32_e32 v10, v3",
+    ):
+        try:
+            lower(enumerate_pcs(cvt_minmax_program(line=line)), [4099], (3, 1))
+        except ValueError:
+            continue
+        raise AssertionError(line)
+
+
 def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header=None):
     from pixel_aot_check import envelope
     from pixel_aot import _read_named_container
@@ -221,6 +527,251 @@ def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header
         subprocess.run([*command, "--compute-fallback"], check=True)
         expected = lower(enumerate_pcs(program), words, (3, 1), header, compute_fallback=True)
         assert translated.read_text() == expected
+    return translated.read_text()
+
+
+def float_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), float_reference()
+    text = binary(tmp, *tools, program=FLOAT_PROGRAM, words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    for op, other in SIBLINGS.items():
+        program = [l.replace(op, other, 1) if l.startswith(op) else l for l in FLOAT_PROGRAM]
+        mutated = evaluate_depth(binary(tmp, *tools, program=program, words=[4099]), inputs)
+        assert mutated != reference, (op, mutated)
+    # Source modifiers and output modifiers change the result, so they are refused.
+    for line in (
+        "v_add_f32_e64 v3, -v3, v13",
+        "v_add_f32_e64 v3, |v3|, v13",
+        "v_mul_f32_e64 v3, v3, v16 mul:2",
+        "v_sub_f32_e64 v3, v3, v14 clamp",
+    ):
+        program = [line if l == "v_mul_f32_e64 v3, v3, v16" else l for l in FLOAT_PROGRAM]
+        try:
+            lower(enumerate_pcs(program), [4099], (3, 1))
+        except ValueError:
+            continue
+        raise AssertionError(line)
+
+
+def cvt_minmax_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), cvt_minmax_reference()
+    text = binary(tmp, *tools, program=CVT_MINMAX_PROGRAM, words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    for op in CVT_MINMAX_SIBLINGS:
+        mutated = evaluate_depth(binary(tmp, *tools, program=cvt_minmax_program(op), words=[4099]), inputs)
+        assert mutated != reference, (op, mutated)
+    # Modifiers change the result, and a float expression is not an integer source: all are refused.
+    for line in (
+        "v_min_f32_e64 v18, -v12, v14",
+        "v_max_f32_e64 v19, |v13|, v15",
+        "v_min_f32_e64 v18, v12, v14 clamp",
+        "v_max_f32_e64 v19, v13, v15 mul:2",
+        "v_cvt_f32_i32_e64 v13, 0x80000000 clamp",
+        "v_cvt_f32_u32_e32 v10, v3",
+    ):
+        try:
+            lower(enumerate_pcs(cvt_minmax_program(line=line)), [4099], (3, 1))
+        except ValueError:
+            continue
+        raise AssertionError(line)
+
+
+# One-source binary32 math. The inputs reach each opcode through a register that holds an added zero the compiler
+# cannot prove, so the compiler's own constant folding is not what the draw checks. Reciprocal, reciprocal square
+# root and square root are approximate in D3D, so each result is rounded to the nearest integer (add 0.5, floor)
+# before it counts: it is an integer for any result within 0.5 of the exact one, and the sibling opcode gives a
+# different integer. The rounding opcodes are exact and are compared directly: floor and truncation of negative
+# fractions, a tie rounded to even (-2.5 and -0.5; floor and round half away give -3 and -1), a fractional part.
+UNARY_CASES = [
+    ("v_rcp_f32_e32", 0.25, "v_rsq_f32_e32"),
+    ("v_rsq_f32_e32", 0.0625, "v_rcp_f32_e32"),
+    ("v_sqrt_f32_e32", 16.0, "v_rsq_f32_e32"),
+    ("v_floor_f32_e32", -2.5, "v_trunc_f32_e32"),
+    ("v_trunc_f32_e32", -2.5, "v_floor_f32_e32"),
+    ("v_rndne_f32_e32", -2.5, "v_floor_f32_e32"),
+    ("v_fract_f32_e32", -2.75, "v_floor_f32_e32"),
+    ("v_rcp_f32_e64", 0.125, "v_rsq_f32_e64"),
+    ("v_rsq_f32_e64", 0.25, "v_rcp_f32_e64"),
+    ("v_sqrt_f32_e64", 9.0, "v_rsq_f32_e64"),
+    ("v_floor_f32_e64", -7.75, "v_trunc_f32_e64"),
+    ("v_trunc_f32_e64", -6.75, "v_floor_f32_e64"),
+    ("v_rndne_f32_e64", -0.5, "v_floor_f32_e64"),
+    ("v_fract_f32_e64", 5.125, "v_floor_f32_e64"),
+]
+APPROXIMATE = ("v_rcp", "v_rsq", "v_sqrt")
+UNARY_BIAS = -4.25  # brings the sum of the rounded results to a depth inside the clip range
+
+
+def fword(x):
+    return struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+def unary_program(swap=None, line=None):
+    # v5 is zero, but not a zero the compiler can see. A swap replaces one case's opcode with its sibling.
+    program = PROGRAM.copy()
+    body = ["v_sub_f32_e32 v5, v3, v3"]
+    for i, (op, x, sibling) in enumerate(UNARY_CASES):
+        approximate = op.startswith(APPROXIMATE)
+        op = sibling if op == swap else op
+        out = f"v{20 + i}"
+        body += [f"v_add_f32_e32 v{40 + i}, 0x{fword(x):08x}, v5", f"{op} {out}, v{40 + i}"]
+        if approximate:
+            body += [f"v_add_f32_e32 {out}, 0x3f000000, {out}", f"v_floor_f32_e32 {out}, {out}"]
+        body.append(f"v_add_f32_e32 v3, {out}, v3")
+    body.append(f"v_add_f32_e32 v3, 0x{fword(UNARY_BIAS):08x}, v3")
+    program[-2:-2] = body
+    if line:
+        program.insert(-2, line)
+    return program
+
+
+def unary_reference():
+    # Independent of the lowering: Python arithmetic on exact values, in the order the program runs. Python rounds
+    # a tie to even, which is what v_rndne_f32 does. An approximate result counts as its nearest integer.
+    exact = {
+        "v_rcp": lambda x: math.floor(1 / x + 0.5),
+        "v_rsq": lambda x: math.floor(1 / math.sqrt(x) + 0.5),
+        "v_sqrt": lambda x: math.floor(math.sqrt(x) + 0.5),
+        "v_floor": math.floor,
+        "v_trunc": math.trunc,
+        "v_rndne": round,
+        "v_fract": lambda x: x - math.floor(x),
+    }
+    z = 0.125 + 0.375  # pointData y plus the matrix value
+    for op, x, _ in UNARY_CASES:
+        z += exact[op.rsplit("_f32", 1)[0]](x)
+    z += UNARY_BIAS
+    # The draw keeps depth clipping on, so a final depth outside [0, 1] would clip the whole triangle.
+    assert 0.0 <= z <= 1.0, z
+    return z
+
+
+def unary_draw(program=None):
+    depth = unary_reference()
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    program = unary_program() if program is None else program
+    return lower(enumerate_pcs(program), [4099], (3, 1)), [(triangle_inputs(), positions, True)]
+
+
+def unary_negative_draws(dxc, renderer, adapter, tmp):
+    source, cases = unary_draw()
+    expected = cases[0][1]
+    # One unit in the last place of the depth word of the last vertex only, then every sibling opcode.
+    word = fword(expected[2][2])
+    off_by_one = struct.unpack("<f", struct.pack("<I", word + 1))[0]
+    wrong = [(source, expected[:2] + [(*expected[2][:2], off_by_one, expected[2][3])])]
+    wrong += [(unary_draw(unary_program(op))[0], expected) for op, _, _ in UNARY_CASES]
+    for text, positions in wrong:
+        if mismatch(dxc, renderer, adapter, tmp, text, positions) == 77:
+            return 77
+    return 0
+
+
+def unary_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), unary_reference()
+    text = binary(tmp, *tools, program=unary_program(), words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    # The three approximate operations may be off by a thousandth either way without moving the depth.
+    for error in (-2**-10, 2**-10):
+        assert evaluate_depth(text, inputs, error) == reference, (error, text)
+    # Each lowering is present, and each sibling opcode changes the depth.
+    for hlsl in ("(1.0f / ", "rsqrt(", "sqrt(", "floor(", "trunc(", "round(", "frac("):
+        assert hlsl in text, hlsl
+    for op, _, _ in UNARY_CASES:
+        mutated = evaluate_depth(binary(tmp, *tools, program=unary_program(op), words=[4099]), inputs)
+        assert mutated != reference, (op, mutated)
+    # Source and output modifiers change the result, so they are refused, as is a clamp.
+    for line in (
+        "v_floor_f32_e64 v21, -v47",
+        "v_sqrt_f32_e64 v21, |v47|",
+        "v_rcp_f32_e64 v21, v47 clamp",
+        "v_fract_f32_e64 v21, v47 mul:2",
+        "v_rndne_f32_e64 v21, v47 div:2",
+    ):
+        try:
+            lower(enumerate_pcs(unary_program(line=line)), [4099], (3, 1))
+        except ValueError:
+            continue
+        raise AssertionError(line)
+    # A second source is not a form of these opcodes.
+    try:
+        lower(enumerate_pcs(unary_program(line="v_floor_f32_e32 v21, v47, v48")), [4099], (3, 1))
+    except ValueError:
+        return
+    raise AssertionError("two-source unary")
+
+
+# Fract of a tiny negative input. x - floor(x) rounds to 1.0 in binary32, but v_fract_f32 returns at most 0x3f7fffff.
+# Both encodings get their own input (-2^-30 and -2^-28), so the two emitted expressions stay distinct. Each result
+# is moved by -1.0 first, which makes it exact (-2^-24, or zero when the clamp is missing).
+FRACT_TINY = [("v_fract_f32_e32", 0xB0800000), ("v_fract_f32_e64", 0xB1800000)]
+# A NaN input must come out as a NaN, in each encoding. The payloads differ so that the expressions stay distinct.
+FRACT_NAN = [("v_fract_f32_e32", 0x7FC00000), ("v_fract_f32_e64", 0x7FC00001)]
+
+
+def fract_program(cases):
+    program = PROGRAM.copy()
+    body = ["v_sub_f32_e32 v5, v3, v3"]
+    for i, (op, word) in enumerate(cases):
+        body += [
+            f"v_add_f32_e32 v{40 + i}, 0x{word:08x}, v5",
+            f"{op} v{20 + i}, v{40 + i}",
+            f"v_add_f32_e32 v{20 + i}, 0xbf800000, v{20 + i}",
+            f"v_add_f32_e32 v3, v{20 + i}, v3",
+        ]
+    program[-2:-2] = body
+    return program
+
+
+def fract_reference(cases):
+    # The RDNA rule in binary32: fract(x) is x - floor(x) capped at 0x3f7fffff, and a NaN stays a NaN. The bare
+    # difference is 1.0 for both tiny inputs.
+    top = F32(struct.unpack("<f", struct.pack("<I", 0x3F7FFFFF))[0])
+    z = F32(0.125) + F32(0.375)  # pointData y plus the matrix value
+    for _, word in cases:
+        x = F32(struct.unpack("<f", struct.pack("<I", word))[0])
+        if math.isnan(x):
+            return F32(math.nan)
+        assert F32(x - math.floor(x)) == 1.0
+        z = z + (F32(min(F32(x - math.floor(x)), top)) - F32(1.0))
+    return z
+
+
+def drop_cap(text, indexes, keep):
+    # Replace the chosen emitted caps by keep(frac call), in place.
+    matches = list(re.finditer(FRACT_CAP, text))
+    for i in sorted(indexes, reverse=True):
+        m = matches[i]
+        text = text[: m.start()] + keep(m[1]) + text[m.end() :]
+    return text
+
+
+def fract_tiny_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), fract_reference(FRACT_TINY)
+    assert reference == 0.5 - 2**-23, reference
+    text = binary(tmp, *tools, program=fract_program(FRACT_TINY), words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    assert len(re.findall(FRACT_CAP, text)) == 2, text
+    # Without the cap, either encoding alone moves the depth, and dropping both moves it further.
+    for chosen in ([0], [1], [0, 1]):
+        mutated = drop_cap(text, chosen, lambda frac: frac)
+        assert evaluate_depth(mutated, inputs) != reference, (chosen, mutated)
+    # The cap as a min gives the same depth on these finite inputs, so only the NaN check below tells it apart.
+    old = drop_cap(text, [0, 1], lambda frac: f"min({frac}, asfloat(0x3f7fffffu))")
+    assert evaluate_depth(old, inputs) == reference, old
+
+
+def fract_nan_binary(tmp, tools):
+    inputs = triangle_inputs()
+    # Each encoding alone, so that a lost NaN in one cannot hide behind the other.
+    for case in FRACT_NAN:
+        text = binary(tmp, *tools, program=fract_program([case]), words=[4099])
+        assert len(re.findall(FRACT_CAP, text)) == 1, text
+        assert math.isnan(evaluate_depth(text, inputs)), (case, text)
+        # The cap as a min turns the NaN into the finite 0x3f7fffff, and a bare frac keeps it a NaN.
+        old = drop_cap(text, [0], lambda frac: f"min({frac}, asfloat(0x3f7fffffu))")
+        assert not math.isnan(evaluate_depth(old, inputs)), (case, old)
+        assert math.isnan(evaluate_depth(drop_cap(text, [0], lambda frac: frac), inputs)), (case, text)
 
 
 def offset_draw():
@@ -258,7 +809,39 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as directory:
         if sys.argv[1] == "binary":
             binary(Path(directory), *sys.argv[2:])
+            text = binary(
+                Path(directory), *sys.argv[2:], program=ALU_PROGRAM, words=[4099]
+            )
+            for operand in ALU_OPERANDS:
+                assert f"asfloat(0x{operand:08x}u)" in text, hex(operand)
+            # The unsigned min is 0x3f200000 and the unsigned max 0xbfc00000; a signed comparison swaps them, and the
+            # unequal use counts (three and two) make the swap visible in the text and in the drawn depth.
+            assert text.count("asfloat(0x3f200000u)") == 3, text
+            assert text.count("asfloat(0xbfc00000u)") == 2, text
+            float_binary(Path(directory), sys.argv[2:])
+            cvt_minmax_binary(Path(directory), sys.argv[2:])
+            unary_binary(Path(directory), sys.argv[2:])
+            fract_tiny_binary(Path(directory), sys.argv[2:])
+            fract_nan_binary(Path(directory), sys.argv[2:])
             sys.exit(0)
+        if sys.argv[1] == "draw-cvt-minmax":
+            args = sys.argv[2:]
+            sys.exit(
+                draw(*args, Path(directory), *cvt_minmax_draw())
+                or cvt_minmax_negative_draws(*args, Path(directory))
+            )
+        if sys.argv[1] == "draw-unary":
+            args = sys.argv[2:]
+            sys.exit(
+                draw(*args, Path(directory), *unary_draw())
+                or unary_negative_draws(*args, Path(directory))
+            )
+        if sys.argv[1] == "draw-float":
+            args = sys.argv[2:]
+            sys.exit(
+                draw(*args, Path(directory), *float_draw())
+                or float_negative_draws(*args, Path(directory))
+            )
         clipped = triangle_inputs()
         struct.pack_into("<f", clipped, 4, -0.625)  # Plus 0.375 gives Z = -0.25.
         clipped_positions = [(x, y, -0.25, w) for x, y, _, w in TRIANGLE]
@@ -277,4 +860,5 @@ if __name__ == "__main__":
                 pixel_source=winding_pixel,
             )
             or draw(*sys.argv[1:], Path(directory), *offset_draw())
+            or draw(*sys.argv[1:], Path(directory), *alu_draw())
         )

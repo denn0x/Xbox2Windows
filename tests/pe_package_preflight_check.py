@@ -154,6 +154,22 @@ class OfflinePreflightChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Entry is not"):
             summarize(self.package, "missing.exe")
 
+    def test_strict_plan_refuses_external_provider(self):
+        package = {
+            "app.exe": info("app", imports=[("normal", "xgameruntime.dll", "XUserAddAsync")]),
+        }
+        report = summarize(package, "app.exe")
+        row = report["imports"][0]
+        self.assertEqual(row["status"], "external_unverified")
+        self.assertFalse(row["chain"][0]["package"])
+        with self.assertRaisesRegex(
+                ValueError, r"app\.exe: xgameruntime\.dll!XUserAddAsync: external_unverified"):
+            plan(report, allow_external=False)
+        order, bindings = plan(report)
+        self.assertEqual(order, ["app.exe"])
+        self.assertEqual(bindings["app.exe"][("xgameruntime.dll", "XUserAddAsync")]["dll"],
+                         "xgameruntime.dll")
+
     def test_inspect_never_executes_and_ignores_non_pe_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -173,7 +189,20 @@ class OfflinePreflightChecks(unittest.TestCase):
                 inspect(root, "../outside.exe")
             with self.assertRaisesRegex(ValueError, "Entry must be"):
                 inspect(root, "data.rpf")
-            (root / "linked.dll").symlink_to(root / "shim.dll")
+
+    def test_inspect_refuses_a_symlinked_pe_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main.exe").write_bytes(b"source-built synthetic fixture")
+            (root / "shim.dll").write_bytes(b"source-built synthetic fixture")
+            try:
+                (root / "linked.dll").symlink_to(root / "shim.dll")
+            except OSError as error:
+                # Windows refuses symlink creation without Developer Mode or
+                # SeCreateSymbolicLinkPrivilege (ERROR_PRIVILEGE_NOT_HELD).
+                if getattr(error, "winerror", None) != 1314:
+                    raise
+                self.skipTest("this Windows account cannot create symlinks (WinError 1314)")
             with self.assertRaisesRegex(ValueError, "symlink"):
                 inspect(root, "main.exe")
 

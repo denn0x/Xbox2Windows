@@ -51,8 +51,10 @@ def run(directory, dxc, mapper, exe, lifted, companion, io, xmem, d3d12):
     cases = (
         ("shadow", first + second, 42, [*frame_zero, "shadow record frame=1 map=1", *frame_one]),
         ("shadow-stale", first + stale, 42, [*frame_zero, "shadow record frame=1 map=0", *frame_one]),
-        ("shadow-reject", b"", 20, ["Xbox device rejected: no device, released adapter and factory",
-                                  "shadow close surfaces=0 device=0"]),
+        ("shadow-reject", b"", 20,
+         ["D3D12XboxCreateDevice: unsupported IID {c1b6694f-ff09-44a9-b03c-77900a0a1d17}",
+          "Xbox device rejected: no device, released adapter and factory",
+          "shadow close surfaces=0 device=0"]),
         ("shadow-fail", first, 24, [*frame_zero, "shadow record frame=1 map=1",
                                   "shadow submit frame=2 rejected", closed]),
     )

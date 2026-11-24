@@ -23,6 +23,8 @@ EXIT = 14 | (2 << 8) | (3 << 16) | (1 << 24)
 LOG_WITHOUT_B, EXIT_WITHOUT_B = "atew2w3m1", (2 << 8) | (3 << 16) | (1 << 24)
 CREATE_FAILED, WAIT_TIMED_OUT = 0xE0000002, 0xE0000003  # startup_exe.cpp failure codes
 EXIT_ALTERED_A = 18 | (2 << 8) | (3 << 16) | (1 << 24)  # a_value 9 instead of 7
+LINGER_DEADLINE = 10  # s; the EXE itself ends in milliseconds
+RETURN_DEADLINE = 3  # s; the returning control never ends by itself while its thread sleeps
 
 
 def observed(done):
@@ -173,6 +175,31 @@ def check_failure_control(mapper, exe_control, a, b, expected, what):
     print(f"control, {what}: both processes end with {expected:#x} before consuming a result or printing the log")
 
 
+def check_lingering(exe_linger, exe_linger_return, a, b):
+    """#1375: a thread that outlives the entry point must not hold the native process open. The _linger build
+    leaves one running and must still end with its result; the _linger_return build returns from its entry
+    point instead and must stay alive until it is killed, which shows the control sees a lingering process.
+    Native launches only: in a host mapping the thread would run unmapped code after the release."""
+    with TemporaryDirectory(ignore_cleanup_errors=True) as temp:  # a killed control may hold its EXE briefly
+        for name, path in ((A, a), (B, b), (EXE, exe_linger), ("returning.exe", exe_linger_return)):
+            shutil.copy(path, Path(temp) / name)
+        try:
+            done = observed(subprocess.run([str(Path(temp) / EXE)], capture_output=True, timeout=LINGER_DEADLINE))
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(f"lingering thread: native EXE still alive after {LINGER_DEADLINE} s") from error
+        if (done["log"], done["exit"]) != (LOG, EXIT) or done["stderr"]:
+            raise AssertionError(f"lingering thread: native launch {done}")
+        try:
+            control = subprocess.run([str(Path(temp) / "returning.exe")], capture_output=True, timeout=RETURN_DEADLINE)
+        except subprocess.TimeoutExpired:
+            pass  # expected: the entry returned, and the lingering thread keeps the process alive
+        else:
+            raise AssertionError(f"returning control ended with {control.returncode & 0xffffffff:#x} within "
+                                 f"{RETURN_DEADLINE} s; the lingering-thread control does not hold the process open")
+    print(f"lingering thread: native EXE exited {EXIT:#x} with the full log while its thread was alive; "
+          f"the returning control was still alive after {RETURN_DEADLINE} s")
+
+
 def check_package_runner(mapper, exe, a, b, native_result):
     tool = Path(__file__).resolve().parents[2] / "tools" / "pe_run_package.py"
     with TemporaryDirectory() as temp:
@@ -198,7 +225,7 @@ def check_package_runner(mapper, exe, a, b, native_result):
         print("package runner found both dependencies, matched the native entry trace, and refused a missing provider")
 
 
-def check(mapper, exe, a, b, b_noinit, a_alt, exe_timeout, exe_create):
+def check(mapper, exe, a, b, b_noinit, a_alt, exe_timeout, exe_create, exe_linger, exe_linger_return):
     check_pe_dependencies(exe, a, b)
     check_failure_control(mapper, exe_timeout, a, b, WAIT_TIMED_OUT, "a worker that outlives the wait")
     check_failure_control(mapper, exe_create, a, b, CREATE_FAILED, "a worker thread that cannot be created")
@@ -238,6 +265,7 @@ def check(mapper, exe, a, b, b_noinit, a_alt, exe_timeout, exe_create):
     if not wrong["failure"] or wrong["failure"][1] != STATUS["unresolved"] or wrong["started"] is not None:
         raise AssertionError(f"mapping out of dependency order: {wrong}")
     print(f"mapping the EXE before its DLLs: {wrong['failure'][2]}")
+    check_lingering(exe_linger, exe_linger_return, a, b)
 
 
 if __name__ == "__main__":
@@ -246,7 +274,9 @@ if __name__ == "__main__":
         run(sys.argv[2], sys.argv[3], sys.argv[4:-1] if flagged else sys.argv[4:], flagged)
     else:
         parser = argparse.ArgumentParser()
-        for argument in ("mapper", "exe", "a", "b", "b_noinit", "a_alt", "exe_timeout", "exe_create"):
+        for argument in ("mapper", "exe", "a", "b", "b_noinit", "a_alt", "exe_timeout", "exe_create", "exe_linger",
+                         "exe_linger_return"):
             parser.add_argument(argument, type=Path)
         args = parser.parse_args()
-        check(args.mapper, args.exe, args.a, args.b, args.b_noinit, args.a_alt, args.exe_timeout, args.exe_create)
+        check(args.mapper, args.exe, args.a, args.b, args.b_noinit, args.a_alt, args.exe_timeout, args.exe_create,
+              args.exe_linger, args.exe_linger_return)

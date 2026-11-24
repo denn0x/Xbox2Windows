@@ -79,6 +79,7 @@ $device = Get-GpuField $blocks '(?m)^adapter=.+?\s+vendor=[0-9A-Fa-f]+\s+device=
 $driver = Get-GpuField $blocks '(?m)^driver=(.+)$'
 $debugLayer = Get-GpuField $blocks '(?m)^backend=\S+\s+debug_layer=(\S+)'
 $laneRange = Get-GpuField $blocks '(?m)^native_lane_range=(\S+)'
+$viewHeapLimit = Get-GpuField $blocks '(?m)^max_view_descriptor_heap_size=([0-9]+)\r?$'
 
 $report = [System.Collections.Generic.List[string]]::new()
 $report.Add('## Xbox2Windows GPU report')
@@ -100,6 +101,7 @@ if ($adapter -and $vendor -and $device) {
 $report.Add("- Driver: $(Format-GpuValue $driver)")
 $report.Add("- Debug layer: $(Format-GpuValue $debugLayer)")
 $report.Add("- Native lane range: $(Format-GpuValue $laneRange)")
+$report.Add("- Shader-visible view heap limit: $(Format-GpuValue $viewHeapLimit)")
 $report.Add('')
 $report.Add('| Test | Result |')
 $report.Add('|---|---|')

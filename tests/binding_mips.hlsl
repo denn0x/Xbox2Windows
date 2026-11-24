@@ -35,3 +35,16 @@ void SampleMip(uint2 xy : SV_DispatchThreadID)
     uint4 rgba = uint4(round(image.SampleLevel(pointClamp, uv, level) * 255.0));
     dst.Store(4*(first + xy.y*width + xy.x), rgba.r | (rgba.g<<8) | (rgba.b<<16) | (rgba.a<<24));
 }
+
+SamplerState dynamicSamplers[2] : register(s1);
+cbuffer SamplerSelection : register(b3) { uint samplerIndex, forceZero, outputWord; }
+
+[RootSignature("DescriptorTable(SRV(t0)),DescriptorTable(Sampler(s1,numDescriptors=2)),"
+               "UAV(u1),RootConstants(num32BitConstants=3,b3)")]
+[numthreads(1,1,1)]
+void DynamicSamplerIndex()
+{
+    const uint selected = forceZero != 0 ? 0 : samplerIndex;
+    const float value = image.SampleLevel(dynamicSamplers[selected], float2(1.25, 0.5), 0).x;
+    dst.Store(4 * outputWord, asuint(value));
+}

@@ -30,8 +30,10 @@ flat argument-rooted 32/64-bit mov between volatile scratch GPRs and
 [base + disp], vzeroupper and terminal ret.
 
 All operations transfer or combine raw bits with no FP arithmetic, no NaN
-canonicalization and no MXCSR involvement. Memory operands on the 28
-register-only AVX forms that have memory encodings, the carved-out move forms
+canonicalization and no MXCSR involvement. The eight logical ops also take a flat
+[base + disp] memory operand as their last source (m128 for VEX.128, m256 for
+VEX.256), read as raw bits. Memory operands on the 20 other register-only AVX
+forms that have memory encodings, the carved-out move forms
 (vmovdqa, vmovups, vmovaps, vmovq, vmovd), nonvolatile vector or GPR registers,
 EVEX encodings, instruction prefixes, unsupported addressing modes, branches
 and all other instructions are rejected.
@@ -60,9 +62,8 @@ NONVOLATILE_GPR = {
 }
 
 # Purely register-domain AVX forms in this translator's policy (memory operands rejected).
+# The eight logical ops are not listed: their last source may be a flat memory operand.
 REGISTER_ONLY_AVX = {
-    M.VANDPD, M.VANDPS, M.VANDNPD, M.VANDNPS,
-    M.VORPD, M.VORPS, M.VXORPD, M.VXORPS,
     M.VBLENDPD, M.VBLENDPS, M.VBLENDVPD, M.VBLENDVPS,
     M.VEXTRACTF128, M.VINSERTF128, M.VEXTRACTPS, M.VINSERTPS,
     M.VPERM2F128, M.VPERMILPD, M.VPERMILPS,
@@ -803,8 +804,13 @@ def lift_code(name, start, raw):
                 statements.append(f"store32({addr}, static_cast<std::uint32_t>({reg_name}));")
         elif mnemonic in LOGICAL_HELPERS:
             src1, _ = read_vec(1, ins)
-            src2, _ = read_vec(2, ins)
             dst_idx, dst, wide = write_vec(0, ins)
+            if ins.op_kind(2) == OpKind.MEMORY:
+                # The memory operand is the last source: dest = op(src1, mem), so
+                # VANDN inverts the register operand and never the memory one.
+                src2 = f"{'load256' if wide else 'load128'}({flat_address(ins)})"
+            else:
+                src2, _ = read_vec(2, ins)
             helper = LOGICAL_HELPERS[mnemonic]
             statements.append(f"{dst} = {helper}({src1}, {src2}, {'true' if wide else 'false'});")
             defined.add(dst_idx)

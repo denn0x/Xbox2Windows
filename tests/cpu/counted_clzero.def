@@ -1,0 +1,9 @@
+EXPORTS
+    counted
+    reference_counted
+    prefix_addr32
+    unknown_rax
+    loop_dx
+    loop_r8
+    loop_r9
+    loop_r10

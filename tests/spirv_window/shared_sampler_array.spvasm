@@ -1,0 +1,99 @@
+; Synthetic Texture2DArray variant of shared_sampler.spvasm. It was produced by editing that module
+; by hand: both images become arrayed (OpTypeImage ... 2D 2 1 0 1) and the sample coordinate becomes a
+; float3 holding u, v and array layer 0. One sampler variable still feeds both depth-comparison and
+; ordinary sampling. Equivalent HLSL:
+;
+;   [[vk::binding(0, 0)]] Texture2DArray<float> depthTexture;
+;   [[vk::binding(1, 0)]] Texture2DArray<float> valueTexture;
+;   [[vk::binding(2, 0)]] SamplerComparisonState cmpSampler;
+;   [[vk::binding(3, 0)]] SamplerState plainSampler;
+;   [[vk::binding(4, 0)]] RWStructuredBuffer<float> results;
+;
+;   const float3 uv = float3(0.25f, 0.25f, 0.0f);
+;   results[0] = depthTexture.SampleCmpLevelZero(cmpSampler, uv, 0.25f);
+;   results[1] = depthTexture.SampleCmpLevelZero(cmpSampler, uv, 0.75f);
+;   results[2] = valueTexture.SampleLevel(plainSampler, uv, 0.0f);
+;
+; SPIR-V
+; Version: 1.5
+; Generator: Google spiregg; 0
+; Bound: 46
+; Schema: 0
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %depthTexture %valueTexture %cmpSampler %plainSampler %results
+               OpExecutionMode %main LocalSize 1 1 1
+               OpSource HLSL 660
+               OpName %type_2d_array_image "type.2d.array.image"
+               OpName %depthTexture "depthTexture"
+               OpName %valueTexture "valueTexture"
+               OpName %type_sampler "type.sampler"
+               OpName %cmpSampler "cmpSampler"
+               OpName %plainSampler "plainSampler"
+               OpName %type_RWStructuredBuffer_float "type.RWStructuredBuffer.float"
+               OpName %results "results"
+               OpName %main "main"
+               OpName %type_sampled_image "type.sampled.image"
+               OpDecorate %depthTexture DescriptorSet 0
+               OpDecorate %depthTexture Binding 0
+               OpDecorate %valueTexture DescriptorSet 0
+               OpDecorate %valueTexture Binding 1
+               OpDecorate %cmpSampler DescriptorSet 0
+               OpDecorate %cmpSampler Binding 2
+               OpDecorate %plainSampler DescriptorSet 0
+               OpDecorate %plainSampler Binding 3
+               OpDecorate %results DescriptorSet 0
+               OpDecorate %results Binding 4
+               OpDecorate %_runtimearr_float ArrayStride 4
+               OpMemberDecorate %type_RWStructuredBuffer_float 0 Offset 0
+               OpDecorate %type_RWStructuredBuffer_float Block
+      %float = OpTypeFloat 32
+ %float_0_25 = OpConstant %float 0.25
+    %float_0 = OpConstant %float 0
+    %v3float = OpTypeVector %float 3
+         %15 = OpConstantComposite %v3float %float_0_25 %float_0_25 %float_0
+        %int = OpTypeInt 32 1
+      %int_0 = OpConstant %int 0
+       %uint = OpTypeInt 32 0
+     %uint_0 = OpConstant %uint 0
+ %float_0_75 = OpConstant %float 0.75
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+%type_2d_array_image = OpTypeImage %float 2D 2 1 0 1 Unknown
+%_ptr_UniformConstant_type_2d_image = OpTypePointer UniformConstant %type_2d_array_image
+%type_sampler = OpTypeSampler
+%_ptr_UniformConstant_type_sampler = OpTypePointer UniformConstant %type_sampler
+%_runtimearr_float = OpTypeRuntimeArray %float
+%type_RWStructuredBuffer_float = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_type_RWStructuredBuffer_float = OpTypePointer StorageBuffer %type_RWStructuredBuffer_float
+       %void = OpTypeVoid
+         %28 = OpTypeFunction %void
+%type_sampled_image = OpTypeSampledImage %type_2d_array_image
+%_ptr_StorageBuffer_float = OpTypePointer StorageBuffer %float
+    %v4float = OpTypeVector %float 4
+%depthTexture = OpVariable %_ptr_UniformConstant_type_2d_image UniformConstant
+%valueTexture = OpVariable %_ptr_UniformConstant_type_2d_image UniformConstant
+ %cmpSampler = OpVariable %_ptr_UniformConstant_type_sampler UniformConstant
+%plainSampler = OpVariable %_ptr_UniformConstant_type_sampler UniformConstant
+    %results = OpVariable %_ptr_StorageBuffer_type_RWStructuredBuffer_float StorageBuffer
+       %main = OpFunction %void None %28
+         %31 = OpLabel
+         %32 = OpLoad %type_2d_array_image %depthTexture
+         %33 = OpLoad %type_sampler %cmpSampler
+         %34 = OpSampledImage %type_sampled_image %32 %33
+         %35 = OpImageSampleDrefExplicitLod %float %34 %15 %float_0_25 Lod %float_0
+         %36 = OpAccessChain %_ptr_StorageBuffer_float %results %int_0 %uint_0
+               OpStore %36 %35
+         %37 = OpSampledImage %type_sampled_image %32 %33
+         %38 = OpImageSampleDrefExplicitLod %float %37 %15 %float_0_75 Lod %float_0
+         %39 = OpAccessChain %_ptr_StorageBuffer_float %results %int_0 %uint_1
+               OpStore %39 %38
+         %40 = OpLoad %type_2d_array_image %valueTexture
+         %41 = OpLoad %type_sampler %cmpSampler
+         %42 = OpSampledImage %type_sampled_image %40 %41
+         %43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0
+         %44 = OpCompositeExtract %float %43 0
+         %45 = OpAccessChain %_ptr_StorageBuffer_float %results %int_0 %uint_2
+               OpStore %45 %44
+               OpReturn
+               OpFunctionEnd

@@ -7,7 +7,7 @@ Xbox2Windows targets x64 Windows for its C++, HLSL, MASM, D3D12, WARP, and GPU t
 | Work or check | macOS / Linux | x64 Windows | Notes |
 |---|---|---|---|
 | Documentation edits | Yes | Yes | Markdown, diff hygiene, and link checks (`tests/docs_links_check.py`). |
-| Platform-independent Python checks | Yes | Yes | The commands below cover the [Linux CI workflow](../.github/workflows/windows.yml), the BC7 block reference and the GPU report formatter. |
+| Platform-independent Python checks | Yes | Yes | The quick starts below run a subset of checks. See the `python-linux` job in the [Linux CI workflow](../.github/workflows/windows.yml) for the full CI list. |
 | LLVM 15 `gfx1013` translation checks | Yes | No (via CI / separate LLVM) | `tests/pixel_aot_check.py binary`, `tests/ffx_dispatch_aot_check.py`, and `tests/rdna2_tools_check.py` (with `LLVM_LIB`, `LLVM_MC`, `LLVM_OBJCOPY`) verify assembling, disassembling, and lowering only. |
 | `cmake --preset dev` build (MSVC `cl` + Ninja) | No | Yes | `CMakePresets.json` selects `cl`. |
 | MASM fixtures (`tests/cpu/*.asm`) and `cpu_*` tests | No | Yes | Assembled and built by the Windows toolchain. |
@@ -26,11 +26,14 @@ Install Python 3.12 and LLVM 15 with Homebrew (both are needed as explicit paths
 brew install python@3.12 llvm@15
 ```
 
-From the repository root, create a virtual environment under `out/pe-env`, install `pefile` at the version pinned in `requirements-dev.txt`, and run the platform-independent checks below:
+From the repository root, create a virtual environment under `out/pe-env`, install `pefile` at the version pinned in `requirements-dev.txt`, and run the platform-independent checks below.
+The block runs in a subshell and returns the first failure:
 
 ```bash
-"$(brew --prefix python@3.12)/bin/python3.12" -m venv out/pe-env
-./out/pe-env/bin/python -m pip install -c requirements-dev.txt pefile
+(
+python_prefix="$(brew --prefix python@3.12)" || exit $?
+"$python_prefix/bin/python3.12" -m venv out/pe-env || exit $?
+./out/pe-env/bin/python -m pip install -c requirements-dev.txt pefile || exit $?
 for t in \
   tests/script_state_check.py \
   tests/resource_root_check.py \
@@ -55,8 +58,9 @@ for t in \
   tests/bidi_controls_check.py \
   tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
-  ./out/pe-env/bin/python -B "$t"
+  ./out/pe-env/bin/python -B "$t" || exit $?
 done
+)
 ```
 
 `tests/form_coverage_check.py` and `tests/xmem_attribute_scan_check.py` import `iced-x86`, which pip builds from source on Apple Silicon, so this list leaves them out. Run them on Linux or Windows.
@@ -86,11 +90,13 @@ sudo apt-get update -q
 sudo apt-get install -y python3-venv
 ```
 
-From the repository root, create `out/pe-env` (Python 3.11 or newer; CI uses 3.12), install dependencies, and run the platform-independent checks below:
+From the repository root, create `out/pe-env` (Python 3.11 or newer; CI uses 3.12), install dependencies, and run the platform-independent checks below.
+The block runs in a subshell and returns the first failure:
 
 ```bash
-python3 -m venv out/pe-env
-./out/pe-env/bin/python -m pip install -r requirements-dev.txt
+(
+python3 -m venv out/pe-env || exit $?
+./out/pe-env/bin/python -m pip install -r requirements-dev.txt || exit $?
 for t in \
   tests/script_state_check.py \
   tests/resource_root_check.py \
@@ -117,8 +123,9 @@ for t in \
   tests/bidi_controls_check.py \
   tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
-  ./out/pe-env/bin/python -B "$t"
+  ./out/pe-env/bin/python -B "$t" || exit $?
 done
+)
 ```
 
 On Debian/Ubuntu, install LLVM 15 and run the three `gfx1013` checks:
@@ -213,6 +220,116 @@ cmake --build --preset release
 ```
 
 The resulting test binaries run under Wine and `vkd3d`, not Windows D3D12 or WARP. Expect `desktop_memory_query`, the `d3d12_xs_shim_*` export and root checks, and `ffx_provider_loop_*` and `bvh_root_roundtrip_*` to fail there, and the DXR and BVH tests to skip. Treat a Wine run as a compile check only. Do not report Wine test results as Windows verification or hardware coverage.
+
+### Cross-compile with clang-cl and an xwin SDK
+
+clang-cl with lld-link and a Windows SDK laid out by [xwin](https://github.com/Jake-Shadle/xwin)
+is a second way to build Windows binaries on Linux without Wine in the build. Like msvc-wine it
+is a real compiler and the real SDK headers and import libraries, not a stub, and like msvc-wine
+it is a compile check: MSVC and Windows CI remain the reference. Review the SDK license before
+using xwin's acceptance option.
+
+Measured on one host (Debian 13, clang-cl 19.1.7, `xwin splat` of SDK 10.0.26100): the eight
+startup stand-ins (`xmem_shim`, `d3d12_xs_shim` and the six `startup_stub_*` targets) and the
+device-free test executables build from a clean checkout. The whole tree and the MASM fixtures
+were not attempted.
+
+Save this as a toolchain file:
+
+```cmake
+# clang-cl, lld-link and an xwin SDK splat as a Windows x64 toolchain on Linux.
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR AMD64)
+set(CMAKE_CXX_COMPILER clang-cl-19)
+set(CMAKE_CXX_COMPILER_TARGET x86_64-pc-windows-msvc)
+set(CMAKE_LINKER lld-link-19)
+set(CMAKE_AR llvm-lib-19)
+set(CMAKE_RC_COMPILER llvm-rc-19)
+set(CMAKE_MT llvm-mt-19)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES XWIN LIBCASE)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+# The paths are quoted inside the flag strings so that a directory with spaces stays one argument.
+set(inc "/imsvc \"${XWIN}/crt/include\" /imsvc \"${XWIN}/sdk/include/ucrt\" /imsvc \"${XWIN}/sdk/include/um\" /imsvc \"${XWIN}/sdk/include/shared\" /imsvc \"${XWIN}/sdk/include/winrt\"")
+# /EHa last: CMake's own default would add /EHsc, and the stand-ins probe memory inside __try.
+set(CMAKE_CXX_FLAGS "${inc} /DWIN32 /D_WINDOWS /clang:-fbracket-depth=2048 /EHa" CACHE STRING "" FORCE)
+set(lib "\"/libpath:${XWIN}/crt/lib/x86_64\" \"/libpath:${XWIN}/sdk/lib/um/x86_64\" \"/libpath:${XWIN}/sdk/lib/ucrt/x86_64\" \"/libpath:${LIBCASE}\"")
+set(CMAKE_EXE_LINKER_FLAGS "${lib}" CACHE STRING "" FORCE)
+set(CMAKE_SHARED_LINKER_FLAGS "${lib}" CACHE STRING "" FORCE)
+set(CMAKE_MODULE_LINKER_FLAGS "${lib}" CACHE STRING "" FORCE)
+```
+
+```bash
+mkdir -p out/libcase
+ln -s "$XWIN/sdk/lib/um/x86_64/onecore.lib" out/libcase/OneCore.lib
+cmake -S . -B out/build/clang -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=/path/to/clang-cl-xwin.cmake -DXWIN="$XWIN" -DLIBCASE="$PWD/out/libcase" \
+  -DDXC_EXECUTABLE=/path/to/linux/dxc
+cmake --build out/build/clang --target xmem_shim d3d12_xs_shim startup_stub_acphal startup_stub_chad \
+  startup_stub_xapu startup_stub_xcrdapi startup_stub_xg_xs startup_stub_gameinput
+```
+
+The toolchain file quotes the SDK and `LIBCASE` paths inside its flag strings, so those two and
+the build directory may contain spaces (checked with all three in directories whose names have a
+space; a source directory with spaces was not tried).
+
+Four things differ from an MSVC build:
+
+- **`/EHa` is required, and it has to come after CMake's default `/EHsc`.** The stand-ins probe
+  title memory inside `__try` (`src/startup_stubs/local_log.h`). MSVC catches the access violation
+  of a load written directly in the `__try` body under `/EHsc`; clang-cl only does so with
+  asynchronous exception handling. Built with `/EHsc`, the first probe of an unreadable address
+  ends the process with an unhandled access violation inside `d3d12_xs.dll`. The toolchain file
+  above sets the flags itself for that reason.
+- **`-fbracket-depth`.** `d3d12_xs_device.cpp` instantiates a 512-argument fold expression; clang
+  stops at 256 nested expressions by default.
+- **`OneCore.lib`.** `CMakeLists.txt` links `OneCore`; the splat has `onecore.lib`, and lld-link on
+  a case-sensitive file system does not find it. The symlink above supplies the spelling.
+- **DXC.** Configure needs a `dxc`. The Linux build from the
+  [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
+  satisfies `find_program`; the HLSL fixtures were not built with it here.
+
+### Startup debugger under Wine
+
+The [startup stand-ins and debugger](startup-runtime.md) target Windows. The following was
+needed to run `tools/startup/debug_launch.py` on the stand-ins built as above, under Wine with
+vkd3d-proton (measured: Proton Experimental's Wine 11.0 and vkd3d-proton 2576c0b4, NVIDIA driver
+550.163.01, one console executable, offline). It is a translation-layer run for finding problems,
+not Windows verification; report it as such.
+
+- **Python.** The debugger uses the Win32 debug API through `ctypes`, so it runs under the
+  Windows build of CPython inside Wine, not the host's Python. The embeddable package works once
+  its `python312._pth` file is removed (with it, the script's own directory is not on the import
+  path). Unpack the `win_amd64` wheel of `iced-x86` next to `python.exe` for the checks that
+  import it.
+- **D3D12.** Wine's built-in D3D12 is not enough. Copy vkd3d-proton's `d3d12.dll` and
+  `d3d12core.dll`, DXVK's `dxgi.dll`, and the `libvkd3d*.dll` files Wine's `d3dcompiler_47` imports
+  into the prefix's `system32`, and set `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n"`.
+- **Package drive.** An executable that opens its package by drive letter needs that letter in the
+  prefix: remove the auto-assigned device link of that letter in `dosdevices/` and add a symlink
+  to the package folder, for example `ln -s /path/to/package "$WINEPREFIX/dosdevices/g:"`.
+- **FXC.** `tools/startup/gfx2hlsl.py --pending` compiles with `fxc.exe`. The x64 `fxc.exe` and
+  its `d3dcompiler_47.dll` from the Windows SDK run under Wine with
+  `WINEDLLOVERRIDES="d3dcompiler_47=n"`, so that FXC uses the SDK's compiler and not Wine's. Set
+  `X2W_FXC` to its Windows path and run the translator with the Windows Python.
+- **Gaming runtime.** The runtime proxy wraps the system `xgameruntime.dll`, which Wine does not
+  have. The x64 `xgameruntime.dll` of Microsoft's `Microsoft.GDK.Windows` NuGet package, placed
+  next to the executable, loads under Wine and answers `QueryApiImpl`.
+- **Section backing.** Wine backs anonymous sections with files in its server directory. When
+  that directory is on a small tmpfs (`/run/user/<uid>` is often a tenth of RAM), unset
+  `XDG_RUNTIME_DIR` for the run so that Wine uses `/tmp`.
+- **Descriptor handles.** vkd3d-proton keeps tag bits in the low bits of its CPU descriptor
+  handles, where native D3D12 returns aligned addresses. An executable that does arithmetic on the
+  handles of a sampler or render-target heap can then pass a corrupted handle back (seen once,
+  on a sampler heap). This is an open difference; the stand-ins hand out the desktop handle for
+  those heap types.
+- **Two top-level windows.** The executable's own window can sit above the stand-in's output
+  window under an X11 window manager. Minimise it to see the output.
+
+Known cost under Wine: one section per 64 KiB physical page
+(`src/xmem_mapped_pages.cpp`) is slow there. A request for about 100,000 pages did not finish
+within 30 s in the measured run; with a local change that maps the same pages as a few large
+views, the run was past that request within 5 s of starting.
 
 ## Troubleshooting
 

@@ -1,11 +1,11 @@
 // Desktop chad.dll trap stubs.
-// Every export traps; see trap.h. Local scaffolding, not an ABI claim.
+// Every export traps; see trap.h. Scaffolding, not an ABI claim.
 #define X2W_TRAP_MODULE "chad.dll"
 #define X2W_TRAP_MODULE_ID 2
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 
-// LOCAL EXPERIMENT ONLY (local/startup-v2, never pushed). With X2W_AUDIO_PERMISSIVE=1 the exports
+// Experimental (docs/startup-runtime.md). With X2W_AUDIO_PERMISSIVE=1 the exports
 // stand in for the DSP stream interface; otherwise they trap. Seen:
 //   XDspConnectWithMaximumStreamLimit(queue memory, 0x60000, 30, 0x80, 1, &handle) -> 0 on success.
 // The others have not been seen yet; they succeed (0) and log their first calls with registers.

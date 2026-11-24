@@ -35,6 +35,11 @@ def imports_by_dll(image):
 
 
 def mapped(mapper_path, exe, companion, io, xmem, d3d12_xs, *, withheld):
+    # DXGI loads d3d10warp.dll from the process's directory first. The native EXE finds an app-local
+    # WARP (OFFSCREEN_WARP_DIR) beside itself; this host is python.exe, so load that copy explicitly.
+    warp = exe.with_name("d3d10warp.dll")
+    if warp.exists():
+        ctypes.WinDLL(str(warp))
     mapper = Mapper(mapper_path)
     providers = {"kernel32.dll": ctypes.WinDLL("kernel32.dll")}
     providers.update({dll.name.casefold(): ctypes.WinDLL(str(dll))

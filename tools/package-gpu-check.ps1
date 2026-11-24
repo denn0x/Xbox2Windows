@@ -31,9 +31,13 @@ try {
     & powershell.exe -NoProfile -File "$smoke/Run-GpuCheck.ps1" -Backend warp
     if ($LASTEXITCODE -ne 0) { throw 'The extracted package failed its WARP tests.' }
     $report = Get-Content -Raw -LiteralPath "$smoke/gpu-report-warp.md"
+    # The Windows 10 in-box WARP (SM 6.2) skips the SM 6.5 fixtures by name; anything else must pass.
+    $sm65Missing = 'bvh_waves_warp', 'bvh_atomics_warp', 'bvh_packed_warp' | Where-Object {
+        $report -notmatch "$_ - PASS" -and
+        $report -notmatch "(?s)### $_ - SKIP[^#]*skip: fixture requires Shader Model 6\.5"
+    }
     if ($report -notmatch 'dual_uav_warp - PASS' -or $report -notmatch 'texture_mips_warp - PASS' -or
-        $report -notmatch 'bvh_waves_warp - PASS' -or $report -notmatch 'bvh_atomics_warp - PASS' -or
-        $report -notmatch 'bvh_packed_warp - PASS' -or $report -notmatch 'bvh_root_roundtrip_warp - PASS' -or
+        $sm65Missing -or $report -notmatch 'bvh_root_roundtrip_warp - PASS' -or
         $report -notmatch [regex]::Escape($revision) -or
         $report -notmatch '### Summary' -or
         $report -notmatch '### Submit this report' -or

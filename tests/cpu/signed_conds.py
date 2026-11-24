@@ -384,14 +384,14 @@ def check_negative_controls():
         raise AssertionError(f"expected unconditional volatile read for CMOV memory source:\n{emitted}")
 
     # 2. Rejection of unhandled / malformed operations
-    # UD2 should be rejected cleanly with ValueError
+    # UD0 should be rejected cleanly with ValueError (UD2 is lowered since #1021, UD0 and UD1 stay refused)
     try:
-        lower(list(Decoder(64, bytes.fromhex("0f 0b c3"), ip=0x1000)), [], {}, {}, {})
+        lower(list(Decoder(64, bytes.fromhex("0f ff c0 c3"), ip=0x1000)), [], {}, {}, {})
     except ValueError as exc:
         if "unsupported query operation" not in str(exc):
             raise AssertionError(f"unexpected diagnostic: {exc}") from exc
     else:
-        raise AssertionError("accepted UD2 instruction")
+        raise AssertionError("accepted UD0 instruction")
 
 
 if __name__ == "__main__":

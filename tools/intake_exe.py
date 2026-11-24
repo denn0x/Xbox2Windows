@@ -5,14 +5,16 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
 from tempfile import NamedTemporaryFile
 import xml.etree.ElementTree as ET
 
 import pefile
 
 from dependency_paths import trace
+from import_routing import annotate
 
-from pe_inventory import changes, scan
+from pe_inventory import changes, import_tables, scan
 from verify_build import read_layout
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,19 @@ PROJECT = Path(__file__).resolve().parents[1]
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def import_routes(image_bytes, caller):
+    """Return candidate route rows for every normal and delay import."""
+    with pefile.PE(data=image_bytes, fast_load=True) as pe:
+        imports = import_tables(pe, caller)
+    return [annotate({"image": caller, "kind": kind, "dll": dll, "symbol": symbol}, "dll")
+            for kind, dll, symbol in imports]
+
+
+def routing_failures(rows):
+    """Return annotated imports whose module has no candidate route."""
+    return [row for row in rows if row.get("route") == "unsupported"]
 
 
 def inside(root, name):
@@ -178,12 +193,16 @@ def collect(root, candidate, baseline, integrity, report):
     candidate_key = next(k for k in current["images"] if k.casefold() == slot.casefold())
     if current["images"][candidate_key]["sha256"] != report["candidate"]["sha256"]:
         raise ValueError("Candidate changed during intake")
+    for row in current["imports"]:
+        annotate(row, "dll")
+    for row in current["unresolved_edges"]:
+        annotate(row, "dll")
     report["diff"] = changes(old, current)
     report["dependency_paths"] = trace(current, candidate_key)
     previous_missing = {(r["dll"], r["symbol"]) for r in old["unresolved_edges"]}
     report["entry_import_gaps"] = [
-        {"dll": r["dll"], "symbol": r["symbol"], "kind": r["kind"],
-         "seen_unresolved_in_baseline": (r["dll"], r["symbol"]) in previous_missing}
+        annotate({"dll": r["dll"], "symbol": r["symbol"], "kind": r["kind"],
+                  "seen_unresolved_in_baseline": (r["dll"], r["symbol"]) in previous_missing}, "dll")
         for r in current["unresolved_edges"] if r["image"] == candidate_key
     ]
     report["inventory"] = current
@@ -198,6 +217,8 @@ def main(argv=None):
     parser.add_argument("--baseline", type=Path, default=PROJECT / "out/dependencies/pre-exe.json")
     parser.add_argument("--integrity", type=Path)
     parser.add_argument("--reports", type=Path, default=PROJECT / "out/intake")
+    parser.add_argument("--require-routing", action="store_true",
+                        help="return 1 and name each reported import without a candidate module route")
     args = parser.parse_args(argv)
     if args.build is None:
         builds = list((PROJECT / "game-files").glob("*/MicrosoftGame.Config"))
@@ -217,6 +238,12 @@ def main(argv=None):
             ET.ParseError, pefile.PEFormatError, struct.error) as exc:
         report["error"] = str(exc)
         code = 2
+    if code == 0 and args.require_routing:
+        failures = routing_failures(report.get("inventory", {}).get("imports", []))
+        for row in failures:
+            print(f"unsupported: {row['image']} -> {row['dll']}!{row['symbol']}", file=sys.stderr)
+        if failures:
+            code = 1
     reports.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(mode="w", suffix=".tmp", dir=reports, encoding="utf-8", delete=False) as f:
         json.dump(report, f, ensure_ascii=False, indent=2)

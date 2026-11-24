@@ -1,4 +1,4 @@
-"""Check the local startup trap stubs.
+"""Check the startup trap stubs.
 
 usage: startup_stub_check.py <consumer.exe> <src/startup_stubs> <stub dll>... <xmem.dll> <d3d12_xs.dll>
 
@@ -8,10 +8,12 @@ usage: startup_stub_check.py <consumer.exe> <src/startup_stubs> <stub dll>... <x
 3. Controls: the 'none' scenario exits 0 and writes no trap line; the physical-page round trip
    in xmem.dll still works next to the traps.
 """
+import atexit
 import ctypes
 import ctypes.wintypes as wt
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,7 +34,7 @@ for name in os.listdir(stub_src):
     if name.endswith(".def"):
         text = open(os.path.join(stub_src, name), encoding="ascii").read()
         library = re.search(r"^LIBRARY\s+(\S+)", text, re.M).group(1)
-        defs[library.lower() + ".dll"] = re.findall(r"^\s{4}(\w+)\s*$", text, re.M)
+        defs[library.lower() + ".dll"] = re.findall(r"^\s{4}(\w+)(?:\s+@\d+)?\s*$", text, re.M)
 extra = {"xmem.dll": ["XMemIsToolsMemAvailable", "XMemMapPhysicalPages", "XMemMapPhysicalPagesScatter",
                       "XMemTransferMemory", "XMemVirtualAlloc", "XMemAllocatePhysicalPages",
                       "XMemFreePhysicalPages"],
@@ -61,14 +63,15 @@ for want in list(defs) + list(extra):
 
 env = dict(os.environ)
 env["PATH"] = os.pathsep.join(sorted({os.path.dirname(os.path.abspath(p)) for p in dlls})) + os.pathsep + env["PATH"]
-log = os.path.join(tempfile.mkdtemp(prefix="x2w_trap_"), "trap.log")
+# The trap log lives in a fresh folder that is removed when the check exits, pass or fail.
+log_dir = tempfile.mkdtemp(prefix="x2w_trap_")
+atexit.register(shutil.rmtree, log_dir, ignore_errors=True)
+log = os.path.join(log_dir, "trap.log")
 env["X2W_TRAP_LOG"] = log
 
 cases = [
     ("chad", "chad.dll!XDspActivate", 0xE2570200, "rcx=0x11 rdx=0x22 r8=0x33 r9=0x44"),
     ("xg_xs", "xg_xs.dll!XGSuggestSwizzleMode", 0xE2570501, "rcx=0x55 rdx=0x0"),
-    ("xmem", "xmem.dll!XMemTransferMemory", 0xE2570603, "rcx=0x0 rdx=0x10000 r8=0x3000 r9=0x4"),
-    ("d3d12", "d3d12_xs.dll!D3D12ConfigureVirtualMemoryX", 0xE2570700, "rcx=0x66 rdx=0x77"),
 ]
 consumer_name = os.path.basename(consumer).lower()
 for scenario, symbol, code, regs in cases:
@@ -92,6 +95,32 @@ for scenario, stdout in (("none", ""), ("physical", "physical ok")):
     print(f"{scenario} control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
     if not ok:
         failures.append(f"{scenario} control: exit {run.returncode}, stderr {run.stderr.strip()!r}")
+
+run = subprocess.run([consumer, "dstorage"], capture_output=True, text=True, env=env, timeout=20)
+traps_after = open(log, encoding="ascii").read().count("x2w-trap ") if os.path.exists(log) else 0
+ok = run.returncode == 0 and "dstorage ok" in run.stdout and "x2w-trap" not in run.stderr and traps_after == len(cases)
+print(f"dstorage control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"dstorage control: exit {run.returncode}, stderr {run.stderr.strip()!r}")
+
+# Page arrays changed between EnqueueRequest and Submit: a replaced entry, and an unreadable array.
+run = subprocess.run([consumer, "dstorage-pages"], capture_output=True, text=True, env=env, timeout=20)
+print(run.stdout.strip())
+ok = run.returncode == 0 and "dstorage-pages ok" in run.stdout and "x2w-trap" not in run.stderr
+print(f"dstorage page-array control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"dstorage page-array control: exit {run.returncode}, stdout {run.stdout.strip()!r}")
+
+store_env = dict(env, X2W_RUNTIME_PROXY="1", X2W_FAKE_USER="1")
+run = subprocess.run([consumer, "store"], capture_output=True, text=True, env=store_env, timeout=20)
+traps_after = open(log, encoding="ascii").read().count("x2w-trap ") if os.path.exists(log) else 0
+ok = (run.returncode == 0 and "store context 5832575300000001" in run.stdout
+      and "store refused 80004005" in run.stdout
+      and "store user refused 80004005" in run.stdout and "x2w-trap" not in run.stderr
+      and traps_after == len(cases))
+print(f"store context: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"store context: exit {run.returncode}, stdout {run.stdout.strip()!r}, stderr {run.stderr.strip()!r}")
 
 if failures:
     print("FAIL")

@@ -310,7 +310,7 @@ def check_rejections():
         "fxch st(1) as DF C9": (attempt(f"{fld} {fld} df c9 {fstp} {fstp} c3"), "unsupported x87 encoding"),
         "fnstenv m28": (attempt(f"{fld} d9 32 {fstp} c3"), "unsupported x87 operation"),
         "fsin": (attempt(f"{fld} d9 fe {fstp} c3"), "unsupported x87 operation"),
-        "ffree st(1)": (attempt(f"{fld} dd c1 {fstp} c3"), "unsupported x87 operation"),
+        "ffree st(0)": (attempt(f"{fld} dd c0 {fstp} c3"), "frees an occupied register"),
         "fdecstp": (attempt(f"{fld} d9 f6 {fstp} c3"), "unsupported x87 operation"),
     }
     for case, (message, needle) in rejected.items():

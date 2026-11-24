@@ -20,7 +20,7 @@ Hardware reporters can use the [standalone package](tools/gpu-check/README.md). 
 
 The [first independent clean build](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821) records the toolchain and three smoke-test outcomes. If a clean build fails on your machine, open a [build bug report](https://github.com/R0Y00/Xbox2Windows/issues/new?template=bug_report.yml) with the commit, toolchain, first failing command and diagnostic. Link a feedback-driven fix to its report and ask the reporter to verify the change.
 
-Start with the [first build](README.md#first-build). Create the Python environment before configuring to include the script-path host and Python-driven script, texture, shader and PE checks. List the tests registered in your environment with `ctest --preset dev -N`, then run the closest group from the [experiment table](README.md#choose-an-experiment). Use `--no-tests=error` when checking a new filter so an empty selection fails.
+Start with the [first build](README.md#first-build). Create the Python environment before configuring to include the script-path host and Python-driven script, texture, shader and PE checks. List the tests registered in your environment with `ctest --preset dev -N`, then run the closest group from the [experiment table](README.md#choose-an-experiment). Use `--no-tests=error` when checking a new filter so an empty selection fails. Run GPU tests serially when verifying results on a local adapter or WARP. Parallel runs compete for the same adapter or host resources and can time out; rerun such a test by itself. Pure-Python checks can run in parallel.
 
 | Location | What to work on |
 |---|---|
@@ -29,7 +29,11 @@ Start with the [first build](README.md#first-build). Create the Python environme
 | `tools/` | Build setup and offline metadata tools. The PE fixtures live in `tests/intake/`. |
 | `docs/experiments.md` | Measured results, assumptions and reproduction commands. |
 
-The Windows job builds the C++ and HLSL, runs the CPU, Python and WARP tests, and smoke-tests the standalone GPU package. A second Windows job builds and runs the same tests with the `release` preset at /O2, because some translation bugs appear only in optimized code. The Ubuntu job assembles and translates gfx1013 fixtures with LLVM 15. A second Ubuntu job runs the platform-independent Python checks. Contributors supply physical GPU coverage. For a hardware report, record the commit, adapter and driver, Windows version, test names and debug-layer status. Include the reported feature tier or wave width when relevant. Record capability skips separately from passes and failures. [CI workflow](.github/workflows/windows.yml) For macOS and Linux setup and troubleshooting, see the [non-Windows host guide](docs/non-windows-hosts.md).
+On pull requests, `Build and test on Windows` builds the smoke-test targets with `cmake --build --preset pr` and runs `ctest --preset pr --no-tests=error`. The preset selects tests for CPU translation, PE startup, memory, archive decoding and WARP rendering, including the SPIR-V bridge checks. The bridge checks can skip locally if their tools are missing; hosted CI installs the pinned tools and requires the WARP bridge checks to pass. For a strict local run, run [the pinned tool setup](tools/setup-spirv-tools.ps1) (`.\tools\setup-spirv-tools.ps1` in PowerShell) before configuring or reconfiguring, then set `$env:X2W_REQUIRE_SPIRV_TOOLS = '1'` before running CTest. Run the tests for your specific change locally and include their results in the PR.
+
+On `main` and manual runs, CI runs the full non-hardware suites in Debug and Release (/O2), generates the coverage chart and smoke-tests the standalone GPU package. To check a branch in both configurations before merge, select it under **Actions → Windows checks → Run workflow**. The Ubuntu jobs assemble gfx1013 fixtures with LLVM 15 and run the platform-independent Python checks. [CI workflow](.github/workflows/windows.yml)
+
+Contributors supply physical GPU coverage. Record the commit, adapter and driver, Windows version, test names and debug-layer status. Include the feature tier or wave width when relevant. Report capability skips separately from passes and failures. [Non-Windows host guide](docs/non-windows-hosts.md)
 
 ## Share a reproducible finding
 

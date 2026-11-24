@@ -1,7 +1,8 @@
 ; coverage: source cpu_aot_sse_mmx
-; Source-built MASM fixture exercising 5 legacy SSE/MMX forms from docs/coverage/x64_zen2.tsv
-; group SSE: cvtpi2ps, cvtps2pi, cvttps2pi, pshufw and movntq, along with
-; transport/ABI glue (movq, movaps, movdqa, movdqu, emms).
+; Source-built MASM fixture exercising 7 legacy SSE/SSE2/MMX forms from
+; docs/coverage/x64_zen2.tsv (SSE: cvtpi2ps, cvtps2pi, cvttps2pi, pshufw,
+; movntq, maskmovq; SSE2: maskmovdqu), along with transport/ABI glue (movq,
+; 64-bit mov for rdi save/restore, movaps, movdqa, movdqu, emms).
 ; Every export uses the Windows x64 leaf ABI:
 ;   RCX = const void* input_a (32 bytes, 16-byte aligned)
 ;   RDX = const void* input_b (32 bytes, 16-byte aligned)
@@ -208,5 +209,58 @@ op_pipeline PROC FRAME
     emms
     ret
 op_pipeline ENDP
+
+; --- maskmovq / maskmovdqu: conditional byte store to [rdi] with rdi save/restore ---
+
+op_maskmovq PROC FRAME
+    .endprolog
+    movq mm0, QWORD PTR [rcx]
+    movq mm1, QWORD PTR [rdx]
+    mov r10, rdi
+    mov rdi, r8
+IFDEF ALTER_IMM
+    maskmovq mm1, mm0
+ELSE
+    maskmovq mm0, mm1
+ENDIF
+    mov rdi, r10
+    emms
+    ret
+op_maskmovq ENDP
+
+op_maskmovdqu PROC FRAME
+    .endprolog
+    movdqu xmm0, XMMWORD PTR [rcx]
+    movdqu xmm1, XMMWORD PTR [rdx]
+    mov r11, rdi
+    mov rdi, r8
+IFDEF ALTER_IMM
+    maskmovdqu xmm1, xmm0
+ELSE
+    maskmovdqu xmm0, xmm1
+ENDIF
+    mov rdi, r11
+    ret
+op_maskmovdqu ENDP
+
+op_maskmov_pipeline PROC FRAME
+    .endprolog
+    movaps xmm0, XMMWORD PTR [rcx]
+    movdqu xmm1, XMMWORD PTR [rdx+1]
+    movdqu XMMWORD PTR [r8], xmm0
+    mov r9, rdi
+    mov rdi, r8
+    maskmovdqu xmm1, xmm0
+    mov rdi, r9
+    cvtps2pi mm0, xmm0
+    cvttps2pi mm1, xmm1
+    movq QWORD PTR [r8+16], mm0
+    mov rax, rdi
+    mov rdi, r8
+    maskmovq mm1, mm0
+    mov rdi, rax
+    emms
+    ret
+op_maskmov_pipeline ENDP
 
 END

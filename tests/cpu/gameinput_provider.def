@@ -1,0 +1,24 @@
+LIBRARY GameInput
+EXPORTS
+    GameInputCreate @1 NONAME
+    get_gameinput_create_calls
+    get_gameinput_create_refusals
+    get_gameinput_register_calls
+    get_gameinput_register_refusals
+    get_gameinput_callbacks
+    get_gameinput_callbacks_other_thread
+    get_gameinput_reading_calls
+    get_gameinput_reading_refusals
+    get_gameinput_gamepad_state_calls
+    get_gameinput_key_state_calls
+    get_gameinput_find_calls
+    get_gameinput_find_refusals
+    get_gameinput_rumble_calls
+    get_gameinput_rumble_trigger_nonzero
+    get_gameinput_rumble_low_bits
+    get_gameinput_unregister_calls
+    get_gameinput_unregister_refusals
+    get_gameinput_unregister_timeout_sum
+    get_gameinput_unexpected_calls
+    get_gameinput_outstanding_refs
+    reset_gameinput_records

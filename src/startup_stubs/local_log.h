@@ -1,4 +1,4 @@
-// LOCAL EXPERIMENT ONLY (local/startup-v2, never pushed): opt-in switches and logging shared by the
+// Experimental (docs/startup-runtime.md): opt-in switches and logging shared by the
 // permissive startup paths. Lines go to stderr and are appended to %X2W_TRAP_LOG% when set.
 #pragma once
 
@@ -9,10 +9,15 @@
 
 namespace x2w_local {
 
+// Reads a switch without disturbing the caller's last-error value (GetEnvironmentVariable sets
+// ERROR_ENVVAR_NOT_FOUND for an absent variable, and shim callers observe GetLastError).
 inline bool env_on(const char* name) noexcept
 {
+    const DWORD saved = GetLastError();
     char value[4]{};
-    return GetEnvironmentVariableA(name, value, sizeof(value)) && value[0] == '1';
+    const bool on = GetEnvironmentVariableA(name, value, sizeof(value)) && value[0] == '1';
+    SetLastError(saved);
+    return on;
 }
 
 inline void logf(const char* format, ...) noexcept
@@ -89,7 +94,8 @@ inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexc
                           protect == PAGE_EXECUTE_WRITECOPY;
     const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
     const auto end = begin + info.RegionSize;
-    if (start + bytes > end || (write && !writable)) return false;
+    // start lies inside the queried region, so end - start cannot wrap; start + bytes could.
+    if (bytes > end - start || (write && !writable)) return false;
     return true;
 }
 inline bool readable(const void* pointer, std::size_t bytes) noexcept { return accessible(pointer, bytes, false); }

@@ -17,9 +17,10 @@ branches. This check uses no wall-time threshold. It checks:
 
 Usage: dxc_compile_time_check.py <dxc.exe>
 
-Exit 77 (skip) when the DXC under test no longer shows the GVN profile: that
-is a change in the compiler, not a failure of this repository. Every other
-mismatch fails.
+Exit 77 (skip) when the DXC under test has no -ftime-report (it arrived after
+DXC 1.6, so an older Windows SDK cannot report pass attribution at all) or when
+it no longer shows the GVN profile: both are changes in the compiler, not a
+failure of this repository. Every other mismatch fails.
 """
 
 import json
@@ -74,6 +75,19 @@ def check_sources():
         check(False, f"{bad} was accepted")
 
 
+def rejects_ftime(output):
+    """True when the compiler itself reports -ftime-report as an unknown argument."""
+    return "Unknown argument" in output and "-ftime-report" in output
+
+
+def ftime_supported(dxc, work):
+    hlsl = work / "probe.hlsl"
+    hlsl.write_text(tool.control_source(), encoding="utf-8", newline="\n")
+    flags = ["-T", tool.DEFAULT_TARGET, "-E", tool.DEFAULT_ENTRY, "-enable-16bit-types",
+             "-ftime-report"]
+    return not rejects_ftime(tool.run_once(dxc, hlsl, work / "probe.cso", flags, 120)["output"])
+
+
 def check_parser():
     four = (";    0.2969 ( 78.6%)   0.0781 (100.0%)   0.3750 ( 83.3%)   0.3782 ( 83.0%)  "
             "Global Value Numbering\n"
@@ -89,6 +103,11 @@ def check_parser():
     rows, total = tool.parse_ftime(three)
     check(total == {"name": "Total", "combined_s": 0.0156, "wall_s": 0.0161}, f"3-column total {total}")
     check([row["name"] for row in rows] == ["Simplify the CFG"], f"3-column rows {rows}")
+    # The capability probe must not turn a working compiler into a skip.
+    check(rejects_ftime("dxc failed : Unknown argument: '-ftime-report'"),
+          "an unknown -ftime-report argument was not detected")
+    for quiet in ("", four, "dxc failed : Unknown argument: '-Fh'"):
+        check(not rejects_ftime(quiet), f"a usable -ftime-report was detected as unsupported: {quiet[:40]!r}")
 
 
 def run_tool(dxc, work, tag, variants, timeout, extra=(), target=None, ftime=False):
@@ -126,6 +145,9 @@ def gvn_share(dxc, work, name, extra=()):
 def check_dxc(dxc):
     with tempfile.TemporaryDirectory(prefix="dxc-compile-time-check-") as temp:
         work = Path(temp)
+        if not ftime_supported(dxc, work):
+            print("SKIP: this DXC has no -ftime-report; pass attribution cannot be measured")
+            return SKIP
         records = run_tool(dxc, work, "outcomes", "control,condstore_256,stores_256", 120)
         for name, record in records.items():
             check(record["outcome"] == "dxil", f"{name} outcome {record['outcome']}")

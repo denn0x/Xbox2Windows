@@ -335,14 +335,14 @@ def check_rejections():
 
     rejected = {
         # Readers of PF, SF or the whole flags register (the comparison clears OF, which SETO and ADOX read).
-        # JP and JNP are lowered only when FUCOMI, SAHF or an 8-bit TEST or AND wrote PF last, and INC writes
-        # it after FUCOMI.
+        # JP, JNP, SETP and CMOVP are lowered only when FUCOMI, SAHF or an 8-bit TEST or AND wrote PF last, and
+        # INC writes it after FUCOMI.
         **{f"fucomi and inc eax, then {name}": (after_fucomi(f"ff c0 {code}"),
                                                 "reads PF, which the integer lowering models only after")
-           for name, code in (("jp", "7a 00"), ("jnp", "7b 00"))},
+           for name, code in (("jp", "7a 00"), ("jnp", "7b 00"), ("setp", "0f 9a c0"), ("cmovp", "0f 4a c1"))},
         **{f"fucomi then {name}": (after_fucomi(code), "unsupported query operation")
-           for name, code in (("setp", "0f 9a c0"), ("cmovp", "0f 4a c1"), ("js", "78 00"), ("jl", "7c 00"),
-                              ("lahf", "9f"), ("cmovs", "0f 48 c1"), ("pushfq", "9c"))},
+           for name, code in (("js", "78 00"), ("jl", "7c 00"), ("lahf", "9f"), ("cmovs", "0f 48 c1"),
+                              ("pushfq", "9c"))},
         "fcomi st, st(1) with one value": (attempt(f"{fld} db f1 dd d8 c3"), "x87 stack underflow"),
         "fucomip st, st(2) with two values": (attempt(f"{fld} {fld} df ea dd d8 c3"), "x87 stack underflow"),
         "fcomip on an empty stack": (attempt("df f0 c3"), "x87 stack underflow"),
@@ -353,7 +353,7 @@ def check_rejections():
         "f2xm1": (attempt(f"{fld} d9 f0 dd d8 c3"), "unsupported x87 operation"),
         "fptan": (attempt(f"{fld} d9 f2 dd d8 c3"), "unsupported x87 operation"),
         "frstor m108": (attempt(f"{fld} dd 21 dd d8 c3"), "unsupported x87 operation"),
-        "fnstsw m16": (attempt(f"{fld} dd 3a dd d8 c3"), "unsupported x87 operand"),
+        "fnstsw m16": (attempt(f"{fld} dd 3a dd d8 c3"), "stores status-word bits"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:

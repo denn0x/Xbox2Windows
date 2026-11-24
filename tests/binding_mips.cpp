@@ -1,5 +1,6 @@
 #include "bvh_fixture.h"
 #include "DualUav.h"
+#include "DynamicSamplerIndex.h"
 #include "SampleMip.h"
 #include <algorithm>
 
@@ -160,4 +161,76 @@ void check_texture_mips(ID3D12Device* device)
     auto actual = read(back.Get(), expected.size());
     for (UINT i = 0; i < expected.size(); ++i) equal(actual[i], expected[i], i, 0);
     std::printf("mips=%u sampled_texels=%zu guard_words=%u\n", mipCount, expected.size()-mipCount, mipCount);
+}
+
+void check_dynamic_sampler_index(ID3D12Device* device)
+{
+    Kernel shader(device, {DynamicSamplerIndex, sizeof(DynamicSamplerIndex)});
+    constexpr Word left = 0x3e800000u, right = 0x3f400000u; // 0.25f and 0.75f
+    constexpr std::array<Word, 4> expected{left, right, left, left};
+    constexpr UINT64 bytes = expected.size() * sizeof(Word);
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 2;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    auto texture = resource(device, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 uploadBytes = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &uploadBytes);
+    std::vector<Word> texels((uploadBytes + sizeof(Word) - 1) / sizeof(Word));
+    texels[0] = left;
+    texels[1] = right;
+    auto staging = upload(device, texels);
+    auto output = uav_buffer(device, bytes);
+    auto back = make_buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    ComPtr<ID3D12DescriptorHeap> views, samplers;
+    check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&views)), "Create dynamic sampler SRV heap");
+    device->CreateShaderResourceView(texture.Get(), nullptr, views->GetCPUDescriptorHandleForHeapStart());
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    heapDesc.NumDescriptors = 2;
+    check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&samplers)), "Create dynamic sampler heap");
+    auto handle = samplers->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    device->CreateSampler(&sampler, handle);
+    handle.ptr += device->GetDescriptorHandleIncrementSize(heapDesc.Type);
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    device->CreateSampler(&sampler, handle);
+
+    ComputeCommands cmd(device, shader.pipeline.Get());
+    auto* list = cmd.list.Get();
+    D3D12_TEXTURE_COPY_LOCATION dst{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION src{staging.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    src.PlacedFootprint = footprint;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(list, output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[]{views.Get(), samplers.Get()};
+    list->SetDescriptorHeaps(2, heaps);
+    list->SetComputeRootSignature(shader.root.Get());
+    list->SetComputeRootDescriptorTable(0, views->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootDescriptorTable(1, samplers->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootUnorderedAccessView(2, output->GetGPUVirtualAddress());
+    const UINT dispatches[][3]{{0, 0, 0}, {1, 0, 1}, {0, 1, 2}, {1, 1, 3}};
+    for (const auto& params : dispatches) {
+        list->SetComputeRoot32BitConstants(3, 3, params, 0);
+        list->Dispatch(1, 1, 1);
+    }
+    transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyResource(back.Get(), output.Get());
+    cmd.submit_and_wait(device);
+
+    const auto actual = read(back.Get(), expected.size());
+    std::printf("dynamic_sampler_index normal=%08x,%08x forced_zero=%08x,%08x\n",
+                actual[0], actual[1], actual[2], actual[3]);
+    for (UINT i = 0; i < expected.size(); ++i) equal(actual[i], expected[i], i, 0);
 }

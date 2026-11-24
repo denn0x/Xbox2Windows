@@ -706,24 +706,19 @@ def check_rejections(original_path):
     ret_ins = Instruction.create(Code.RETNQ)
 
     # 1) VEX.L=1 (256-bit) packed-integer encodings of surviving forms must be rejected explicitly (AVX2, not AVX1).
+    # The 256-bit add, subtract, saturating add and subtract, compare, minimum, maximum, absolute value,
+    # sign and word shuffle forms are lowered and are covered by avx_int_ymm_addsub_check.py,
+    # avx_int_ymm_sat_check.py, avx_int_ymm_minmax_check.py and avx_int_ymm_abs_sign_shuf_check.py.
     vex256_int_cases = [
-        ("vpaddq_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPADDQ_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpaddsb_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPADDSB_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpsubb_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPSUBB_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpabsd_ymm", Instruction.create_reg_reg(Code.VEX_VPABSD_YMM_YMMM256, R.YMM0, R.YMM1)),
+        ("vpackusdw_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPACKUSDW_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vpackssdw_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPACKSSDW_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vpalignr_ymm", Instruction.create_reg_reg_reg_u32(Code.VEX_VPALIGNR_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, R.YMM2, 4)),
         ("vpblendvb_ymm", Instruction.create_reg_reg_reg_reg(Code.VEX_VPBLENDVB_YMM_YMM_YMMM256_YMM, R.YMM0, R.YMM1, R.YMM2, R.YMM3)),
         ("vpblendw_ymm", Instruction.create_reg_reg_reg_u32(Code.VEX_VPBLENDW_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, R.YMM2, 0xAA)),
-        ("vpcmpeqd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPCMPEQD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpmaxsd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMAXSD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vphaddd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPHADDD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vpmaddwd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMADDWD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vpmulld_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMULLD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vmpsadbw_ymm", Instruction.create_reg_reg_reg_u32(Code.VEX_VMPSADBW_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, R.YMM2, 0)),
-        ("vpshufhw_ymm", Instruction.create_reg_reg_u32(Code.VEX_VPSHUFHW_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, 0x1B)),
-        ("vpshuflw_ymm", Instruction.create_reg_reg_u32(Code.VEX_VPSHUFLW_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, 0x4E)),
-        ("vpsignd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPSIGND_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vpmovsxbw_ymm", Instruction.create_reg_reg(Code.VEX_VPMOVSXBW_YMM_XMMM128, R.YMM0, R.XMM1)),
         ("vpmovzxdq_ymm", Instruction.create_reg_reg(Code.VEX_VPMOVZXDQ_YMM_XMMM128, R.YMM0, R.XMM1)),
         ("vpunpckldq_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPUNPCKLDQ_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
@@ -731,8 +726,8 @@ def check_rejections(original_path):
         ("vpslld_ymm_xmm", Instruction.create_reg_reg_reg(Code.VEX_VPSLLD_YMM_YMM_XMMM128, R.YMM0, R.YMM1, R.XMM2)),
         ("vpsrlq_ymm_imm", Instruction.create_reg_reg_u32(Code.VEX_VPSRLQ_YMM_YMM_IMM8, R.YMM0, R.YMM1, 4)),
         ("vpmovmskb_ymm", Instruction.create_reg_reg(Code.VEX_VPMOVMSKB_R32_YMM, R.EAX, R.YMM1)),
-        ("vpsubd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPSUBD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
     ]
+    vex256_by_label = dict(vex256_int_cases)
 
     # Alternate valid encodings: r64/W1 GPR bridge forms MASM may not emit by default.
     alt_accept = [
@@ -929,9 +924,9 @@ def check_rejections(original_path):
         max_len = orig_end - entry
 
     pe_patches = [
-        ("pe_vpaddq_ymm", encode_seq(ld_ymm1, ld_ymm2, vex256_int_cases[0][1], ret_ins),
+        ("pe_vpackusdw_ymm", encode_seq(ld_ymm1, ld_ymm2, vex256_by_label["vpackusdw_ymm"], ret_ins),
          "unsupported VEX.256 (L=1) packed-integer encoding"),
-        ("pe_vpslld_ymm_xmm", encode_seq(ld_ymm1, ld_xmm2, vex256_int_cases[21][1], ret_ins),
+        ("pe_vpslld_ymm_xmm", encode_seq(ld_ymm1, ld_xmm2, vex256_by_label["vpslld_ymm_xmm"], ret_ins),
          "unsupported VEX.256 (L=1) packed-integer encoding"),
         ("pe_vpaddq_mem", encode_seq(ld_xmm1, reg_only_mem_cases[2][1], ret_ins),
          "unsupported memory operand for register-domain AVX integer instruction"),

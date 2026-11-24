@@ -22,7 +22,12 @@ EXPORTS
     saved_across_call
     low_half
     partial_write
+    partial_xor_byte
+    partial_xor_word
     exported_passthrough
     caller_copy
     caller_copy_low
     forward_alloc
+    default_alloc
+    default_free_tail
+    cmove_guarded

@@ -13,3 +13,12 @@ EXPORTS
     neg_jcc
     setcc_mix
     cmovcc_mix
+    min_ss
+    max_ss
+    min_sd
+    max_sd
+    root_ss
+    root_sd
+    root_const_ss
+    root_const_sd
+    round_cvt

@@ -1234,16 +1234,9 @@ def check_alt_encodings_and_rejections(original_path):
         src, count = lift_code(label, 0x1000, encode_seq(*seq))
         assert f"lifted_{label}" in src and count == len(seq), (label, count)
 
-    # 1) Memory-operand encodings of all 28 register-only AVX forms must be rejected explicitly.
+    # 1) Memory-operand encodings of all 20 register-only AVX forms must be rejected explicitly.
+    # (The eight logical ops take a memory source and are covered by avx_move_mem_check.py.)
     reg_only_mem_cases = [
-        ("vandpd_mem", Instruction.create_reg_reg_mem(Code.VEX_VANDPD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vandps_mem", Instruction.create_reg_reg_mem(Code.VEX_VANDPS_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vandnpd_mem", Instruction.create_reg_reg_mem(Code.VEX_VANDNPD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vandnps_mem", Instruction.create_reg_reg_mem(Code.VEX_VANDNPS_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vorpd_mem", Instruction.create_reg_reg_mem(Code.VEX_VORPD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vorps_mem", Instruction.create_reg_reg_mem(Code.VEX_VORPS_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vxorpd_mem", Instruction.create_reg_reg_mem(Code.VEX_VXORPD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
-        ("vxorps_mem", Instruction.create_reg_reg_mem(Code.VEX_VXORPS_YMM_YMM_YMMM256, R.YMM0, R.YMM1, MemoryOperand(R.RDX))),
         ("vblendpd_mem", Instruction.create_reg_reg_mem_u32(Code.VEX_VBLENDPD_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, MemoryOperand(R.RDX), 0xA)),
         ("vblendps_mem", Instruction.create_reg_reg_mem_u32(Code.VEX_VBLENDPS_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, MemoryOperand(R.RDX), 0xAA)),
         ("vblendvpd_mem", Instruction.create_reg_reg_mem_reg(Code.VEX_VBLENDVPD_YMM_YMM_YMMM256_YMM, R.YMM0, R.YMM1, MemoryOperand(R.RDX), R.YMM2)),
@@ -1267,6 +1260,8 @@ def check_alt_encodings_and_rejections(original_path):
         ("vmovshdup_mem", Instruction.create_reg_mem(Code.VEX_VMOVSHDUP_YMM_YMMM256, R.YMM0, MemoryOperand(R.RCX))),
         ("vmovsldup_mem", Instruction.create_reg_mem(Code.VEX_VMOVSLDUP_YMM_YMMM256, R.YMM0, MemoryOperand(R.RCX))),
     ]
+
+    reg_only = dict(reg_only_mem_cases)
 
     # 2) Carved-out move forms owned by cpu_vex_aot.py (PR #325) (vmovdqa, vmovups, vmovaps, vmovq, vmovd must reject).
     ld_rax = Instruction.create_reg_mem(Code.MOV_R64_RM64, R.RAX, MemoryOperand(R.RCX))
@@ -1399,9 +1394,9 @@ def check_alt_encodings_and_rejections(original_path):
         max_len = orig_end - entry
 
     pe_patches = [
-        ("pe_vandps_mem", encode_seq(ld_ymm1, reg_only_mem_cases[1][1], ret_ins),
+        ("pe_vshufps_mem", encode_seq(ld_ymm1, reg_only["vshufps_mem"], ret_ins),
          "unsupported memory operand for register-domain AVX instruction"),
-        ("pe_vperm2f128_mem", encode_seq(ld_ymm1, reg_only_mem_cases[16][1], ret_ins),
+        ("pe_vperm2f128_mem", encode_seq(ld_ymm1, reg_only["vperm2f128_mem"], ret_ins),
          "unsupported memory operand for register-domain AVX instruction"),
         ("pe_carved_vmovups", encode_seq(carved_out_cases[2][1], ret_ins),
          "unsupported instruction"),

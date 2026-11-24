@@ -1,0 +1,15 @@
+EXPORTS
+    vcomiss_reg_flags
+    vcomiss_mem_flags
+    vucomiss_reg_flags
+    vucomiss_mem_flags
+    vcomisd_reg_flags
+    vcomisd_mem_flags
+    vucomisd_reg_flags
+    vucomisd_mem_flags
+    setp_reg_bytes
+    cmov_reg_outcomes
+    cmovp_mem32
+    cmovnp_mem32
+    join_vcomi_pf
+    back_to_back_vcomi
