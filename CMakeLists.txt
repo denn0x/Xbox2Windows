@@ -1707,6 +1707,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # draw of the translated pair with FXC 5_1 (the --pending path) and DXC 6_0.
     add_test(NAME startup_flat_param_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_flat_param_check.py")
+    # The pixel input mask scan finds where a pipeline stores the two masks, from shader register use (#1629).
+    add_test(NAME startup_ps_input_scan COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_ps_input_scan_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_packed_screen_position_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_packed_position_check.py" "${DXC_EXECUTABLE}"

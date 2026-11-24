@@ -10,6 +10,67 @@ a different input register, and a disabled position input each produce a detecta
 The fixture rejects differing enable/address masks. Production startup requests still omit these
 arguments. Identifying both masks for the affected pipeline remains open. [Refs #1629](https://github.com/R0Y00/Xbox2Windows/issues/1629)
 
+### Locating the pixel input masks from shader register use
+
+Run `python -B tools/startup/ps_input_scan.py [<request_dir>] [--capture <capture.bin>] [--pixel-dir <dir>] [--json <file>] [--list] [--top N]`.
+At least one input is required and they can be combined. A request directory holds
+`req_<key>.a/.b/.root` files. In a `--pixel-dir` every regular file is one pixel shader, either a
+DXBC container or a raw blob; pipelines are numbered `p000001` upward in sorted file-name order and
+file names are never printed. The check is
+`ctest --preset dev --no-tests=error -R '^startup_ps_input_scan$' -V`.
+
+For each pixel shader the tool reads only the disassembly and records a contract: the vector
+registers read before any write (live-in), the I/J register pairs that feed attribute
+interpolation, and the live-in registers split into low and high 16-bit halves. Compare forms give
+no half evidence. A first read is a live-in register unless a backward branch spans it and the
+register is written later in program order: that value can be loop-carried, so the register is
+reported as ambiguous and takes no part in any rule, and evidence taken from such a read is
+dropped. Aliases made by `v_mov_b32` do not cross a branch or a branch target. A branch whose
+target the text does not give, and an indirect branch, make every first read of a register that is
+written somewhere ambiguous. A contract that no address mask satisfies at all (for example a
+definite live-in register above v23) is excluded from every tally and reported on its own line. A
+candidate address mask is consistent when every live-in register is covered by
+its register layout (C1) and every pair starts at a two-register input (C2); a value above 0xffff
+fails C0. Inputs that are enabled but never read are expected, so a layout may be larger than
+the highest live-in register needs. A consistent pipeline is tight when the layout has exactly as many registers as the
+highest live-in register needs. A mask with every bit set is consistent with every shader but never
+tight, so tight separates it from a real mask.
+
+The candidate locations are the byte regions of each pipeline: the bytes before the prefetch marker
+of a raw pixel blob; for a container the FSSM image head and tail, the other XDAT entries and every
+part other than the DXIL part (`ps.part.<TAG>`, for example `ps.part.PSV0`); with `--capture` the
+pipeline description and its two state blocks. The capture stores only the 96-byte description in
+its PSO record, so the state blocks are scanned only when the capture also holds that memory. In a
+request directory every other regular file `req_<key>.<ext>` (not `a`, `b`, `root` or `rtv`, at
+most 1 MiB) is a region `req.<ext>`; this is the way to scan a recorded description or state block
+without changing the tool. In each region the tool tries every aligned pair or
+single value, plus words that follow the register byte addresses 0x286CC/0x286D0 or the context
+indices 0x1B3/0x1B4 (0xA1B3/0xA1B4 as "mm" indices). Candidates that read the same address
+everywhere are listed once with a count of equivalents. Only the first `--region-limit` bytes
+(0x1000) of each region are searched.
+
+Read the verdict line. `unique full match` means one location is consistent in every pipeline with
+a live-in register and has more tight pipelines than any other full match. `N full matches
+(ambiguous)` means several distinct locations fit equally and tie on the number of tight pipelines. `no location is consistent with all
+pipelines` means none fits. `uninformative corpus` means no shader reads a live-in register, so
+nothing can be told apart. Two separate lines follow for the top candidate. `mask agreement` counts
+pipelines that satisfy the coverage and pair rules, those that are tight and the failures per rule.
+`packed-position agreement` counts the pipelines that split a live-in register into 16-bit halves
+and have it at the register the address mask predicts for bit 15. The second line never votes: it
+tests the assumed register widths, not a location, and does not prove the hardware register order.
+When any shader splits a register, `full matches that also agree on every packed split` names the
+full matches whose predicted bit-15 register matches every such split, or `none`; it does not
+change the ranking or the verdict.
+The scan takes the layout from the address mask and reports, in the relation counts, where the
+enable value differs from it.
+
+The header counts the pipelines with ambiguous live-in reads and the excluded unsatisfiable contracts.
+By default stdout holds aggregates only: counts, reasons and ranked candidates, no pipeline ids.
+`--list` adds the per-pipeline table (id, enable, address, predicted packed register, live-in, split and
+ambiguous registers); `--json` always keeps the ids. The tool and its check have run on synthetic blobs
+only; no result for real pipelines is claimed.
+[Refs #1629](https://github.com/R0Y00/Xbox2Windows/issues/1629)
+
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
 ## One-dimensional texture sampling in startup draws

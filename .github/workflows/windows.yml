@@ -178,6 +178,7 @@ jobs:
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \
             tests/startup_flat_param_check.py \
+            tests/startup_ps_input_scan_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_inline_sampler_check.py \
             tests/compute_entry_layout_check.py \
