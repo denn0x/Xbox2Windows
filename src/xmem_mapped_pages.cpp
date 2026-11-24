@@ -63,12 +63,28 @@ BOOL physical_result(era_physical::Status status) noexcept
     }
 }
 
+// LOCAL EXPERIMENT (X2W_XMEM_LAZY=1): sections are reserved, not committed, so a page counts
+// against system commit only once it is touched. A touch through a mapped view faults; the vectored
+// handler below commits the page there (the commit belongs to the section, so every view sees it).
+// The shim's own writes commit first. Kernel-mode accesses (ReadFile into such a page) do not fault
+// and fail instead; none are expected on these pages.
+bool lazy_commit()
+{
+    static const bool on = [] {
+        char value[8];
+        const DWORD n = GetEnvironmentVariableA("X2W_XMEM_LAZY", value, sizeof value);
+        return n && n < sizeof value && value[0] == '1';
+    }();
+    return on;
+}
+LONG lazy_commits;
+
 HANDLE section_for(ULONG_PTR page)
 {
     const auto existing = memory.backings.find(page);
     if (existing != memory.backings.end())
         return existing->second.section;
-    const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+    const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | (lazy_commit() ? SEC_RESERVE : 0),
                                               0, page_bytes, nullptr);
     if (section) {
         try {
@@ -414,6 +430,10 @@ extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PT
         if (!section) return FALSE;
         void* view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, page_bytes);
         if (!view) return FALSE;
+        if (lazy_commit() && !VirtualAlloc(view, page_bytes, MEM_COMMIT, PAGE_READWRITE)) {
+            UnmapViewOfFile(view);
+            return FALSE;
+        }
         const SIZE_T chunk = bytes < page_bytes - offset ? bytes : page_bytes - offset;
         std::memcpy(static_cast<unsigned char*>(view) + offset, source, chunk);
         UnmapViewOfFile(view);
@@ -424,6 +444,26 @@ extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PT
     }
     return TRUE;
 }
+
+namespace {
+// First touch of a reserved section page through a mapped view: commit that page and retry.
+LONG CALLBACK lazy_commit_handler(EXCEPTION_POINTERS* info)
+{
+    const EXCEPTION_RECORD* record = info->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const ULONG_PTR address = record->ExceptionInformation[1];
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof mbi) || mbi.Type != MEM_MAPPED || mbi.State != MEM_RESERVE)
+        return EXCEPTION_CONTINUE_SEARCH;
+    // A mapped view that is still reserved can only come from the SEC_RESERVE sections above.
+    const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
+    if (!VirtualAlloc(reinterpret_cast<void*>(page), page_bytes, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_SEARCH;
+    const LONG n = InterlockedIncrement(&lazy_commits);
+    if ((n & (n - 1)) == 0) x2w_local::logf("x2w-xmem lazy commit #%ld (%ld MiB committed on touch)", n, n / 16);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+const bool lazy_handler_installed = lazy_commit() && AddVectoredExceptionHandler(1, lazy_commit_handler) != nullptr;
+}  // namespace
 
 extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const ULONG_PTR* tokens)
 {

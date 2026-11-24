@@ -334,6 +334,7 @@ extern LONG draw_calls_seen;
 // with its slot, the kinds of any wrapped objects among its arguments, and stack arguments.
 LONG trace_frame_active;
 extern LONG capture_active;
+extern LONG frame_number;
 // Command-list methods with a real implementation (render mode). Every list call enters through
 // noop_slot, which times, captures and traces it, then hands over to the entry here if there is one.
 using ListTyped = u64(__stdcall*)(u64, u64, u64, u64, u64, u64, u64, u64);
@@ -1026,8 +1027,12 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     {
         static wchar_t dump_path[MAX_PATH];
         static const bool dump = GetEnvironmentVariableW(L"X2W_D3D12_DUMP_SURFACE", dump_path, MAX_PATH) != 0;
-        if (dump && (shown_frames % 4) == 3 && desc.Width <= 8192 && desc.Height <= 8192) {
-            const UINT width = static_cast<UINT>(desc.Width), height = desc.Height;
+        // A path containing %ld gets the read-back number and a picture reduced to at most 960 pixels
+        // wide, written at every read-back (about every 2 s), so a run keeps a series of shots.
+        static const bool numbered = dump && std::wcsstr(dump_path, L"%ld") != nullptr;
+        if (dump && (numbered || (shown_frames % 4) == 3) && desc.Width <= 8192 && desc.Height <= 8192) {
+            const UINT step = numbered && desc.Width > 960 ? static_cast<UINT>((desc.Width + 959) / 960) : 1;
+            const UINT width = static_cast<UINT>(desc.Width) / step, height = desc.Height / step;
             std::vector<unsigned char> file(54 + std::size_t{width} * height * 4);
             const std::uint32_t header[] = {static_cast<std::uint32_t>(file.size()), 0, 54, 40, width, static_cast<std::uint32_t>(-static_cast<int>(height)),
                                             1 | (32u << 16), 0, width * height * 4, 2835, 2835, 0, 0};
@@ -1035,16 +1040,23 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
             file[1] = 'M';
             std::memcpy(file.data() + 2, header, sizeof(header));
             for (UINT y = 0; y < height; ++y) {
-                const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset + UINT64{y} * footprint.Footprint.RowPitch;
+                const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset + UINT64{y} * step * footprint.Footprint.RowPitch;
                 unsigned char* out = file.data() + 54 + std::size_t{y} * width * 4;
                 for (UINT x = 0; x < width; ++x) {
-                    out[x * 4 + 0] = rgba ? row[x * 4 + 2] : row[x * 4 + 0];
-                    out[x * 4 + 1] = row[x * 4 + 1];
-                    out[x * 4 + 2] = rgba ? row[x * 4 + 0] : row[x * 4 + 2];
+                    const unsigned char* texel = row + std::size_t{x} * step * 4;
+                    out[x * 4 + 0] = rgba ? texel[2] : texel[0];
+                    out[x * 4 + 1] = texel[1];
+                    out[x * 4 + 2] = rgba ? texel[0] : texel[2];
                     out[x * 4 + 3] = 255;
                 }
             }
-            write_file(dump_path, file.data(), file.size());
+            if (numbered) {
+                wchar_t path[MAX_PATH];
+                swprintf(path, MAX_PATH, dump_path, static_cast<long>(shown_frames));
+                write_file(path, file.data(), file.size());
+            } else {
+                write_file(dump_path, file.data(), file.size());
+            }
         }
     }
     const D3D12_RANGE none{0, 0};
@@ -1052,7 +1064,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const LONG count = InterlockedIncrement(&shown_frames);
     std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
                   desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
-    if (count <= 3 || count % 40 == 0) log("x2w-render presented %s", shown_note);
+    if (count <= 3 || count % 5 == 0) log("x2w-render presented %s (frame %ld)", shown_note, frame_number);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1948,7 +1960,9 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         return S_OK;
     }
     MEMORY_BASIC_INFORMATION info{};
-    if (!address || VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT) {
+    // A mapped view still in MEM_RESERVE is a lazily committed physical page (X2W_XMEM_LAZY): valid memory.
+    if (!address || VirtualQuery(address, &info, sizeof(info)) != sizeof(info) ||
+        !(info.State == MEM_COMMIT || (info.State == MEM_RESERVE && info.Type == MEM_MAPPED))) {
         log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) address=%p not committed -> E_INVALIDARG", address);
         return E_INVALIDARG;
     }
