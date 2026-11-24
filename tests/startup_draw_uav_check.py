@@ -10,7 +10,7 @@ one-column strips (columns 0 and 1).
 - tex / tex-noflag / tex-uint: `uav 0 tex2d table 0 0` on a UAV-capable RGBA8 texture (drawn), a texture
   without unordered access (skipped) and an R8G8B8A8_UINT view (skipped).
 - heap: `heap 1`; the pixel stage reads the view id from heapmem and the raw buffer of that view (dword 77).
-- copy-same / copy-two / copy-none / copy-cpu: CopyBufferRegion (list slot 15) between the two draws. uav 0 = title + 64
+- copy-same / copy-two / copy-twice / copy-none / copy-cpu: CopyBufferRegion (list slot 15) between the two draws. uav 0 = title + 64
   of allocation A (entry 0), srv 0 = title + 0x400 of A (copy-same) or of allocation B (copy-two) (entry 1). Draw 1
   stores into A, the list copies A + 64 (128 bytes) to the srv range, draw 2 reads the copied values as its srv
   (the constant-buffer path of translated draws: raw srvs). X2W_D3D12_COPY_BUFFER=gpu must order the copy after
@@ -70,7 +70,7 @@ HEAP_HLSL = (
 )
 
 
-COPY_ENV = {"copy-same": "gpu", "copy-two": "gpu", "copy-none": "gpu", "copy-cpu": "1"}
+COPY_ENV = {"copy-same": "gpu", "copy-two": "gpu", "copy-twice": "gpu", "copy-none": "gpu", "copy-cpu": "1"}
 
 
 def run_mode(directory, consumer, backend, mode):
@@ -129,7 +129,7 @@ def need(log, mode, *needles):
 
 def check(directory, consumer, backend):
     results = {}
-    for mode in ("aligned", "misaligned", "uavbase", "tex", "tex-noflag", "tex-uint", "heap", "copy-same", "copy-two", "copy-none", "copy-cpu"):
+    for mode in ("aligned", "misaligned", "uavbase", "tex", "tex-noflag", "tex-uint", "heap", "copy-same", "copy-two", "copy-twice", "copy-none", "copy-cpu"):
         got = run_mode(directory, consumer, backend, mode)
         if got is None:
             print("no existing-heap support or no adapter: skip")
@@ -190,25 +190,28 @@ def check(directory, consumer, backend):
             raise AssertionError(f"heap: increment {increment} but drawn: {image[:16].hex()}")
         need(log, "heap", "heap draw skipped: descriptor increment is not 32")
         heap = f"heap draw NOT exercised (view increment {increment}; skipped as required)"
-    # copy-*: GPU order (copy after draw 1's stores, draw 2 reads the copy in place) against two controls.
-    stored = [0] * 64
-    for y in range(4):
-        stored[16 + y * 8] = 1000 + y * 8
-    copied_gpu = [0] * 32
-    for y in range(4):
-        copied_gpu[y * 8] = 1000 + y * 8
-    for mode in ("copy-same", "copy-two", "copy-none", "copy-cpu"):
+    # copy-*: GPU order against two controls. Simulated: draw x stores A[16 + 8y + x] = B[8y] + 1000 + 8y + x;
+    # after draw x (not the last) the list copies 128 bytes from A + 64 + 4x to B. copy-twice: the second copy reads
+    # what draw 2 stored, through a window draw 2 read in place (read state -> UAV for the copy).
+    def simulate(strips, copies):
+        a, b = [0] * 64, [0] * 32
+        for x in range(strips):
+            for y in range(4):
+                a[16 + y * 8 + x] = b[y * 8] + 1000 + y * 8 + x
+            if copies and x < strips - 1:
+                b = a[16 + x:16 + x + 32]
+        return a, b
+    for mode in ("copy-same", "copy-two", "copy-twice", "copy-none", "copy-cpu"):
         (memory, copied), image, log = results[mode]
-        gpu = mode in ("copy-same", "copy-two")
-        expected = list(stored)
-        for y in range(4):
-            expected[16 + y * 8 + 1] = ((1000 + y * 8) if gpu else 0) + 1000 + y * 8 + 1
+        gpu = mode in ("copy-same", "copy-two", "copy-twice")
+        strips = 3 if mode == "copy-twice" else 2
+        expected, expected_copy = simulate(strips, gpu)
         if memory != expected:
             raise AssertionError(f"{mode}: memory {memory}\nexpected {expected}")
-        if copied != (copied_gpu if gpu else [0] * 32):
-            raise AssertionError(f"{mode}: copied range {copied}")
-        column1 = bytes((255 if gpu else 0, 255, 0, 255))
-        if image[:8] != bytes((0, 255, 0, 255)) + column1:
+        if copied != expected_copy:
+            raise AssertionError(f"{mode}: copied range {copied}\nexpected {expected_copy}")
+        row = b"".join(bytes((255 if x and gpu else 0, 255, 0, 255)) for x in range(strips))
+        if image[:4 * strips] != row:
             raise AssertionError(f"{mode}: pixels {image[:16].hex()}")
         if gpu:
             need(log, mode, "runs on the GPU in list order", "x2w-copy-gpu CopyBufferRegion", ": on the GPU, window")
@@ -216,8 +219,8 @@ def check(directory, consumer, backend):
                 raise AssertionError(f"{mode}: copy fell back\n{log[-3000:]}")
         elif mode == "copy-cpu":
             need(log, mode, "copies title memory at record time")
-    print(f"{backend}: CopyBufferRegion on the GPU in list order (same window, two windows): draw 2 reads the bytes draw 1 "
-          f"stored; controls without the copy and with the record-time copy read zeros")
+    print(f"{backend}: CopyBufferRegion on the GPU in list order (same window, two windows, copy-draw-copy-draw): each draw reads the "
+          f"bytes the draw before it stored; controls without the copy and with the record-time copy read zeros")
     print(f"{backend}: draw UAV buffer stores reach title memory (aligned, in-place re-read, uavbase; misaligned "
           f"control stores nothing); texture UAV bound, two refusals skip the draw; {heap}")
     return 0

@@ -147,13 +147,15 @@ int draw_uav_stores(ID3D12Device* desktop, void* guest, void* list)
     }
     invoke(list, 32, 1, ptr(&heap));
     invoke(list, 36, 0, invoke(heap, 10));
-    for (LONG x = 0; x < 2; ++x) {
+    // copy-twice: three strips; a second copy after draw 2 takes A + 68 (what draw 2 stored), and draw 3 reads it.
+    const LONG strips = mode_is(L"copy-twice") ? 3 : 2;
+    for (LONG x = 0; x < strips; ++x) {
         const D3D12_RECT strip{x, 0, x + 1, 4};
         invoke(list, 22, 1, ptr(&strip));
         invoke(list, 12, 3, 1);
         // CopyBufferRegion(dest, dest offset, source, source offset, bytes); copy-none: no copy (negative control)
-        if (!x && copy_dest && !mode_is(L"copy-none"))
-            invoke(list, 15, ptr(copy_dest), copy_dest_offset, ptr(copy_source), copy_source_offset, 128);
+        if (x < strips - 1 && copy_dest && !mode_is(L"copy-none"))
+            invoke(list, 15, ptr(copy_dest), copy_dest_offset, ptr(copy_source), copy_source_offset + 4 * x, 128);
     }
     return 0;
 }

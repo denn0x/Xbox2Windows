@@ -1876,7 +1876,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_draw_uav_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_uav_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
-        set_tests_properties(startup_draw_uav_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_draw_uav_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
