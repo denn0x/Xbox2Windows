@@ -301,6 +301,42 @@ bool linear_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE
                         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) &&
            v.Format == r.Format && linear_view_in_range(r, v);
 }
+// LOCAL (textures): X2W_MEMORY_SRV_ANNOUNCED=1. The XG stand-in ignores the Layout field: computer_copy_into writes
+// every description in desktop copyable-footprint order (xg_xs.cpp) and announces the base address
+// (x2w_d3d12_texture_written). A memory SRV whose description carries a console swizzle (0x100-0x1ff) at such
+// an announced address therefore holds linear data, and takes the linear path above with the console
+// description. Unannounced memory (storage-filled, console-tiled) and the announced BC7 4 KiB form stay refused.
+// Runs 97/98: every logged texture refusal (about 335) has layout 0x100 or 0x105; how many of them are announced
+// is not measured (X2W_TEXTURE_CENSUS=1 counts it).
+bool memory_srv_announced_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MEMORY_SRV_ANNOUNCED");
+        if (v) log("x2w-memsrv X2W_MEMORY_SRV_ANNOUNCED=1: console-swizzled memory SRVs at XG-announced addresses take the linear path");
+        return v;
+    }();
+    return on;
+}
+bool xg_announced(u64 address)
+{
+    AcquireSRWLockShared(&written_lock);
+    const auto found = written_textures().find(address);
+    const bool announced = found != written_textures().end() && !found->second.bc7_width;
+    ReleaseSRWLockShared(&written_lock);
+    return announced;
+}
+bool console_swizzle(const D3D12_RESOURCE_DESC& r)
+{
+    const UINT layout = static_cast<UINT>(r.Layout);
+    return layout >= 0x100 && layout <= 0x1ff;
+}
+bool announced_linear_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v, u64 address)
+{
+    if (!console_swizzle(r) || tiled_bc_srv(r) || x2w_startup::bc64::supports(r) || !xg_announced(address)) return false;
+    D3D12_RESOURCE_DESC as_linear = r;
+    as_linear.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    return linear_memory_srv(as_linear, v);
+}
 std::mutex linear_srv_mutex;
 std::unordered_multimap<u64, std::pair<D3D12_RESOURCE_DESC, Wrapper*>> linear_srv_textures;
 u64 linear_srv_bytes;  // desktop allocation size of the textures above (GetResourceAllocationInfo)
@@ -454,8 +490,10 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             log("x2w-noop-census memory SRV call %lld: destination 0x%llx = %s index 0x%llx of the heap at 0x%llx", n, destination,
                 in_heap ? (h.desktop ? "DESKTOP" : "title") : "no heap", h.index, h.base);
     }
-    if (memory_srv_linear_on() && destination && x2w_local::readable(resource, sizeof(*resource)) &&
-        x2w_local::readable(input, sizeof(*input)) && input->address && linear_memory_srv(*resource, input->view) &&
+    const bool described = destination && x2w_local::readable(resource, sizeof(*resource)) &&
+        x2w_local::readable(input, sizeof(*input)) && input->address;
+    const bool plain = described && memory_srv_linear_on() && linear_memory_srv(*resource, input->view);
+    if ((plain || (described && memory_srv_announced_on() && announced_linear_srv(*resource, input->view, input->address))) &&
         memory_srv_destination(destination)) {
         Wrapper* texture = existing_memory_texture(input->address, *resource);
         if (!texture) texture = publish_linear_texture(self, input->address, *resource);

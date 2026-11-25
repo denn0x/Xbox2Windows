@@ -7,6 +7,7 @@
 #include <vector>
 
 using Word = std::uint64_t;
+extern "C" __declspec(dllimport) HRESULT XGCreateTextureComputer(const D3D12_RESOURCE_DESC*, void***, UINT64, UINT64);
 Word invoke(void*, unsigned, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0);
 namespace {
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
@@ -202,6 +203,67 @@ int draw_bc_chain(void* guest, void* list)
     }
     invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
     invoke(list, 12, 3, 1);
+    return 0;
+}
+
+// LOCAL (textures): memory SRVs of a console-swizzled description (layout 0x105, flags 0x300000) whose memory the
+// XG stand-in filled (CopyIntoSubresource announces the base). Two such textures A and B, two mips each, and a
+// third texture C with the same description and the same footprint bytes written by hand (not announced).
+// Columns: 0 A, 1 B, 2 C (refused: B stays), 3 A, 4 B, 5 C (refused: B stays), 6 A, 7 A.
+int draw_announced_srvs(ID3D12Device* desktop, void* guest, void* list)
+{
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 2, 2, 1, 2, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+        static_cast<D3D12_TEXTURE_LAYOUT>(0x105), static_cast<D3D12_RESOURCE_FLAGS>(0x300000)};
+    static std::array<char, 4 * 65536> storage{};
+    std::array<unsigned char*, 3> memory{};
+    for (unsigned i = 0; i < 3; ++i)
+        memory[i] = reinterpret_cast<unsigned char*>(((ptr(storage.data()) + 0xffff) & ~Word{0xffff}) + i * Word{65536});
+    const auto texel = [](unsigned which, unsigned mip, unsigned x, unsigned y) -> std::array<unsigned char, 4> {
+        if (mip) return which == 1 ? std::array<unsigned char, 4>{9, 99, 199, 255} : std::array<unsigned char, 4>{5, 6, 7, 255};
+        return which == 1 ? std::array<unsigned char, 4>{static_cast<unsigned char>(100 + 20 * x + 50 * y), 50, 150, 255}
+                          : std::array<unsigned char, 4>{static_cast<unsigned char>(10 + 40 * x + 80 * y), 200, 30, 255};
+    };
+    for (unsigned which = 0; which < 3; ++which) {
+        void** computer = nullptr;
+        if (FAILED(XGCreateTextureComputer(&desc, &computer, 0, 0)) || !computer) return 50;
+        const auto table = static_cast<void**>(computer[0]);
+        using Write = HRESULT(*)(void*, unsigned char*, UINT, UINT, const unsigned char*, UINT, UINT);
+        for (unsigned mip = 0; mip < 2; ++mip) {
+            const unsigned side = 2 >> mip;
+            std::array<unsigned char, 16> linear{};
+            for (unsigned y = 0; y < side; ++y)
+                for (unsigned x = 0; x < side; ++x) std::memcpy(&linear[(y * side + x) * 4], texel(which % 2, mip, x, y).data(), 4);
+            if (which < 2) {
+                if (FAILED(reinterpret_cast<Write>(table[8])(computer, memory[which], 0, mip, linear.data(), side * 4, side * side * 4)))
+                    return 51;
+            } else {
+                // C: the bytes CopyIntoSubresource would write (desktop footprints), without the announcement.
+                D3D12_RESOURCE_DESC plain = desc;
+                plain.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+                plain.Flags = D3D12_RESOURCE_FLAG_NONE;
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+                desktop->GetCopyableFootprints(&plain, mip, 1, 0, &fp, nullptr, nullptr, nullptr);
+                for (unsigned y = 0; y < side; ++y)
+                    std::memcpy(memory[2] + fp.Offset + y * fp.Footprint.RowPitch, &linear[y * side * 4], side * 4);
+            }
+        }
+        reinterpret_cast<UINT64(*)(void*)>(table[1])(computer);
+    }
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    ViewAt v{};
+    v.view.Format = desc.Format;
+    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.view.Texture2D.MipLevels = 2;
+    const unsigned order[8] = {0, 1, 2, 0, 1, 2, 0, 0};
+    for (LONG x = 0; x < 8; ++x) {
+        v.address = ptr(memory[order[x]]);
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    }
     return 0;
 }
 
