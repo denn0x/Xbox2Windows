@@ -184,6 +184,9 @@ class Stage:
         self.written_v = set()    # VGPRs assigned so far in program order
         self.entry_reads = {}     # VGPR read before any write (its entry value) -> offset of the first such read
         self.pc = 0
+        # MODE.round[3:2], the f16/f64 rounding (see op_s_round_mode); 0 (round to nearest even) at launch is ASSUMED:
+        # the translator does not read SPI_SHADER_PGM_RSRC1 FLOAT_MODE.
+        self.round16 = 0
         self.setup_entry()
         self.translate()
 
@@ -475,6 +478,10 @@ class Stage:
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
                 sources.setdefault(target, []).append(off)
+        # The first branch or branch target: before it the program is one straight-line path (op_s_round_mode).
+        self.uses_round_mode = any(name == 's_round_mode' for off, n, name, asm in self.ins)
+        self.cf_first = min([off for off, n, name, asm in self.ins if name.startswith('s_cbranch') or name == 's_branch']
+                            + list(targets) + [1 << 32])
         self.blocks = []          # (offset, [lines], terminator)
         self.uniform_v = set()    # VGPRs proven to hold one value in every lane (see set_v)
         self.partial_uniform = {}  # VGPRs holding one value in every lane active at their write (see set_v)
@@ -575,6 +582,9 @@ class Stage:
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
+        if base.startswith('s_setreg') and 'HW_REG_MODE' in asm and self.uses_round_mode:
+            # a MODE write the tracking of op_s_round_mode would miss (none in the measured programs)
+            raise Unsupported('%s writes MODE in a program that uses s_round_mode' % base)
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
                     's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
@@ -588,6 +598,8 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
+        if self.round16:
+            self.check_round16(name)
         if base.endswith('_dpp'):
             return self.quad_dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
@@ -1463,6 +1475,8 @@ class Stage:
         self.emit('t = %s;' % call)
         n = dst[1]
         if 'd16' in mods:
+            if self.round16:
+                raise Unsupported('image_%s d16 under s_round_mode f16/f64 toward zero' % how)
             # Packed D16 (gfx9+, LLVM GCNSubtarget hasPackedD16VMem; SIISelLowering adjustLoadValueType): each enabled
             # channel of the filtered result is converted to binary16 and two go in one VGPR, the first channel in
             # the low half; the high half after an odd channel count is written as 0 here (undefined in hardware).
@@ -1819,7 +1833,7 @@ class Stage:
             raise Unsupported('v_cvt_f16_f32 with %d operands, expected 2' % len(ops))
         d = reg_range(ops[0])[1]
         self.used_v.add(d)
-        self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(F(%s))' % (d, self.u(ops[1])))
+        self.set_v(d, '(v%d & 0xffff0000u) | %s' % (d, self.to_f16('F(%s)' % self.u(ops[1]))))
 
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
@@ -1893,7 +1907,7 @@ class Stage:
             raise Unsupported('v_interp_p2_f16 with op_sel %#x' % opsel)
         d = reg_range(ops[0])[1]
         self.used_v.add(d)
-        value = 'f32tof16(i.%sparam%d.%s)' % (half, attr, comp)
+        value = self.to_f16('i.%sparam%d.%s' % (half, attr, comp))
         if opsel:
             self.set_v(d, '(v%d & 0xffffu) | (%s << 16)' % (d, value))
         else:
@@ -1964,9 +1978,56 @@ class Stage:
             return self.set_v(d, 'U(%s)' % expr)
         self.used_v.add(d)
         if dest == 'hi':
-            self.set_v(d, '(v%d & 0xffffu) | (f32tof16(%s) << 16)' % (d, expr))
+            self.set_v(d, '(v%d & 0xffffu) | (%s << 16)' % (d, self.to_f16(expr)))
         else:
-            self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(%s)' % (d, expr))
+            self.set_v(d, '(v%d & 0xffff0000u) | %s' % (d, self.to_f16(expr)))
+
+    # s_round_mode writes MODE[3:0] from its immediate: bits 1:0 round f32 results, bits 3:2 round f16 and f64 results
+    # (LLVM SIDefines.h FP_ROUND_MODE_SP / FP_ROUND_MODE_DP; Mesa aco_ir.h struct float_mode, round32 : 2 then
+    # round16_64 : 2, "matches encoding of the MODE register"), each 0 nearest even, 1 +inf, 2 -inf, 3 toward zero
+    # (FP_ROUND_ROUND_TO_*, aco fp_round_*). The denorm bits are s_denorm_mode's and stay refused. Taken: f32 to
+    # nearest even (what the HLSL arithmetic does) with f16/f64 to nearest even or toward zero, in the straight-line
+    # entry of the program, so the mode at every later instruction is known. Under a nonzero f16/f64 mode the
+    # instructions that round an f16 result go through to_f16; check_round16 refuses every other f16/f64 one.
+    ROUND16_EXACT = ('v_cvt_f32_f16', 'v_cmp_', 'v_cmpx_', 'v_interp_p1ll_f16', 'v_fma_mix_f32', 'v_min_f16',
+                     'v_max_f16', 'v_pk_min_f16', 'v_pk_max_f16', 'v_cvt_pkrtz_f16_f32')
+    ROUND16_LOWERED = ('v_fma_mixlo_f16', 'v_fma_mixhi_f16', 'v_cvt_f16_f32', 'v_interp_p2_f16')
+    round16 = 0  # the class defaults, for a Stage built without __init__ (the operand-count probe)
+    uses_round_mode = False
+
+    def op_s_round_mode(self, ops, mods):
+        value = int(ops[0], 0) if ops and re.fullmatch(r'(0x[0-9a-f]+|\d+)', ops[0]) else None
+        if value is None or mods:
+            raise Unsupported('s_round_mode %s' % ' '.join(ops + mods))
+        if self.kind != 'ps':
+            # only pixel stages are checked for f16 emitters that bypass to_f16 (mesh2hlsl's d16 image packing does)
+            raise Unsupported('s_round_mode in a %s stage' % self.kind)
+        if self.pc >= self.cf_first:
+            raise Unsupported('s_round_mode %#x after the straight-line entry (at %#x, control flow from %#x)'
+                              % (value, self.pc, self.cf_first))
+        if value & ~0xf or value & 3 or (value >> 2) not in (0, 3):
+            raise Unsupported('s_round_mode %#x (only f32 nearest even with f16/f64 nearest even or toward zero)'
+                              % value)
+        self.round16 = value >> 2
+
+    def check_round16(self, name):
+        """Under f16/f64 round toward zero: refuse an f16/f64 instruction that rounds and is not lowered for it.
+
+        Exact whatever the mode: the f16 -> f32 widening, compares (no result rounding), v_interp_p1ll_f16 and
+        v_fma_mix_f32 (f32 results, MODE[1:0]), f16 min/max (the result is an operand), v_cvt_pkrtz_f16_f32 (its
+        rounding is toward zero by definition)."""
+        if not re.search(r'f16|f64', name):
+            return
+        bare = re.sub(r'_(e32|e64|sdwa|dpp)$', '', name)
+        if bare.startswith(self.ROUND16_EXACT):
+            return
+        if re.sub(r'_(e32|e64)$', '', name) in self.ROUND16_LOWERED:
+            return
+        raise Unsupported('%s under s_round_mode f16/f64 toward zero (not lowered)' % name)
+
+    def to_f16(self, expr):
+        """An f32 value rounded to binary16 under the current MODE[3:2] (see op_s_round_mode)."""
+        return ('x2w_f32tof16_rtz(%s)' if self.round16 == 3 else 'f32tof16(%s)') % expr
 
     def op_v_fma_mix_f32(self, ops, mods):
         self.mix(ops, mods, 'f32')
@@ -2372,7 +2433,12 @@ LSHL64_HI = ('((n & 63u) == 0u ? h : (n & 63u) < 32u ? (h << (n & 63u)) | (l >> 
 HELPERS = {
     'x2w_mul_hi_u32': 'uint x2w_mul_hi_u32(uint a, uint b) { return %s; }' % MUL_HI_U32,
     'x2w_class_f32': 'uint x2w_class_f32(uint x, uint mask) { return (mask >> %s) & 1u; }' % CLASS_F32,
-    'x2w_class_f16': 'uint x2w_class_f16(uint x, uint mask) { return (mask >> %s) & 1u; }' % CLASS_F16,
+    # binary16 rounding toward zero (MODE[3:2] = 3, see Stage.op_s_round_mode): f32tof16, then one step toward zero
+    # when that rounded away from zero. Exact if f32tof16 rounds to nearest or toward zero: overflow to inf steps
+    # back to 0x7bff; a NaN or an exactly representable value stays (the compare is false).
+    'x2w_f32tof16_rtz': ('uint x2w_f32tof16_rtz(float x) { uint h = f32tof16(x); '
+                         'return abs(f16tof32(h)) > abs(x) ? h - 1u : h; }'),
+    'x2w_class_f16':'uint x2w_class_f16(uint x, uint mask) { return (mask >> %s) & 1u; }' % CLASS_F16,
     # The words of a 64-bit shift of (l, h) by n[5:0]. HLSL masks shift counts to five bits, so a count of 0
     # (where 32 - n would wrap to a shift by 0) and counts of 32..63 are separate cases.
     'x2w_lshr64_lo': 'uint x2w_lshr64_lo(uint l, uint h, uint n) { return %s; }' % LSHR64_LO,
