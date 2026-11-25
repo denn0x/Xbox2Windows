@@ -1253,6 +1253,11 @@ void retire_placement(Wrapper* w);
 void memcut_released(Wrapper* self);
 void memcut_list_reset(Wrapper* list);
 void memcut_reap();
+// LOCAL memcut: upload ring chunk lifetimes (d3d12_upload_ring.inl).
+void ring_list_reset(Wrapper* list);
+void ring_list_close(Wrapper* list);
+void ring_list_gone(Wrapper* list);
+void ring_submitted(const std::vector<Wrapper*>& lists);
 void memcut_revive(Wrapper* w);
 ID3D12Heap* memcut_slab_heap(void* address, UINT64 bytes, UINT64* offset);  // X2W_MEMCUT_ALIAS_SLABS
 void memcut_slab_failed(void* address, UINT64 bytes, HRESULT hr);
@@ -1261,6 +1266,7 @@ ULONG __stdcall release(Wrapper* self)
     const auto refs = InterlockedDecrement(&self->own().refs);
     if (!refs && self->own().kind == resource_kind && self->own().title_memory) retire_placement(self);
     if (!refs && self->own().kind == resource_kind) memcut_released(self);  // LOCAL memcut
+    if (!refs && self->own().kind == list_kind) ring_list_gone(self);       // LOCAL memcut (upload ring)
     return static_cast<ULONG>(refs);
 }
 
@@ -1761,6 +1767,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     }
     if (SUCCEEDED(hr)) {
         memcut_list_reset(self);  // LOCAL memcut
+        ring_list_reset(self);    // LOCAL memcut (upload ring)
         forget_list_dispatches(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
         gpu_time::reset(self);
         gpu_time::list_begin(self, static_cast<ID3D12GraphicsCommandList*>(self->own().real));  // LOCAL: X2W_GPU_TIME_CLASSES
@@ -1784,6 +1791,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         release_targets(self);
         gpu_time::close(self, static_cast<ID3D12GraphicsCommandList*>(self->own().real));  // LOCAL: X2W_CX_GPU_TIME
         const HRESULT hr = static_cast<ID3D12GraphicsCommandList*>(self->own().real)->Close();
+        ring_list_close(self);  // LOCAL memcut (upload ring): a failed Close is never executed; it holds its chunks until a Reset
         self->own().list_open = false;
         self->own().list_ready = SUCCEEDED(hr);
         if (FAILED(hr)) discard_draw_sampler_heaps(self);
@@ -2489,57 +2497,20 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 
 // Transient data the title addresses by GPU address (fetch tables, vertices, constants) is copied
 // from its memory into a desktop upload buffer; the copy's GPU address is bound instead.
-ID3D12Resource* upload_ring;
-bool ring_copy(u64 title_address, std::size_t bytes, u64* offset);
-D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes)
+// LOCAL memcut: the buffer is a chunk of the upload ring (d3d12_upload_ring.inl), returned with the offset.
+#include "startup_stubs/d3d12_upload_ring.inl"
+bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** buffer)
 {
-    u64 offset = 0;
-    return ring_copy(title_address, bytes, &offset) ? upload_ring->GetGPUVirtualAddress() + offset : 0;
-}
-unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset)
-{
-    constexpr u64 ring_bytes = u64{256} << 20;
-    ID3D12Resource*& ring = upload_ring;
-    static unsigned char* mapped;
-    static volatile LONG64 cursor;
-    static SRWLOCK lock = SRWLOCK_INIT;
-    if (!ring) {
-        AcquireSRWLockExclusive(&lock);
-        if (!ring) {
-            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
-            D3D12_RESOURCE_DESC buffer{};
-            buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            buffer.Width = ring_bytes;
-            buffer.Height = 1;
-            buffer.DepthOrArraySize = 1;
-            buffer.MipLevels = 1;
-            buffer.SampleDesc.Count = 1;
-            buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            ID3D12Resource* created = nullptr;
-            void* base = nullptr;
-            if (SUCCEEDED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&created))) && SUCCEEDED(created->Map(0, nullptr, &base))) {
-                mapped = static_cast<unsigned char*>(base);
-                ring = created;
-            }
-        }
-        ReleaseSRWLockExclusive(&lock);
-    }
-    if (!ring || bytes == 0 || bytes > ring_bytes / 4) return x2w_memcut::note_ring_refused(), nullptr;
-    const u64 rounded = (bytes + 511) & ~u64{511};  // 512: texture footprints are placed in the ring too
-    x2w_memcut::note_ring(frame_number, rounded);  // LOCAL memcut
-    u64 start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded))) % ring_bytes;
-    if (start + rounded > ring_bytes) start = static_cast<u64>(InterlockedExchangeAdd64(&cursor, static_cast<LONG64>(rounded) + (ring_bytes - start))) % ring_bytes, start = 0;
-    *offset = start;
-    return mapped + start;
-}
-
-bool ring_copy(u64 title_address, std::size_t bytes, u64* offset)
-{
-    auto* dest = reserve_upload_ring(bytes, offset);
+    auto* dest = reserve_upload_ring(bytes, offset, buffer, nullptr);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
+}
+D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes)
+{
+    u64 offset = 0;
+    ID3D12Resource* buffer = nullptr;
+    return ring_copy(title_address, bytes, &offset, &buffer) ? buffer->GetGPUVirtualAddress() + offset : 0;
 }
 
 // Number of contiguous readable bytes at address, up to wanted.
@@ -3613,6 +3584,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
             memcut_reap();  // LOCAL memcut (X2W_MEMCUT_RELEASE)
+            ring_submitted(submitted);  // LOCAL memcut (upload ring)
             gpu_time::submitted(queue, submitted);  // LOCAL: X2W_CX_GPU_TIME
             static const bool srv_report_submits = x2w_local::env_on("X2W_DRAW_SRV_STATS_SUBMITS");  // LOCAL stall: fixtures only
             if (srv_report_submits) report_srv_copies();
@@ -5475,6 +5447,8 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
 #include "startup_stubs/d3d12_mem_counters.inl"  // LOCAL memcut: x2w_memory_counters export
 #include "startup_stubs/d3d12_memcut_release.inl"  // LOCAL memcut: X2W_MEMCUT_RELEASE
 #include "startup_stubs/d3d12_memcut_alias.inl"  // LOCAL memcut: X2W_MEMCUT_ALIAS_SLABS
+// LOCAL memcut: upload ring counters for fixtures (d3d12_upload_ring.inl upload_ring_counter).
+extern "C" __declspec(dllexport) unsigned long long x2w_upload_ring_test(int what) { return upload_ring_counter(what); }
 
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {

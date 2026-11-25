@@ -1497,6 +1497,8 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
 struct FrameCopy {
     u64 address = 0;
     u64 offset = 0;
+    ID3D12Resource* buffer = nullptr;  // LOCAL memcut: the upload ring chunk, valid while ring_touch(tag) says so
+    RingTag tag;
     std::vector<unsigned char> content;
 };
 std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
@@ -1544,7 +1546,7 @@ void report_srv_copies()  // the 5 s report (d3d12_xs_device.cpp)
 }
 
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
-bool frame_copy(u64 address, std::size_t bytes, u64* offset)
+bool frame_copy(u64 address, std::size_t bytes, u64* offset, ID3D12Resource** buffer)
 {
     if (frame_copies_frame != frame_number) {
         frame_copies().clear();
@@ -1554,13 +1556,16 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
     const auto* title = reinterpret_cast<const unsigned char*>(address);
     const auto found = frame_copies().find(key);
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
-    if (known && std::memcmp(found->second.content.data(), title, bytes) == 0) {
+    if (known && std::memcmp(found->second.content.data(), title, bytes) == 0 && ring_touch(found->second.tag)) {
         srvc_note(frame_copy_class, srvc_compared, bytes);  // LOCAL stall
         *offset = found->second.offset;
+        *buffer = found->second.buffer;
         return true;
     }
     u64 fresh = 0;
-    auto* ring = reserve_upload_ring(bytes, &fresh);
+    ID3D12Resource* chunk = nullptr;
+    RingTag tag;
+    auto* ring = reserve_upload_ring(bytes, &fresh, &chunk, &tag);
     if (!ring) return false;
     srvc_note(frame_copy_class, srvc_copied, bytes);  // LOCAL stall (a refreshed hit also compared its bytes first)
     // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
@@ -1568,7 +1573,7 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
     try {
         std::vector<unsigned char> content(title, title + bytes);
         // Use the stored snapshot to fill the ring so the GPU bytes and subsequent comparisons agree.
-        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, fresh, std::move(content)});
+        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, fresh, chunk, tag, std::move(content)});
         source = entry.first->second.content.data();
     } catch (const std::bad_alloc&) {
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
@@ -1581,6 +1586,7 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
             log("x2w-draw frame copy of 0x%llx (%zu bytes) refreshed: the title changed it since an earlier draw of this frame", address, bytes);
     }
     *offset = fresh;
+    *buffer = chunk;
     return true;
 }
 
@@ -1696,38 +1702,41 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             for (UINT i = 0; i < mips; ++i) {
                 const u64 bytes = plan.bytes(i);
                 u64 offset = 0;
-                auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
+                ID3D12Resource* chunk = nullptr;
+                auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset, &chunk, nullptr);
                 if (!rows) {
                     state.done = false;
                     return;
                 }
                 std::memset(rows, 0, static_cast<std::size_t>(bytes));
                 chain.copy<false>(i, slice, rows, memory, plan.placed[i].Footprint.RowPitch);
-                plan.upload(list, texture, upload_ring, mips, slices, slice, i, offset);
+                plan.upload(list, texture, chunk, mips, slices, slice, i, offset);
             }
         }
     } else if (tiled) {
         u64 offset = 0;
+        ID3D12Resource* chunk = nullptr;
         const auto bytes = plan.bytes(0);
-        auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
+        auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset, &chunk, nullptr);
         if (!rows) {
             state.done = false;
             return;
         }
         std::memset(rows, 0, static_cast<std::size_t>(bytes));
         surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
-        plan.upload(list, texture, upload_ring, 1, 1, 0, 0, offset);
+        plan.upload(list, texture, chunk, 1, 1, 0, 0, offset);
     } else {
         for (UINT s = 0; s < slices; ++s)
             for (UINT i = 0; i < plan.count; ++i) {
                 const auto& fp = plan.placed[i];
                 const u64 bytes = plan.bytes(i);
                 u64 offset = 0;
-                if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
+                ID3D12Resource* chunk = nullptr;
+                if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset, &chunk)) {
                     state.done = false;
                     return;
                 }
-                plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
+                plan.upload(list, texture, chunk, mips, slices, s, i, offset);
             }
     }
     state.hash = hash;
@@ -2114,6 +2123,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
+    const u64 ring_refusals_at_start = ring_cap_refusals;  // LOCAL memcut: upload ring refusals during this draw
     const bool mesh = mesh_issue_active(self);  // LOCAL meshrt: a DispatchMesh call (d3d12_mesh.inl); no topology, rect entry value 0
     const bool rect = !mesh && pass.topology == 0x11;
     last_draw_key = 0;
@@ -2396,12 +2406,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             // Preserve tight byte-sized streams. The desktop raw view is rounded
             // to a DWORD, so initialise its final padding without reading the guest.
             const auto padded = (bytes + 3) & ~std::size_t{3};
-            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(padded, &offset) : nullptr;
+            ID3D12Resource* chunk = nullptr;
+            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(padded, &offset, &chunk, nullptr) : nullptr;
             if (target) {
                 std::memcpy(target, reinterpret_cast<const void*>(address), bytes);
                 std::memset(target + bytes, 0, padded - bytes);
             }
-            buffer_view(dest, target ? upload_ring : nullptr, offset, padded);
+            buffer_view(dest, target ? chunk : nullptr, offset, padded);
             count_buffer(target != nullptr);
             continue;
         }
@@ -2451,7 +2462,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             InterlockedIncrement(&rt_srv_stale_copy);
         }
         frame_copy_class = mesh ? 2 : 1;  // LOCAL stall: srv copy counters
-        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset);
+        ID3D12Resource* chunk = nullptr;  // LOCAL memcut: the upload ring chunk of the copy
+        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset, &chunk);
         frame_copy_class = 0;
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
@@ -2462,9 +2474,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
             address = reinterpret_cast<u64>(identity);
             bytes = sizeof(identity);
-            have = frame_copy(address, bytes, &offset);
+            have = frame_copy(address, bytes, &offset, &chunk);
         }
-        buffer_view(dest, have ? upload_ring : nullptr, offset, bytes);
+        buffer_view(dest, have ? chunk : nullptr, offset, bytes);
         count_buffer(have);
         // LOCAL (video): a traced frame (X2W_D3D12_TRACE_FRAME/BUSY/QUIET) logs every draw's bindings.
         if (x2w_local::first_calls(tr->logged_bindings, 8) || trace_frame_active) {
@@ -2542,12 +2554,17 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
     gpu_time::mark(self, list, gpu_time::c_draw, tr->key, false);  // LOCAL: X2W_GPU_TIME_CLASSES
-    if (indirect_pending(self)) { drawn = indirect_draw_issue(self, list, indexed); } else if (indexed) {  // LOCAL: d3d12_indirect.inl
+    if (ring_cap_refusals != ring_refusals_at_start) {
+        // LOCAL memcut: a copy of this draw was refused because the upload ring chain is at its cap: the draw is not
+        // issued (it would read zeros where its data should be). Counted in the x2w-upload ring line.
+        ring_draw_refused(tr->key);
+    } else if (indirect_pending(self)) { drawn = indirect_draw_issue(self, list, indexed); } else if (indexed) {  // LOCAL: d3d12_indirect.inl
         u64 offset = 0;
         const u64 address = index_address;
         const std::size_t bytes = index_total;
-        if (indices_ok && frame_copy(address, bytes, &offset)) {
-            const D3D12_INDEX_BUFFER_VIEW view{upload_ring->GetGPUVirtualAddress() + offset, static_cast<UINT>(bytes),
+        ID3D12Resource* chunk = nullptr;
+        if (indices_ok && frame_copy(address, bytes, &offset, &chunk)) {
+            const D3D12_INDEX_BUFFER_VIEW view{chunk->GetGPUVirtualAddress() + offset, static_cast<UINT>(bytes),
                                                index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
             list->IASetIndexBuffer(&view);
             list->DrawIndexedInstanced(count, instances ? instances : 1, 0, 0, start_instance);

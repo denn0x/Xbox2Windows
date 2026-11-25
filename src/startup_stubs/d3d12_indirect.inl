@@ -528,7 +528,8 @@ bool indirect_issue(Wrapper* self, ID3D12GraphicsCommandList* list)
     if (readback) {
         const LONG index = InterlockedIncrement(&indirect_readback_used) - 1;
         u64 marker_at = 0;
-        auto* marker = index < indirect_readback_wanted() ? reserve_upload_ring(4, &marker_at) : nullptr;
+        ID3D12Resource* marker_chunk = nullptr;
+        auto* marker = index < indirect_readback_wanted() ? reserve_upload_ring(4, &marker_at, &marker_chunk, nullptr) : nullptr;
         if (marker) {
             const std::uint32_t value = 0x1d000000u | (static_cast<std::uint32_t>(indirect_readback_generation & 0xff) << 16) |
                                         static_cast<std::uint32_t>(index);
@@ -536,7 +537,7 @@ bool indirect_issue(Wrapper* self, ID3D12GraphicsCommandList* list)
             indirect_readback_type[index] = static_cast<unsigned char>(p->type);
             const u64 dest = u64{static_cast<UINT>(index)} * 32;
             list->CopyBufferRegion(indirect_readback, dest + 4, indirect_ring, slot, record_bytes < 28 ? record_bytes : 28);
-            list->CopyBufferRegion(indirect_readback, dest, upload_ring, marker_at, 4);
+            list->CopyBufferRegion(indirect_readback, dest, marker_chunk, marker_at, 4);
         }
     }
     D3D12_RESOURCE_BARRIER rest;
@@ -569,12 +570,13 @@ bool indirect_draw_issue(Wrapper* self, ID3D12GraphicsCommandList* list, bool in
         const Pass& pass = pass_of(self);
         const std::size_t bytes = pass.ib.SizeInBytes < (16u << 20) ? pass.ib.SizeInBytes : (16u << 20);
         u64 offset = 0;
+        ID3D12Resource* chunk = nullptr;
         if (!pass.ib.BufferLocation || !bytes || readable_window(pass.ib.BufferLocation, bytes) < bytes ||
-            !frame_copy(pass.ib.BufferLocation, bytes, &offset)) {
+            !frame_copy(pass.ib.BufferLocation, bytes, &offset, &chunk)) {
             indirect_current->refused = skip_unresolved_buffer;
             return false;
         }
-        const D3D12_INDEX_BUFFER_VIEW view{upload_ring->GetGPUVirtualAddress() + offset, static_cast<UINT>(bytes),
+        const D3D12_INDEX_BUFFER_VIEW view{chunk->GetGPUVirtualAddress() + offset, static_cast<UINT>(bytes),
                                            pass.ib.Format == DXGI_FORMAT_R16_UINT ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
         list->IASetIndexBuffer(&view);
     }
@@ -604,7 +606,8 @@ void indirect_probe(ID3D12GraphicsCommandList* list, int type, ID3D12Resource* w
     if (!indirect_readback_wanted() || indirect_readback_used >= indirect_readback_wanted() || !ensure_indirect_readback()) return;
     const LONG index = InterlockedIncrement(&indirect_readback_used) - 1;
     u64 marker_at = 0;
-    auto* marker = index < indirect_readback_wanted() ? reserve_upload_ring(4, &marker_at) : nullptr;
+    ID3D12Resource* marker_chunk = nullptr;
+    auto* marker = index < indirect_readback_wanted() ? reserve_upload_ring(4, &marker_at, &marker_chunk, nullptr) : nullptr;
     if (!marker) return;
     const std::uint32_t value = 0x1d000000u | (static_cast<std::uint32_t>(indirect_readback_generation & 0xff) << 16) |
                                 static_cast<std::uint32_t>(index);
@@ -617,7 +620,7 @@ void indirect_probe(ID3D12GraphicsCommandList* list, int type, ID3D12Resource* w
     list->CopyBufferRegion(indirect_readback, dest + 4, window, at, bytes < 28 ? bytes : 28);
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     list->ResourceBarrier(1, &b);
-    list->CopyBufferRegion(indirect_readback, dest, upload_ring, marker_at, 4);
+    list->CopyBufferRegion(indirect_readback, dest, marker_chunk, marker_at, 4);
 }
 
 void indirect_run(Wrapper* self, ID3D12GraphicsCommandList* list, int type, Wrapper* signature, UINT stride, UINT max_count,
