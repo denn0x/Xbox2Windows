@@ -210,14 +210,18 @@ void census_classes(ULONGLONG second, const std::vector<CensusRegion>& regions) 
     try {
         const ULONGLONG began = GetTickCount64();
         static std::vector<ULONG_PTR> previous;  // allocation bases at the last census (reporter thread only)
+        // Committed bytes per allocation base at the last census (sorted by base): which existing allocations grew.
+        static std::vector<std::pair<ULONG_PTR, ULONGLONG>> previous_bytes;
         const bool first = previous.empty();
+        struct Total { ULONG_PTR base; ULONGLONG committed, resident; int c; };
+        std::vector<Total> totals;  // per allocation base, this census
         std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(16384);
         // reservations: the stand-in's reserved ranges (size, not commit), where the title's pages are mapped
         enum { p4, p404, other, mapped, reservations, classes };
         const char* const names[classes] = {"p4", "p404", "other", "mapped", "stand-in reservations"};
         ULONGLONG committed[classes]{}, resident[classes]{}, count[classes]{};
         ULONGLONG fresh_committed[classes]{}, fresh_resident[classes]{}, fresh_count[classes]{};
-        struct Fresh { ULONG_PTR base; ULONGLONG committed, resident; DWORD protect; };
+        struct Fresh { ULONG_PTR base; ULONGLONG committed, resident; DWORD protect; bool mapped; };
         std::vector<Fresh> fresh;
         std::vector<ULONG_PTR> bases;
         for (const CensusRegion& r : regions) {
@@ -227,6 +231,12 @@ void census_classes(ULONGLONG second, const std::vector<CensusRegion>& regions) 
             const bool new_base = !std::binary_search(previous.begin(), previous.end(), r.base);
             committed[c] += r.bytes;
             resident[c] += res;
+            if (!totals.empty() && totals.back().base == r.base) {
+                totals.back().committed += r.bytes;
+                totals.back().resident += res;
+            } else {
+                totals.push_back({r.base, r.bytes, res, c});
+            }
             if (bases.empty() || bases.back() != r.base) {
                 bases.push_back(r.base);
                 ++count[c];
@@ -239,12 +249,36 @@ void census_classes(ULONGLONG second, const std::vector<CensusRegion>& regions) 
                 fresh.back().committed += r.bytes;
                 fresh.back().resident += res;
             } else {
-                fresh.push_back({r.base, r.bytes, res, r.protect});
+                fresh.push_back({r.base, r.bytes, res, r.protect, r.mapped});
             }
         }
         std::sort(bases.begin(), bases.end());
         bases.erase(std::unique(bases.begin(), bases.end()), bases.end());
         previous.swap(bases);
+        // Existing allocations (base seen at the last census) that grew most since then.
+        std::stable_sort(totals.begin(), totals.end(), [](const Total& a, const Total& b) { return a.base < b.base; });
+        std::vector<Total> merged;  // one entry per base (regions of one allocation are adjacent; merged to be sure)
+        for (const Total& t : totals) {
+            if (!merged.empty() && merged.back().base == t.base) {
+                merged.back().committed += t.committed;
+                merged.back().resident += t.resident;
+            } else {
+                merged.push_back(t);
+            }
+        }
+        struct Grown { ULONG_PTR base; ULONGLONG grown, committed, resident; int c; };
+        std::vector<Grown> grown;
+        ULONGLONG grown_bytes[classes]{};
+        std::vector<std::pair<ULONG_PTR, ULONGLONG>> now_bytes;
+        now_bytes.reserve(merged.size());
+        for (const Total& t : merged) {
+            now_bytes.emplace_back(t.base, t.committed);
+            const auto before = std::lower_bound(previous_bytes.begin(), previous_bytes.end(), std::make_pair(t.base, ULONGLONG{0}));
+            if (first || before == previous_bytes.end() || before->first != t.base || t.committed <= before->second) continue;
+            grown.push_back({t.base, t.committed - before->second, t.committed, t.resident, t.c});
+            grown_bytes[t.c] += t.committed - before->second;
+        }
+        previous_bytes.swap(now_bytes);
         char line[1500];
         int n = std::snprintf(line, sizeof(line), "x2w-mem census-classes %llu s: outside startup blocks, committed/resident MiB (allocations):",
                               second);
@@ -260,12 +294,25 @@ void census_classes(ULONGLONG second, const std::vector<CensusRegion>& regions) 
                            fresh_count[c]);
             std::sort(fresh.begin(), fresh.end(), [](const Fresh& a, const Fresh& b) { return a.committed > b.committed; });
             n = append(line, n, sizeof(line), "; largest new:");
+            // A mapped view (counted under "mapped") is marked: its protection alone reads like a p4 allocation.
             for (std::size_t i = 0; i < fresh.size() && i < 12; ++i)
-                n = append(line, n, sizeof(line), " %p:%llu/%llu p%lx", reinterpret_cast<void*>(fresh[i].base), fresh[i].committed / mib,
-                           fresh[i].resident / mib, fresh[i].protect);
+                n = append(line, n, sizeof(line), " %p:%llu/%llu %sp%lx", reinterpret_cast<void*>(fresh[i].base), fresh[i].committed / mib,
+                           fresh[i].resident / mib, fresh[i].mapped ? "mapped-" : "", fresh[i].protect);
         }
         n = append(line, n, sizeof(line), " (%llu ms)", GetTickCount64() - began);
         x2w_local::logf("%s", line);
+        if (first) return;
+        // Second line (logf keeps 1.5 KB a line): growth inside allocations that already existed at the last census.
+        char more[1024];
+        int m = std::snprintf(more, sizeof(more), "x2w-mem census-grown %llu s: existing allocations grown MiB:", second);
+        if (m < 0) return;
+        for (int c = 0; c < classes; ++c) m = append(more, m, sizeof(more), " %s +%llu", names[c], grown_bytes[c] / mib);
+        std::sort(grown.begin(), grown.end(), [](const Grown& a, const Grown& b) { return a.grown > b.grown; });
+        m = append(more, m, sizeof(more), "; grown most (base:+MiB, now committed/resident, class):");
+        for (std::size_t i = 0; i < grown.size() && i < 10; ++i)
+            m = append(more, m, sizeof(more), " %p:+%llu %llu/%llu %s", reinterpret_cast<void*>(grown[i].base), grown[i].grown / mib,
+                       grown[i].committed / mib, grown[i].resident / mib, names[grown[i].c]);
+        x2w_local::logf("%s", more);
     } catch (...) {
         // out of memory while counting: no line this time
     }
