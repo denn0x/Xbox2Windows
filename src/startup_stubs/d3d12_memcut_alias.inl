@@ -41,4 +41,18 @@ ID3D12Heap* memcut_slab_heap(void* address, UINT64 bytes, UINT64* offset)
     if (heap) *offset = at;
     return heap;
 }
+
+// Slot 133: CreatePlacedResource on the slab heap failed (the buffer falls back to a copy). Moves it from the aliased
+// count to the refused one, so the counters say what was placed.
+void memcut_slab_failed(void* address, UINT64 bytes, HRESULT hr)
+{
+    InterlockedDecrement(&memcut_alias_done);
+    InterlockedAdd64(&memcut_alias_bytes, -static_cast<LONG64>(bytes));
+    const LONG n = InterlockedIncrement(&memcut_alias_refused);
+    InterlockedAdd64(&memcut_alias_refused_bytes, static_cast<LONG64>(bytes));
+    static LONG shown;
+    if (x2w_local::first_of(InterlockedIncrement(&shown), 8) || n % 256 == 0)
+        log("x2w-memcut alias slabs: buffer %p width 0x%llx: placing on the pool section failed 0x%08lx, copied as before", address, bytes,
+            static_cast<unsigned long>(hr));
+}
 }  // namespace

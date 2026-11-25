@@ -1255,6 +1255,7 @@ void memcut_list_reset(Wrapper* list);
 void memcut_reap();
 void memcut_revive(Wrapper* w);
 ID3D12Heap* memcut_slab_heap(void* address, UINT64 bytes, UINT64* offset);  // X2W_MEMCUT_ALIAS_SLABS
+void memcut_slab_failed(void* address, UINT64 bytes, HRESULT hr);
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
@@ -4530,6 +4531,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     // existing heap. Fallback: a committed default-heap buffer, not aliased with the title memory.
     const bool aliased = SUCCEEDED(hr);
     const char* placement = slab_heap && aliased ? "aliased slab" : "aliased";  // LOCAL memcut: "aliased slab"
+    if (slab_heap && !aliased) memcut_slab_failed(address, desc->Width, hr);
     if (FAILED(hr)) {
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
         copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
