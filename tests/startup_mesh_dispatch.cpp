@@ -82,6 +82,7 @@ extern "C" __declspec(dllimport) int x2w_d3d12_summarise_traced_targets();
 extern "C" __declspec(dllimport) void x2w_d3d12_mesh_stats_report();
 extern "C" __declspec(dllimport) void x2w_d3d12_record_trace_report();  // LOCAL (scene): X2W_MESH_RECORD_TRACE
 extern "C" __declspec(dllimport) void x2w_d3d12_mesh_frame_stats_report();  // X2W_MESH_STATS_FRAMES: close the frame, report
+extern "C" __declspec(dllimport) void x2w_d3d12_mesh_frame_stats_present();  // X2W_MESH_STATS_FRAMES: what a present does
 
 namespace {
 using Word = std::uint64_t;
@@ -1266,9 +1267,49 @@ int main(int argc, char** argv)
     // frame is closed and reported here (the fixture has no present; the GPU work is complete). gpu: record-time X 1 >
     // 0, so the frame counts: one target-set line with 1 call (1 with groups), the GPU's 2 groups = 6 MS invocations, 2
     // triangles; zero (control): X = 0 at record time, the frame does not count: no target-set line.
-    char frames_env[8]{};
+    // X2W_TEST_FS_MULTI=1 (framestatsmulti_* tests, X2W_MESH_STATS_FRAMES=2): the present path, no report export. After
+    // the main frame (frame 0): a present; 20 frames of one call with record X = 0 (each presented: slots wrap past 16,
+    // more than 8 frames that do not count); frame 21: a call with record {1, 1, 1} and one with {1, 0, 1} (X > 0, no
+    // groups); frame 22: one {1, 1, 1} call (collection has stopped: 2 frames counted); 9 more presents (frame 21 is
+    // read 8 presents after it ends). gpu: frames 0 and 21 count; zero (control): every record has X = 0, nothing counts.
+    char frames_env[8]{}, multi_env[8]{};
+    const bool fs_multi = GetEnvironmentVariableA("X2W_TEST_FS_MULTI", multi_env, sizeof(multi_env)) && multi_env[0] == '1';
     if (GetEnvironmentVariableA("X2W_MESH_STATS_FRAMES", frames_env, sizeof(frames_env)) && frames_env[0]) {
-        x2w_d3d12_mesh_frame_stats_report();
+        if (fs_multi) {
+            UINT64 fence_value = 1;
+            const auto fs_call = [&](std::uint32_t record_x, std::uint32_t record_y) {
+                const std::uint32_t record[3] = {record_x, record_y, 1};
+                std::memcpy(args_memory, record, 12);  // the record at record time, and what the GPU reads
+                invoke(list, 139, arg(allocator));     // Reset
+                invoke(list, 50, 1, arg(&target_handle));
+                invoke(list, 21, 1, arg(&viewport));
+                invoke(list, 22, 1, arg(&scissor));
+                invoke(list, 34, arg(title_root));
+                invoke(list, 32, smp ? 2 : 1, arg(heaps));
+                invoke(list, 36, 1, view_gpu);
+                invoke(list, 40, 2, 1, arg(&colour), 0);
+                invoke(list, 25, arg(pipeline));
+                invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);
+                invoke(list, 9);                       // Close
+                invoke(queue, 10, 1, arg(lists));
+                invoke(queue, 14, arg(fence), ++fence_value);
+                for (const auto until = GetTickCount64() + 10000; invoke(fence, 8) < fence_value && GetTickCount64() < until;) Sleep(1);
+            };
+            const std::uint32_t x1 = mode == "zero" ? 0u : 1u;
+            x2w_d3d12_mesh_frame_stats_present();  // frame 0 ends
+            for (int f = 1; f <= 20; ++f) {
+                fs_call(0, 1);
+                x2w_d3d12_mesh_frame_stats_present();
+            }
+            fs_call(x1, 1);
+            fs_call(x1, 0);
+            x2w_d3d12_mesh_frame_stats_present();  // frame 21 ends
+            fs_call(x1, 1);
+            x2w_d3d12_mesh_frame_stats_present();  // frame 22 ends
+            for (int i = 0; i < 9; ++i) x2w_d3d12_mesh_frame_stats_present();
+        } else {
+            x2w_d3d12_mesh_frame_stats_report();
+        }
         std::ifstream again(log_path, std::ios::binary);
         const std::string after{std::istreambuf_iterator<char>(again), {}};
         std::string set_line, total_line;
@@ -1278,7 +1319,28 @@ int main(int argc, char** argv)
         }
         if (const std::size_t p = after.find("x2w-mesh stats frames total "); p != std::string::npos) total_line = after.substr(p, after.find('\n', p) - p);
         std::printf("log: frame stats \"%s\" / \"%s\"\n", set_line.c_str(), total_line.c_str());
-        const bool set_ok = mode == "zero"
+        const auto line_of = [&](const std::string& start) {
+            const std::size_t p = after.find(start);
+            return p == std::string::npos ? std::string() : after.substr(p, after.find('\n', p) - p);
+        };
+        std::size_t not_counted = 0;
+        for (std::size_t p = after.find(" not counted (no record with X > 0"); p != std::string::npos; p = after.find(" not counted (no record with X > 0", p + 1))
+            ++not_counted;
+        const std::string set0 = line_of("x2w-mesh stats frame 0 set "), set21 = line_of("x2w-mesh stats frame 21 set ");
+        if (fs_multi)
+            std::printf("log: multi: frame 0 \"%s\", frame 21 \"%s\", not counted lines %zu, frame 22 lines %d\n", set0.c_str(), set21.c_str(), not_counted,
+                        after.find("x2w-mesh stats frame 22 ") != std::string::npos);
+        const std::string targets = "set targets 1 [fmt 28 32x32] dsv none: ";
+        const bool set_ok = fs_multi
+            ? mode == "zero"
+                ? set_line.empty() && total_line.empty() && not_counted == 8
+                : set0.find(targets + "calls 1 (1 with groups), ") != std::string::npos &&
+                      set21.find(targets + "calls 2 (1 with groups), ") != std::string::npos && set21.find("clipper invocations 0 ") == std::string::npos &&
+                      total_line.find("x2w-mesh stats frames total 1 of 2 frames (frame 0)") == 0 &&
+                      line_of("x2w-mesh stats frames total 2 ").find("x2w-mesh stats frames total 2 of 2 frames (frame 21): 1 target sets, calls 2 (1 with groups)") == 0 &&
+                      not_counted == 8 && after.find("x2w-mesh stats frame 22 ") == std::string::npos &&
+                      after.find("x2w-mesh stats frames total 3 ") == std::string::npos
+            : mode == "zero"
             ? set_line.empty() && after.find("x2w-mesh stats frame 0 not counted (no record with X > 0") != std::string::npos
             : set_line.find(" set targets 1 [fmt 28 32x32] dsv none: calls 1 (1 with groups), ") != std::string::npos &&
                   (set_line.find("MS invocations 6 primitives 2, clipper invocations 2 primitives 2, PS invocations ") != std::string::npos ||

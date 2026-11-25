@@ -763,6 +763,10 @@ foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_mesh_dispatch_framestats_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
         set_tests_properties(startup_mesh_dispatch_framestats_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_MESH_STATS_FRAMES=1")
+        # framestatsmulti_*: X2W_MESH_STATS_FRAMES=2 through presents only (23 frames, slot wrap, 20 frames not counted).
+        add_test(NAME startup_mesh_dispatch_framestatsmulti_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_framestatsmulti_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_MESH_STATS_FRAMES=2;X2W_TEST_FS_MULTI=1")
     endforeach()
 endforeach()
 

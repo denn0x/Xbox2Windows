@@ -719,7 +719,8 @@ extern "C" __declspec(dllexport) void x2w_d3d12_mesh_stats_report() { mesh_stats
 
 // LOCAL meshrt: X2W_MESH_STATS_FRAMES=<n> (default 0: off). Outside the traced frame, every issued mesh call gets a
 // pipeline statistics query (its own query heap, 16 frame slots of 2048 calls) until n frames have been COUNTED: a frame
-// counts when at least one of its mesh calls had a record with X, Y, Z > 0 in title memory at record time. 8 presents
+// counts when at least one of its mesh calls had a record with X > 0 in title memory at record time ("with groups" on
+// the lines: X, Y, Z all > 0). 8 presents
 // after a frame ends its results are read (no GPU wait); a counted frame prints one line per target set (render target
 // formats / sizes + depth format / size; the resources at the end of the line) with the call count, the calls with
 // groups and the summed statistics, then a frame line; a frame that does not count prints one "not counted" line (the
@@ -727,8 +728,9 @@ extern "C" __declspec(dllexport) void x2w_d3d12_mesh_stats_report() { mesh_stats
 struct MeshFrameSlot {
     LONG frame = -1;      // the frame id collected in this slot (-1: free)
     LONG used = 0;        // calls handed a query
-    LONG groups = 0;      // calls with a record with groups (record time)
-    LONG due = 0;         // present count at which to read
+    LONG groups = 0;      // calls with a record with groups (X, Y, Z > 0 at record time)
+    LONG xpos = 0;        // calls with a record with X > 0 at record time: the frame counts when > 0
+    LONG due = 0;        // present count at which to read
     bool closed = false;  // the frame has ended (due is set)
 };
 constexpr UINT mesh_fs_slots = 16, mesh_fs_calls = 2048;
@@ -822,26 +824,38 @@ u64 mesh_fs_set(const Pass& pass)
     ReleaseSRWLockExclusive(&mesh_fs_lock);
     return h;
 }
-// mesh_hook: a query index for this call, or -1. The current frame's slot.
-LONG mesh_fs_begin(const Pass& pass, bool groups)
+// mesh_hook: a query index for this call, or -1. The current frame's slot. The claim holds mesh_fs_lock shared, so
+// it cannot straddle a present's close (exclusive) or a slot's release; the counters are interlocked for concurrent
+// recording threads.
+LONG mesh_fs_begin(const Pass& pass, bool groups, bool xpos)
 {
     if (!mesh_fs_collecting() || !mesh_fs_ready()) return -1;
+    const u64 set = mesh_fs_set(pass);  // takes mesh_fs_lock itself: before the claim
+    AcquireSRWLockShared(&mesh_fs_lock);
     const LONG frame = mesh_fs_current;
-    MeshFrameSlot& slot = mesh_fs_slot[static_cast<UINT>(frame) % mesh_fs_slots];
-    if (slot.frame != frame) return -1;  // the slot is still being read (cannot happen with 16 slots and 8 presents)
-    const LONG i = InterlockedIncrement(&slot.used) - 1;
-    if (i >= static_cast<LONG>(mesh_fs_calls)) return -1;
-    if (groups) InterlockedIncrement(&slot.groups);
-    MeshFrameCall& call = mesh_fs_calls_of()[(static_cast<UINT>(frame) % mesh_fs_slots) * mesh_fs_calls + static_cast<UINT>(i)];
-    call.set = mesh_fs_set(pass);
-    call.groups = groups;
-    return static_cast<LONG>((static_cast<UINT>(frame) % mesh_fs_slots) * mesh_fs_calls) + i;
+    const UINT s = static_cast<UINT>(frame) % mesh_fs_slots;
+    MeshFrameSlot& slot = mesh_fs_slot[s];
+    LONG i = -1;
+    if (slot.frame == frame && !slot.closed) {  // else: the slot is still being read, or collection has stopped
+        i = InterlockedIncrement(&slot.used) - 1;
+        if (i < static_cast<LONG>(mesh_fs_calls)) {
+            if (groups) InterlockedIncrement(&slot.groups);
+            if (xpos) InterlockedIncrement(&slot.xpos);
+            MeshFrameCall& call = mesh_fs_calls_of()[s * mesh_fs_calls + static_cast<UINT>(i)];
+            call.set = set;
+            call.groups = groups;
+        } else {
+            i = -1;
+        }
+    }
+    ReleaseSRWLockShared(&mesh_fs_lock);
+    return i < 0 ? -1 : static_cast<LONG>(s * mesh_fs_calls) + i;
 }
 void mesh_fs_read(UINT s)
 {
     MeshFrameSlot& slot = mesh_fs_slot[s];
     const LONG used = slot.used < static_cast<LONG>(mesh_fs_calls) ? slot.used : static_cast<LONG>(mesh_fs_calls);
-    const bool counted = slot.groups > 0;
+    const bool counted = slot.xpos > 0;
     if (counted && used > 0 && mesh_fs_readback) {
         struct Sum {
             LONG calls = 0, groups = 0;
@@ -890,19 +904,22 @@ void mesh_fs_read(UINT s)
     } else if (first_calls(mesh_fs_skipped_lines, 8)) {
         log("x2w-mesh stats frame %ld not counted (no record with X > 0 at record time; %ld mesh calls)", slot.frame, slot.used);
     }
-    slot.used = slot.groups = 0;
+    AcquireSRWLockExclusive(&mesh_fs_lock);  // the release: mesh_fs_close may reuse the slot for a later frame
+    slot.used = slot.groups = slot.xpos = 0;
     slot.due = 0;
     slot.closed = false;
     slot.frame = -1;
+    ReleaseSRWLockExclusive(&mesh_fs_lock);
 }
-// Ends the frame being collected: it counts if a call had groups; its results are read `delay` presents later.
+// Ends the frame being collected: it counts if a call had a record with X > 0; its results are read `delay` presents
+// later.
 void mesh_fs_close(LONG delay)
 {
     AcquireSRWLockExclusive(&mesh_fs_lock);
     const LONG frame = mesh_fs_current;
     MeshFrameSlot& slot = mesh_fs_slot[static_cast<UINT>(frame) % mesh_fs_slots];
     if (slot.frame == frame) {
-        if (slot.groups > 0) ++mesh_fs_counted;
+        if (slot.xpos > 0) ++mesh_fs_counted;
         slot.due = mesh_fs_presents + delay;
         slot.closed = true;
     }
@@ -927,6 +944,8 @@ extern "C" __declspec(dllexport) void x2w_d3d12_mesh_frame_stats_report()
     for (UINT s = 0; s < mesh_fs_slots; ++s)
         if (mesh_fs_slot[s].frame >= 0 && mesh_fs_slot[s].closed) mesh_fs_read(s);
 }
+// Fixtures: what queue_present does for X2W_MESH_STATS_FRAMES (the fixture has no swap chain present).
+extern "C" __declspec(dllexport) void x2w_d3d12_mesh_frame_stats_present() { mesh_fs_present(); }
 void mesh_trace_call(Wrapper* self, bool drawn, const Translation* tr, const char* why)
 {
     const Pass& pass = pass_of(self);
@@ -1169,8 +1188,10 @@ bool mesh_hook(Wrapper* self, ID3D12GraphicsCommandList* list)
     LONG fs_query = -1;
     if (!trace_frame_active && mesh_fs_collecting()) {
         std::uint32_t xyz[3] = {};
-        const bool groups = mesh_dump_record_groups(xyz) && xyz[0] && xyz[1] && xyz[2];
-        fs_query = mesh_fs_begin(pass_of(self), groups);
+        const bool readable = mesh_dump_record_groups(xyz);
+        const bool groups = readable && xyz[0] && xyz[1] && xyz[2];  // "with groups" on the lines
+        const bool xpos = readable && xyz[0];                        // the frame counts (the request: X > 0)
+        fs_query = mesh_fs_begin(pass_of(self), groups, xpos);
         if (fs_query >= 0) list->BeginQuery(mesh_fs_heap, mesh_stats_type(), static_cast<UINT>(fs_query));
     }
     const bool issued = draw_translated(self, false, 0, 0, 0, 0, 0);
