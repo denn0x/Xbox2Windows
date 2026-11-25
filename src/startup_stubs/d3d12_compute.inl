@@ -24,12 +24,16 @@ void note_window(ID3D12Resource* buffer)
 }
 
 LONG range_split, range_unmapped, range_ok;
+// LOCAL indirect: X2W_RANGE_ALIAS (d3d12_range_alias.inl): split chunk-page ranges are described and counted there.
+bool range_alias_on();
+bool range_alias_split(u64 address, u64 bytes);
+void range_alias_repeat();
 // The desktop window buffer and byte offset that address [address, address + bytes) of title memory,
 // when the range is contiguous in one window. Results are cached for the frame.
 bool desktop_range(u64 address, u64 bytes, ID3D12Resource** buffer, u64* offset)
 {
     Timed timed(time_cx_desktop_range);
-    struct Hit { ID3D12Resource* buffer; u64 offset; };
+    struct Hit { ID3D12Resource* buffer; u64 offset; bool chunk_split = false; };
     static SRWLOCK lock = SRWLOCK_INIT;
     static std::unordered_map<u64, Hit> cache;
     static LONG cache_frame = -1;
@@ -43,7 +47,9 @@ bool desktop_range(u64 address, u64 bytes, ID3D12Resource** buffer, u64* offset)
     if (const auto found = cache.find(key); found != cache.end()) {
         *buffer = found->second.buffer;
         *offset = found->second.offset;
+        const bool chunk_split = found->second.chunk_split;
         ReleaseSRWLockExclusive(&lock);
+        if (chunk_split) range_alias_repeat();
         return *buffer != nullptr;
     }
     ReleaseSRWLockExclusive(&lock);
@@ -92,6 +98,10 @@ bool desktop_range(u64 address, u64 bytes, ID3D12Resource** buffer, u64* offset)
                             hit.buffer = nullptr;
                             break;
                         }
+                    }
+                    if (!hit.buffer && range_alias_on()) {
+                        range_alias_split(address, bytes);  // never an alias today: described, counted, NULL
+                        hit.chunk_split = true;
                     }
                 }
             } else {
