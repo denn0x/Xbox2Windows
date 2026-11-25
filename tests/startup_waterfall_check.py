@@ -64,8 +64,8 @@ def one_lane(own, active, s12bit, heap, first_lane_index=None, passes=4):
     passes=1 is the emitted form: the body once, the back edge dropped."""
     v44, exec_, s25 = None, active, active
     for _ in range(passes):
-        if passes == 1:
-            s13 = own if first_lane_index is None else first_lane_index
+        if passes == 1:  # as emitted: an inactive lane's index is 0 (its stale value never reaches a heap read)
+            s13 = (own if active else 0) if first_lane_index is None else first_lane_index
             exec_ &= int(s13 == own)
             desc = heap[(s13 << 5) >> 5]
             s13, exec_ = exec_, s12bit & exec_
@@ -162,12 +162,12 @@ def one_pass():
 
 def translation():
     one_pass()
-    assert readfirstlane(build(LOOP), 0x100) == ['s13 = v46;']
+    assert readfirstlane(build(LOOP), 0x100) == ['s13 = ((exec & 1) != 0 ? v46 : 0u);']
     wide = ['s_waitcnt vmcnt(0)', 'v_readfirstlane_b32 s10, v28', 'v_cmpx_eq_i32_e32 s10, v28',
             's_lshl_b32 s10, s10, 5', 's_load_dwordx8 s[48:55], s[30:31], s10', 's_waitcnt lgkmcnt(0)',
             'image_sample_lz v21, v[21:22], s[48:55], s[32:35] dmask:0x8 dim:SQ_RSRC_IMG_2D',
             's_andn2_wrexec_b64 s[44:45], s[44:45]', 's_cbranch_scc1 label_0x%x']
-    assert readfirstlane(build(wide), 0x104) == ['s10 = v28;']
+    assert readfirstlane(build(wide), 0x104) == ['s10 = ((exec & 1) != 0 ? v28 : 0u);']
     controls = 0
     no_cmpx = [x for x in LOOP if not x.startswith('v_cmpx')]
     refused(build(no_cmpx), 0x100, 'requires a proven uniform source'); controls += 1
@@ -185,7 +185,7 @@ def translation():
     refused(build(unclosed), 0x100, 'not closed by s_andn2_wrexec'); controls += 1
     # written again before any read on every exit path: accepted
     assert readfirstlane(build(LOOP, after=('s_mov_b32 s13, 0', 's_mov_b32 s26, 1', 's_mov_b32 s5, s13',
-                                            's_endpgm')), 0x100) == ['s13 = v46;']
+                                            's_endpgm')), 0x100) == ['s13 = ((exec & 1) != 0 ? v46 : 0u);']
     return controls
 
 

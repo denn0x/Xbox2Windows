@@ -2005,7 +2005,10 @@ class Stage:
                 and following.startswith('v_cmpx_eq_')):
             # a waterfall loop head (see waterfall): this lane's own value
             self.waterfall(dst[1], src[1])
-            self.set_s(dst[1], self.u(ops[1]))
+            # An inactive lane's vM is stale (hardware never uses it: no iteration serves that lane), but the HLSL
+            # evaluates the body's descriptor reads in every lane, and the heap memory is a root SRV with no bounds
+            # check; index 0 keeps that read inside the heap. Active lanes read their own vM as hardware does.
+            self.set_s(dst[1], '((exec & 1) != 0 ? %s : 0u)' % self.u(ops[1]))
             return
         partial = getattr(self, 'partial_uniform', {}).get(src[1]) if src and src[0] == 'v' else None
         if (not mods and dst and dst[0] == 's' and partial is not None and
