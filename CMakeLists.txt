@@ -1504,6 +1504,23 @@ if(XBOX2WINDOWS_ADDRLIB_DIR)
 else()
     message(STATUS "xg_swizzle_select: addrlib not configured, the test will skip (77)")
 endif()
+# LOCAL (textures): the GFX10 layout of console-swizzled memory views (src/startup_stubs/gfx10_layout.h). The golden
+# check runs in every build (addrlib-recorded hashes); the addrlib check compares every element address with addrlib
+# itself and skips (77) without it. The two mutated runs are the negative controls.
+add_executable(gfx10_layout_check tests/gfx10_layout_check.cpp)
+target_compile_features(gfx10_layout_check PRIVATE cxx_std_17)
+target_include_directories(gfx10_layout_check PRIVATE src)
+if(XBOX2WINDOWS_ADDRLIB_DIR)
+    target_link_libraries(gfx10_layout_check PRIVATE xbw_addrlib)
+    target_compile_definitions(gfx10_layout_check PRIVATE XBOX2WINDOWS_HAVE_ADDRLIB)
+endif()
+set(_gfx10_golden "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfx10_layout_golden.txt")
+add_test(NAME gfx10_layout_golden COMMAND gfx10_layout_check "${_gfx10_golden}")
+add_test(NAME gfx10_layout_floor_control COMMAND gfx10_layout_check "${_gfx10_golden}" --mutate floor)
+add_test(NAME gfx10_layout_tail_control COMMAND gfx10_layout_check "${_gfx10_golden}" --mutate tail)
+set_tests_properties(gfx10_layout_floor_control gfx10_layout_tail_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME gfx10_layout_addrlib COMMAND gfx10_layout_check --addrlib)
+set_tests_properties(gfx10_layout_addrlib PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 add_test(NAME xg_bc64_tiling_reference COMMAND xg_swizzle_select_check --bc64-tiling)
 set_tests_properties(xg_bc64_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 # Which descriptions take the 64 KiB standard BC chain (src/startup_stubs/bc64_chain.h), without addrlib
@@ -2005,6 +2022,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_srv_announced_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_memory_srv_announced_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # LOCAL (textures): X2W_MEMORY_SRV_DETILE; surfaces at addrlib's addresses when gfx10_layout_check has addrlib.
+        add_test(NAME startup_memory_srv_detile_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_srv_detile_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "$<TARGET_FILE:gfx10_layout_check>")
+        set_tests_properties(startup_memory_srv_detile_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
         add_test(NAME startup_address_buffer_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_buffer_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -2017,6 +2039,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_uav_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_draw_uav_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # LOCAL (textures): X2W_HEAP_TEXTURE_UPLOAD; heap draws need 32-byte view slots (77 elsewhere, e.g. WARP).
+        add_test(NAME startup_heap_texture_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_heap_texture_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "$<TARGET_FILE:gfx10_layout_check>")
+        set_tests_properties(startup_heap_texture_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")

@@ -341,12 +341,15 @@ bool announced_linear_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOU
 std::mutex linear_srv_mutex;
 std::unordered_multimap<u64, std::pair<D3D12_RESOURCE_DESC, Wrapper*>> linear_srv_textures;
 u64 linear_srv_bytes;  // desktop allocation size of the textures above (GetResourceAllocationInfo)
-Wrapper* publish_linear_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
+// detiled: the memory is console-swizzled (X2W_MEMORY_SRV_DETILE); a separate texture from a linear one with the
+// same description, so one desktop copy per (address, description, form).
+Wrapper* publish_linear_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc, bool detiled = false)
 {
     std::lock_guard lock(linear_srv_mutex);
     const auto [first, last] = linear_srv_textures.equal_range(address);
     for (auto it = first; it != last; ++it)
-        if (same_texture_description(it->second.first, desc)) return it->second.second;
+        if (same_texture_description(it->second.first, desc) && it->second.second->own().detiled_memory_srv == detiled)
+            return it->second.second;
     const D3D12_RESOURCE_DESC texture = sanitized(desc);
     const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
     ID3D12Resource* created = nullptr;
@@ -362,10 +365,103 @@ Wrapper* publish_linear_texture(Wrapper* device, u64 address, const D3D12_RESOUR
     Wrapper* w = wrap(created, resource_kind);
     w->own().title_memory = reinterpret_cast<void*>(address);
     w->own().linear_memory_srv = true;
+    w->own().detiled_memory_srv = detiled;
     note_resource(w, &desc, 0);
     linear_srv_bytes += device_of(device)->GetResourceAllocationInfo(0, 1, &texture).SizeInBytes;
     linear_srv_textures.emplace(address, std::make_pair(desc, w));
     return w;
+}
+
+// LOCAL (textures): X2W_MEMORY_SRV_DETILE=1. A memory SRV of a console-swizzled texture (layout 0x100 linear, 0x105
+// SW_4KB_S, 0x109 SW_64KB_S; 0x106 SW_4KB_D and 0x10a SW_64KB_D except for 4-byte elements; 2D, 2D array or 3D;
+// run 102's top texture refusal classes are 0x105 / 0x10a BC mip chains and 0x100 R16G16B16A16F) at an address the XG stand-in did
+// not announce, that none of the paths above takes (tiled_bc_srv, bc64, linear, announced), gets a desktop texture of
+// its own (publish_linear_texture, detiled) that upload_texture fills by reading every element at its GFX10
+// address (gfx10_layout.h, addrlib's layout). Without the switch these calls stay refused.
+bool memory_srv_detile_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MEMORY_SRV_DETILE");
+        if (v) log("x2w-memsrv X2W_MEMORY_SRV_DETILE=1: unannounced console-swizzled memory SRVs are detiled (GFX10 layout)");
+        return v;
+    }();
+    return on;
+}
+// Bytes per element (per 4x4 block for BC); 0 when the format is not detiled (not a power of two, depth, video).
+UINT detile_element_bytes(DXGI_FORMAT f, bool& bc)
+{
+    bc = true;
+    switch (f) {
+    case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
+        return 8;
+    case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+        return 16;
+    default:
+        break;
+    }
+    bc = false;
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return 16;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_TYPELESS: return 8;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+        return 4;
+    case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_B5G5R5A1_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM:
+        return 2;
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_A8_UNORM: return 1;
+    default: {
+        const UINT n = x2w_startup::typed_buffer_format_bytes(f);
+        return n == 12 ? 0 : n;
+    }
+    }
+}
+x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r)
+{
+    bool bc = false;
+    const UINT bytes = detile_element_bytes(r.Format, bc);
+    const UINT layout = static_cast<UINT>(r.Layout);
+    // The D modes (0x106, 0x10a) are taken for 1-, 2-, 8- and 16-byte elements (BC blocks are 8 or 16), whose
+    // equations addrlib gives the same on Navi1x and Navi21. For 4-byte elements they are left out: there addrlib's
+    // equation differs between Navi1x and Navi21 (RB+), and which one the console uses is not known
+    // (tests/gfx10_layout_check.cpp --addrlib). Thick D has no equation (gfx10_layout.h), so a 3D D-mode is invalid.
+    const bool d_mode = layout == 0x106 || layout == 0x10a;
+    const bool known = layout == 0x100 || layout == 0x105 || layout == 0x109 || (d_mode && bytes != 4);
+    const bool dim = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if (!bytes || !known || !dim || r.Width > 0xffffffffull)
+        return x2w_startup::gfx10::Layout(~0u, false, 0, 0, 0, 0, 0);  // invalid
+    const UINT w = static_cast<UINT>(r.Width), h = r.Height;
+    // A BC mip's block count is ceil(max(1, pixels >> i) / 4) in D3D; the layout halves the block count of mip 0
+    // (ceil). They differ for some sizes that are not multiples of 4 << i (9 pixels: 1 block at mip 1, 2 in the
+    // chain), and which one the console uses there is not checked (gfx10_layout_check has block-sized shapes
+    // only), so such chains stay refused.
+    const UINT mips = r.MipLevels ? r.MipLevels : 1;
+    if (bc)
+        for (UINT i = 1; i < mips && i < 32; ++i) {
+            const auto d3d = [i](UINT v) { return ((v >> i ? v >> i : 1u) + 3) / 4; };
+            const auto chain = [i](UINT v) { return (((v + 3) / 4) + (1u << i) - 1) >> i; };
+            if (d3d(w) != chain(w) || d3d(h) != chain(h)) return x2w_startup::gfx10::Layout(~0u, false, 0, 0, 0, 0, 0);
+        }
+    return x2w_startup::gfx10::Layout(layout - 0x100, r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D, bytes,
+                                      bc ? (w + 3) / 4 : w, bc ? (h + 3) / 4 : h, r.DepthOrArraySize, r.MipLevels ? r.MipLevels : 1);
+}
+bool detile_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v, u64 address)
+{
+    // Only what the tiled paths take (supports_memory_srv: single-mip tiled_bc_srv forms, the bc64 chains) is left
+    // to them; a tiled_bc_srv description they refuse (a BC7 0x105 mip chain, run 102: 3929 calls) is detiled here.
+    if (!console_swizzle(r) || supports_memory_srv(r, v) || xg_announced(address)) return false;
+    D3D12_RESOURCE_DESC as_linear = r;
+    as_linear.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;  // (tiled_bc_srv / bc64 need a console layout: false here)
+    if (!linear_memory_srv(as_linear, v)) return false;
+    const auto l = detile_layout(r);
+    return l.valid && l.size <= (1ull << 30) && x2w_local::readable(reinterpret_cast<const void*>(address), static_cast<std::size_t>(l.size));
 }
 
 // LOCAL (video): X2W_MEMORY_SRV_BUFFER=1. A memory buffer view (slot 70 SRV, slot 71 UAV) whose address
@@ -457,8 +553,8 @@ void __stdcall device_memory_uav(Wrapper* self, const D3D12_RESOURCE_DESC* resou
 // not), past the 2048-line refusal cap (these lines have no cap of their own). Lines, all cumulative:
 // "x2w-texcensus slot70 calls N (...)" and "x2w-texcensus slot70 refusals N (...), top classes:" (up to 24 classes)
 // with every 300-frame draw census line, and also at powers of two (calls from 1024, refusals from 256).
-enum MemorySrvOutcome { mso_linear, mso_announced, mso_tiled, mso_buffer, mso_standin, mso_refused, mso_count };
-const char* const memory_srv_outcome_names[mso_count] = {"linear", "announced-linear", "tiled/bc64", "buffer", "stand-in buffer", "refused"};
+enum MemorySrvOutcome { mso_linear, mso_announced, mso_tiled, mso_buffer, mso_standin, mso_refused, mso_detiled, mso_count };
+const char* const memory_srv_outcome_names[mso_count] = {"linear", "announced-linear", "tiled/bc64", "buffer", "stand-in buffer", "refused", "detiled"};
 LONG64 memory_srv_outcomes[mso_count];
 std::mutex refusal_census_mutex;
 std::unordered_map<u64, LONG64> refusal_census;
@@ -487,8 +583,8 @@ void log_memory_srv_outcomes(const char* when)
     LONG64 total = 0;
     for (LONG64 n : memory_srv_outcomes) total += n;
     log("x2w-texcensus slot70 calls %lld (%s, cumulative): linear %lld, announced-linear %lld, tiled/bc64 %lld, buffer %lld, stand-in buffer %lld, "
-        "refused %lld", total, when, memory_srv_outcomes[0], memory_srv_outcomes[1], memory_srv_outcomes[2], memory_srv_outcomes[3],
-        memory_srv_outcomes[4], memory_srv_outcomes[5]);
+        "detiled %lld, refused %lld", total, when, memory_srv_outcomes[0], memory_srv_outcomes[1], memory_srv_outcomes[2], memory_srv_outcomes[3],
+        memory_srv_outcomes[4], memory_srv_outcomes[6], memory_srv_outcomes[5]);
 }
 void log_refusal_classes(const char* when)  // refusal_census_mutex held
 {
@@ -633,6 +729,23 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             }
             note_linear_form(linear_form(input->view.ViewDimension), destination);
             census_memory_srv_outcome(plain ? mso_linear : mso_announced);
+            view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
+            return;
+        }
+    }
+    // LOCAL (textures): X2W_MEMORY_SRV_DETILE (detile_srv above); after the linear and announced forms, before the
+    // refusal checks, so every path that took a call before still takes it.
+    if (described && memory_srv_detile_on() && detile_srv(*resource, input->view, input->address) && memory_srv_destination(destination)) {
+        Wrapper* texture = existing_memory_texture(input->address, *resource);
+        if (!texture) texture = publish_linear_texture(self, input->address, *resource, true);
+        if (texture) {
+            static LONG shown;
+            if (first_calls(shown, 16))
+                log("x2w-memsrv detiled memory SRV at 0x%llx: %llux%ux%u mips %u fmt %d layout 0x%x dim %d", input->address,
+                    resource->Width, resource->Height, resource->DepthOrArraySize, resource->MipLevels, resource->Format,
+                    static_cast<unsigned>(resource->Layout), resource->Dimension);
+            note_linear_form(linear_form(input->view.ViewDimension), destination);
+            census_memory_srv_outcome(mso_detiled);
             view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
             return;
         }
