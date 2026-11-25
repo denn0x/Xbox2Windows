@@ -3604,6 +3604,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
             gpu_time::submitted(queue, submitted);  // LOCAL: X2W_CX_GPU_TIME
+            static const bool srv_report_submits = x2w_local::env_on("X2W_DRAW_SRV_STATS_SUBMITS");  // LOCAL stall: fixtures only
+            if (srv_report_submits) report_srv_copies();
             ReleaseSRWLockExclusive(&draw_lock);
             InterlockedIncrement(&render_executes);
         }
@@ -5262,6 +5264,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             if (used) log("x2w-d3d12 command-list slots over 20 ms:%s", text);
         }
         rawaddr_report();  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
+        report_srv_copies();  // LOCAL stall: X2W_DRAW_SRV_STATS / X2W_DRAW_SRV_IN_PLACE (d3d12_draw.inl)
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));

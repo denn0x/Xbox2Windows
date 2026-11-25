@@ -1451,6 +1451,47 @@ struct FrameCopy {
 std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
 LONG frame_copies_frame = -1;
 
+// LOCAL stall: what draw_translated's buffer srvs cost, per class (0 other callers, 1 plain draw srv, 2 mesh srv):
+// bytes memcmp'd on a frame_copy hit, bytes copied on a miss (twice: snapshot + ring), bytes bound in place by
+// X2W_DRAW_SRV_IN_PLACE. Reported every 5 s when X2W_DRAW_SRV_STATS=1 or X2W_DRAW_SRV_IN_PLACE is set.
+enum { srvc_compared, srvc_copied, srvc_in_place, srvc_kinds };
+volatile LONG64 srvc_bytes[3][srvc_kinds], srvc_calls[3][srvc_kinds];
+volatile LONG64 srvc_in_place_missed[3];  // over the threshold, but no 16-aligned desktop window: copied as before
+thread_local int frame_copy_class;
+void srvc_note(int cls, int kind, std::size_t bytes)
+{
+    InterlockedAdd64(&srvc_bytes[cls][kind], static_cast<LONG64>(bytes));
+    InterlockedIncrement64(&srvc_calls[cls][kind]);
+}
+// X2W_DRAW_SRV_IN_PLACE=<min bytes> (off by default; 0 or unset = off).
+std::size_t srv_in_place_min()
+{
+    static const std::size_t min = [] {
+        char value[24]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_DRAW_SRV_IN_PLACE", value, sizeof(value));
+        return n && n < sizeof(value) ? static_cast<std::size_t>(std::strtoull(value, nullptr, 0)) : std::size_t{0};
+    }();
+    return min;
+}
+void report_srv_copies()  // the 5 s report (d3d12_xs_device.cpp)
+{
+    static const bool on = srv_in_place_min() || x2w_local::env_on("X2W_DRAW_SRV_STATS");
+    if (!on) return;
+    char text[640];
+    int used = 0;
+    static const char* const names[3] = {"other", "draw", "mesh"};
+    for (int c = 0; c < 3; ++c) {
+        LONG64 b[srvc_kinds], n[srvc_kinds];
+        for (int k = 0; k < srvc_kinds; ++k) b[k] = InterlockedExchange64(&srvc_bytes[c][k], 0), n[k] = InterlockedExchange64(&srvc_calls[c][k], 0);
+        const LONG64 missed = InterlockedExchange64(&srvc_in_place_missed[c], 0);
+        used += std::snprintf(text + used, sizeof(text) - used, "%s%s: compared %lld MiB/%lld, copied %lld MiB/%lld, in place %lld MiB/%lld, in-place misses %lld",
+                              c ? "; " : "", names[c], b[srvc_compared] >> 20, n[srvc_compared], b[srvc_copied] >> 20, n[srvc_copied],
+                              b[srvc_in_place] >> 20, n[srvc_in_place], missed);
+        if (used >= static_cast<int>(sizeof(text))) used = static_cast<int>(sizeof(text)) - 1;
+    }
+    log("x2w-draw srv copies since the last report (X2W_DRAW_SRV_IN_PLACE=%zu): %s", srv_in_place_min(), text);
+}
+
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
 bool frame_copy(u64 address, std::size_t bytes, u64* offset)
 {
@@ -1463,12 +1504,14 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
     const auto found = frame_copies().find(key);
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
     if (known && std::memcmp(found->second.content.data(), title, bytes) == 0) {
+        srvc_note(frame_copy_class, srvc_compared, bytes);  // LOCAL stall
         *offset = found->second.offset;
         return true;
     }
     u64 fresh = 0;
     auto* ring = reserve_upload_ring(bytes, &fresh);
     if (!ring) return false;
+    srvc_note(frame_copy_class, srvc_copied, bytes);  // LOCAL stall (a refreshed hit also compared its bytes first)
     // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
     const unsigned char* source = title;
     try {
@@ -2315,6 +2358,29 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             buffer_view(dest, placed.alias, address - reinterpret_cast<u64>(placed.owner->own().title_memory), bytes);
             continue;
         }
+        if (address && srv_in_place_min() && bytes >= srv_in_place_min()) {
+            // LOCAL stall: X2W_DRAW_SRV_IN_PLACE: a large buffer srv reads the title memory in place (the GPU sees it at
+            // execution time, as on the console) instead of a record-time copy compared or made on every call.
+            ID3D12Resource* window = nullptr;
+            u64 at = 0;
+            if (desktop_range(address, bytes, &window, &at) && at % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0) {
+                // States: only a window this list already tracks is transitioned (window_read_state). An untracked window
+                // gets no barrier, as translated compute binds windows in place (implicit buffer promotion): the indirect
+                // stage and compute may have it promoted to UNORDERED_ACCESS, which a COMMON-based barrier would contradict.
+                bool tracked = false;
+                for (const auto& known : pass.states) tracked |= known.first == window;
+                if (tracked) window_read_state(self, window);
+                buffer_view(dest, window, at, bytes);
+                count_buffer(true);
+                srvc_note(mesh ? 2 : 1, srvc_in_place, bytes);
+                static LONG shown;
+                if (first_calls(shown, 4))
+                    log("x2w-draw   %016llx srv %u: 0x%llx (%zu bytes) bound in place at window %p +0x%llx (X2W_DRAW_SRV_IN_PLACE)", tr->key, i,
+                        address, bytes, static_cast<void*>(window), at);
+                continue;
+            }
+            InterlockedIncrement64(&srvc_in_place_missed[mesh ? 2 : 1]);
+        }
         if (address && bytes && !gpu_written().empty() && gpu_written_overlaps(address, bytes)) {
             // LOCAL draw-rt: a translated draw or a GPU copy stores into this range: read it in place, not from a record-time copy.
             ID3D12Resource* window = nullptr;
@@ -2332,7 +2398,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             InterlockedIncrement(&rt_srv_stale_copy);
         }
+        frame_copy_class = mesh ? 2 : 1;  // LOCAL stall: srv copy counters
         bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset);
+        frame_copy_class = 0;
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.
