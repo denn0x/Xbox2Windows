@@ -752,6 +752,18 @@ foreach(backend IN ITEMS warp hardware)
         set_tests_properties(startup_mesh_dispatch_trace_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_D3D12_TRACE_ALL=1;X2W_D3D12_TRACE_TARGETS=1")
     endforeach()
+    # LOCAL meshrt: NOT traced. dump_*: X2W_MESH_DUMP_INPUTS lists the key (statez: dumped; zero: X = 0, not dumped).
+    # framestats_*: X2W_MESH_STATS_FRAMES=1 (gpu: the frame counts, one target-set line; zero: not counted).
+    foreach(mode IN ITEMS statez zero)
+        add_test(NAME startup_mesh_dispatch_dump_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_dump_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_TEST_MESH_DUMP=1")
+    endforeach()
+    foreach(mode IN ITEMS gpu zero)
+        add_test(NAME startup_mesh_dispatch_framestats_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
+        set_tests_properties(startup_mesh_dispatch_framestats_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_MESH_STATS_FRAMES=1")
+    endforeach()
 endforeach()
 
 # LOCAL stall: device slot 133 without the allocation walk once the heap is open (X2W_PLACED_FAST; walk = control).

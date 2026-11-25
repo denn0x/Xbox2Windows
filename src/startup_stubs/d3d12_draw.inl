@@ -2904,6 +2904,18 @@ const MeshDumpKeys& mesh_dump_keys()
 }
 u64 mesh_dump_key() { return mesh_dump_keys().count ? mesh_dump_keys().keys[0] : 0; }  // non-zero: any key wanted
 LONG mesh_dump_claimed[16];              // one dump per listed key
+LONG mesh_dump_done;                     // keys dumped
+// Any listed key not dumped yet (then the indirect stage reads each mesh call's record, in any frame).
+bool mesh_dump_pending() { return mesh_dump_keys().count && mesh_dump_done < static_cast<LONG>(mesh_dump_keys().count); }
+// X2W_MESH_DUMP_FROM_FRAME=<n> (default 0): no dump before present n (to skip the start-up pages if needed).
+LONG mesh_dump_from_frame()
+{
+    static const LONG n = [] {
+        char v[16]{};
+        return GetEnvironmentVariableA("X2W_MESH_DUMP_FROM_FRAME", v, sizeof(v)) ? std::atol(v) : 0L;
+    }();
+    return n;
+}
 thread_local std::string mesh_dump_dir;  // non-empty: this call is being dumped (folder with trailing backslash)
 // d3d12_mesh.inl: the group counts of this call's first indirect record as in title memory at record time
 // (false: no readable record). Run 113: the executed counts equal these (mesh, 063500).
@@ -2914,11 +2926,13 @@ bool mesh_dump_begin(u64 key)
     const MeshDumpKeys& list = mesh_dump_keys();
     unsigned at = 0;
     while (at < list.count && list.keys[at] != key) ++at;
-    if (!key || at == list.count || mesh_dump_claimed[at]) return false;
-    // Only a call that dispatches groups (X, Y and Z non-zero): the first such traced call of each key.
+    if (!key || at == list.count || mesh_dump_claimed[at] || frame_number < mesh_dump_from_frame()) return false;
+    // Only a call that dispatches groups (X, Y and Z non-zero): the first such call of each key, in any frame
+    // (run 114: the traced frame had none).
     std::uint32_t xyz[3] = {};
     if (!mesh_dump_record_groups(xyz) || !xyz[0] || !xyz[1] || !xyz[2]) return false;
     if (InterlockedCompareExchange(&mesh_dump_claimed[at], 1, 0) != 0) return false;
+    InterlockedIncrement(&mesh_dump_done);
     char log_path[MAX_PATH]{};
     std::string dir;
     if (GetEnvironmentVariableA("X2W_TRAP_LOG", log_path, sizeof(log_path))) {
@@ -2931,8 +2945,8 @@ bool mesh_dump_begin(u64 key)
     dir += name;
     CreateDirectoryA(dir.c_str(), nullptr);
     mesh_dump_dir = dir;
-    log("x2w-mesh dump %016llx: inputs of the first traced call with groups (record %u %u %u) to %s", static_cast<unsigned long long>(key),
-        xyz[0], xyz[1], xyz[2], dir.c_str());
+    log("x2w-mesh dump %016llx: inputs of the first call with groups (record %u %u %u, frame %ld%s) to %s", static_cast<unsigned long long>(key),
+        xyz[0], xyz[1], xyz[2], frame_number, trace_frame_active ? ", traced" : "", dir.c_str());
     return true;
 }
 void mesh_dump_file(const char* file, const void* data, std::size_t bytes, const char* note)
@@ -3077,7 +3091,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     if (vertex_first < 0) vertex_first = 0;
     bool dumping = false;
-    if (mesh && trace_frame_active && mesh_dump_key()) {
+    if (mesh && mesh_dump_pending()) {  // any frame (the first call with groups of each listed key)
         SplitRelock relock(split, 100000 + __LINE__);
         dumping = mesh_dump_begin(tr->key);  // LOCAL meshrt
     }

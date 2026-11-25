@@ -81,6 +81,7 @@ extern "C" __declspec(dllimport) unsigned x2w_d3d12_traced_targets(unsigned* out
 extern "C" __declspec(dllimport) int x2w_d3d12_summarise_traced_targets();
 extern "C" __declspec(dllimport) void x2w_d3d12_mesh_stats_report();
 extern "C" __declspec(dllimport) void x2w_d3d12_record_trace_report();  // LOCAL (scene): X2W_MESH_RECORD_TRACE
+extern "C" __declspec(dllimport) void x2w_d3d12_mesh_frame_stats_report();  // X2W_MESH_STATS_FRAMES: close the frame, report
 
 namespace {
 using Word = std::uint64_t;
@@ -378,9 +379,15 @@ int main(int argc, char** argv)
     if (!no_ps) key = fnv(pixel_code, sizeof(pixel_code), key);
     key = fnv(mesh_code, sizeof(mesh_code), key);
     key = fnv(title_blob->GetBufferPointer(), title_blob->GetBufferSize(), key);
-    {  // trace_statez: X2W_MESH_DUMP_INPUTS=<this key> (read by the stand-in at the first traced mesh call)
-        char traced_now[8]{}, key_hex[24];
-        if ((mode == "statez" || mode == "zero") && GetEnvironmentVariableA("X2W_D3D12_TRACE_ALL", traced_now, sizeof(traced_now)) && traced_now[0] == '1') {
+    // trace_statez / trace_zero, and dump_statez / dump_zero (X2W_TEST_MESH_DUMP=1, NOT traced: the dump does not need
+    // the traced frame): X2W_MESH_DUMP_INPUTS lists this key (read by the stand-in at the first mesh call with groups).
+    char dump_env[8]{};
+    const bool dump_test = (mode == "statez" || mode == "zero") &&
+                           ((GetEnvironmentVariableA("X2W_D3D12_TRACE_ALL", dump_env, sizeof(dump_env)) && dump_env[0] == '1') ||
+                            (GetEnvironmentVariableA("X2W_TEST_MESH_DUMP", dump_env, sizeof(dump_env)) && dump_env[0] == '1'));
+    {
+        char key_hex[24];
+        if (dump_test) {
             std::snprintf(key_hex, sizeof(key_hex), "%016llx", static_cast<unsigned long long>(key));
             // A list: another key first, then this one (each listed key is dumped once).
             SetEnvironmentVariableA("X2W_MESH_DUMP_INPUTS", (std::string("0000000000000001, ") + key_hex).c_str());
@@ -1208,50 +1215,83 @@ int main(int argc, char** argv)
                     ++failures;
                 }
             }
-            // X2W_MESH_DUMP_INPUTS (statez): the dump folder next to the log, the vertex srv bytes equal to the test's
-            // vertices, entry constants, root constants and the 12-byte record of an issued call.
-            if (mode == "statez") {
-                const std::wstring dump = cache + L"\\mesh_dump_" + std::wstring(key_text, key_text + 16) + L"\\";
-                const auto read_all = [](const std::wstring& path) {
-                    std::ifstream f(path, std::ios::binary);
-                    return std::string{std::istreambuf_iterator<char>(f), {}};
-                };
-                const std::string index = read_all(dump + L"index.txt");
-                bool vertices_found = false;
-                for (int s = 0; s < 8 && !vertices_found; ++s) {
-                    const std::string bytes = read_all(dump + L"srv" + std::to_wstring(s) + L".bin");
-                    vertices_found = bytes.size() == sizeof(vertices) && std::memcmp(bytes.data(), vertices, sizeof(vertices)) == 0;
-                }
-                const std::string record = read_all(dump + L"record.bin");
-                // The heap buffer named by root constant [0][1] (bit 28, index 0): the vertices again, and its descriptor.
-                const std::string heap0 = read_all(dump + L"heap0.bin"), heap0_desc = read_all(dump + L"heap0_desc.bin");
-                const bool heap_ok = heap0.size() == sizeof(vertices) && std::memcmp(heap0.data(), vertices, sizeof(vertices)) == 0 &&
-                                     heap0_desc.size() == 32 && index.find("(root constant [0][1] = 0x10000000)") != std::string::npos &&
-                                     index.find("heap3") == std::string::npos;
-                // The list's other key (0000000000000001) matches no call: no folder for it.
-                const DWORD other = GetFileAttributesW((cache + L"\\mesh_dump_0000000000000001").c_str());
-                const bool dump_ok = other == INVALID_FILE_ATTRIBUTES && has("x2w-mesh X2W_MESH_DUMP_INPUTS: 2 key(s)") && heap_ok &&
-                                     vertices_found && index.find("entry.bin ") != std::string::npos &&
-                                     index.find("root_constants.bin 512 bytes") != std::string::npos && record.size() == 12 &&
-                                     index.find("call issued") != std::string::npos && has(std::string("x2w-mesh dump ") + key_text + ":");
-                std::printf("log: dump index:\n%s(vertices found %d, record %zu bytes)\n", index.c_str(), vertices_found, record.size());
-                if (!dump_ok) {
-                    std::printf("FAIL: the X2W_MESH_DUMP_INPUTS files do not match (heap buffer %d)\n", heap_ok);
-                    ++failures;
-                }
-            }
-            if (mode == "zero") {  // the control: the key is listed, but its only call has X = 0 at record time: no dump
-                const DWORD folder = GetFileAttributesW((cache + L"\\mesh_dump_" + std::wstring(key_text, key_text + 16)).c_str());
-                const bool none = folder == INVALID_FILE_ATTRIBUTES && !has(std::string("x2w-mesh dump ") + key_text + ":") &&
-                                  has("x2w-mesh X2W_MESH_DUMP_INPUTS: 2 key(s)");
-                std::printf("log: zero-group call dumped %d\n", !none);
-                if (!none) {
-                    std::printf("FAIL: a call with X = 0 was dumped\n");
-                    ++failures;
-                }
-            }
             log_tail = after.substr(log.size() < after.size() ? log.size() : after.size());
         }
+    }
+    if (dump_test) {  // X2W_MESH_DUMP_INPUTS, traced or not (the dump selects the first call with groups in any frame)
+        // X2W_MESH_DUMP_INPUTS (statez): the dump folder next to the log, the vertex srv bytes equal to the test's
+        // vertices, entry constants, root constants and the 12-byte record of an issued call.
+        if (mode == "statez") {
+            const std::wstring dump = cache + L"\\mesh_dump_" + std::wstring(key_text, key_text + 16) + L"\\";
+            const auto read_all = [](const std::wstring& path) {
+                std::ifstream f(path, std::ios::binary);
+                return std::string{std::istreambuf_iterator<char>(f), {}};
+            };
+            const std::string index = read_all(dump + L"index.txt");
+            bool vertices_found = false;
+            for (int s = 0; s < 8 && !vertices_found; ++s) {
+                const std::string bytes = read_all(dump + L"srv" + std::to_wstring(s) + L".bin");
+                vertices_found = bytes.size() == sizeof(vertices) && std::memcmp(bytes.data(), vertices, sizeof(vertices)) == 0;
+            }
+            const std::string record = read_all(dump + L"record.bin");
+            // The heap buffer named by root constant [0][1] (bit 28, index 0): the vertices again, and its descriptor.
+            const std::string heap0 = read_all(dump + L"heap0.bin"), heap0_desc = read_all(dump + L"heap0_desc.bin");
+            const bool heap_ok = heap0.size() == sizeof(vertices) && std::memcmp(heap0.data(), vertices, sizeof(vertices)) == 0 &&
+                                 heap0_desc.size() == 32 && index.find("(root constant [0][1] = 0x10000000)") != std::string::npos &&
+                                 index.find("heap3") == std::string::npos;
+            // The list's other key (0000000000000001) matches no call: no folder for it.
+            const DWORD other = GetFileAttributesW((cache + L"\\mesh_dump_0000000000000001").c_str());
+            const bool dump_ok = other == INVALID_FILE_ATTRIBUTES && has("x2w-mesh X2W_MESH_DUMP_INPUTS: 2 key(s)") && heap_ok &&
+                                 vertices_found && index.find("entry.bin ") != std::string::npos &&
+                                 index.find("root_constants.bin 512 bytes") != std::string::npos && record.size() == 12 &&
+                                 index.find("call issued") != std::string::npos && has(std::string("x2w-mesh dump ") + key_text + ":");
+            std::printf("log: dump index:\n%s(vertices found %d, record %zu bytes)\n", index.c_str(), vertices_found, record.size());
+            if (!dump_ok) {
+                std::printf("FAIL: the X2W_MESH_DUMP_INPUTS files do not match (heap buffer %d)\n", heap_ok);
+                ++failures;
+            }
+        }
+        if (mode == "zero") {  // the control: the key is listed, but its only call has X = 0 at record time: no dump
+            const DWORD folder = GetFileAttributesW((cache + L"\\mesh_dump_" + std::wstring(key_text, key_text + 16)).c_str());
+            const bool none = folder == INVALID_FILE_ATTRIBUTES && !has(std::string("x2w-mesh dump ") + key_text + ":") &&
+                              has("x2w-mesh X2W_MESH_DUMP_INPUTS: 2 key(s)");
+            std::printf("log: zero-group call dumped %d\n", !none);
+            if (!none) {
+                std::printf("FAIL: a call with X = 0 was dumped\n");
+                ++failures;
+            }
+        }
+    }
+    // X2W_MESH_STATS_FRAMES=1 (framestats_* tests, not traced): the frame's mesh calls carry a statistics query; the
+    // frame is closed and reported here (the fixture has no present; the GPU work is complete). gpu: record-time X 1 >
+    // 0, so the frame counts: one target-set line with 1 call (1 with groups), the GPU's 2 groups = 6 MS invocations, 2
+    // triangles; zero (control): X = 0 at record time, the frame does not count: no target-set line.
+    char frames_env[8]{};
+    if (GetEnvironmentVariableA("X2W_MESH_STATS_FRAMES", frames_env, sizeof(frames_env)) && frames_env[0]) {
+        x2w_d3d12_mesh_frame_stats_report();
+        std::ifstream again(log_path, std::ios::binary);
+        const std::string after{std::istreambuf_iterator<char>(again), {}};
+        std::string set_line, total_line;
+        for (std::size_t p = after.find("x2w-mesh stats frame "); p != std::string::npos && set_line.empty(); p = after.find("x2w-mesh stats frame ", p + 1)) {
+            const std::string line = after.substr(p, after.find('\n', p) - p);
+            if (line.find(" set ") != std::string::npos) set_line = line;  // a target-set line (not "not counted")
+        }
+        if (const std::size_t p = after.find("x2w-mesh stats frames total "); p != std::string::npos) total_line = after.substr(p, after.find('\n', p) - p);
+        std::printf("log: frame stats \"%s\" / \"%s\"\n", set_line.c_str(), total_line.c_str());
+        const bool set_ok = mode == "zero"
+            ? set_line.empty() && after.find("x2w-mesh stats frame 0 not counted (no record with X > 0") != std::string::npos
+            : set_line.find(" set targets 1 [fmt 28 32x32] dsv none: calls 1 (1 with groups), ") != std::string::npos &&
+                  (set_line.find("MS invocations 6 primitives 2, clipper invocations 2 primitives 2, PS invocations ") != std::string::npos ||
+                   set_line.find("(no MS counts) clipper invocations 2 primitives 2") != std::string::npos) &&
+                  total_line.find("x2w-mesh stats frames total 1 of 1 frames") == 0;
+        if (!set_ok) {
+            std::printf("FAIL: the X2W_MESH_STATS_FRAMES lines do not match mode %s\n", mode.c_str());
+            ++failures;
+        }
+        log_tail += after.substr(log.size() < after.size() ? log.size() : after.size());
+    } else if (has("X2W_MESH_STATS_FRAMES") || has("x2w-mesh stats frame")) {  // every other run: the switch is off
+        std::printf("FAIL: frame statistics lines without X2W_MESH_STATS_FRAMES\n");
+        ++failures;
     }
     const std::string debug_log = log + log_tail;
     for (std::size_t p = debug_log.find("x2w-d3d12-debug"); p != std::string::npos; p = debug_log.find("x2w-d3d12-debug", p + 1)) {

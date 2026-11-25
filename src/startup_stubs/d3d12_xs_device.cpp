@@ -5309,6 +5309,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         static LONG busy_end, busy_next;
         const LONG dispatched = InterlockedExchange(&frame_dispatches, 0);
         mesh_stats_present(frame);  // LOCAL meshrt: traced mesh calls' pipeline statistics, 8 presents after the traced frame
+        mesh_fs_present();          // LOCAL meshrt: X2W_MESH_STATS_FRAMES
         if (busy && busy_end && frame == busy_end) {
             InterlockedExchange(&trace_frame_active, 0);
             log("x2w-frame ---- end busy frame %ld", frame);

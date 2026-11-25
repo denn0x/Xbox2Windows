@@ -417,6 +417,10 @@ thread_local IndirectPending* indirect_current;
 // x2w-frame mesh line (d3d12_mesh.inl mesh_trace_call); null otherwise.
 thread_local const unsigned char* mesh_trace_record;
 thread_local UINT mesh_trace_stride, mesh_trace_max;
+// Also outside the traced frame while an X2W_MESH_DUMP_INPUTS key is not dumped yet or X2W_MESH_STATS_FRAMES collects
+// (d3d12_mesh.inl): both select by the record's group counts.
+bool mesh_fs_collecting();
+bool mesh_record_wanted() { return trace_frame_active || mesh_dump_pending() || mesh_fs_collecting(); }
 
 bool indirect_pending(Wrapper* self) { return indirect_current && !indirect_current->issued && indirect_current->list == self; }
 
@@ -629,7 +633,7 @@ void indirect_run(Wrapper* self, ID3D12GraphicsCommandList* list, int type, Wrap
         (count_resource && !indirect_window(count_resource, count_offset, 4, &p.count_window, &p.count_at)))
         return indirect_skip(type, skip_unresolved_buffer);
     mesh_trace_record = nullptr;
-    if (type == itype_mesh && trace_frame_active) {  // LOCAL meshrt: traced frame only
+    if (type == itype_mesh && mesh_record_wanted()) {  // LOCAL meshrt: traced frame, pending dump, frame statistics
         mesh_trace_record = arguments->own().kind == resource_kind && arguments->own().title_memory
                                 ? static_cast<const unsigned char*>(arguments->own().title_memory) + offset : nullptr;
         mesh_trace_stride = stride;

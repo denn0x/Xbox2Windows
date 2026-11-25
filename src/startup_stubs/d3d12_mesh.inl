@@ -716,6 +716,217 @@ void mesh_stats_present(LONG frame)
     else if (frame >= due) mesh_stats_report();
 }
 extern "C" __declspec(dllexport) void x2w_d3d12_mesh_stats_report() { mesh_stats_report(); }  // fixtures, after their fence
+
+// LOCAL meshrt: X2W_MESH_STATS_FRAMES=<n> (default 0: off). Outside the traced frame, every issued mesh call gets a
+// pipeline statistics query (its own query heap, 16 frame slots of 2048 calls) until n frames have been COUNTED: a frame
+// counts when at least one of its mesh calls had a record with X, Y, Z > 0 in title memory at record time. 8 presents
+// after a frame ends its results are read (no GPU wait); a counted frame prints one line per target set (render target
+// formats / sizes + depth format / size; the resources at the end of the line) with the call count, the calls with
+// groups and the summed statistics, then a frame line; a frame that does not count prints one "not counted" line (the
+// first 8 only). The traced frame keeps its per-call queries (mesh_stats) and is not part of this.
+struct MeshFrameSlot {
+    LONG frame = -1;      // the frame id collected in this slot (-1: free)
+    LONG used = 0;        // calls handed a query
+    LONG groups = 0;      // calls with a record with groups (record time)
+    LONG due = 0;         // present count at which to read
+    bool closed = false;  // the frame has ended (due is set)
+};
+constexpr UINT mesh_fs_slots = 16, mesh_fs_calls = 2048;
+struct MeshFrameCall {
+    u64 set = 0;          // target-set hash
+    bool groups = false;  // the record had X, Y, Z > 0 at record time
+};
+SRWLOCK mesh_fs_lock = SRWLOCK_INIT;
+ID3D12QueryHeap* mesh_fs_heap;
+ID3D12Resource* mesh_fs_readback;
+bool mesh_fs_failed;
+MeshFrameSlot mesh_fs_slot[mesh_fs_slots];
+std::vector<MeshFrameCall>& mesh_fs_calls_of() { static std::vector<MeshFrameCall> v(mesh_fs_slots * mesh_fs_calls); return v; }
+std::map<u64, std::string>& mesh_fs_sets() { static std::map<u64, std::string> m; return m; }  // under mesh_fs_lock
+LONG mesh_fs_current;     // the frame id being collected
+LONG mesh_fs_presents;    // presents seen
+LONG mesh_fs_counted;     // frames counted so far
+LONG mesh_fs_reported;    // counted frames reported
+LONG mesh_fs_skipped_lines;
+LONG mesh_fs_wanted()
+{
+    static const LONG n = [] {
+        char v[16]{};
+        const LONG k = GetEnvironmentVariableA("X2W_MESH_STATS_FRAMES", v, sizeof(v)) ? std::atol(v) : 0;
+        if (k > 0) log("x2w-mesh X2W_MESH_STATS_FRAMES=%ld: mesh calls carry statistics queries until %ld frames with groups are counted", k, k);
+        return k > 0 ? k : 0;
+    }();
+    return n;
+}
+bool mesh_fs_collecting() { return mesh_fs_wanted() && mesh_fs_counted < mesh_fs_wanted() && !mesh_fs_failed; }
+bool mesh_fs_ready()
+{
+    if (!mesh_stats_ready()) return false;  // the query type (v1 or not) is chosen there
+    AcquireSRWLockExclusive(&mesh_fs_lock);
+    if (!mesh_fs_heap && !mesh_fs_failed) {
+        ID3D12Device* device = device_of(the_device);
+        const UINT count = mesh_fs_slots * mesh_fs_calls;
+        const D3D12_QUERY_HEAP_DESC desc{mesh_stats.v1 ? D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1 : D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, count, 0};
+        D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, u64{count} * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1), 1, 1, 1,
+                                   DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+        const HRESULT hq = device->CreateQueryHeap(&desc, IID_PPV_ARGS(&mesh_fs_heap));
+        const HRESULT hb = SUCCEEDED(hq) ? device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                                          nullptr, IID_PPV_ARGS(&mesh_fs_readback)) : hq;
+        if (FAILED(hb)) {
+            if (mesh_fs_heap) mesh_fs_heap->Release();
+            mesh_fs_heap = nullptr;
+            mesh_fs_failed = true;
+        }
+        mesh_fs_calls_of();
+        mesh_fs_slot[0].frame = mesh_fs_current;
+        log("x2w-mesh X2W_MESH_STATS_FRAMES query heap (%u queries) -> 0x%08lx / 0x%08lx", count, static_cast<unsigned long>(hq),
+            static_cast<unsigned long>(hb));
+    }
+    const bool made = mesh_fs_heap != nullptr;
+    ReleaseSRWLockExclusive(&mesh_fs_lock);
+    return made;
+}
+// The target set of this call: hash, and its text the first time it is seen.
+u64 mesh_fs_set(const Pass& pass)
+{
+    u64 h = fnv_bytes(&pass.target_count, sizeof(pass.target_count), 1469598103934665603ull);
+    for (UINT i = 0; i < pass.target_count; ++i) h = fnv_bytes(&pass.targets[i], sizeof(pass.targets[i]), h);
+    h = fnv_bytes(&pass.dsv_resource, sizeof(pass.dsv_resource), h);
+    AcquireSRWLockShared(&mesh_fs_lock);
+    const bool known = mesh_fs_sets().count(h) != 0;
+    ReleaseSRWLockShared(&mesh_fs_lock);
+    if (known) return h;
+    char text[600];
+    int n = std::snprintf(text, sizeof(text), "targets %u", pass.target_count);
+    std::string res = "; resources";
+    char part[64];
+    for (UINT i = 0; i < pass.target_count && n > 0 && n < 480; ++i) {
+        const D3D12_RESOURCE_DESC rd = pass.targets[i] ? pass.targets[i]->GetDesc() : D3D12_RESOURCE_DESC{};
+        n += std::snprintf(text + n, sizeof(text) - n, " [fmt %d %llux%u]", static_cast<int>(pass.target_formats[i]),
+                           static_cast<unsigned long long>(rd.Width), rd.Height);
+        std::snprintf(part, sizeof(part), " rt%u %p", i, static_cast<void*>(pass.targets[i]));
+        res += part;
+    }
+    if (pass.dsv_resource && n > 0 && n < 540) {
+        const D3D12_RESOURCE_DESC dd = pass.dsv_resource->GetDesc();
+        std::snprintf(text + n, sizeof(text) - n, " dsv fmt %d %llux%u", static_cast<int>(pass.dsv_format), static_cast<unsigned long long>(dd.Width),
+                      dd.Height);
+        std::snprintf(part, sizeof(part), " dsv %p", static_cast<void*>(pass.dsv_resource));
+        res += part;
+    } else if (n > 0 && n < 540) {
+        std::snprintf(text + n, sizeof(text) - n, " dsv none");
+    }
+    AcquireSRWLockExclusive(&mesh_fs_lock);
+    mesh_fs_sets().emplace(h, std::string(text) + '\x1f' + res);
+    ReleaseSRWLockExclusive(&mesh_fs_lock);
+    return h;
+}
+// mesh_hook: a query index for this call, or -1. The current frame's slot.
+LONG mesh_fs_begin(const Pass& pass, bool groups)
+{
+    if (!mesh_fs_collecting() || !mesh_fs_ready()) return -1;
+    const LONG frame = mesh_fs_current;
+    MeshFrameSlot& slot = mesh_fs_slot[static_cast<UINT>(frame) % mesh_fs_slots];
+    if (slot.frame != frame) return -1;  // the slot is still being read (cannot happen with 16 slots and 8 presents)
+    const LONG i = InterlockedIncrement(&slot.used) - 1;
+    if (i >= static_cast<LONG>(mesh_fs_calls)) return -1;
+    if (groups) InterlockedIncrement(&slot.groups);
+    MeshFrameCall& call = mesh_fs_calls_of()[(static_cast<UINT>(frame) % mesh_fs_slots) * mesh_fs_calls + static_cast<UINT>(i)];
+    call.set = mesh_fs_set(pass);
+    call.groups = groups;
+    return static_cast<LONG>((static_cast<UINT>(frame) % mesh_fs_slots) * mesh_fs_calls) + i;
+}
+void mesh_fs_read(UINT s)
+{
+    MeshFrameSlot& slot = mesh_fs_slot[s];
+    const LONG used = slot.used < static_cast<LONG>(mesh_fs_calls) ? slot.used : static_cast<LONG>(mesh_fs_calls);
+    const bool counted = slot.groups > 0;
+    if (counted && used > 0 && mesh_fs_readback) {
+        struct Sum {
+            LONG calls = 0, groups = 0;
+            std::uint64_t v[5] = {};
+        };
+        std::map<u64, Sum> sums;
+        Sum all;
+        void* mapped = nullptr;
+        const SIZE_T base = SIZE_T{s} * mesh_fs_calls * mesh_stats_size();
+        const D3D12_RANGE range{base, base + static_cast<SIZE_T>(used) * mesh_stats_size()};
+        if (SUCCEEDED(mesh_fs_readback->Map(0, &range, &mapped))) {
+            for (LONG i = 0; i < used; ++i) {
+                D3D12_QUERY_DATA_PIPELINE_STATISTICS1 q{};
+                std::memcpy(&q, static_cast<const unsigned char*>(mapped) + base + std::size_t(i) * mesh_stats_size(), mesh_stats_size());
+                const MeshFrameCall& call = mesh_fs_calls_of()[s * mesh_fs_calls + static_cast<UINT>(i)];
+                const std::uint64_t v[5] = {q.MSInvocations, q.MSPrimitives, q.CInvocations, q.CPrimitives, q.PSInvocations};
+                for (Sum* sum : {&sums[call.set], &all}) {
+                    ++sum->calls;
+                    sum->groups += call.groups;
+                    for (int k = 0; k < 5; ++k) sum->v[k] += v[k];
+                }
+            }
+            const D3D12_RANGE none{0, 0};
+            mesh_fs_readback->Unmap(0, &none);
+        }
+        const LONG number = InterlockedIncrement(&mesh_fs_reported);
+        for (const auto& [set, sum] : sums) {
+            AcquireSRWLockShared(&mesh_fs_lock);
+            const auto found = mesh_fs_sets().find(set);
+            const std::string text = found == mesh_fs_sets().end() ? std::string("?\x1f") : found->second;
+            ReleaseSRWLockShared(&mesh_fs_lock);
+            const std::size_t cut = text.find('\x1f');
+            if (mesh_stats.v1)
+                log("x2w-mesh stats frame %ld set %s: calls %ld (%ld with groups), MS invocations %llu primitives %llu, clipper invocations %llu "
+                    "primitives %llu, PS invocations %llu%s", slot.frame, text.substr(0, cut).c_str(), sum.calls, sum.groups, sum.v[0], sum.v[1],
+                    sum.v[2], sum.v[3], sum.v[4], text.substr(cut + 1).c_str());
+            else
+                log("x2w-mesh stats frame %ld set %s: calls %ld (%ld with groups), (no MS counts) clipper invocations %llu primitives %llu, PS "
+                    "invocations %llu%s", slot.frame, text.substr(0, cut).c_str(), sum.calls, sum.groups, sum.v[2], sum.v[3], sum.v[4],
+                    text.substr(cut + 1).c_str());
+        }
+        log("x2w-mesh stats frames total %ld of %ld frames (frame %ld): %zu target sets, calls %ld (%ld with groups%s), MS invocations %llu "
+            "primitives %llu, clipper invocations %llu primitives %llu, PS invocations %llu", number, mesh_fs_wanted(), slot.frame, sums.size(),
+            all.calls, all.groups, slot.used > static_cast<LONG>(mesh_fs_calls) ? "; calls past 2048 had no query" : "", all.v[0], all.v[1], all.v[2],
+            all.v[3], all.v[4]);
+    } else if (first_calls(mesh_fs_skipped_lines, 8)) {
+        log("x2w-mesh stats frame %ld not counted (no record with X > 0 at record time; %ld mesh calls)", slot.frame, slot.used);
+    }
+    slot.used = slot.groups = 0;
+    slot.due = 0;
+    slot.closed = false;
+    slot.frame = -1;
+}
+// Ends the frame being collected: it counts if a call had groups; its results are read `delay` presents later.
+void mesh_fs_close(LONG delay)
+{
+    AcquireSRWLockExclusive(&mesh_fs_lock);
+    const LONG frame = mesh_fs_current;
+    MeshFrameSlot& slot = mesh_fs_slot[static_cast<UINT>(frame) % mesh_fs_slots];
+    if (slot.frame == frame) {
+        if (slot.groups > 0) ++mesh_fs_counted;
+        slot.due = mesh_fs_presents + delay;
+        slot.closed = true;
+    }
+    mesh_fs_current = frame + 1;
+    MeshFrameSlot& next = mesh_fs_slot[static_cast<UINT>(frame + 1) % mesh_fs_slots];
+    if (next.frame == -1 && mesh_fs_counted < mesh_fs_wanted()) next.frame = frame + 1;
+    ReleaseSRWLockExclusive(&mesh_fs_lock);
+}
+void mesh_fs_present()
+{
+    if (!mesh_fs_wanted() || !mesh_fs_heap) return;
+    const LONG now = InterlockedIncrement(&mesh_fs_presents);
+    mesh_fs_close(8);
+    for (UINT s = 0; s < mesh_fs_slots; ++s)
+        if (mesh_fs_slot[s].frame >= 0 && mesh_fs_slot[s].closed && now >= mesh_fs_slot[s].due) mesh_fs_read(s);
+}
+// Fixtures (after their fence): ends the current frame and reads every closed slot now.
+extern "C" __declspec(dllexport) void x2w_d3d12_mesh_frame_stats_report()
+{
+    if (!mesh_fs_heap) return;
+    mesh_fs_close(0);
+    for (UINT s = 0; s < mesh_fs_slots; ++s)
+        if (mesh_fs_slot[s].frame >= 0 && mesh_fs_slot[s].closed) mesh_fs_read(s);
+}
 void mesh_trace_call(Wrapper* self, bool drawn, const Translation* tr, const char* why)
 {
     const Pass& pass = pass_of(self);
@@ -954,7 +1165,20 @@ bool mesh_hook(Wrapper* self, ID3D12GraphicsCommandList* list)
             list->BeginQuery(mesh_stats.heap, mesh_stats_type(), static_cast<UINT>(slot));
         }
     }
+    // LOCAL meshrt: X2W_MESH_STATS_FRAMES: outside the traced frame, a query from the frame slots (mesh_fs_begin).
+    LONG fs_query = -1;
+    if (!trace_frame_active && mesh_fs_collecting()) {
+        std::uint32_t xyz[3] = {};
+        const bool groups = mesh_dump_record_groups(xyz) && xyz[0] && xyz[1] && xyz[2];
+        fs_query = mesh_fs_begin(pass_of(self), groups);
+        if (fs_query >= 0) list->BeginQuery(mesh_fs_heap, mesh_stats_type(), static_cast<UINT>(fs_query));
+    }
     const bool issued = draw_translated(self, false, 0, 0, 0, 0, 0);
+    if (fs_query >= 0) {
+        list->EndQuery(mesh_fs_heap, mesh_stats_type(), static_cast<UINT>(fs_query));
+        list->ResolveQueryData(mesh_fs_heap, mesh_stats_type(), static_cast<UINT>(fs_query), 1, mesh_fs_readback,
+                               u64{static_cast<UINT>(fs_query)} * mesh_stats_size());
+    }
     if (mesh_trace_query >= 0) {
         list->EndQuery(mesh_stats.heap, mesh_stats_type(), static_cast<UINT>(mesh_trace_query));
         list->ResolveQueryData(mesh_stats.heap, mesh_stats_type(), static_cast<UINT>(mesh_trace_query), 1, mesh_stats.readback,
