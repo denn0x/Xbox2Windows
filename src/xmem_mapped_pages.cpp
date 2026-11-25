@@ -939,7 +939,14 @@ BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* p
         want.resize(kept);
     }
     std::vector<ULONG_PTR> unmap, map_at, map_page;
+    BOOL ok = TRUE;
+    DWORD error = 0;
     {
+        // The plan (which addresses to unmap, which to map) and both steps under ONE hold of the mutex: a call from
+        // another thread naming the same addresses in between would make the plan wrong and the call fail (a "live"
+        // view on a map, a missing one on an unmap), where the console applies both calls one after the other.
+        const bool share_views = fault_retry.ready();
+        const MappingThread marker;
         const std::lock_guard guard(memory.mutex);
         for (const auto& [address, page] : want) {
             const auto live = memory.views.find(address);
@@ -954,17 +961,16 @@ BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* p
             map_at.push_back(address);
             map_page.push_back(page);
         }
-    }
-    BOOL ok = TRUE;
-    DWORD error = 0;
-    if (!unmap.empty() && !map_pages(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; }, what)) {
-        ok = FALSE;
-        error = GetLastError();
-    }
-    if (ok && !map_at.empty() &&
-        !map_pages(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; }, what)) {
-        ok = FALSE;
-        error = GetLastError();
+        if (!unmap.empty() &&
+            !map_pages_locked(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; }, share_views, what)) {
+            ok = FALSE;
+            error = GetLastError();
+        }
+        if (ok && !map_at.empty() &&
+            !map_pages_locked(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; }, share_views, what)) {
+            ok = FALSE;
+            error = GetLastError();
+        }
     }
     static LONG calls;
     if (!ok || x2w_local::first_calls(calls, 16))
