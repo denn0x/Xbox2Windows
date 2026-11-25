@@ -165,6 +165,7 @@ class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
     uses_q = False
     uses_swap = False
+    uses_xsave = False
 
     def __init__(self, pipe, kind, code):
         self.pipe, self.kind = pipe, kind
@@ -887,10 +888,18 @@ class Stage:
     def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
         d = reg_range(ops[0])[1]
         src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
+        # S0 is read before D is written: with D == S0 (s_and_saveexec_b64 s[6:7], s[6:7]) the new exec is
+        # exec & old S0, not exec & exec (RDNA 2 ISA SOP1: D = EXEC; EXEC = S0 & EXEC, with S0 the value read at issue).
+        if reg_range(ops[1]) and reg_range(ops[1])[0] == 's' and reg_range(ops[1])[1] == d:
+            self.uses_xsave = True
+            self.lines.append('xsave = %s;' % self.u(src))  # every lane: a temporary read only below
+            value = 'xsave'
+        else:
+            value = self.u(src)
         self.set_s(d, 'exec')
         self.masks.add(d)
         self.exec_known = False
-        self.emit('exec = (%s) & 1; scc = exec != 0;' % text.format(self.u(src)))
+        self.emit('exec = (%s) & 1; scc = exec != 0;' % text.format(value))
 
     op_s_and_saveexec_b32 = op_s_and_saveexec_b64
 
@@ -2243,6 +2252,8 @@ class Stage:
             lines.append('    uint2 q = 0;')
         if self.uses_swap:
             lines.append('    uint xswap = 0;')
+        if self.uses_xsave:
+            lines.append('    uint xsave = 0;')
         return lines
 
 
