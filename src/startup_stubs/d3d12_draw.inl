@@ -289,7 +289,7 @@ void report_draw_rt()  // draw_lock held
 bool texture_census_on();
 bool census_every_event();
 void report_memory_srv_census(long frame);
-enum TextureSource { ts_linear_srv, ts_tiled_address, ts_other, ts_detiled, ts_count };
+enum TextureSource { ts_linear_srv, ts_tiled_address, ts_other, ts_count };
 LONG64 census_real[ts_count], census_null[x2w_local::null_cause_count], census_real_format[128];
 LONG census_report_frame = -1;
 void log_texture_census(const char* when);
@@ -299,8 +299,7 @@ void census_texture_binding(Wrapper* resource, ID3D12Resource* texture, x2w_loca
     if (!texture) {
         InterlockedIncrement64(&census_null[static_cast<int>(cause)]);
     } else {
-        const int source = resource && resource->own().detiled_memory_srv ? ts_detiled
-                         : resource && resource->own().linear_memory_srv ? ts_linear_srv
+        const int source = resource && resource->own().linear_memory_srv ? ts_linear_srv
                          : resource && resource->own().tiled_address_srv ? ts_tiled_address : ts_other;
         InterlockedIncrement64(&census_real[source]);
         InterlockedIncrement64(&census_real_format[static_cast<UINT>(texture->GetDesc().Format) & 127]);
@@ -326,10 +325,8 @@ void log_texture_census(const char* when)
     used = 0;
     for (int c = 0; c < x2w_local::null_cause_count && used < 230; ++c)
         if (census_null[c]) used += std::snprintf(nulls + used, sizeof(nulls) - used, " cause%d:%lld", c, census_null[c]);
-    log("x2w-texcensus draw textures %s (cumulative): real %lld (linear memory srv %lld, tiled address %lld, other %lld, detiled %lld), "
-        "null%s; real by format%s",
-        when, census_real[0] + census_real[1] + census_real[2] + census_real[3], census_real[0], census_real[1], census_real[2],
-        census_real[3], nulls, formats);
+    log("x2w-texcensus draw textures %s (cumulative): real %lld (linear memory srv %lld, tiled address %lld, other %lld), null%s; real by format%s",
+        when, census_real[0] + census_real[1] + census_real[2], census_real[0], census_real[1], census_real[2], nulls, formats);
 }
 
 void count_null_binding(x2w_local::NullCause cause)
@@ -1758,7 +1755,6 @@ u64 hash_memory(const unsigned char* data, std::size_t bytes)
     for (std::size_t i = words * 8; i < bytes; ++i) h = (h ^ data[i]) * 0x100000001b3ull;
     return h;
 }
-x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r);  // d3d12_memory_srv.inl (X2W_MEMORY_SRV_DETILE)
 void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 {
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
@@ -1801,11 +1797,6 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const bool tiled_address = resource->own().tiled_address_srv;
     const bool tiled_bc7 = !tiled_chain && !tiled_address && written.bc7_width != 0;
     const bool tiled = tiled_bc7 || tiled_address || tiled_chain;
-    // LOCAL (textures): X2W_MEMORY_SRV_DETILE textures: the title memory holds the console layout of the console
-    // description (gfx10_layout.h); the readable window, the hash and the change check cover that whole surface.
-    const bool detiled = resource->own().detiled_memory_srv && original;
-    const x2w_startup::gfx10::Layout console_layout = detiled ? detile_layout(original->console) : x2w_startup::gfx10::Layout(~0u, false, 0, 0, 0, 0, 0);
-    if (resource->own().detiled_memory_srv && !console_layout.valid) return;
     const auto generation = written.generation;
     const x2w_startup::Bc16Surface surface(tiled_bc7 ? written.bc7_width : static_cast<UINT>(desc.Width),
                                          tiled_bc7 ? written.bc7_height : desc.Height);
@@ -1817,8 +1808,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     if (tiled && !tiled_chain && (plan.count != 1 || plan.rows[0] != surface.rows ||
                   plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
-    const u64 total = detiled ? console_layout.size
-        : tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled ? surface.size() : stride * (slices - 1) + slice_total;
+    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
     const bool recheck = (tiled_address || tiled_chain) ? elapsed != 0
@@ -1837,31 +1827,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         return;
     }
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (detiled) {
-        // Each element of each level, array slice or volume depth from its console address into the desktop
-        // footprint. Element extents are the desktop ones (rows and row bytes of the footprint), which addrlib's
-        // ceiling level extents contain.
-        const UINT eb = 1u << console_layout.elem_log2;
-        for (UINT s = 0; s < slices; ++s)
-            for (UINT i = 0; i < mips; ++i) {
-                const auto& fp = plan.placed[i];
-                const u64 bytes = plan.bytes(i);
-                u64 offset = 0;
-                auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
-                if (!rows) {
-                    state.done = false;
-                    return;
-                }
-                const UINT columns = static_cast<UINT>(plan.row_bytes[i] / eb), depth = fp.Footprint.Depth ? fp.Footprint.Depth : 1;
-                for (UINT z = 0; z < depth; ++z)
-                    for (UINT y = 0; y < plan.rows[i]; ++y) {
-                        auto* row = rows + (u64{z} * plan.rows[i] + y) * fp.Footprint.RowPitch;
-                        for (UINT x = 0; x < columns; ++x)
-                            std::memcpy(row + u64{x} * eb, memory + console_layout.address(i, x, y, volume ? z : s), eb);
-                    }
-                plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
-            }
-    } else if (tiled_chain) {
+    if (tiled_chain) {
         const x2w_startup::bc64::Chain chain(original->console);
         for (UINT slice = 0; slice < slices; ++slice) {
             for (UINT i = 0; i < mips; ++i) {

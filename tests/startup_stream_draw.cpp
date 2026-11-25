@@ -246,9 +246,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
     const bool single = integer || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
     const bool legacy = !single;
-    const bool detile = GetEnvironmentVariableW(L"X2W_TEST_DETILE_SRV", nullptr, 0) != 0;  // a 64x64 check target
-    const UINT width = detile ? 64 : bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : single ? 1 : 8;
-    const UINT height = detile ? 64 : bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
+    const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     Bc7Binding binding;
@@ -258,7 +257,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
-                                          legacy && !bc7 && !bc_chain && !detile ? width / 2 : width, frame)) return rc;
+                                          legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
@@ -280,9 +279,6 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
-    } else if (detile) {
-        extern int draw_detile_srvs(void*, void*);
-        if (const int result = draw_detile_srvs(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ANNOUNCED_SRV", nullptr, 0)) {
         extern int draw_announced_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_announced_srvs(desktop.Get(), guest, list)) return result;
