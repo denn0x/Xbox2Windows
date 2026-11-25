@@ -733,6 +733,21 @@ foreach(backend IN ITEMS warp hardware)
     endforeach()
 endforeach()
 
+# LOCAL stall: device slot 133 without the allocation walk once the heap is open (X2W_PLACED_FAST; walk = control).
+add_executable(startup_placed_fast tests/startup_placed_fast.cpp)
+target_compile_features(startup_placed_fast PRIVATE cxx_std_17)
+target_link_libraries(startup_placed_fast PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS fast walk)
+        add_test(NAME startup_placed_fast_${mode}_${backend} COMMAND startup_placed_fast ${backend} ${mode})
+        set(placed_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+        if(mode STREQUAL "fast")
+            set(placed_env "${placed_env};X2W_PLACED_FAST=1")
+        endif()
+        set_tests_properties(startup_placed_fast_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "${placed_env}")
+    endforeach()
+endforeach()
+
 # LOCAL stall: a translated slot-67 dispatch while its pipeline is held back (d3d12_compute.inl, X2W_CX_ASYNC).
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CountMain -Vn startup_cx_async_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"

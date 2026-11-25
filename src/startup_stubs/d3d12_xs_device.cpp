@@ -4492,7 +4492,32 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                           initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
     MEMORY_BASIC_INFORMATION region{};
     SIZE_T allocation_bytes = 0;
-    if (!rejected || always_walk)
+    // LOCAL stall: X2W_PLACED_FAST=1. Once the allocation's heap is open (existing_heaps), CreatePlacedResource is
+    // bounded by that heap's size, not by the committed prefix from the base, so the walk is skipped when the
+    // buffer lies inside the committed region already queried at `address` and inside the heap. Run 104 scene:
+    // 27 walks per frame at 6.1 ms each ("placed-query" 166 ms/frame on title threads).
+    static const bool placed_fast = x2w_local::env_on("X2W_PLACED_FAST");
+    bool fast = false;
+    if (placed_fast && !rejected && !always_walk) {
+        const auto* region_end = static_cast<const char*>(info.BaseAddress) + info.RegionSize;
+        if (static_cast<const char*>(address) + desc->Width <= region_end) {
+            UINT64 heap_bytes = 0;
+            {
+                std::lock_guard lock(placed_mutex);
+                for (auto& [known, h] : existing_heaps)
+                    if (known == base) heap_bytes = h->GetDesc().SizeInBytes;
+            }
+            if (heap_bytes && offset <= heap_bytes && desc->Width <= heap_bytes - offset) {
+                fast = true;
+                allocation_bytes = static_cast<SIZE_T>(heap_bytes);
+                static LONG fast_calls;
+                const LONG n = InterlockedIncrement(&fast_calls);
+                if (x2w_local::first_of(n, 3) || n % 10000 == 0)
+                    log("x2w-d3d12 slot133 X2W_PLACED_FAST: %ld calls placed without the allocation walk (heap %llu bytes)", n, heap_bytes);
+            }
+        }
+    }
+    if ((!rejected || always_walk) && !fast)
         for (auto* cursor = static_cast<char*>(base);
              VirtualQuery(cursor, &region, sizeof(region)) && region.AllocationBase == base && region.State == MEM_COMMIT;
              cursor += region.RegionSize)
