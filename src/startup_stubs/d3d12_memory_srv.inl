@@ -451,6 +451,94 @@ void __stdcall device_memory_uav(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     view_slot<19, 3>(self, reinterpret_cast<u64>(standin), 0, reinterpret_cast<u64>(&input->view), destination);
 }
 
+// LOCAL (textures): X2W_TEXTURE_CENSUS=1 counts every slot-70 outcome, and every refusal by its class (reason,
+// resource dimension, layout, format, mip chain or not, XG-announced address or not, first 256 bytes non-zero or
+// not), past the 2048-line refusal cap. Lines: "x2w-texcensus slot70 calls N: ..." at powers of two from 1024 and
+// "x2w-texcensus slot70 refusals N, top classes:" (up to 24 classes) at powers of two from 256.
+enum MemorySrvOutcome { mso_linear, mso_announced, mso_tiled, mso_buffer, mso_standin, mso_refused, mso_count };
+const char* const memory_srv_outcome_names[mso_count] = {"linear", "announced-linear", "tiled/bc64", "buffer", "stand-in buffer", "refused"};
+LONG64 memory_srv_outcomes[mso_count];
+std::mutex refusal_census_mutex;
+std::unordered_map<u64, LONG64> refusal_census;
+LONG64 refusal_census_total;
+const char* const census_reasons[] = {"null_destination", "unreadable_resource", "unreadable_view", "null_address",
+    "unsupported_description", "destination_outside_view_heaps", "buffer_unavailable", "texture_unavailable"};
+bool texture_census_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_TEXTURE_CENSUS");
+        if (v) log("x2w-texcensus X2W_TEXTURE_CENSUS=1: slot-70 outcomes and refusal classes, draw texture bindings real/null every 300 frames");
+        return v;
+    }();
+    return on;
+}
+void census_memory_srv_outcome(int outcome)
+{
+    if (!texture_census_on()) return;
+    InterlockedIncrement64(&memory_srv_outcomes[outcome]);
+    LONG64 total = 0;
+    for (LONG64 n : memory_srv_outcomes) total += n;
+    if (total >= 1024 && (total & (total - 1)) == 0)
+        log("x2w-texcensus slot70 calls %lld: linear %lld, announced-linear %lld, tiled/bc64 %lld, buffer %lld, stand-in buffer %lld, refused %lld",
+            total, memory_srv_outcomes[0], memory_srv_outcomes[1], memory_srv_outcomes[2], memory_srv_outcomes[3], memory_srv_outcomes[4],
+            memory_srv_outcomes[5]);
+}
+void census_refusal(const char* reason, const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input)
+{
+    if (!texture_census_on()) return;
+    census_memory_srv_outcome(mso_refused);
+    u64 r = 0;
+    while (r < std::size(census_reasons) && std::strcmp(census_reasons[r], reason) != 0) ++r;
+    const bool resource_ok = x2w_local::readable(resource, sizeof(*resource));
+    const bool input_ok = x2w_local::readable(input, sizeof(*input));
+    const u64 address = input_ok ? input->address : 0;
+    bool nonzero = false;
+    if (address && x2w_local::readable(reinterpret_cast<const void*>(address), 256)) {
+        const auto* bytes = reinterpret_cast<const unsigned char*>(address);
+        for (int i = 0; i < 256 && !nonzero; ++i) nonzero = bytes[i] != 0;
+    }
+    const u64 dim = resource_ok && resource->Dimension >= 0 && resource->Dimension <= 4 ? resource->Dimension : 7;
+    const u64 layout = resource_ok ? (static_cast<UINT>(resource->Layout) & 0x1ff) : 0x1ff;
+    const u64 format = resource_ok ? (static_cast<UINT>(resource->Format) & 0xff) : 0xff;
+    const u64 chain = resource_ok && resource->MipLevels > 1;
+    const u64 key = r | dim << 4 | layout << 8 | format << 20 | chain << 28 | u64{address && xg_announced(address)} << 29 | u64{nonzero} << 30;
+    std::lock_guard lock(refusal_census_mutex);
+    ++refusal_census[key];
+    const LONG64 total = ++refusal_census_total;
+    if (total < 256 || (total & (total - 1)) != 0) return;
+    std::vector<std::pair<LONG64, u64>> sorted;
+    for (const auto& [k, n] : refusal_census) sorted.emplace_back(n, k);
+    std::sort(sorted.begin(), sorted.end(), std::greater<>());
+    log("x2w-texcensus slot70 refusals %lld, %zu classes, top classes:", total, sorted.size());
+    for (std::size_t i = 0; i < sorted.size() && i < 24; ++i) {
+        const u64 k = sorted[i].second;
+        log("x2w-texcensus   %lld x %s dim %llu layout 0x%llx fmt %llu %s %s %s", sorted[i].first,
+            (k & 15) < std::size(census_reasons) ? census_reasons[k & 15] : "other", (k >> 4) & 15, (k >> 8) & 0x1ff, (k >> 20) & 0xff,
+            (k >> 28) & 1 ? "mips>1" : "mips=1", (k >> 29) & 1 ? "announced" : "not-announced", (k >> 30) & 1 ? "nonzero" : "zero");
+    }
+}
+
+// LOCAL (textures): device slot 61 is a no-op that the title calls instead of CreateSampler (slot 22, never called
+// in run 97): run 97 trap.log 214, rdx = a stack block, r8 = the start of the 128-entry CPU sampler heap (line 114),
+// r9 = 1; each call is followed by CopyDescriptorsSimple of one type-1 descriptor into the shader-visible sampler
+// heap (lines 216, 258, 449; 54 calls each). With X2W_TEXTURE_CENSUS=1 this handler replaces the no-op: it logs the
+// first 16 calls with 64 bytes at rdx (the description, whatever its form) and still does nothing.
+u64 __stdcall device_slot61_census(Wrapper* self, u64 rdx, u64 r8, u64 r9)
+{
+    (void)self;
+    static LONG calls;
+    if (first_calls(calls, 16)) {
+        char hex[200] = "unreadable";
+        if (x2w_local::readable(reinterpret_cast<const void*>(rdx), 64)) {
+            const auto* w = reinterpret_cast<const std::uint32_t*>(rdx);
+            int used = 0;
+            for (int i = 0; i < 16; ++i) used += std::snprintf(hex + used, sizeof(hex) - used, "%08x ", w[i]);
+        }
+        log("x2w-texcensus Device::slot61 (sampler?) rdx=0x%llx r8=0x%llx r9=0x%llx words %s", rdx, r8, r9, hex);
+    }
+    return 0;
+}
+
 // The first check that refuses a call, in the order the checks run; null when every check passes.
 const char* memory_srv_refusal(const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, u64 destination)
 {
@@ -512,12 +600,14 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                     bytes >> 10, destination);
             }
             note_linear_form(linear_form(input->view.ViewDimension), destination);
+            census_memory_srv_outcome(plain ? mso_linear : mso_announced);
             view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
             return;
         }
     }
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         if (first_calls(refused, noop_census_enabled() ? 2048 : 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
+        census_refusal(reason, resource, input);
         return;
     }
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -530,6 +620,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             // LOCAL (video): no buffer resource covers the address; a stand-in whose title memory starts there.
             if (Wrapper* standin = standin_memory_buffer(input->address, *resource, span_bytes)) {
                 note_linear_form(lf_buffer_srv, destination);
+                census_memory_srv_outcome(mso_standin);
                 view_slot<18, 2>(self, reinterpret_cast<u64>(standin), reinterpret_cast<u64>(&input->view), destination, 0);
                 return;
             }
@@ -540,8 +631,10 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             if (first_calls(refused, noop_census_enabled() ? 2048 : 8))
                 log_refused_memory_srv("unavailable buffer at the supplied address", "buffer_unavailable",
                                        resource, input, destination);
+            census_refusal("buffer_unavailable", resource, input);
             return;
         }
+        census_memory_srv_outcome(mso_buffer);
         view_slot<18, 2>(self, reinterpret_cast<u64>(buffer), reinterpret_cast<u64>(&adjusted), destination, 0);
         return;
     }
@@ -550,7 +643,9 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (!texture) {
         if (first_calls(refused, noop_census_enabled() ? 2048 : 8))
             log_refused_memory_srv("unavailable texture at the supplied base and layout", "texture_unavailable", resource, input, destination);
+        census_refusal("texture_unavailable", resource, input);
         return;
     }
+    census_memory_srv_outcome(mso_tiled);
     view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
 }

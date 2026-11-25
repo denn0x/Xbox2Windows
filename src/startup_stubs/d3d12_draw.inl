@@ -256,8 +256,10 @@ LONG cg_gpu, cg_same_window, cg_copy_list, cg_record_too, cg_fallback[cf_reasons
 LONG64 cg_bytes;
 std::size_t gpu_written_count();  // draw_lock held
 LONG rt_report_frame = -1;
+void report_texture_census();
 void report_draw_rt()  // draw_lock held
 {
+    report_texture_census();
     if (frame_number % 300 || frame_number == rt_report_frame) return;
     LONG fallbacks = 0;
     for (LONG f : cg_fallback) fallbacks += f;
@@ -278,6 +280,41 @@ void report_draw_rt()  // draw_lock held
         frame_number, rt_loaded_word3, rt_loaded_uav, rt_loaded_heap, rt_word3_set, rt_word3_zero,
         rt_uav_draws, rt_uav_buf_bound, rt_uav_buf_unresolved, rt_uav_buf_misaligned, rt_srv_in_place, rt_srv_stale_copy,
         rt_uav_tex[0], rt_uav_tex[1], rt_uav_tex[2], rt_uav_tex[3], rt_uav_tex[4], rt_uav_tex[5], rt_heap_draws, rt_heap_skipped);
+}
+
+// LOCAL (textures): X2W_TEXTURE_CENSUS=1 (d3d12_memory_srv.inl). Table texture srvs of translated draws, counted
+// by outcome: bound to a real texture (by where the texture came from, and by desktop format) or null (by cause).
+// One "x2w-texcensus draw textures" line every 300 frames, cumulative.
+bool texture_census_on();
+enum TextureSource { ts_linear_srv, ts_tiled_address, ts_other, ts_count };
+LONG64 census_real[ts_count], census_null[x2w_local::null_cause_count], census_real_format[128];
+LONG census_report_frame = -1;
+void census_texture_binding(Wrapper* resource, ID3D12Resource* texture, x2w_local::NullCause cause)
+{
+    if (!texture_census_on()) return;
+    if (!texture) {
+        InterlockedIncrement64(&census_null[static_cast<int>(cause)]);
+        return;
+    }
+    const int source = resource && resource->own().linear_memory_srv ? ts_linear_srv
+                     : resource && resource->own().tiled_address_srv ? ts_tiled_address : ts_other;
+    InterlockedIncrement64(&census_real[source]);
+    InterlockedIncrement64(&census_real_format[static_cast<UINT>(texture->GetDesc().Format) & 127]);
+}
+void report_texture_census()  // draw_lock held
+{
+    if (!texture_census_on() || frame_number % 300 || frame_number == census_report_frame) return;
+    census_report_frame = frame_number;
+    char formats[512] = "";
+    int used = 0;
+    for (int f = 0; f < 128 && used < 480; ++f)
+        if (census_real_format[f]) used += std::snprintf(formats + used, sizeof(formats) - used, " %d:%lld", f, census_real_format[f]);
+    char nulls[256] = "";
+    used = 0;
+    for (int c = 0; c < x2w_local::null_cause_count && used < 230; ++c)
+        if (census_null[c]) used += std::snprintf(nulls + used, sizeof(nulls) - used, " cause%d:%lld", c, census_null[c]);
+    log("x2w-texcensus draw textures frame %ld: real %lld (linear memory srv %lld, tiled address %lld, other %lld), null%s; real by format%s",
+        frame_number, census_real[0] + census_real[1] + census_real[2], census_real[0], census_real[1], census_real[2], nulls, formats);
 }
 
 void count_null_binding(x2w_local::NullCause cause)
@@ -2277,6 +2314,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             facts.resource_wrapper = had_texture;
             facts.dimension_matches = !mismatched;
             count_null_binding(x2w_local::classify_null_binding(facts));
+            census_texture_binding(resource, texture, x2w_local::classify_null_binding(facts));
             note_null_texture(tr->key, i, entry, words, x2w_local::classify_null_binding(facts));
             D3D12_SHADER_RESOURCE_VIEW_DESC depth_default{};
             const bool no_desc = texture && record.desc_bytes < 40;

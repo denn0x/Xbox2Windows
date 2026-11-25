@@ -5339,6 +5339,7 @@ void build_tables()
     tables[device_kind][48] = reinterpret_cast<void*>(&device_create_command_queue_x);
     tables[device_kind][70] = reinterpret_cast<void*>(&device_memory_srv);
     if (memory_srv_buffer_on()) tables[device_kind][71] = reinterpret_cast<void*>(&device_memory_uav);  // LOCAL (video)
+    if (texture_census_on()) tables[device_kind][61] = reinterpret_cast<void*>(&device_slot61_census);  // LOCAL (textures)
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);
