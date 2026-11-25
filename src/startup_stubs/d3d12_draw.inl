@@ -3257,6 +3257,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
         const std::size_t full_bytes = bytes;  // LOCAL meshrt: the dump writes the whole range (up to 256 MiB)
+        if (mesh && trace_frame_active) record_trace_mesh_read(tr->key, i, srv.source, srv.a, srv.b, address, full_bytes);  // LOCAL (scene)
         if (bytes > (16u << 20)) bytes = 16u << 20;
         if (dumping) {  // LOCAL meshrt: X2W_MESH_DUMP_INPUTS
             char file[16], note[240];
@@ -3435,6 +3436,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 log("x2w-draw-rt bufword3 first use: pipeline %016llx entry value %zu = word 3 of srv %d = 0x%08x", tr->key, i, ud.a, values[i]);
         }
     }
+    if (mesh && trace_frame_active) record_trace_mesh_heap(self, *tr);  // LOCAL (scene): X2W_MESH_RECORD_TRACE heap reads
     if (dumping) {  // LOCAL meshrt: X2W_MESH_DUMP_INPUTS: the entry constants as set, their kinds, and the raw root constants
         SplitRelock relock(split, 100000 + __LINE__);
         char note[600];

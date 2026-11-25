@@ -13,6 +13,21 @@
 //      32-byte entries; '?' = may be an srv). Root views: R (the readable window from the root address, at most
 //      1 MiB). The report then names, per argument buffer, the dispatches whose ranges cover the records
 //      ("x2w-frame record writers").
+// Run 115 additions (same switch, same frame):
+//  (d) image entries: each table entry that is a texture view token (slot 18 / 19, not a buffer) or a raw gfx10 T#
+//      (word 3 TYPE 8-13) gives one "x2w-frame cx-img" line: the view or T# fields, the resource (wrapper, title
+//      memory, desktop resource, its size / mips / format / flags) and what this frame did to it before the dispatch
+//      ("content": drawn as a render / depth target N times so far (traced_targets), bound as a texture UAV by an
+//      earlier dispatch of the frame (key, #, state), or no writer seen in this frame). A raw T# is matched to a
+//      resource by its base address = the resource's title memory.
+//  (e) heap reads: each 32-bit root constant of the dispatch whose value is below the title view heap's descriptor
+//      count (or has bit 28 set with an index below it in bits 0-9, the mesh rule) is taken as a heap index
+//      (ASSUMED: a root constant that is a plain number gives an extra line); the descriptor there gives one
+//      "x2w-frame cx-heap" line (buffer range, image, or other) and a buffer range is kept as an 'H' range, so the
+//      writers and mesh-read lines see it. At most 8 per dispatch.
+//  (f) mesh reads: every buffer a traced mesh call binds (table / root srv) and every heap buffer it names through a
+//      bit-28 root constant (the X2W_MESH_DUMP_INPUTS rule) is noted; the report gives, per distinct range, the
+//      dispatch ranges of the frame that overlap it, skipped ones first ("x2w-frame mesh-read"), and totals.
 // Nothing here runs outside a traced frame or without the switch. Owned files are only read: mesh_trace_key
 // (d3d12_mesh.inl), indirect_current (d3d12_indirect.inl), compute_translations() (d3d12_compute.inl, under
 // draw_lock, try-acquired) and view_records() (under note_lock).
@@ -44,11 +59,24 @@ struct TracedRange {
     int param = 0, offset = 0;
     u64 lo = 0, hi = 0;
     const char* state = "";
+    LONG order = 0;  // record order shared with the mesh reads
+    bool executed = false;
+};
+// (f) one buffer a traced mesh call reads: kind 'S' srv i (source a b), 'H' heap descriptor `slot` (root constant p w).
+struct TracedMeshRead {
+    u64 key = 0;
+    char kind = 'S';
+    int slot = 0, source = 0, a = 0, b = 0;
+    u64 lo = 0, hi = 0;
+    LONG order = 0;
 };
 SRWLOCK record_trace_lock = SRWLOCK_INIT;
 std::vector<TracedRecord>& traced_records() { static std::vector<TracedRecord> v; return v; }
 std::vector<TracedRange>& traced_ranges() { static std::vector<TracedRange> v; return v; }
-LONG record_trace_seq, dispatch_trace_seq;
+std::vector<TracedMeshRead>& traced_mesh_reads() { static std::vector<TracedMeshRead> v; return v; }
+// (d) texture UAVs bound by this frame's dispatches so far: title wrapper -> "key K #n state".
+std::map<const void*, std::string>& traced_image_writers() { static std::map<const void*, std::string> m; return m; }
+LONG record_trace_seq, dispatch_trace_seq, record_trace_order;
 thread_local bool record_trace_dispatch_noted;  // set by record_trace_dispatch inside an indirect call
 
 const char* record_trace_outcome(int outcome)
@@ -96,6 +124,156 @@ bool record_trace_entry(const std::uint32_t* w, u64* address, u64* bytes)
     return *address && *bytes;
 }
 
+// (d) The resource half of an image line: wrapper, title memory, desktop resource and what this frame did to it.
+// No side effects (no memcut revive, no tiled stand-in made): a released resource says so.
+void record_trace_resource_text(Wrapper* resource, char* text, std::size_t room)
+{
+    if (!resource || resource->own().kind != resource_kind) {
+        std::snprintf(text, room, "resource unknown");
+        return;
+    }
+    const bool live = InterlockedCompareExchange(&resource->own().refs, 0, 0) > 0;
+    auto* desktop = static_cast<ID3D12Resource*>(resource->own().real);
+    int n = std::snprintf(text, room, "res %p title 0x%llx desktop %p%s", static_cast<void*>(resource),
+                          static_cast<unsigned long long>(reinterpret_cast<u64>(resource->own().title_memory)), static_cast<void*>(desktop),
+                          resource->own().tiled_address_srv ? " (tiled address srv: sampled through a stand-in)" : "");
+    if (desktop && live) {
+        const D3D12_RESOURCE_DESC d = desktop->GetDesc();
+        n += std::snprintf(text + n, room - n, " %llux%ux%u mips %u fmt %d flags 0x%x", static_cast<unsigned long long>(d.Width), d.Height,
+                           d.DepthOrArraySize, d.MipLevels, static_cast<int>(d.Format), static_cast<unsigned>(d.Flags));
+    } else {
+        n += std::snprintf(text + n, room - n, " (%s)", live ? "no desktop resource" : "released");
+    }
+    // Content: this frame's writers before now.
+    int drawn = -1;
+    if (desktop) {
+        AcquireSRWLockShared(&traced_lock);
+        for (const auto& t : traced_targets())
+            if (t.first == desktop) drawn = t.second;
+        ReleaseSRWLockShared(&traced_lock);
+    }
+    std::string uav;
+    AcquireSRWLockShared(&record_trace_lock);
+    const auto found = traced_image_writers().find(resource);
+    if (found != traced_image_writers().end()) uav = found->second;
+    ReleaseSRWLockShared(&record_trace_lock);
+    if (drawn < 0 && uav.empty()) {
+        std::snprintf(text + n, room - n, "; content: no writer seen in this frame before this dispatch%s",
+                      desktop && live && !(desktop->GetDesc().Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                                                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                          ? " (no GPU-write flags: uploaded from title memory)" : "");
+        return;
+    }
+    n += std::snprintf(text + n, room - n, "; content:");
+    if (drawn >= 0) n += std::snprintf(text + n, room - n, " render/depth target of this frame, %d drawn draws so far;", drawn);
+    if (!uav.empty()) std::snprintf(text + n, room - n, " texture uav of %s", uav.c_str());
+}
+
+// (d) A 32-byte entry as an image: a view token of a texture view, or a raw gfx10 T#. Fills `text` and returns the
+// title wrapper (or null); *uav: a UAV view (slot 19). False: not an image entry.
+bool record_trace_image(const std::uint32_t* w, char* text, std::size_t room, Wrapper** wrapper_out, bool* uav)
+{
+    *wrapper_out = nullptr, *uav = false;
+    char res[400];
+    if (w[0] == view_token_magic) {
+        ViewRecord record{};
+        AcquireSRWLockShared(&note_lock);
+        const bool known = w[1] < view_records().size();
+        if (known) record = view_records()[w[1]];
+        ReleaseSRWLockShared(&note_lock);
+        if (!known || (record.slot != 18 && record.slot != 19) || record.desc_bytes < 12) return false;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        UINT dimension = 0, mip = 0;
+        std::memcpy(&format, record.desc, 4);
+        std::memcpy(&dimension, record.desc + 4, 4);
+        // SRV: ViewDimension 1 = buffer; UAV: 1 = buffer. Both: the first mip at +16 (SRV MostDetailedMip) / +8 (UAV MipSlice).
+        if (dimension == 1 || dimension == 0) return false;
+        if (record.slot == 18 && record.desc_bytes >= 20) std::memcpy(&mip, record.desc + 16, 4);
+        if (record.slot == 19 && record.desc_bytes >= 12) std::memcpy(&mip, record.desc + 8, 4);
+        Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
+        record_trace_resource_text(resource, res, sizeof(res));
+        std::snprintf(text, room, "view %u (%s) dim %u fmt %d mip %u; %s", w[1], record.slot == 19 ? "uav" : "srv", dimension,
+                      static_cast<int>(format), mip, res);
+        *wrapper_out = resource;
+        *uav = record.slot == 19;
+        return true;
+    }
+    const std::uint32_t type = w[3] >> 28;
+    if (w[0] == 0x52463258u || type < 8 || type > 13) return false;
+    const u64 address = (static_cast<u64>(w[0]) | (static_cast<u64>(w[1] & 0xff) << 32)) << 8;
+    const std::uint32_t width = (((w[1] >> 30) & 3) | ((w[2] & 0xfff) << 2)) + 1, height = ((w[2] >> 14) & 0x3fff) + 1;
+    // The resource whose title memory starts at the T# base (a texture; several: the first, counted).
+    Wrapper* resource = nullptr;
+    int matches = 0;
+    if (address) {
+        AcquireSRWLockShared(&note_lock);
+        for (const auto& [wrapper, info] : resource_infos())
+            if (reinterpret_cast<u64>(wrapper->own().title_memory) == address && info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0) {
+                if (!resource) resource = const_cast<Wrapper*>(wrapper);
+                ++matches;
+            }
+        ReleaseSRWLockShared(&note_lock);
+    }
+    if (resource) record_trace_resource_text(resource, res, sizeof(res));
+    else std::snprintf(res, sizeof(res), "no resource starts at the base");
+    std::snprintf(text, room, "T# 0x%llx %ux%u depth %u fmt %u levels %u-%u type %u sw %u; %s%s", static_cast<unsigned long long>(address), width,
+                  height, (w[4] & 0x1fff) + 1, (w[1] >> 20) & 0x1ff, (w[3] >> 12) & 15, (w[3] >> 16) & 15, type, (w[3] >> 20) & 0x1f, res,
+                  matches > 1 ? " (several resources start there: the first)" : "");
+    *wrapper_out = resource;
+    return true;
+}
+
+// (e) The title CBV_SRV_UAV heap of a list: the bound one (SetDescriptorHeaps), else the one holding a bound compute
+// table, else the newest (title_view_heap's rule).
+struct TraceHeap {
+    u64 base = 0, bytes = 0;
+    UINT increment = 32, count = 0;
+};
+TraceHeap record_trace_heap(const Pass& pass)
+{
+    TraceHeap out;
+    AcquireSRWLockShared(&note_lock);
+    const HeapInfo* best = nullptr;
+    for (const HeapInfo& h : heap_infos()) {
+        if (h.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !h.title_cpu || !h.increment) continue;
+        if (pass.source_view_heap && h.wrapper == pass.source_view_heap) {
+            best = &h;
+            break;
+        }
+        for (UINT i = 0; i < 16; ++i)
+            if (pass.compute_kind[i] == 5 && pass.compute_address[i] >= h.title_cpu && pass.compute_address[i] < h.title_cpu + u64{h.count} * h.increment)
+                best = &h;
+        if (!best) best = &h;
+    }
+    if (best) out.base = best->title_cpu, out.increment = best->increment, out.count = best->logical_count ? best->logical_count : best->count,
+              out.bytes = u64{out.count} * best->increment;
+    ReleaseSRWLockShared(&note_lock);
+    return out;
+}
+// (e) The descriptor at heap index `index`: a buffer range (true, *address / *bytes) or text for anything else.
+bool record_trace_heap_slot(const TraceHeap& heap, std::uint32_t index, u64* address, u64* bytes, char* text, std::size_t room, Wrapper** image)
+{
+    *address = 0, *bytes = 0, *image = nullptr;
+    text[0] = 0;
+    const u64 slot = heap.base + u64{index} * heap.increment;
+    std::uint32_t w[8] = {};
+    if (!heap.base || index >= heap.count || !x2w_local::readable(reinterpret_cast<const void*>(slot), 32)) {
+        std::snprintf(text, room, "slot 0x%llx not readable", static_cast<unsigned long long>(slot));
+        return false;
+    }
+    std::memcpy(w, reinterpret_cast<const void*>(slot), 32);
+    if (record_trace_entry(w, address, bytes)) return true;
+    bool uav = false;
+    char image_text[700];
+    if (record_trace_image(w, image_text, sizeof(image_text), image, &uav)) {
+        std::snprintf(text, room, "image: %s", image_text);
+        return false;
+    }
+    std::snprintf(text, room, "other: words %08x %08x %08x %08x", w[0], w[1], w[2], w[3]);
+    return false;
+}
+
 // (c) execute_dispatch, every dispatch on this thread (direct, and indirect through indirect_run).
 void record_trace_dispatch(Wrapper* self, u64 key, UINT x, UINT y, UINT z, bool executed, int outcome)
 {
@@ -106,7 +284,7 @@ void record_trace_dispatch(Wrapper* self, u64 key, UINT x, UINT y, UINT z, bool 
     const char* state = executed ? "run" : record_trace_outcome(outcome);
     const Pass& pass = pass_of(self);
     // The manifest's buffer resources, when the key is translated (state 1).
-    struct Res { bool uav; int source, a, b; };
+    struct Res { bool uav; int kind, source, a, b; };
     std::vector<Res> manifest;
     bool have_manifest = false;
     if ((key >> 56) == 0x67) {
@@ -116,17 +294,34 @@ void record_trace_dispatch(Wrapper* self, u64 key, UINT x, UINT y, UINT z, bool 
             const auto found = compute_translations().find(key);
             if (found != compute_translations().end() && found->second.state == 1) {
                 have_manifest = true;
-                for (const auto& r : found->second.res)
-                    if (r.kind == 0) manifest.push_back({r.uav, r.source, r.a, r.b});
+                for (const auto& r : found->second.res) manifest.push_back({r.uav, r.kind, r.source, r.a, r.b});
             }
             ReleaseSRWLockExclusive(&draw_lock);
         }
     }
+    const LONG order = InterlockedIncrement(&record_trace_order);
     std::vector<TracedRange> ranges;
     const auto add = [&](char label, int param, int offset, u64 address, u64 bytes) {
         TracedRange r;
         r.seq = seq, r.key = key, r.pipeline = pass.pipeline, r.label = label, r.param = param, r.offset = offset, r.lo = address, r.hi = address + bytes, r.state = state;
+        r.order = order, r.executed = executed;
         ranges.push_back(r);
+    };
+    // (d) image entries: logged after the cx-uav line; texture UAVs become writers once this dispatch is logged.
+    std::vector<std::string> image_lines;
+    std::vector<const void*> uav_images;
+    const auto image_at = [&](char label, int param, int offset, const std::uint32_t* w) {
+        if (image_lines.size() >= 16) return;
+        Wrapper* resource = nullptr;
+        bool uav_view = false;
+        char text[900];
+        if (!record_trace_image(w, text, sizeof(text), &resource, &uav_view)) return;
+        const bool uav = uav_view || label == 'U';
+        char line[1100];
+        std::snprintf(line, sizeof(line), "x2w-frame cx-img #%ld key %016llx %c p%d+0x%x%s: %s", seq, static_cast<unsigned long long>(key), label, param,
+                      offset, uav ? " (uav)" : "", text);
+        image_lines.push_back(line);
+        if (uav && resource) uav_images.push_back(resource);
     };
     for (int p = 0; p < 16; ++p) {
         const int kind = pass.compute_kind[p];
@@ -141,14 +336,47 @@ void record_trace_dispatch(Wrapper* self, u64 key, UINT x, UINT y, UINT z, bool 
                 std::memcpy(w, reinterpret_cast<const void*>(entry), 32);
                 u64 at = 0, bytes = 0;
                 if (record_trace_entry(w, &at, &bytes)) add(label, p, offset, at, bytes);
+                else image_at(label == 'S' ? 'T' : label, p, offset, w);  // (d)
                 return true;
             };
-            if (have_manifest) {  // translated: exactly the manifest's buffers in this table
+            if (have_manifest) {  // translated: exactly the manifest's buffers (and, d, images) in this table
                 for (const Res& r : manifest)
                     if (r.source == 0 && r.a == p && r.b >= 0) entry_at(r.uav ? 'U' : 'S', r.b);
-            } else {  // not translated: every buffer-shaped entry of the first 64
+            } else {  // not translated: every buffer-shaped (and image) entry of the first 64
                 for (int e = 0; e < 64 && entry_at('?', e * 32); ++e) {
                 }
+            }
+        }
+    }
+    // (e) heap descriptors named by root constants (ASSUMED rule, see the head of this file).
+    std::vector<std::string> heap_lines;
+    {
+        const TraceHeap heap = record_trace_heap(pass);
+        unsigned looked = 0;
+        std::uint32_t seen[8];
+        for (int p = 0; p < 16 && heap.base && looked < 8; ++p) {
+            if (pass.compute_kind[p] != 1) continue;
+            for (UINT w = 0; w < pass.compute_count[p] && w < 16 && looked < 8; ++w) {
+                const std::uint32_t c = pass.compute_constants[p][w];
+                const std::uint32_t index = c < heap.count ? c : (c & (1u << 28)) && (c & 0x3ff) < heap.count ? (c & 0x3ff) : 0xffffffffu;
+                if (index == 0xffffffffu) continue;
+                bool again = false;
+                for (unsigned k = 0; k < looked; ++k) again |= seen[k] == index;
+                if (again) continue;
+                seen[looked++] = index;
+                u64 at = 0, bytes = 0;
+                Wrapper* image = nullptr;
+                char text[800];
+                const bool buffer = record_trace_heap_slot(heap, index, &at, &bytes, text, sizeof(text), &image);
+                if (buffer) {
+                    add('H', p, static_cast<int>(w * 4), at, bytes);
+                    std::snprintf(text, sizeof(text), "buffer 0x%llx %llu bytes", static_cast<unsigned long long>(at), static_cast<unsigned long long>(bytes));
+                }
+                char line[1100];
+                std::snprintf(line, sizeof(line), "x2w-frame cx-heap #%ld key %016llx root constant p%d w%u = 0x%08x -> heap 0x%llx index %u (count %u, increment %u): %s",
+                              seq, static_cast<unsigned long long>(key), p, w, c, static_cast<unsigned long long>(heap.base), index, heap.count,
+                              heap.increment, text);
+                heap_lines.push_back(line);
             }
         }
     }
@@ -167,8 +395,55 @@ void record_trace_dispatch(Wrapper* self, u64 key, UINT x, UINT y, UINT z, bool 
                            static_cast<unsigned long long>(r.lo), static_cast<unsigned long long>(r.hi - r.lo));
     }
     log("%s", text);
+    for (const std::string& line : image_lines) log("%s", line.c_str());
+    for (const std::string& line : heap_lines) log("%s", line.c_str());
+    char writer[96];
+    std::snprintf(writer, sizeof(writer), "key %016llx #%ld (%s)", static_cast<unsigned long long>(key), seq, state);
     AcquireSRWLockExclusive(&record_trace_lock);
     traced_ranges().insert(traced_ranges().end(), ranges.begin(), ranges.end());
+    for (const void* image : uav_images) traced_image_writers()[image] = writer;
+    ReleaseSRWLockExclusive(&record_trace_lock);
+}
+
+// (f) d3d12_draw.inl draw_translated, a traced mesh call: one buffer srv it binds (title address and full size).
+void record_trace_mesh_read(u64 key, UINT srv, int source, int a, int b, u64 address, u64 bytes)
+{
+    if (!record_trace_on() || !address || !bytes) return;
+    TracedMeshRead r;
+    r.key = key, r.kind = 'S', r.slot = static_cast<int>(srv), r.source = source, r.a = a, r.b = b, r.lo = address, r.hi = address + bytes;
+    r.order = InterlockedIncrement(&record_trace_order);
+    AcquireSRWLockExclusive(&record_trace_lock);
+    traced_mesh_reads().push_back(r);
+    ReleaseSRWLockExclusive(&record_trace_lock);
+}
+// (f) the heap buffers a traced mesh call names through root constants the translation reads with bit 28 set
+// (index in bits 0-9: the X2W_MESH_DUMP_INPUTS rule, ASSUMED).
+void record_trace_mesh_heap(Wrapper* self, const Translation& tr)
+{
+    if (!record_trace_on()) return;
+    const Pass& pass = pass_of(self);
+    const TraceHeap heap = record_trace_heap(pass);
+    if (!heap.base) return;
+    std::vector<TracedMeshRead> reads;
+    for (const Translation::Ud& ud : tr.uds) {
+        if (ud.kind != Translation::root_constant || ud.a < 0 || ud.a >= 16 || ud.b < 0 || ud.b >= 8) continue;
+        const std::uint32_t c = pass.constants[ud.a][ud.b];
+        if (!(c & (1u << 28)) || (c & 0x3ff) >= heap.count) continue;
+        u64 at = 0, bytes = 0;
+        Wrapper* image = nullptr;
+        char text[800];
+        if (!record_trace_heap_slot(heap, c & 0x3ff, &at, &bytes, text, sizeof(text), &image)) continue;
+        bool again = false;
+        for (const TracedMeshRead& r : reads) again |= r.lo == at && r.hi == at + bytes;
+        if (again) continue;
+        TracedMeshRead r;
+        r.key = tr.key, r.kind = 'H', r.slot = static_cast<int>(c & 0x3ff), r.a = ud.a, r.b = ud.b, r.lo = at, r.hi = at + bytes;
+        r.order = InterlockedIncrement(&record_trace_order);
+        reads.push_back(r);
+    }
+    if (reads.empty()) return;
+    AcquireSRWLockExclusive(&record_trace_lock);
+    traced_mesh_reads().insert(traced_mesh_reads().end(), reads.begin(), reads.end());
     ReleaseSRWLockExclusive(&record_trace_lock);
 }
 
@@ -213,12 +488,16 @@ void record_trace_report(ID3D12CommandQueue* queue)
     AcquireSRWLockExclusive(&record_trace_lock);
     std::vector<TracedRecord> records;
     std::vector<TracedRange> ranges;
+    std::vector<TracedMeshRead> mesh_reads;
     records.swap(traced_records());
     ranges.swap(traced_ranges());
+    mesh_reads.swap(traced_mesh_reads());
+    traced_image_writers().clear();
     ReleaseSRWLockExclusive(&record_trace_lock);
     InterlockedExchange(&record_trace_seq, 0);
     InterlockedExchange(&dispatch_trace_seq, 0);
-    if (records.empty() && ranges.empty()) return;
+    InterlockedExchange(&record_trace_order, 0);
+    if (records.empty() && ranges.empty() && mesh_reads.empty()) return;
     const char* when = "no GPU wait";
     if (queue && the_device) {
         ID3D12Fence* fence = nullptr;
@@ -289,5 +568,73 @@ void record_trace_report(ID3D12CommandQueue* queue)
         }
         if (writers.size() > 32) log("x2w-frame record writers args %p: %zu more not shown", static_cast<const void*>(base), writers.size() - 32);
     }
+    // (f) mesh reads: per distinct (key, kind, slot, range), the dispatch ranges of the frame that overlap it.
+    struct Read { TracedMeshRead r; LONG calls = 0, first_order = 0; };
+    std::vector<Read> distinct;
+    for (const TracedMeshRead& m : mesh_reads) {
+        Read* d = nullptr;
+        for (Read& e : distinct)
+            if (e.r.key == m.key && e.r.kind == m.kind && e.r.slot == m.slot && e.r.lo == m.lo && e.r.hi == m.hi) d = &e;
+        if (!d) {
+            distinct.push_back({m, 0, m.order});
+            d = &distinct.back();
+        }
+        ++d->calls;
+    }
+    std::size_t in_skipped = 0, in_run_only = 0, in_none = 0, shown = 0;
+    std::vector<std::string> later;  // lines without a skipped overlap, shown after the ones with
+    for (const Read& d : distinct) {
+        // Overlapping dispatch ranges, merged per (key, label, param, offset, range, state): skipped first.
+        struct Hit { const TracedRange* r; LONG dispatches; bool before; };
+        std::vector<Hit> hits;
+        bool skipped = false;
+        for (const TracedRange& r : ranges) {
+            if (r.hi <= d.r.lo || r.lo >= d.r.hi) continue;
+            Hit* h = nullptr;
+            for (Hit& e : hits)
+                if (e.r->key == r.key && e.r->label == r.label && e.r->param == r.param && e.r->offset == r.offset && e.r->lo == r.lo && e.r->hi == r.hi &&
+                    e.r->executed == r.executed)
+                    h = &e;
+            if (!h) {
+                hits.push_back({&r, 0, false});
+                h = &hits.back();
+            }
+            ++h->dispatches;
+            h->before |= r.order < d.first_order;
+            skipped |= !r.executed;
+        }
+        std::stable_sort(hits.begin(), hits.end(), [](const Hit& x, const Hit& y) { return !x.r->executed && y.r->executed; });
+        if (skipped) ++in_skipped;
+        else if (!hits.empty()) ++in_run_only;
+        else ++in_none;
+        char text[1400];
+        int n = std::snprintf(text, sizeof(text), "x2w-frame mesh-read key %016llx %c%d", static_cast<unsigned long long>(d.r.key), d.r.kind, d.r.slot);
+        if (d.r.kind == 'S') n += std::snprintf(text + n, sizeof(text) - n, " (source %d %d+0x%x)", d.r.source, d.r.a, d.r.b);
+        else n += std::snprintf(text + n, sizeof(text) - n, " (heap index %d, root constant p%d w%d)", d.r.slot, d.r.a, d.r.b);
+        n += std::snprintf(text + n, sizeof(text) - n, " 0x%llx %llu bytes, %ld calls: %s", static_cast<unsigned long long>(d.r.lo),
+                           static_cast<unsigned long long>(d.r.hi - d.r.lo), d.calls,
+                           skipped ? "INSIDE a skipped dispatch's range" : hits.empty() ? "no dispatch of this frame binds it" : "run dispatches only");
+        for (std::size_t k = 0; k < hits.size() && k < 6 && n < static_cast<int>(sizeof(text)) - 200; ++k) {
+            const TracedRange& r = *hits[k].r;
+            const u64 lo = r.lo > d.r.lo ? r.lo : d.r.lo, hi = r.hi < d.r.hi ? r.hi : d.r.hi;
+            n += std::snprintf(text + n, sizeof(text) - n, "; key %016llx %c p%d+0x%x 0x%llx %llu bytes, %s, %ld dispatches (first #%ld)%s, overlap %llu bytes",
+                               static_cast<unsigned long long>(r.key), r.label, r.param, r.offset, static_cast<unsigned long long>(r.lo),
+                               static_cast<unsigned long long>(r.hi - r.lo), r.state, hits[k].dispatches, r.seq,
+                               hits[k].before ? " recorded before the first read" : " recorded after the first read",
+                               static_cast<unsigned long long>(hi - lo));
+        }
+        if (hits.size() > 6) std::snprintf(text + n, sizeof(text) - n, "; %zu more", hits.size() - 6);
+        if (skipped && shown < 64) {
+            log("%s", text);
+            ++shown;
+        } else if (!skipped && later.size() < 64) {
+            later.push_back(text);
+        }
+    }
+    for (std::size_t k = 0; k < later.size() && shown < 64; ++k, ++shown) log("%s", later[k].c_str());
+    if (!mesh_reads.empty())
+        log("x2w-frame mesh-read totals: %zu reads, %zu distinct ranges: %zu inside a skipped dispatch's range, %zu run dispatches only, %zu bound by no "
+            "dispatch of this frame (%zu lines shown)",
+            mesh_reads.size(), distinct.size(), in_skipped, in_run_only, in_none, shown);
 }
 extern "C" __declspec(dllexport) void x2w_d3d12_record_trace_report() { record_trace_report(nullptr); }  // fixtures, after their fence

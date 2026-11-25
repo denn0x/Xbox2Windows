@@ -80,6 +80,7 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 extern "C" __declspec(dllimport) unsigned x2w_d3d12_traced_targets(unsigned* out, unsigned capacity);
 extern "C" __declspec(dllimport) int x2w_d3d12_summarise_traced_targets();
 extern "C" __declspec(dllimport) void x2w_d3d12_mesh_stats_report();
+extern "C" __declspec(dllimport) void x2w_d3d12_record_trace_report();  // LOCAL (scene): X2W_MESH_RECORD_TRACE
 
 namespace {
 using Word = std::uint64_t;
@@ -192,8 +193,21 @@ int main(int argc, char** argv)
         mode != "rtvuint" && mode != "smpheap" && mode != "smpheapswap" && mode != "statez" && mode != "statezge" && mode != "statezoff" &&
         mode != "statecull" && mode != "stateculloff" && mode != "statedepth" && mode != "statecullflip" && mode != "statecullnone" &&
         mode != "statezrepeat" && mode != "statezuncleared" && mode != "statezlateclear" && mode != "async" && mode != "asyncone" && mode != "rtvvariant" &&
-        mode != "uavtex" && mode != "uavtexnoflag" && mode != "rtvnops" && mode != "stateclip" && mode != "stateclipon" && mode != "stateclipkeep")
+        mode != "uavtex" && mode != "uavtexnoflag" && mode != "rtvnops" && mode != "stateclip" && mode != "stateclipon" && mode != "stateclipkeep" &&
+        mode != "rectrace" && mode != "rectraceapart")
         return 2;
+    // LOCAL (scene) rectrace / rectraceapart (X2W_MESH_RECORD_TRACE=1 in a traced frame, d3d12_record_trace.inl): the
+    // gpu call plus, before it, a stand-in of the title's cull pass: a slot-62 pipeline with a descriptor-table argument
+    // (skipped: "c62 table argument"), dispatched twice. The view heap has 8 slots: 0 the vertex V# (the mesh srv), 1 a
+    // Texture2D SRV, 2 a raw gfx10 T# over the same 2x1 texture (placed on title memory), 3 a Texture2D UAV of it, 4 a V#
+    // over other memory. Root constant [0][1] of the mesh call = bit 28 + index 0 (a heap read of the vertices).
+    // rectrace: the cull table starts at slot 0 and its root constant names heap index 0: both mesh reads (srv 0 and
+    // heap 0) must be "INSIDE a skipped dispatch's range". rectraceapart (control): table at slot 1, heap index 4: no
+    // mesh read inside a skipped range. Both: cx-img lines for the SRV, the raw T# (matched to the texture by address)
+    // and the UAV; on the second dispatch the texture's content names the first as its texture uav writer; a cx-heap
+    // line for the named index.
+    const bool rectrace = mode == "rectrace" || mode == "rectraceapart";
+    if (rectrace) SetEnvironmentVariableW(L"X2W_MESH_RECORD_TRACE", L"1");
     // stateclip / stateclipon / stateclipkeep (X2W_DRAW_STATE_DEPTHCLIP, without X2W_MESH_STATE): the triangles at z 1.5,
     // beyond the far plane. stateclip: PA_CL_CLIP_CNTL ZCLIP_NEAR + FAR_DISABLE and the switch: depth clip off, drawn.
     // stateclipon (control): the same words, switch unset: default depth clip on, dropped. stateclipkeep (control):
@@ -323,6 +337,22 @@ int main(int argc, char** argv)
     if (!write_file(cache + L"\\" + hex_key(fnv(writer_blob->GetBufferPointer(), writer_blob->GetBufferSize(), fnv(startup_mesh_writer, sizeof(startup_mesh_writer)))) +
                         L".cs.dxbc", startup_mesh_writer, sizeof(startup_mesh_writer)))
         return 5;
+    // rectrace: the cull stand-in's root signature (the writer's two parameters, then a table and two constants): a
+    // cache file too, so its desktop pipeline exists; the table argument keeps it from running.
+    D3D12_DESCRIPTOR_RANGE cull_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 8, 0, 0, 0};
+    D3D12_ROOT_PARAMETER cull_params[4]{writer_params[0], writer_params[1]};
+    cull_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    cull_params[2].DescriptorTable = {1, &cull_range};
+    cull_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    cull_params[3].Constants = {2, 0, 2};
+    const D3D12_ROOT_SIGNATURE_DESC cull_root_desc{4, cull_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> cull_blob;
+    if (rectrace) {
+        if (FAILED(D3D12SerializeRootSignature(&cull_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &cull_blob, nullptr))) return 5;
+        if (!write_file(cache + L"\\" + hex_key(fnv(cull_blob->GetBufferPointer(), cull_blob->GetBufferSize(), fnv(startup_mesh_writer, sizeof(startup_mesh_writer)))) +
+                            L".cs.dxbc", startup_mesh_writer, sizeof(startup_mesh_writer)))
+            return 5;
+    }
 
     // The title's graphics root signature of the mesh record: [0] constants, [1] a table, [2] constants. Its bytes go
     // into the key; the translated root signature is built from the manifest.
@@ -369,7 +399,7 @@ int main(int argc, char** argv)
             : uavtex ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\nuav 0 tex2d table 1 " +
                            std::to_string(2 * view_increment) + "\n" + fma + "stage mesh\nms 3 3 1\n"
                   // statez: entry value 2 = root constant 0.1 (the dump's bit-28 heap reference; MeshMain ignores it).
-                  : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\n" + std::string(mode == "statez" ? "udsrc 2 rootconst 0 1\n" : "") +
+                  : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\n" + std::string(mode == "statez" || rectrace ? "udsrc 2 rootconst 0 1\n" : "") +
                         "srv 0 buf table 1 0\n" + fma + "stage mesh\nms 3 3 1\n";
         const std::wstring base = cache + L"\\" + hex_key(key);
         if (!(words ? write_file(base + L".ms.cso", startup_mesh_heap_ms, sizeof(startup_mesh_heap_ms))
@@ -410,6 +440,13 @@ int main(int argc, char** argv)
     compute.pRootSignature = static_cast<ID3D12RootSignature*>(writer_root);
     compute.CS = {startup_mesh_writer, sizeof(startup_mesh_writer)};
     if (!ok(invoke(device, 62, arg(&compute), 0, 0, arg(&__uuidof(ID3D12PipelineState)), arg(&writer)))) return 8;
+    void *cull_root = nullptr, *cull = nullptr;  // rectrace: the cull stand-in
+    if (rectrace) {
+        if (!ok(invoke(device, 16, 0, arg(cull_blob->GetBufferPointer()), cull_blob->GetBufferSize(), arg(&__uuidof(ID3D12RootSignature)), arg(&cull_root))))
+            return 7;
+        compute.pRootSignature = static_cast<ID3D12RootSignature*>(cull_root);
+        if (!ok(invoke(device, 62, arg(&compute), 0, 0, arg(&__uuidof(ID3D12PipelineState)), arg(&cull)))) return 8;
+    }
     // The slot-57 mesh record.
     alignas(8) static unsigned char record[0x300];
     Word record_words[16] = {};
@@ -543,7 +580,7 @@ int main(int argc, char** argv)
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word backing, bytes;
-    } view_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+    } view_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, rectrace ? 8u : 4u, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
                      mode == "wordsoob" ? arg(memory + 0x60000) : Word{0}, mode == "wordsoob" ? Word{4 * 32} : Word{0}};
     void* view_heap = nullptr;
     if (!ok(invoke(device, 14, arg(&view_heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&view_heap)))) return 12;
@@ -630,6 +667,33 @@ int main(int argc, char** argv)
             invoke(device, 18, arg(uav_texture), arg(&view), view_cpu + 2 * view_increment);
         }
     }
+    // rectrace: heap slots 1-4 (see the mode comment at the top of main).
+    void* trace_texture = nullptr;
+    unsigned char* const trace_texels = memory + 0x40000;  // 256-byte aligned: a T# base
+    unsigned char* const other_memory = memory + 0x70000;
+    if (rectrace) {
+        const std::uint32_t texels[2] = {0xff0000ffu, 0xffff0000u};
+        std::memcpy(trace_texels, texels, sizeof(texels));
+        D3D12_RESOURCE_DESC tex{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 2, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+        if (!ok(invoke(device, 133, arg(trace_texels), arg(&tex), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&trace_texture))))
+            return 12;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        invoke(device, 18, arg(trace_texture), arg(&srv), view_cpu + view_increment);
+        // A raw T# (gfx10 SQ_IMG_RSRC words): base >> 8, FORMAT 56, WIDTH 2, HEIGHT 1, TYPE 9 (2D), levels 0-0.
+        const Word base = arg(trace_texels) >> 8;
+        const std::uint32_t tsharp[8] = {static_cast<std::uint32_t>(base), (static_cast<std::uint32_t>(base >> 32) & 0xff) | (56u << 20) | (1u << 30), 0, 9u << 28};
+        std::memcpy(reinterpret_cast<void*>(view_cpu + 2 * view_increment), tsharp, sizeof(tsharp));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_UAV_DIMENSION_TEXTURE2D};
+        invoke(device, 19, arg(trace_texture), 0, arg(&uav), view_cpu + 3 * view_increment);
+        const Word other = arg(other_memory);
+        const std::uint32_t vsharp[8] = {static_cast<std::uint32_t>(other), static_cast<std::uint32_t>(other >> 32) & 0xffff, 64, 0};
+        std::memcpy(reinterpret_cast<void*>(view_cpu + 4 * view_increment), vsharp, sizeof(vsharp));
+    }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -650,6 +714,20 @@ int main(int argc, char** argv)
     invoke(list, 45, 0, arg(args_memory));                                 // SetComputeRootUnorderedAccessView(0, title address)
     invoke(list, 39, 1, 4, arg(record_values), 0);                         // SetComputeRoot32BitConstants(1, 4, record, 0)
     invoke(list, 14, 1, 1, 1);                                             // Dispatch: the writer stores {x, 1, 1}
+    if (rectrace) {  // the cull stand-in, twice (skipped: c62 table argument)
+        const std::uint32_t far_values[4] = {0x100, 0x100, 0x100, 0x100};  // over the heap's 8 slots: no heap index
+        const std::uint32_t heap_index[2] = {mode == "rectrace" ? 0u : 4u, 0x100};
+        void* const cull_heaps[1] = {view_heap};
+        invoke(list, 33, arg(cull_root));
+        invoke(list, 25, arg(cull));
+        invoke(list, 32, 1, arg(cull_heaps));                              // SetDescriptorHeaps
+        invoke(list, 45, 0, arg(memory + 0x80000));                        // root UAV past the vertices and slot 4's memory
+        invoke(list, 39, 1, 4, arg(far_values), 0);
+        invoke(list, 35, 2, view_gpu + (mode == "rectrace" ? 0 : view_increment));  // SetComputeRootDescriptorTable(2, slot 0 / 1)
+        invoke(list, 39, 3, 2, arg(heap_index), 0);
+        invoke(list, 14, 1, 1, 1);
+        invoke(list, 14, 1, 1, 1);
+    }
     if (depth) {
         invoke(list, 50, 0, 0, 0, arg(&target_handle));                    // OMSetRenderTargets(0, null, FALSE, &dsv)
     } else {
@@ -678,7 +756,7 @@ int main(int argc, char** argv)
     // statez: root constant [0][1] (read by the translation) = bit 28 + heap index 0 (srv 0's view, the vertices): the
     // dump's heap buffer case. [0][2] = bit 28 + index 3 is NOT read by the translation (the control): no heap3 files.
     const std::uint32_t heap_reference[2] = {0x10000000u, 0x10000003u};
-    if (mode == "statez") invoke(list, 40, 0, 2, arg(heap_reference), 1);  // SetGraphicsRoot32BitConstants(0, 2, refs, 1)
+    if (mode == "statez" || rectrace) invoke(list, 40, 0, 2, arg(heap_reference), 1);  // SetGraphicsRoot32BitConstants(0, 2, refs, 1)
     invoke(list, 25, arg(pipeline));                                       // SetPipelineState (the mesh pipeline)
     invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);               // ExecuteIndirect(mesh signature, 1, args, 0)
     if (mode == "async") {  // the worker's PSO line, then a second call
@@ -733,7 +811,7 @@ int main(int argc, char** argv)
         ++failures;
     }
     const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || smp || mode == "statez" || mode == "statezoff" ||
-                                mode == "stateculloff" || mode == "statecullnone" || mode == "stateclip" || repeat || mode == "statezuncleared" || mode == "statezlateclear" || mode == "async" || mode == "rtvvariant" || mode == "uavtex" || (!words_skip && (mode == "words16" || mode == "words32"));
+                                mode == "stateculloff" || mode == "statecullnone" || mode == "stateclip" || repeat || mode == "statezuncleared" || mode == "statezlateclear" || mode == "async" || mode == "rtvvariant" || mode == "uavtex" || rectrace || (!words_skip && (mode == "words16" || mode == "words32"));
     // RGBA8 little-endian: R c0, G 40, B ff, A ff. words modes: G = the FORMAT code in vdesc word 3 (29 = 0x1d, 64 = 0x40).
     // smpheap: entry 65 point -> texel 0 (red ff0000ff); smpheapswap: entry 65 linear at u = 0.375 -> 0.75 red + 0.25
     // blue (R bf, B 40, A ff; filtering precision allows +-3 per channel).
@@ -993,6 +1071,8 @@ int main(int argc, char** argv)
             trace_ok = frame_line.find(std::string("x2w-frame mesh drawn key ") + key_text + " targets 1 [0 ") == 0 &&
                        frame_line.find(" raster cull 1 ccw 0 depthclip 1 bias 0/") != std::string::npos &&
                        frame_line.find("(default: X2W_MESH_STATE off or NOCULL; title PA_SU_SC_MODE_CNTL ") != std::string::npos && notes == 1 && noted[3] == 1;
+        } else if (rectrace) {  // the gpu call drawn, its target noted
+            trace_ok = frame_line.find(std::string("x2w-frame mesh drawn key ") + key_text + " targets 1 [0 ") == 0 && notes == 1 && noted[3] == 1;
         } else if (mode == "zero") {  // issued with 0 groups (the stats control): a drawn line with a query, the target noted
             trace_ok = frame_line.find(std::string("x2w-frame mesh drawn key ") + key_text + " targets 1 [0 ") == 0 &&
                        frame_line.find(" query #0 ") != std::string::npos && notes == 1 && noted[2] == 28 && noted[3] == 1;
@@ -1007,6 +1087,7 @@ int main(int argc, char** argv)
         // statez: target 0 (RGBA8, drawn: some texels non-zero) and target 1 (D32, cleared to 0.5 and drawn at 0.25:
         // non-zero); notargets: no target line. Then the debug-layer check below covers the read-back too.
         if (traced) {
+            x2w_d3d12_record_trace_report();  // LOCAL (scene): no-op without X2W_MESH_RECORD_TRACE
             x2w_d3d12_mesh_stats_report();  // the GPU work is complete (the pixels were read back above)
             x2w_d3d12_summarise_traced_targets();
             std::ifstream again(log_path, std::ios::binary);
@@ -1027,6 +1108,7 @@ int main(int argc, char** argv)
                       t1.find(" snapshot ") != std::string::npos && t1.find(" 32x32 fmt 40 draws 1:") != std::string::npos && nonzero_share(t1) > 0.0
                 : mode == "zero" ? t0.find(" snapshot ") != std::string::npos && t0.find(" 32x32 fmt 28 draws 1:") != std::string::npos && nonzero_share(t0) == 0.0
                 : mode == "statecull" || mode == "stateculloff" ? t0.find(" snapshot ") != std::string::npos && nonzero_share(t0) > 0.0
+                : rectrace ? true  // not what these modes check
                 : t0.empty();
             if (!read_ok || bad) {
                 std::printf("FAIL: the traced-target read-back does not match mode %s\n", mode.c_str());
@@ -1052,10 +1134,63 @@ int main(int argc, char** argv)
                 // culled one is what this run measures (printed above); either 1 or 2 passes, one triangle's pixels.
                 : mode == "statecull" ? !stats.empty() && (ms_primitives == -2 || ms_primitives == 2) && (c_primitives == 1 || c_primitives == 2) && ps >= 1
                 : mode == "stateculloff" ? !stats.empty() && (ms_primitives == -2 || ms_primitives == 2) && c_primitives == 2 && ps >= 1
+                : rectrace ? !stats.empty()
                 : stats.empty() && after.find("x2w-frame mesh stats #") == std::string::npos;
             if (!stats_ok) {
                 std::printf("FAIL: the pipeline statistics do not match mode %s\n", mode.c_str());
                 ++failures;
+            }
+            // LOCAL (scene) rectrace / rectraceapart: the cx-img, cx-heap and mesh-read lines (see the top of main).
+            if (rectrace) {
+                const auto count_of = [&](const std::string& text) {
+                    std::size_t n = 0;
+                    for (std::size_t p = after.find(text); p != std::string::npos; p = after.find(text, p + 1)) ++n;
+                    return n;
+                };
+                char cull_ptr[32], tex_ptr[32], tsharp_text[96], vertex_text[48], other_text[48];
+                std::snprintf(cull_ptr, sizeof(cull_ptr), "pipeline %p: skipped: c62 table argument:", cull);
+                std::snprintf(tex_ptr, sizeof(tex_ptr), "res %p title ", trace_texture);
+                std::snprintf(tsharp_text, sizeof(tsharp_text), ": T# 0x%llx 2x1 depth 1 fmt 56 levels 0-0 type 9 sw 0; ",
+                              static_cast<unsigned long long>(arg(trace_texels)));
+                std::snprintf(vertex_text, sizeof(vertex_text), "buffer 0x%llx 48 bytes", static_cast<unsigned long long>(vertex_address));
+                std::snprintf(other_text, sizeof(other_text), "buffer 0x%llx 64 bytes", static_cast<unsigned long long>(arg(other_memory)));
+                const bool apart = mode == "rectraceapart";
+                // Image lines only (the writer's cx-heap lines also describe images: its record words 2, 1, 0 are taken
+                // as heap indexes, the ASSUMED rule).
+                const auto img_lines = [&](const std::string& text) {
+                    std::size_t n = 0;
+                    for (std::size_t p = after.find("x2w-frame cx-img #"); p != std::string::npos; p = after.find("x2w-frame cx-img #", p + 1)) {
+                        const std::string line = after.substr(p, after.find('\n', p) - p);
+                        n += line.find(text) != std::string::npos;
+                    }
+                    return n;
+                };
+                const std::size_t cull_lines = count_of(cull_ptr);
+                const std::size_t srv_images = img_lines("(srv) dim 4 fmt 28 mip 0; " + std::string(tex_ptr));
+                const std::size_t uav_images = img_lines(" (uav): view ");
+                const std::size_t raw_images = img_lines(tsharp_text + std::string(tex_ptr));
+                const std::size_t no_writer = img_lines("; content: no writer seen in this frame before this dispatch");
+                const std::size_t uav_writer = img_lines("; content: texture uav of key ");
+                const std::string heap_index = apart ? " index 4 (count 8, increment " : " index 0 (count 8, increment ";
+                const std::size_t heap_lines = count_of(heap_index) && count_of(apart ? other_text : vertex_text) ? 1 : 0;
+                // The mesh reads: srv 0 (table 1 + 0) and heap index 0 (root constant [0][1]).
+                char srv_read[160], heap_read[160];
+                std::snprintf(srv_read, sizeof(srv_read), "x2w-frame mesh-read key %s S0 (source 0 1+0x0) 0x%llx 48 bytes, 1 calls: ", key_text,
+                              static_cast<unsigned long long>(vertex_address));
+                std::snprintf(heap_read, sizeof(heap_read), "x2w-frame mesh-read key %s H0 (heap index 0, root constant p0 w1) 0x%llx 48 bytes, 1 calls: ",
+                              key_text, static_cast<unsigned long long>(vertex_address));
+                const std::string verdict = apart ? "run dispatches only" : "INSIDE a skipped dispatch's range";
+                const std::size_t srv_ok = count_of(srv_read + verdict), heap_ok = count_of(heap_read + verdict);
+                const std::size_t totals = count_of(apart ? "2 distinct ranges: 0 inside a skipped dispatch's range" : "2 distinct ranges: 2 inside a skipped dispatch's range");
+                std::printf("log: rectrace cull lines %zu, images srv %zu uav %zu raw T# %zu, content none %zu / uav writer %zu, heap line %zu, "
+                            "mesh reads srv %zu heap %zu, totals %zu\n",
+                            cull_lines, srv_images, uav_images, raw_images, no_writer, uav_writer, heap_lines, srv_ok, heap_ok, totals);
+                // Two dispatches x 3 image entries; the first sees no writer, the second names the first's UAV.
+                if (cull_lines != 2 || srv_images != 2 || uav_images != 2 || raw_images != 2 || no_writer != 3 || uav_writer != 3 || !heap_lines ||
+                    srv_ok != 1 || heap_ok != 1 || totals != 1) {
+                    std::printf("FAIL: the X2W_MESH_RECORD_TRACE lines do not match mode %s\n", mode.c_str());
+                    ++failures;
+                }
             }
             // X2W_MESH_DUMP_INPUTS (statez): the dump folder next to the log, the vertex srv bytes equal to the test's
             // vertices, entry constants, root constants and the 12-byte record of an issued call.

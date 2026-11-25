@@ -3114,6 +3114,8 @@ void indirect_execute(Wrapper* self, void* signature, UINT max_count, Wrapper* a
 void record_trace_indirect(Wrapper* self, UINT type, UINT stride, UINT max_count, Wrapper* arguments, u64 offset);
 void record_trace_dispatch(Wrapper* self, u64 key, UINT x, UINT y, UINT z, bool executed, int outcome);
 void record_trace_report(ID3D12CommandQueue* queue);
+void record_trace_mesh_read(u64 key, UINT srv, int source, int a, int b, u64 address, u64 bytes);  // d3d12_draw.inl, mesh calls
+void record_trace_mesh_heap(Wrapper* self, const Translation& tr);
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT max_count, Wrapper* arguments, u64 offset,
                                      Wrapper* count_resource, u64 count_offset)
 {
