@@ -131,22 +131,14 @@ struct ComputeTranslation {
 };
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG cx_ready, cx_missing, cx_dispatched, cx_null_res, cx_bad_uav;
+volatile LONG64 cx_compile_ms;  // LOCAL stall: driver compile time of every translation loaded this run
 
 void load_compute(u64 key, ComputeTranslation& tr)
 {
     tr.state = 2;
-    // LOCAL stall, fixtures only: X2W_CX_TEST_HOLD_EVENT=<name> holds every load until the named event is set
-    // (at most 20 s), so a test can issue a dispatch while its pipeline is deliberately not ready.
-    {
-        wchar_t hold[128];
-        const DWORD n = GetEnvironmentVariableW(L"X2W_CX_TEST_HOLD_EVENT", hold, 128);
-        if (n && n < 128)
-            if (const HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, hold)) {
-                const DWORD waited = WaitForSingleObject(event, 20000);
-                CloseHandle(event);
-                log("x2w-cx %016llx: load held by X2W_CX_TEST_HOLD_EVENT (%s)", key, waited == WAIT_OBJECT_0 ? "released" : "timed out");
-            }
-    }
+    // LOCAL stall, fixtures only: X2W_CX_TEST_HOLD_EVENT (d3d12_draw.inl test_hold), so a test can issue a
+    // dispatch while its pipeline is deliberately not ready.
+    test_hold("x2w-cx", key);
     wchar_t path[MAX_PATH];
     std::string manifest;
     if (!cache_path(path, L"", key, L".cs.txt") || !read_text(path, manifest)) {
@@ -249,6 +241,7 @@ void load_compute(u64 key, ComputeTranslation& tr)
     QueryPerformanceFrequency(&frequency);
     const SIZE_T code_bytes = code->GetBufferSize();
     code->Release();
+    InterlockedAdd64(&cx_compile_ms, (compile_end.QuadPart - compile_start.QuadPart) * 1000 / frequency.QuadPart);
     // LOCAL: the driver compile time and DXIL size, so a run shows which first uses are slow
     log("x2w-cx %016llx translated: %zu entry values, %u resources, %zu samplers, group %ux%ux%u -> 0x%08lx (%zu bytes, compiled in %lld ms)",
         key, tr.uds.size(), n, tr.samplers.size(), tr.threads[0], tr.threads[1], tr.threads[2], static_cast<unsigned long>(hr), code_bytes,
@@ -762,6 +755,15 @@ bool cx_async()
     static const bool on = x2w_local::env_on("X2W_CX_ASYNC") && !x2w_local::env_on("X2W_CX_COMPILE_LOCKED");
     return on;
 }
+// LOCAL stall: X2W_CX_PREWARM_ALL=1 (prewarm_known_start, below) queues the known keys when the device is made.
+// known_keys is filled before any of them is queued and not changed after, so the workers read it unlocked.
+std::unordered_set<u64>& known_keys()
+{
+    static std::unordered_set<u64> s;
+    return s;
+}
+LONG cx_known_done;
+ULONGLONG cx_known_started;
 // The prewarm workers. A key with skipped dispatches logs when it is ready.
 DWORD WINAPI prewarm_thread(void*)
 {
@@ -775,6 +777,13 @@ DWORD WINAPI prewarm_thread(void*)
         const int state = loaded_compute(key).state;
         const LONG n = InterlockedIncrement(&cx_prewarm_done);
         if (n <= 4 || n % 200 == 0) log("x2w-cx prewarm %ld of %ld queued pipelines loaded (latest %016llx)", n, cx_prewarm_queued, key);
+        if (known_keys().count(key)) {
+            const LONG done = InterlockedIncrement(&cx_known_done);
+            if (done == static_cast<LONG>(known_keys().size()))
+                log("x2w-cx prewarm: all %ld known pipelines loaded %.1f s after the device was made (X2W_CX_PREWARM_ALL); "
+                    "driver compile time of all translations so far %.1f s", done, (GetTickCount64() - cx_known_started) / 1000.0,
+                    static_cast<double>(cx_compile_ms) / 1000.0);
+        }
         if (cx_async()) {
             AcquireSRWLockExclusive(&compute_load_lock);
             const auto found = cx_async_keys().find(key);
@@ -801,7 +810,7 @@ bool prewarm_compute(u64 key, bool front)
     static const int threads = [] {
         char value[4]{};
         const DWORD n = GetEnvironmentVariableA("X2W_CX_PREWARM_THREADS", value, sizeof(value));
-        int count = n && n < sizeof(value) ? std::atoi(value) : 2;
+        int count = n && n < sizeof(value) ? std::atoi(value) : x2w_local::env_on("X2W_CX_PREWARM_ALL") ? 3 : 2;
         count = count < 1 ? 1 : count > 4 ? 4 : count;
         for (int i = 0; i < count; ++i)
             if (const HANDLE t = CreateThread(nullptr, 0, prewarm_thread, nullptr, 0, nullptr)) CloseHandle(t);
@@ -889,6 +898,134 @@ void report_cx_async()
     log("%s", line);
 }
 
+// LOCAL stall: X2W_CX_PREWARM_ALL=1. When the device is made, every slot-67 key that has a translation in the
+// cache (<key>.cs.cso) and is in the keys-seen file goes to the prewarm workers (3 by default), smallest .cso
+// first; without a keys-seen file, every cached translation does. The keys-seen file (X2W_CX_KEYS_SEEN, default
+// <X2W_SHADER_CACHE>\cx_keys_seen.lst: one key per line; not .txt, so the manifest watcher ignores it) holds the
+// keys of earlier runs plus every key dispatched in this one; it is rewritten every 10 s when it changed (a
+// temporary file and a rename), since a run usually ends without a clean exit.
+bool prewarm_all()
+{
+    static const bool on = x2w_local::env_on("X2W_CX_PREWARM_ALL") && prewarm_enabled();
+    return on;
+}
+SRWLOCK keys_seen_lock = SRWLOCK_INIT;
+std::unordered_set<u64>& keys_seen()  // keys_seen_lock: the file's keys and the keys dispatched this run
+{
+    static std::unordered_set<u64> s;
+    return s;
+}
+LONG keys_seen_changed;
+bool keys_seen_path(wchar_t* out)
+{
+    DWORD n = GetEnvironmentVariableW(L"X2W_CX_KEYS_SEEN", out, MAX_PATH);
+    if (n && n < MAX_PATH) return true;
+    wchar_t dir[MAX_PATH];
+    n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) return false;
+    swprintf(out, MAX_PATH, L"%s\\cx_keys_seen.lst", dir);
+    return true;
+}
+// execute_translated: the key was dispatched (every dispatch; a shared lookup once the key is known).
+void note_key_seen(u64 key)
+{
+    if (!prewarm_all()) return;
+    AcquireSRWLockShared(&keys_seen_lock);
+    const bool known = keys_seen().count(key) != 0;
+    ReleaseSRWLockShared(&keys_seen_lock);
+    if (known) return;
+    AcquireSRWLockExclusive(&keys_seen_lock);
+    if (keys_seen().insert(key).second) InterlockedIncrement(&keys_seen_changed);
+    ReleaseSRWLockExclusive(&keys_seen_lock);
+}
+DWORD WINAPI keys_seen_writer(void*)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    wchar_t path[MAX_PATH], temp[MAX_PATH];
+    if (!keys_seen_path(path)) return 0;
+    swprintf(temp, MAX_PATH, L"%s.%lu.tmp", path, GetCurrentProcessId());
+    for (;;) {
+        Sleep(10000);
+        if (!InterlockedExchange(&keys_seen_changed, 0)) continue;
+        std::string text;
+        AcquireSRWLockShared(&keys_seen_lock);
+        std::vector<u64> keys(keys_seen().begin(), keys_seen().end());
+        ReleaseSRWLockShared(&keys_seen_lock);
+        std::sort(keys.begin(), keys.end());
+        for (const u64 key : keys) {
+            char line[24];
+            std::snprintf(line, sizeof(line), "%016llx\n", key);
+            text += line;
+        }
+        const HANDLE file = CreateFileW(temp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (file == INVALID_HANDLE_VALUE) continue;
+        DWORD written = 0;
+        const bool ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) && written == text.size();
+        CloseHandle(file);
+        const bool moved = ok && MoveFileExW(temp, path, MOVEFILE_REPLACE_EXISTING);
+        if (!moved) DeleteFileW(temp);
+        static LONG logged;
+        if (first_calls(logged, 4) || !moved) log("x2w-cx keys seen: %zu keys written to %ls%s", keys.size(), path, moved ? "" : " FAILED");
+    }
+}
+// attach_device, after the_device is set.
+void prewarm_known_start()
+{
+    if (!prewarm_all()) return;
+    cx_known_started = GetTickCount64();
+    wchar_t path[MAX_PATH], dir[MAX_PATH];
+    const DWORD dn = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
+    if (!dn || dn >= MAX_PATH) return;
+    std::string text;
+    const bool have_file = keys_seen_path(path) && read_text(path, text);
+    std::size_t file_keys = 0;
+    AcquireSRWLockExclusive(&keys_seen_lock);
+    for (std::size_t at = 0; have_file && at < text.size();) {
+        std::size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        const u64 key = std::strtoull(text.substr(at, end - at).c_str(), nullptr, 16);
+        if ((key >> 56) == 0x67 && keys_seen().insert(key).second) ++file_keys;
+        at = end + 1;
+    }
+    ReleaseSRWLockExclusive(&keys_seen_lock);
+    // The cached translations, smallest first.
+    std::vector<std::pair<u64, u64>> cached;  // (size, key)
+    wchar_t pattern[MAX_PATH];
+    swprintf(pattern, MAX_PATH, L"%s\\67*.cs.cso", dir);
+    WIN32_FIND_DATAW found{};
+    const HANDLE find = FindFirstFileW(pattern, &found);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            wchar_t* tail = nullptr;
+            const u64 key = std::wcstoull(found.cFileName, &tail, 16);
+            if (!tail || tail - found.cFileName != 16 || _wcsicmp(tail, L".cs.cso") != 0) continue;
+            if (have_file && !keys_seen().count(key)) continue;  // keys_seen is not written by another thread yet
+            cached.push_back({(static_cast<u64>(found.nFileSizeHigh) << 32) | found.nFileSizeLow, key});
+        } while (FindNextFileW(find, &found));
+        FindClose(find);
+    }
+    std::sort(cached.begin(), cached.end());
+    for (const auto& c : cached) known_keys().insert(c.second);
+    if (have_file)
+        log("x2w-cx prewarm: %zu known pipelines queued (X2W_CX_PREWARM_ALL; keys seen file %ls: %zu keys, %zu with a translation), smallest first",
+            cached.size(), path, file_keys, cached.size());
+    else
+        log("x2w-cx prewarm: %zu known pipelines queued (X2W_CX_PREWARM_ALL; no keys seen file: every cached translation), smallest first",
+            cached.size());
+    for (const auto& c : cached) prewarm_compute(c.second);
+    if (const HANDLE t = CreateThread(nullptr, 0, keys_seen_writer, nullptr, 0, nullptr)) CloseHandle(t);
+}
+// Heartbeat, and the first translated dispatch: how many of the known pipelines are loaded.
+void report_prewarm_known(const char* when)
+{
+    static LONG complete_logged;
+    if (!prewarm_all() || known_keys().empty() || complete_logged) return;
+    const LONG done = cx_known_done;
+    if (done == static_cast<LONG>(known_keys().size())) InterlockedExchange(&complete_logged, 1);
+    log("x2w-cx prewarm: %ld of %zu pipelines ready %s, %.1f s after the device was made; driver compile time so far %.1f s",
+        done, known_keys().size(), when, (GetTickCount64() - cx_known_started) / 1000.0, static_cast<double>(cx_compile_ms) / 1000.0);
+}
+
 // Runs a dispatch through the translation of compute key `key`. False: not translated (or no list).
 bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key, UINT x, UINT y, UINT z)
 {
@@ -901,6 +1038,9 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     Pass& pass = pass_of(self);
     // LOCAL: X2W_CX_COMPILE_LOCKED=1 restores the old order (compile while holding draw_lock), for comparison.
     static const bool compile_locked = x2w_local::env_on("X2W_CX_COMPILE_LOCKED");
+    note_key_seen(key);  // LOCAL stall: X2W_CX_PREWARM_ALL keys-seen file
+    static LONG first_dispatch;
+    if (!first_dispatch && !InterlockedExchange(&first_dispatch, 1)) report_prewarm_known("at the first translated dispatch");
     // LOCAL stall: X2W_CX_ASYNC=1 skips a dispatch whose pipeline is not loaded yet (ready_compute).
     ComputeTranslation* ready = compile_locked ? nullptr : cx_async() ? ready_compute(key) : &loaded_compute(key);
     if (!compile_locked && !ready) {

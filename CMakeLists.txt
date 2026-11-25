@@ -743,11 +743,13 @@ target_include_directories(startup_cx_async PRIVATE "${CMAKE_CURRENT_BINARY_DIR}
 target_compile_features(startup_cx_async PRIVATE cxx_std_17)
 target_link_libraries(startup_cx_async PRIVATE d3d12_xs_shim d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
-    foreach(mode IN ITEMS async sync)
+    foreach(mode IN ITEMS async sync known seen)
         add_test(NAME startup_cx_async_${mode}_${backend} COMMAND startup_cx_async ${backend} ${mode})
         set(cx_async_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
         if(mode STREQUAL "async")
             set(cx_async_env "${cx_async_env};X2W_CX_ASYNC=1")
+        elseif(mode STREQUAL "known" OR mode STREQUAL "seen")
+            set(cx_async_env "${cx_async_env};X2W_CX_ASYNC=1;X2W_CX_PREWARM_ALL=1")
         endif()
         set_tests_properties(startup_cx_async_${mode}_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
             ENVIRONMENT "${cx_async_env}")
@@ -1946,6 +1948,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_stream_draw_${backend} PROPERTIES TIMEOUT 90)
+        # LOCAL stall: a draw while its desktop pipeline compile is held back (X2W_DRAW_ASYNC; sync = control)
+        foreach(mode IN ITEMS async sync)
+            add_test(NAME startup_draw_async_${mode}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_async_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${mode}")
+            set_tests_properties(startup_draw_async_${mode}_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endforeach()
         add_test(NAME startup_stream_viewport_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_viewport_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")

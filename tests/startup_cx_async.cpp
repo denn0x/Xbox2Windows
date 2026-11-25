@@ -1,7 +1,7 @@
 // LOCAL stall: a translated slot-67 compute dispatch (list slot 14) issued while its pipeline is not loaded yet
 // (d3d12_compute.inl, X2W_CX_ASYNC).
 //
-//   startup_cx_async <warp|hardware> <async|sync>
+//   startup_cx_async <warp|hardware> <async|sync|known|seen>
 //   (X2W_D3D12_RENDER=1 X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_DEBUG=1; async also X2W_CX_ASYNC=1;
 //    the test sets X2W_SHADER_CACHE, X2W_TRAP_LOG and X2W_CX_TEST_HOLD_EVENT itself)
 //
@@ -18,8 +18,14 @@
 //          compiling.
 //   sync (control, switch off): the event is set 300 ms after recording starts; the recording thread waits for
 //          the load, so list 1 runs all three: word 0 is 3; no skip line and no ready line.
-// Both: the translation's "translated:" line, the hold line "released", no debug-layer error or corruption
-// message, device not removed.
+//   known (X2W_CX_PREWARM_ALL=1 X2W_CX_ASYNC=1, no hold): a second cached translation B; no keys-seen file. Both
+//          keys are queued at device creation ("2 known pipelines queued ... every cached translation") and loaded
+//          before the pipeline is created; list 1 runs all three (counter 3), no skip line; the keys-seen file
+//          becomes exactly key A (the only dispatched key).
+//   seen (as known, with a keys-seen file of B and C; C has no translation): "1 known pipelines queued ... 2 keys,
+//          1 with a translation"; the file becomes A, B and C.
+// All: the translation's "translated:" line; the hold line "released" in async / sync only; no debug-layer error
+// or corruption message, device not removed.
 // Exit 0 pass, 77 capability skip (no adapter, no existing-heap support), other values name the step.
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -77,8 +83,9 @@ int main(int argc, char** argv)
 {
     if (argc != 3) return 2;
     const std::string mode = argv[2];
-    if (mode != "async" && mode != "sync") return 2;
+    if (mode != "async" && mode != "sync" && mode != "known" && mode != "seen") return 2;
     const bool async = mode == "async";
+    const bool prewarm = mode == "known" || mode == "seen";  // X2W_CX_PREWARM_ALL (no hold)
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
     ComPtr<IDXGIAdapter> adapter;
@@ -131,7 +138,7 @@ int main(int argc, char** argv)
     const std::wstring event_name = L"Local\\x2w_cx_hold_" + tag;
     hold_event = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
     if (!hold_event) return 5;
-    SetEnvironmentVariableW(L"X2W_CX_TEST_HOLD_EVENT", event_name.c_str());
+    if (!prewarm) SetEnvironmentVariableW(L"X2W_CX_TEST_HOLD_EVENT", event_name.c_str());
 
     // The title's compute root signature (its bytes go into the key; the translated one comes from the manifest).
     D3D12_ROOT_PARAMETER title_params[1]{};
@@ -146,14 +153,28 @@ int main(int argc, char** argv)
     char key_text[24];
     std::snprintf(key_text, sizeof(key_text), "%016llx", static_cast<unsigned long long>(key));
     std::printf("compute key %s\n", key_text);
-    {
+    // known / seen: a second cached translation (key B, never created or dispatched); seen: a keys-seen file of
+    // B and C (C has no translation), so only B is queued at start and the file afterwards holds A, B and C.
+    const std::uint64_t key_b = key ^ 0x10, key_c = 0x67000000000000c0ull;
+    for (const std::uint64_t k : {key, key_b}) {
+        if (k == key_b && !prewarm) continue;
         wchar_t name[24];
-        swprintf(name, 24, L"%016llx", static_cast<unsigned long long>(key));
+        swprintf(name, 24, L"%016llx", static_cast<unsigned long long>(k));
         const std::wstring base = cache + L"\\" + name;
         const std::string manifest = "cs 1 1 1\nuav 0 buf root 0 0\n";
         if (!write_file(base + L".cs.cso", startup_cx_async_cs, sizeof(startup_cx_async_cs)) ||
             !write_file(base + L".cs.txt", manifest.data(), manifest.size()))
             return 5;
+    }
+    const auto key_line = [](std::uint64_t k) {
+        char text[24];
+        std::snprintf(text, sizeof(text), "%016llx\n", static_cast<unsigned long long>(k));
+        return std::string(text);
+    };
+    const std::wstring seen_path = cache + L"\\cx_keys_seen.lst";
+    if (mode == "seen") {
+        const std::string seen = key_line(key_b) + key_line(key_c);
+        if (!write_file(seen_path, seen.data(), seen.size())) return 5;
     }
 
     std::array<unsigned char, 64> device_parameters{};
@@ -161,6 +182,17 @@ int main(int argc, char** argv)
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), device_parameters.data(), __uuidof(ID3D12Device), &device))) return 6;
     ComPtr<ID3D12Device> desktop;  // the same device object as the stand-in's (one device per adapter)
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 6;
+    // known / seen: the start prewarm loads the known keys before the title creates anything (at most 15 s).
+    const std::string all_loaded = std::string("x2w-cx prewarm: all ") + (mode == "known" ? "2" : "1") + " known pipelines loaded";
+    if (prewarm) {
+        bool loaded = false;
+        for (int i = 0; i < 300 && !loaded; ++i) {
+            loaded = read_log(log_path).find(all_loaded) != std::string::npos;
+            if (!loaded) Sleep(50);
+        }
+        std::printf("start prewarm: \"%s\" %s\n", all_loaded.c_str(), loaded ? "seen" : "NOT seen within 15 s");
+        if (!loaded) return 9;
+    }
     void *title_root = nullptr, *pipeline = nullptr;
     if (!ok(invoke(device, 16, 0, arg(title_blob->GetBufferPointer()), title_blob->GetBufferSize(), arg(&__uuidof(ID3D12RootSignature)), arg(&title_root))))
         return 7;
@@ -211,14 +243,15 @@ int main(int argc, char** argv)
     };
 
     int failures = 0;
-    if (!async) {
+    if (mode == "sync") {
         if (const HANDLE t = CreateThread(nullptr, 0, release_later, nullptr, 0, nullptr)) CloseHandle(t);
         else return 13;
     }
     const ULONGLONG list1_start = GetTickCount64();
     if (!run_list(3)) return 14;
     const std::uint32_t after_first = memory[0];
-    std::printf("list 1 (3 dispatches, pipeline held back): counter %u, recorded and executed in %llu ms\n", after_first,
+    std::printf(prewarm ? "list 1 (3 dispatches, pipeline prewarmed at start): counter %u, recorded and executed in %llu ms\n"
+                        : "list 1 (3 dispatches, pipeline held back): counter %u, recorded and executed in %llu ms\n", after_first,
                 static_cast<unsigned long long>(GetTickCount64() - list1_start));
     if (after_first != (async ? 0u : 3u)) {
         std::printf("FAIL: list 1 should leave the counter at %u\n", async ? 0u : 3u);
@@ -258,9 +291,35 @@ int main(int argc, char** argv)
     const bool released = has(std::string("x2w-cx ") + key_text + ": load held by X2W_CX_TEST_HOLD_EVENT (released)");
     std::printf("log: translated %d, hold released %d, skip line %d, ready line %d (%ld dispatches skipped while compiling)\n", translated, released,
                 has(skip_line), has(ready_line), skipped);
-    if (!translated || !released) {
-        std::printf("FAIL: the translation was not loaded through the hold\n");
+    if (!translated || released == prewarm) {
+        std::printf("FAIL: the translation was not loaded %s\n", prewarm ? "(or the hold was set)" : "through the hold");
         ++failures;
+    }
+    if (prewarm) {
+        // The queued line, and the keys-seen file the writer thread writes every 10 s (wait at most 25 s).
+        const std::string queued = mode == "known"
+                                       ? "x2w-cx prewarm: 2 known pipelines queued (X2W_CX_PREWARM_ALL; no keys seen file: every cached translation)"
+                                       : "x2w-cx prewarm: 1 known pipelines queued (X2W_CX_PREWARM_ALL; keys seen file ";
+        const std::string counts = ": 2 keys, 1 with a translation)";
+        const bool queued_ok = has(queued) && (mode == "known" || has(counts));
+        std::printf("log: queued line %d\n", queued_ok);
+        if (!queued_ok) {
+            std::printf("FAIL: the start prewarm did not queue what mode %s expects\n", mode.c_str());
+            ++failures;
+        }
+        std::uint64_t sorted[3] = {key_c, key < key_b ? key : key_b, key < key_b ? key_b : key};  // key_c is the smallest
+        const std::string want = mode == "known" ? key_line(key) : key_line(sorted[0]) + key_line(sorted[1]) + key_line(sorted[2]);
+        std::string seen;
+        for (int i = 0; i < 250; ++i) {
+            seen = read_log(seen_path);
+            if (seen == want) break;
+            Sleep(100);
+        }
+        std::printf("keys seen file: \"%s\" (want \"%s\")\n", seen.c_str(), want.c_str());
+        if (seen != want) {
+            std::printf("FAIL: the keys seen file is not the union of the earlier file and the dispatched key\n");
+            ++failures;
+        }
     }
     if (async ? (!has(skip_line) || skipped < 3) : (has(skip_line) || has(ready_line))) {
         std::printf("FAIL: the X2W_CX_ASYNC lines do not match mode %s\n", mode.c_str());

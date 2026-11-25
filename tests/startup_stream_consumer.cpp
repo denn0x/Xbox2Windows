@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <wrl/client.h>
 
 #include <array>
@@ -137,6 +138,35 @@ int main(int argc, char** argv)
         if (const int rc = check_stream_draw(adapter.Get(), device, pso, first.c_str(), nullptr, format)) return rc;
         if (!MoveFileW((std::wstring(manifest) + L".pending").c_str(), manifest)) return 61;
         Sleep(1100);
+    }
+    // LOCAL stall (X2W_DRAW_ASYNC): X2W_TEST_HOLD_RELEASE=first|<ms> with X2W_CX_TEST_HOLD_EVENT=<name>. The
+    // pipeline compile of the first draw waits for the named event: "first" sets it after the first draw
+    // (<output>.first) returns, <ms> from another thread that many ms after the first draw starts. Then, 1.5 s
+    // after the release, a second draw to <output>.
+    wchar_t hold_name[128], release[16];
+    const DWORD hold_length = GetEnvironmentVariableW(L"X2W_CX_TEST_HOLD_EVENT", hold_name, 128);
+    const DWORD release_length = GetEnvironmentVariableW(L"X2W_TEST_HOLD_RELEASE", release, 16);
+    if (hold_length && hold_length < 128 && release_length && release_length < 16) {
+        static HANDLE hold = CreateEventW(nullptr, TRUE, FALSE, hold_name);
+        static DWORD delay = 0;
+        if (!hold) return 62;
+        const bool after_first = std::wcscmp(release, L"first") == 0;
+        if (!after_first) {
+            delay = static_cast<DWORD>(std::wcstoul(release, nullptr, 10));
+            const auto later = [](void*) -> DWORD {
+                Sleep(delay);
+                SetEvent(hold);
+                return 0;
+            };
+            if (const HANDLE t = CreateThread(nullptr, 0, later, nullptr, 0, nullptr)) CloseHandle(t);
+            else return 62;
+        }
+        const std::string first = std::string(argv[5]) + ".first";
+        if (const int rc = check_stream_draw(adapter.Get(), device, pso, first.c_str(), nullptr, format)) return rc;
+        if (after_first) SetEvent(hold);
+        else WaitForSingleObject(hold, 30000);
+        Sleep(1500);
+        return check_stream_draw(adapter.Get(), device, pso, argv[5], nullptr, format);
     }
     if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
         extern void release_placed_vertices(bool);

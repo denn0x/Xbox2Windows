@@ -1245,7 +1245,7 @@ struct PsoBuild {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC fallback{};
 };
 struct PsoSlot {
-    int state = 0;  // 1 compiling, 2 done
+    int state = 0;  // 1 compiling, 2 done, 3 queued for an X2W_DRAW_ASYNC worker
     ID3D12PipelineState* pipeline = nullptr;
 };
 SRWLOCK pso_build_lock = SRWLOCK_INIT;  // inside draw_lock when both are held
@@ -1257,6 +1257,118 @@ std::map<std::pair<const BoundPipeline*, u64>, PsoSlot>& pso_slots()
     return m;
 }
 
+// LOCAL stall, fixtures only: X2W_CX_TEST_HOLD_EVENT=<name> holds every translated compute load and every
+// translated draw pipeline compile until the named event is set (at most 20 s).
+void test_hold(const char* what, u64 key)
+{
+    wchar_t hold[128];
+    const DWORD n = GetEnvironmentVariableW(L"X2W_CX_TEST_HOLD_EVENT", hold, 128);
+    if (!n || n >= 128) return;
+    if (const HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, hold)) {
+        const DWORD waited = WaitForSingleObject(event, 20000);
+        CloseHandle(event);
+        log("%s %016llx: load held by X2W_CX_TEST_HOLD_EVENT (%s)", what, key, waited == WAIT_OBJECT_0 ? "released" : "timed out");
+    }
+}
+
+// LOCAL stall: X2W_DRAW_ASYNC=1 (also on with X2W_CX_ASYNC=1 unless X2W_DRAW_ASYNC_OFF=1). A draw whose desktop
+// pipeline is not built yet queues the build for two below-normal workers and is skipped ("pipeline compiling"),
+// so the recording thread never compiles and never waits for a compile. A skipped draw is dropped, not replayed.
+// Slot state 3 = queued for a worker; a thread without the switch that finds it claims it and compiles itself.
+bool draw_async()
+{
+    static const bool on = !x2w_local::env_on("X2W_DRAW_PSO_LOCKED") &&
+                           (x2w_local::env_on("X2W_DRAW_ASYNC") || (x2w_local::env_on("X2W_CX_ASYNC") && !x2w_local::env_on("X2W_DRAW_ASYNC_OFF")));
+    return on;
+}
+struct DrawAsync {
+    LONG skipped = 0, since_report = 0;
+};
+std::unordered_map<u64, DrawAsync>& draw_async_keys()  // pso_build_lock; by translation key
+{
+    static std::unordered_map<u64, DrawAsync> m;
+    return m;
+}
+std::deque<PsoBuild>& pso_queue()  // pso_build_lock
+{
+    static std::deque<PsoBuild> q;
+    return q;
+}
+CONDITION_VARIABLE pso_wanted = CONDITION_VARIABLE_INIT;
+
+void compile_pso(const PsoBuild& build, PsoSlot& slot);
+DWORD WINAPI pso_thread(void*)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        AcquireSRWLockExclusive(&pso_build_lock);
+        while (pso_queue().empty()) SleepConditionVariableSRW(&pso_wanted, &pso_build_lock, INFINITE, 0);
+        const PsoBuild build = pso_queue().front();
+        pso_queue().pop_front();
+        PsoSlot& slot = pso_slots()[{build.bound, build.key}];
+        const bool mine = slot.state == 3;  // else another thread claimed it
+        if (mine) slot.state = 1;
+        ReleaseSRWLockExclusive(&pso_build_lock);
+        if (mine) compile_pso(build, slot);
+    }
+}
+// draw_translated without draw_lock: queues `build` unless it is queued, compiling or built; counts the skip.
+void queue_pso_build(const PsoBuild& build)
+{
+    static const bool started = [] {
+        for (int i = 0; i < 2; ++i)
+            if (const HANDLE t = CreateThread(nullptr, 0, pso_thread, nullptr, 0, nullptr)) CloseHandle(t);
+        log("x2w-draw X2W_DRAW_ASYNC: 2 pipeline build threads; a draw whose desktop pipeline is not built yet is skipped");
+        return true;
+    }();
+    (void)started;
+    AcquireSRWLockExclusive(&pso_build_lock);
+    PsoSlot& slot = pso_slots()[{build.bound, build.key}];
+    const bool queue = slot.state == 0;
+    if (queue) {
+        slot.state = 3;
+        pso_queue().push_back(build);
+    }
+    DrawAsync& a = draw_async_keys()[build.translation];
+    const bool first = !a.skipped;
+    ++a.skipped, ++a.since_report;
+    ReleaseSRWLockExclusive(&pso_build_lock);
+    if (queue) WakeConditionVariable(&pso_wanted);
+    static LONG logged;
+    if (first && first_calls(logged, 32))
+        log("x2w-draw %016llx: desktop pipeline not built yet, draw skipped and the build queued (X2W_DRAW_ASYNC)", build.translation);
+}
+// Heartbeat: draws skipped while their pipeline compiled, since the last report, per translation key.
+void report_draw_async()
+{
+    if (!draw_async()) return;
+    std::vector<std::pair<u64, LONG>> keys;
+    LONG total = 0, all_time = 0;
+    AcquireSRWLockExclusive(&pso_build_lock);
+    for (auto& entry : draw_async_keys()) {
+        all_time += entry.second.skipped;
+        if (!entry.second.since_report) continue;
+        keys.push_back({entry.first, entry.second.since_report});
+        total += entry.second.since_report;
+        entry.second.since_report = 0;
+    }
+    const std::size_t waiting = pso_queue().size();
+    ReleaseSRWLockExclusive(&pso_build_lock);
+    if (!total) return;
+    std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    char line[1400];
+    int n = std::snprintf(line, sizeof(line), "x2w-draw draws skipped while compiling since the last report (X2W_DRAW_ASYNC): %ld over %zu keys "
+                          "(%ld this run; %zu builds waiting):", total, keys.size(), all_time, waiting);
+    for (const auto& k : keys) {
+        if (n > static_cast<int>(sizeof(line)) - 40) {
+            n += std::snprintf(line + n, sizeof(line) - n, " ...");
+            break;
+        }
+        n += std::snprintf(line + n, sizeof(line) - n, " %016llx=%ld", k.first, k.second);
+    }
+    log("%s", line);
+}
+
 void build_pipeline(const PsoBuild& build)
 {
     AcquireSRWLockExclusive(&pso_build_lock);
@@ -1266,8 +1378,13 @@ void build_pipeline(const PsoBuild& build)
         ReleaseSRWLockExclusive(&pso_build_lock);
         return;
     }
-    slot.state = 1;
+    slot.state = 1;  // from 0, or 3 (queued for a worker: claimed here)
     ReleaseSRWLockExclusive(&pso_build_lock);
+    compile_pso(build, slot);
+}
+void compile_pso(const PsoBuild& build, PsoSlot& slot)
+{
+    test_hold("x2w-draw", build.translation);
     LARGE_INTEGER start, end, frequency;
     QueryPerformanceCounter(&start);
     ID3D12PipelineState* pipeline = nullptr;
@@ -1283,8 +1400,12 @@ void build_pipeline(const PsoBuild& build)
     AcquireSRWLockExclusive(&pso_build_lock);
     slot.pipeline = pipeline;
     slot.state = 2;
+    LONG skipped = 0;
+    if (draw_async())
+        if (const auto found = draw_async_keys().find(build.translation); found != draw_async_keys().end()) skipped = found->second.skipped;
     ReleaseSRWLockExclusive(&pso_build_lock);
     WakeAllConditionVariable(&pso_built);
+    if (skipped) log("x2w-draw %016llx ready (X2W_DRAW_ASYNC); %ld draws skipped while compiling", build.translation, skipped);
 }
 
 void pipeline_desc(const BoundPipeline& bound, const Translation& tr, const Pass& pass, DXGI_FORMAT dsv_format,
@@ -2159,6 +2280,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                        ? pipeline_for(*bound, *tr, pass, pso_locked || attempt ? nullptr : &build) : nullptr;
         if (pipeline || !build.bound) break;
         ReleaseSRWLockExclusive(&draw_lock);
+        if (draw_async()) {  // LOCAL stall: never compile or wait here; the draw is skipped
+            queue_pso_build(build);
+            last_draw_key = tr->key;
+            last_draw_why = "desktop pipeline compiling (X2W_DRAW_ASYNC)";
+            return false;
+        }
         build_pipeline(build);
         lock_draw(100000 + __LINE__);
     }

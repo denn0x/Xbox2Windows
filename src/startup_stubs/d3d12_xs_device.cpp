@@ -5302,6 +5302,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         rawaddr_report();  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
         report_srv_copies();  // LOCAL stall: X2W_DRAW_SRV_STATS / X2W_DRAW_SRV_IN_PLACE (d3d12_draw.inl)
         report_cx_async();    // LOCAL stall: X2W_CX_ASYNC (d3d12_compute.inl)
+        report_prewarm_known("at the heartbeat");  // LOCAL stall: X2W_CX_PREWARM_ALL
+        report_draw_async();  // LOCAL stall: X2W_DRAW_ASYNC (d3d12_draw.inl)
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));
@@ -5495,6 +5497,7 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
     removal_device = device;
     the_device = wrap(device, device_kind);
     *wrapped = the_device;
+    prewarm_known_start();  // LOCAL stall: X2W_CX_PREWARM_ALL (d3d12_compute.inl)
 }
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
