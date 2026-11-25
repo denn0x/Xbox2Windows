@@ -252,7 +252,7 @@ bool rawaddr_dispatch(Wrapper* self, ID3D12GraphicsCommandList* list, UINT x, UI
     std::uint32_t table[ra::kTableDwords];
     ra::fill_table(regions, count, table);
 
-    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(300000 + __LINE__);
+    lock_draw(400000 + __LINE__);
     if (!ensure_draw_heap(the_device)) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;

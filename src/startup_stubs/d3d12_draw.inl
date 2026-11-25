@@ -226,13 +226,154 @@ void draw_lock_taken(int line)
 }
 // LOCAL: takes draw_lock; time spent blocked behind another holder is reported as "draw-lock-wait"
 // in the time-inside line (calls = acquisitions that had to wait), which the 10 s monitor cannot show.
+// LOCAL stall: X2W_DRAW_LOCK_TIMES=1 (default off): hold and wait time of draw_lock by the site that took it (the
+// `line` id passed to lock_draw: d3d12_xs_device.cpp line, 100000 + d3d12_draw.inl line, 200000 + d3d12_compute.inl,
+// 300000 + d3d12_mesh.inl, 400000 + d3d12_rawaddr.inl, 900000 + d3d12_memcut_release.inl). One "x2w-draw lock times"
+// line every 300 frames (queue_present), counters reset there. The hold ends at ReleaseSRWLockExclusive(&draw_lock):
+// the macro below routes every exclusive SRW release after this point through release_exclusive_timed, which only
+// does the accounting for draw_lock released by the thread that took it. Off: one static bool test per release.
+namespace draw_lock_times {
+struct Site {
+    volatile LONG id;
+    volatile LONG64 holds, hold_ticks, hold_max, waits, wait_ticks, wait_max;
+};
+constexpr int site_count = 128;
+Site sites[site_count];
+volatile LONG overflow;     // acquisitions whose site found no free slot
+volatile LONG hold_open;    // written by the holder only: draw_lock_taken ran and the release has not been counted
+bool on()
+{
+    static const bool value = x2w_local::env_on("X2W_DRAW_LOCK_TIMES");
+    return value;
+}
+Site* site(LONG id)
+{
+    const unsigned start = static_cast<unsigned>(id) * 2654435761u;
+    for (int i = 0; i < site_count; ++i) {
+        Site& s = sites[(start + static_cast<unsigned>(i)) % site_count];
+        LONG seen = s.id;
+        if (seen == id) return &s;
+        if (seen == 0) {
+            seen = InterlockedCompareExchange(&s.id, id, 0);
+            if (seen == 0 || seen == id) return &s;
+        }
+    }
+    InterlockedIncrement(&overflow);
+    return nullptr;
+}
+void raise_max(volatile LONG64& max, LONG64 value)
+{
+    for (LONG64 seen = max; value > seen;) {
+        const LONG64 before = InterlockedCompareExchange64(&max, value, seen);
+        if (before == seen) break;
+        seen = before;
+    }
+}
+void note_wait(LONG id, LONG64 ticks)
+{
+    if (Site* s = site(id)) {
+        InterlockedIncrement64(&s->waits);
+        InterlockedAdd64(&s->wait_ticks, ticks);
+        raise_max(s->wait_max, ticks);
+    }
+}
+const char* file_of(LONG id)
+{
+    switch (id / 100000) {
+    case 0: return "xs_device";
+    case 1: return "draw";
+    case 2: return "compute";
+    case 3: return "mesh";
+    case 4: return "rawaddr";
+    case 9: return id >= 999000 ? "fixture" : "memcut_release";
+    default: return "?";
+    }
+}
+// Every 300 frames (queue_present) and from the fixture export: sites by hold time, then reset.
+void report(const char* when)
+{
+    if (!on()) return;
+    static LONG64 frequency = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart;
+    }();
+    struct Row { LONG id; LONG64 holds, hold_ticks, hold_max, waits, wait_ticks, wait_max; };
+    Row rows[site_count];
+    int count = 0;
+    for (Site& s : sites) {
+        if (!s.id) continue;
+        rows[count++] = {s.id, InterlockedExchange64(&s.holds, 0), InterlockedExchange64(&s.hold_ticks, 0), InterlockedExchange64(&s.hold_max, 0),
+                         InterlockedExchange64(&s.waits, 0), InterlockedExchange64(&s.wait_ticks, 0), InterlockedExchange64(&s.wait_max, 0)};
+        if (!rows[count - 1].holds && !rows[count - 1].waits) --count;
+    }
+    std::sort(rows, rows + count, [](const Row& a, const Row& b) { return a.hold_ticks > b.hold_ticks; });
+    const auto ms = [](LONG64 ticks) { return static_cast<double>(ticks) * 1000.0 / static_cast<double>(frequency); };
+    LONG64 hold_total = 0, wait_total = 0;
+    for (int i = 0; i < count; ++i) hold_total += rows[i].hold_ticks, wait_total += rows[i].wait_ticks;
+    char line[3072];
+    int n = std::snprintf(line, sizeof(line), "x2w-draw lock times (%s, X2W_DRAW_LOCK_TIMES): held %.1f ms, waited %.1f ms over %d sites%s; "
+                          "site id file holds/total ms/max ms, waits/total ms/max ms:", when, ms(hold_total), ms(wait_total), count,
+                          overflow ? " (site table full: some not counted)" : "");
+    for (int i = 0; i < count && n < static_cast<int>(sizeof(line)) - 160; ++i) {
+        const Row& r = rows[i];
+        n += std::snprintf(line + n, sizeof(line) - n, " %ld %s %lld/%.1f/%.2f, %lld/%.1f/%.2f;", r.id, file_of(r.id), r.holds, ms(r.hold_ticks),
+                           ms(r.hold_max), r.waits, ms(r.wait_ticks), ms(r.wait_max));
+    }
+    log("%s", line);
+}
+}  // namespace draw_lock_times
 void lock_draw(int line)
 {
     if (!TryAcquireSRWLockExclusive(&draw_lock)) {
         Timed waited(time_draw_lock_wait);
-        AcquireSRWLockExclusive(&draw_lock);
+        if (draw_lock_times::on()) {
+            LARGE_INTEGER before, after;
+            QueryPerformanceCounter(&before);
+            AcquireSRWLockExclusive(&draw_lock);
+            QueryPerformanceCounter(&after);
+            draw_lock_times::note_wait(line, after.QuadPart - before.QuadPart);
+        } else {
+            AcquireSRWLockExclusive(&draw_lock);
+        }
     }
     draw_lock_taken(line);
+    if (draw_lock_times::on()) draw_lock_times::hold_open = 1;
+}
+void release_exclusive_timed(PSRWLOCK lock)
+{
+    if (lock == &draw_lock && draw_lock_times::on() && draw_lock_times::hold_open &&
+        draw_lock_thread == static_cast<LONG>(GetCurrentThreadId())) {
+        draw_lock_times::hold_open = 0;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        const LONG64 ticks = now.QuadPart - draw_lock_since;
+        if (draw_lock_times::Site* s = draw_lock_times::site(draw_lock_line)) {
+            InterlockedIncrement64(&s->holds);
+            InterlockedAdd64(&s->hold_ticks, ticks);
+            draw_lock_times::raise_max(s->hold_max, ticks);
+        }
+    }
+    ReleaseSRWLockExclusive(lock);
+}
+#define ReleaseSRWLockExclusive(lock) release_exclusive_timed(lock)
+// Fixture hook (startup_draw_lock_times): op 0 takes draw_lock at site 999000 + b, holds it a microseconds (spin)
+// and releases it; op 1 writes the report now ("fixture").
+extern "C" __declspec(dllexport) u64 WINAPI x2w_draw_lock_times_test(int op, u64 a, u64 b)
+{
+    if (op == 1) {
+        draw_lock_times::report("fixture");
+        return draw_lock_times::on() ? 1 : 0;
+    }
+    if (op != 0) return 0;
+    lock_draw(999000 + static_cast<int>(b));
+    LARGE_INTEGER start, now, frequency;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    do QueryPerformanceCounter(&now);
+    while (static_cast<u64>(now.QuadPart - start.QuadPart) * 1000000ull < a * static_cast<u64>(frequency.QuadPart));
+    ReleaseSRWLockExclusive(&draw_lock);
+    return 1;
 }
 std::unordered_map<const Wrapper*, BoundPipeline*>& translation_by_pipeline() { static std::unordered_map<const Wrapper*, BoundPipeline*> m; return m; }
 std::unordered_map<u64, Translation*>& translation_by_key() { static std::unordered_map<u64, Translation*> m; return m; }
@@ -1038,7 +1179,7 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     if (found != root_blobs().end()) root_blob = found->second;
     ReleaseSRWLockShared(&note_lock);
     if (root_blob.empty()) return nullptr;
-    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
+    lock_draw(100000 + __LINE__);
     auto* result = cached_translation(stages[0].pShaderBytecode, stages[0].BytecodeLength,
                                       stages[1].pShaderBytecode, stages[1].BytecodeLength, root_blob);
     ReleaseSRWLockExclusive(&draw_lock);
@@ -1638,7 +1779,7 @@ std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
 
 void discard_draw_sampler_heaps(Wrapper* self)
 {
-    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
+    lock_draw(100000 + __LINE__);
     recorded_draw_sampler_heaps.erase(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
     ReleaseSRWLockExclusive(&draw_lock);
 }
@@ -3312,7 +3453,7 @@ void __stdcall list_copy_buffer_gpu(Wrapper* self, Wrapper* dest, u64 dest_offse
     // A source the GPU never wrote (CPU-filled upload memory) is also copied at record time, so the paths that read
     // the destination's title memory when the title records (vertex/index ring copies, misaligned srvs, texture
     // uploads) see what X2W_D3D12_COPY_BUFFER=1 gave them; the GPU copy then writes the same bytes in list order.
-    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
+    lock_draw(100000 + __LINE__);
     const bool source_gpu_written = gpu_written_overlaps(from_address, bytes);
     ReleaseSRWLockExclusive(&draw_lock);
     copy_watch_note("gpu", to_address, from_address, bytes, source_gpu_written ? "GPU copy (source GPU-written)" : "GPU copy + record-time copy");
@@ -3361,7 +3502,7 @@ void __stdcall list_copy_buffer_gpu(Wrapper* self, Wrapper* dest, u64 dest_offse
         const Pass& pass = pass_of(self);
         if (pass.pipeline_real && pass.pipeline) list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
     }
-    AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(100000 + __LINE__);
+    lock_draw(100000 + __LINE__);
     note_gpu_written(to_address, bytes);
     report_draw_rt();
     ReleaseSRWLockExclusive(&draw_lock);

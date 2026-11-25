@@ -756,6 +756,19 @@ foreach(backend IN ITEMS warp hardware)
     endforeach()
 endforeach()
 
+# LOCAL stall: draw_lock hold / wait time by site (d3d12_draw.inl, X2W_DRAW_LOCK_TIMES; off = control). No GPU.
+add_executable(startup_draw_lock_times tests/startup_draw_lock_times.cpp)
+target_compile_features(startup_draw_lock_times PRIVATE cxx_std_17)
+add_dependencies(startup_draw_lock_times d3d12_xs_shim)
+foreach(mode IN ITEMS on off)
+    add_test(NAME startup_draw_lock_times_${mode} COMMAND startup_draw_lock_times ${mode})
+    set(lock_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1")
+    if(mode STREQUAL "on")
+        set(lock_env "${lock_env};X2W_DRAW_LOCK_TIMES=1")
+    endif()
+    set_tests_properties(startup_draw_lock_times_${mode} PROPERTIES TIMEOUT 60 ENVIRONMENT "${lock_env}")
+endforeach()
+
 # LOCAL stall: a translated slot-67 dispatch while its pipeline is held back (d3d12_compute.inl, X2W_CX_ASYNC).
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CountMain -Vn startup_cx_async_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"

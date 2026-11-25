@@ -5346,7 +5346,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
     LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
     if (render_mode() && frame % 300 == 0) {
-        AcquireSRWLockExclusive(&draw_lock); draw_lock_taken(0 + __LINE__);
+        lock_draw(0 + __LINE__);
         null_total = null_bindings;
         for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
         ReleaseSRWLockExclusive(&draw_lock);
@@ -5361,6 +5361,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             texture_bytes_uploaded, textures_unreadable);
     if (render_mode() && frame % 300 == 0) report_target_binds();
     if (render_mode() && frame % 300 == 0) report_draw_state();  // LOCAL (renderstate): d3d12_draw.inl
+    if (frame % 300 == 0) draw_lock_times::report("300 frames");  // LOCAL stall: X2W_DRAW_LOCK_TIMES
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];
