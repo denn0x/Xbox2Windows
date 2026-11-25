@@ -3254,6 +3254,31 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make_k())
 
 
+def _cmp_u64(equal):
+    # s_cmp_eq_u64 / s_cmp_lg_u64: SCC = (S0 == S1) / (S0 != S1) on 64-bit values (RDNA 2 ISA, SOPC). Lowered on
+    # data pairs only (a 64-bit pointer or constant read from memory, an inline constant): a lane mask compared
+    # with anything is a question about the whole wave, which this one-lane model holds as this lane's bit only,
+    # so exec, vcc and any pair holding a lane mask (or a copy of exec) are refused.
+    def handler(self, ops, mods):
+        if len(ops) != 2 or mods:
+            raise Unsupported('s_cmp_%s_u64 form %s %s' % ('eq' if equal else 'lg', ops, mods))
+        for tok in ops:
+            r = reg_range(tok)
+            if r and r[0] == 's' and any(n in getattr(self, 'masks', ()) or (self.sym.get(n) or ('',))[0] == 'execcopy'
+                                         for n in (r[1], r[2])):
+                raise Unsupported('s_cmp_%s_u64 on a lane mask' % ('eq' if equal else 'lg'))
+        (a0, a1), (b0, b1) = self.pair(ops[0]), self.pair(ops[1])
+        if equal:
+            self.emit('scc = %s == %s && %s == %s;' % (a0, b0, a1, b1))
+        else:
+            self.emit('scc = %s != %s || %s != %s;' % (a0, b0, a1, b1))
+    return handler
+
+
+Stage.op_s_cmp_eq_u64 = _cmp_u64(True)
+Stage.op_s_cmp_lg_u64 = _cmp_u64(False)
+
+
 def parse_root(blob):
     if not blob or blob[:4] != b'DXBC':
         raise Unsupported('root signature blob missing')
