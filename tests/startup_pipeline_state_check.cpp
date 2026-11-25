@@ -316,6 +316,13 @@ void switch_cases()
     check(!s.uncleared, "uncleared depth tests need the depth group");
     s = parse_switches("0", "1", nullptr, nullptr, nullptr, nullptr, "1");
     check(!s.uncleared, "X2W_DRAW_STATE=0 turns uncleared depth tests off");
+    check(!s.depthclip, "depth clip default off");
+    s = parse_switches(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "1");
+    check(s.depthclip && !s.cull && !s.depth && !s.blend, "depth clip on its own switch");
+    s = parse_switches("0", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "1");
+    check(!s.depthclip, "X2W_DRAW_STATE=0 turns depth clip off");
+    s = parse_switches(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "yes");
+    check(!s.depthclip, "only \"1\" turns depth clip on");
 }
 }  // namespace
 

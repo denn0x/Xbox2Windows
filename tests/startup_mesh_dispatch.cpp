@@ -192,8 +192,14 @@ int main(int argc, char** argv)
         mode != "rtvuint" && mode != "smpheap" && mode != "smpheapswap" && mode != "statez" && mode != "statezge" && mode != "statezoff" &&
         mode != "statecull" && mode != "stateculloff" && mode != "statedepth" && mode != "statecullflip" && mode != "statecullnone" &&
         mode != "statezrepeat" && mode != "statezuncleared" && mode != "statezlateclear" && mode != "async" && mode != "asyncone" && mode != "rtvvariant" &&
-        mode != "uavtex" && mode != "uavtexnoflag" && mode != "rtvnops")
+        mode != "uavtex" && mode != "uavtexnoflag" && mode != "rtvnops" && mode != "stateclip" && mode != "stateclipon" && mode != "stateclipkeep")
         return 2;
+    // stateclip / stateclipon / stateclipkeep (X2W_DRAW_STATE_DEPTHCLIP, without X2W_MESH_STATE): the triangles at z 1.5,
+    // beyond the far plane. stateclip: PA_CL_CLIP_CNTL ZCLIP_NEAR + FAR_DISABLE and the switch: depth clip off, drawn.
+    // stateclipon (control): the same words, switch unset: default depth clip on, dropped. stateclipkeep (control):
+    // switch set, clip bits clear: the decoded depth clip is on, dropped.
+    const bool clipmode = mode.compare(0, 9, "stateclip") == 0;
+    if (mode == "stateclip" || mode == "stateclipkeep") SetEnvironmentVariableW(L"X2W_DRAW_STATE_DEPTHCLIP", L"1");
     // statecullflip: X2W_MESH_STATE_CULL_FLIP=1, the other triangle culled; statecullnone: X2W_MESH_STATE_NOCULL=1, both
     // drawn. statezrepeat: 32 calls with render target + depth, then 32 with the render target only: exactly two PSO
     // lines (dsv 40, dsv 0), i.e. the calls after the first of each pass take the PSO kept with the binding.
@@ -204,7 +210,7 @@ int main(int argc, char** argv)
     // X2W_MESH_STATE=1 except in the *off modes. The UNSHIFTED offsets hold contradicting values (ZFUNC NEVER, cull
     // front), so a decode that misses the shift fails.
     const bool state_mode = mode.compare(0, 5, "state") == 0;
-    const bool state_on = state_mode && mode != "statezoff" && mode != "stateculloff";
+    const bool state_on = state_mode && mode != "statezoff" && mode != "stateculloff" && mode.compare(0, 9, "stateclip") != 0;
     const bool zmode = mode.compare(0, 6, "statez") == 0;  // render target and depth target
     const bool cullmode = mode.compare(0, 9, "statecull") == 0;
     if (state_on) SetEnvironmentVariableW(L"X2W_MESH_STATE", L"1");
@@ -344,9 +350,10 @@ int main(int argc, char** argv)
     key = fnv(title_blob->GetBufferPointer(), title_blob->GetBufferSize(), key);
     {  // trace_statez: X2W_MESH_DUMP_INPUTS=<this key> (read by the stand-in at the first traced mesh call)
         char traced_now[8]{}, key_hex[24];
-        if (mode == "statez" && GetEnvironmentVariableA("X2W_D3D12_TRACE_ALL", traced_now, sizeof(traced_now)) && traced_now[0] == '1') {
+        if ((mode == "statez" || mode == "zero") && GetEnvironmentVariableA("X2W_D3D12_TRACE_ALL", traced_now, sizeof(traced_now)) && traced_now[0] == '1') {
             std::snprintf(key_hex, sizeof(key_hex), "%016llx", static_cast<unsigned long long>(key));
-            SetEnvironmentVariableA("X2W_MESH_DUMP_INPUTS", key_hex);
+            // A list: another key first, then this one (each listed key is dumped once).
+            SetEnvironmentVariableA("X2W_MESH_DUMP_INPUTS", (std::string("0000000000000001, ") + key_hex).c_str());
         }
     }
     std::printf("mesh key %016llx\n", static_cast<unsigned long long>(key));
@@ -416,9 +423,11 @@ int main(int argc, char** argv)
         put(0x078 + shift, 0xf);                         // CB_SHADER_MASK: target 0 all channels
         put(0x0cc + shift, 0xf);                         // CB_TARGET_MASK
         put(0x0d0 + shift, 0);                           // CB_BLEND0: blend off
-        put(0x09c + shift, 0);                           // PA_CL_CLIP_CNTL: depth clip on
-        // DB_DEPTH_CONTROL: Z_ENABLE (1) | Z_WRITE_ENABLE (2) | ZFUNC (4-6): 1 LESS, 6 GEQUAL; none in the cull modes.
-        put(0x0b8 + shift, cullmode ? 0u : 0x2u | 0x4u | ((mode == "statezge" ? 6u : 1u) << 4));
+        // PA_CL_CLIP_CNTL: depth clip on; stateclip / stateclipon: ZCLIP_NEAR_DISABLE (26) + ZCLIP_FAR_DISABLE (27).
+        put(0x09c + shift, mode == "stateclip" || mode == "stateclipon" ? 0x0c000000u : 0u);
+        put(0x09c, mode == "stateclipkeep" ? 0x0c000000u : 0u);  // unshifted: the opposite (a missed shift fails)
+        // DB_DEPTH_CONTROL: Z_ENABLE (1) | Z_WRITE_ENABLE (2) | ZFUNC (4-6): 1 LESS, 6 GEQUAL; none in the cull / clip modes.
+        put(0x0b8 + shift, cullmode || clipmode ? 0u : 0x2u | 0x4u | ((mode == "statezge" ? 6u : 1u) << 4));
         put(0x0a0 + shift, cullmode ? 0x2u : 0u);        // PA_SU_SC_MODE_CNTL: CULL_BACK (bit 1), FACE 0
         put(0x0b8, 0x2u);                                // unshifted: Z on, ZFUNC NEVER (a missed shift draws nothing)
         put(0x0a0, 0x1u);                                // unshifted: cull front
@@ -444,7 +453,8 @@ int main(int argc, char** argv)
     auto* memory = static_cast<unsigned char*>(VirtualAlloc(nullptr, 2u << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!memory) return 10;
     unsigned char* const args_memory = memory + 0x1c20;
-    const std::uint32_t sentinel[3] = {1, 1, 1};
+    // zero: X = 0 already at record time (the X2W_MESH_DUMP_INPUTS control: a call without groups is not dumped).
+    const std::uint32_t sentinel[3] = {mode == "zero" ? 0u : 1u, 1, 1};
     std::memcpy(args_memory, sentinel, 12);
     D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 64, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
@@ -630,7 +640,7 @@ int main(int argc, char** argv)
 
     const std::uint32_t x = mode == "zero" ? 0u : mode == "huge" ? 70000u : 2u;
     const std::uint32_t record_values[4] = {x, 1, 1, 0};
-    const std::uint32_t colour = 0x00ff40c0;  // R c0, G 40, B ff
+    const std::uint32_t colour = clipmode ? 0x01ff40c0u : 0x00ff40c0u;  // R c0, G 40, B ff; bit 24: z 1.5 (MeshMain)
     const float clear_colour[4] = {0, 0, 0, 0};
     invoke(list, 139, arg(allocator));                                     // Reset
     invoke(list, 33, arg(writer_root));                                    // SetComputeRootSignature
@@ -663,6 +673,9 @@ int main(int argc, char** argv)
     invoke(list, 36, 1, view_gpu);                                         // SetGraphicsRootDescriptorTable(1, heap start)
     invoke(list, 40, 2, 1, arg(&colour), 0);                               // SetGraphicsRoot32BitConstants(2, 1, &colour, 0)
     if (words) invoke(list, 40, 0, 1, arg(&shader_slot), 0);                 // SetGraphicsRoot32BitConstants(0, 1, &slot, 0): entry value 2
+    // statez: root constant [0][1] = bit 28 + heap index 0 (srv 0's view, the vertices): the dump's heap buffer case.
+    const std::uint32_t heap_reference = 0x10000000u;
+    if (mode == "statez") invoke(list, 40, 0, 1, arg(&heap_reference), 1);  // SetGraphicsRoot32BitConstants(0, 1, &ref, 1)
     invoke(list, 25, arg(pipeline));                                       // SetPipelineState (the mesh pipeline)
     invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);               // ExecuteIndirect(mesh signature, 1, args, 0)
     if (mode == "async") {  // the worker's PSO line, then a second call
@@ -717,7 +730,7 @@ int main(int argc, char** argv)
         ++failures;
     }
     const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || smp || mode == "statez" || mode == "statezoff" ||
-                                mode == "stateculloff" || mode == "statecullnone" || repeat || mode == "statezuncleared" || mode == "statezlateclear" || mode == "async" || mode == "rtvvariant" || mode == "uavtex" || (!words_skip && (mode == "words16" || mode == "words32"));
+                                mode == "stateculloff" || mode == "statecullnone" || mode == "stateclip" || repeat || mode == "statezuncleared" || mode == "statezlateclear" || mode == "async" || mode == "rtvvariant" || mode == "uavtex" || (!words_skip && (mode == "words16" || mode == "words32"));
     // RGBA8 little-endian: R c0, G 40, B ff, A ff. words modes: G = the FORMAT code in vdesc word 3 (29 = 0x1d, 64 = 0x40).
     // smpheap: entry 65 point -> texel 0 (red ff0000ff); smpheapswap: entry 65 linear at u = 0.375 -> 0.75 red + 0.25
     // blue (R bf, B 40, A ff; filtering precision allows +-3 per channel).
@@ -884,8 +897,15 @@ int main(int argc, char** argv)
     if (state_mode) {  // the PSO line says which state it was made with; the switch line only with X2W_MESH_STATE=1
         const bool switch_line = has("x2w-mesh X2W_MESH_STATE=1: ");
         const bool decoded_line = has(std::string("x2w-mesh desktop pipeline for ") + key_text) && has("; state decoded (X2W_MESH_STATE)");
-        std::printf("log: X2W_MESH_STATE line %d, PSO with decoded state %d\n", switch_line, decoded_line);
-        if (switch_line != state_on || decoded_line != state_on) {
+        // The clip modes: the PSO line says depth clip alone was decoded (stateclip: off; stateclipkeep: on = the
+        // default, so no change and a "default" PSO), and the switch line exists when the switch is set.
+        const bool clip_line = has("; state default + depth clip decoded (X2W_DRAW_STATE_DEPTHCLIP): ") &&
+                               has(", cull 1 ccw 0 depthclip 0, ");
+        const bool clip_switch_line = has("x2w-mesh X2W_DRAW_STATE_DEPTHCLIP=1: ");
+        std::printf("log: X2W_MESH_STATE line %d, PSO with decoded state %d, depth clip alone %d (switch line %d)\n", switch_line,
+                    decoded_line, clip_line, clip_switch_line);
+        if (switch_line != state_on || decoded_line != state_on || clip_line != (mode == "stateclip") ||
+            clip_switch_line != (mode == "stateclip" || mode == "stateclipkeep")) {
             std::printf("FAIL: the X2W_MESH_STATE lines do not match mode %s\n", mode.c_str());
             ++failures;
         }
@@ -960,7 +980,16 @@ int main(int argc, char** argv)
                        frame_line.find(" 32x32 fmt 28] dsv ") != std::string::npos && frame_line.find(" fmt 40 (32x32 res fmt 40, last clear depth 0.5 stencil 0 flags 0x1 frame ") != std::string::npos &&
                        frame_line.find(") query #0 viewport 0.0 0.0 32.0 32.0 depth 0.00-1.00 scissor 0 0 32 32 depth 1 func 2 write 1 stencil ") != std::string::npos &&
                        frame_line.find(" record (max count 1, stride ") != std::string::npos &&
+                       frame_line.find(" raster cull ") != std::string::npos && frame_line.find("(from the title; title PA_SU_SC_MODE_CNTL ") != std::string::npos &&
                        notes == 2 && noted[0] == 32 && noted[1] == 32 && noted[2] == 28 && noted[3] == 1 && noted[4] == 32 && noted[6] == 40 && noted[7] == 1;
+        } else if (mode == "statecull") {  // X2W_MESH_STATE: the decoded rasterizer (cull back) in the PSO, with the title's words
+            trace_ok = frame_line.find(std::string("x2w-frame mesh drawn key ") + key_text + " targets 1 [0 ") == 0 &&
+                       frame_line.find(" raster cull 3 ccw ") != std::string::npos &&
+                       frame_line.find("(from the title; title PA_SU_SC_MODE_CNTL ") != std::string::npos && notes == 1 && noted[3] == 1;
+        } else if (mode == "stateculloff") {  // the control: X2W_MESH_STATE unset, the default rasterizer (cull none)
+            trace_ok = frame_line.find(std::string("x2w-frame mesh drawn key ") + key_text + " targets 1 [0 ") == 0 &&
+                       frame_line.find(" raster cull 1 ccw 0 depthclip 1 bias 0/") != std::string::npos &&
+                       frame_line.find("(default: X2W_MESH_STATE off or NOCULL; title PA_SU_SC_MODE_CNTL ") != std::string::npos && notes == 1 && noted[3] == 1;
         } else if (mode == "zero") {  // issued with 0 groups (the stats control): a drawn line with a query, the target noted
             trace_ok = frame_line.find(std::string("x2w-frame mesh drawn key ") + key_text + " targets 1 [0 ") == 0 &&
                        frame_line.find(" query #0 ") != std::string::npos && notes == 1 && noted[2] == 28 && noted[3] == 1;
@@ -994,6 +1023,7 @@ int main(int argc, char** argv)
                 ? t0.find(" snapshot ") != std::string::npos && t0.find(" 32x32 fmt 28 draws 1:") != std::string::npos && nonzero_share(t0) > 0.0 &&
                       t1.find(" snapshot ") != std::string::npos && t1.find(" 32x32 fmt 40 draws 1:") != std::string::npos && nonzero_share(t1) > 0.0
                 : mode == "zero" ? t0.find(" snapshot ") != std::string::npos && t0.find(" 32x32 fmt 28 draws 1:") != std::string::npos && nonzero_share(t0) == 0.0
+                : mode == "statecull" || mode == "stateculloff" ? t0.find(" snapshot ") != std::string::npos && nonzero_share(t0) > 0.0
                 : t0.empty();
             if (!read_ok || bad) {
                 std::printf("FAIL: the traced-target read-back does not match mode %s\n", mode.c_str());
@@ -1015,6 +1045,10 @@ int main(int argc, char** argv)
             const bool stats_ok = mode == "statez"
                 ? frame_line.find(" query #0") != std::string::npos && c_primitives >= 1 && ps >= 1 && (ms_primitives == -2 || ms_primitives >= 1)
                 : mode == "zero" ? !stats.empty() && c_prims == 0 && c_primitives == 0 && ps == 0 && (ms_primitives == -2 || ms_primitives == 0)
+                // statecull: 2 triangles emitted, one back-facing and culled. Whether the clipper count includes the
+                // culled one is what this run measures (printed above); either 1 or 2 passes, one triangle's pixels.
+                : mode == "statecull" ? !stats.empty() && (ms_primitives == -2 || ms_primitives == 2) && (c_primitives == 1 || c_primitives == 2) && ps >= 1
+                : mode == "stateculloff" ? !stats.empty() && (ms_primitives == -2 || ms_primitives == 2) && c_primitives == 2 && ps >= 1
                 : stats.empty() && after.find("x2w-frame mesh stats #") == std::string::npos;
             if (!stats_ok) {
                 std::printf("FAIL: the pipeline statistics do not match mode %s\n", mode.c_str());
@@ -1035,12 +1069,29 @@ int main(int argc, char** argv)
                     vertices_found = bytes.size() == sizeof(vertices) && std::memcmp(bytes.data(), vertices, sizeof(vertices)) == 0;
                 }
                 const std::string record = read_all(dump + L"record.bin");
-                const bool dump_ok = vertices_found && index.find("entry.bin ") != std::string::npos &&
+                // The heap buffer named by root constant [0][1] (bit 28, index 0): the vertices again, and its descriptor.
+                const std::string heap0 = read_all(dump + L"heap0.bin"), heap0_desc = read_all(dump + L"heap0_desc.bin");
+                const bool heap_ok = heap0.size() == sizeof(vertices) && std::memcmp(heap0.data(), vertices, sizeof(vertices)) == 0 &&
+                                     heap0_desc.size() == 32 && index.find("(root constant [0][1] = 0x10000000)") != std::string::npos;
+                // The list's other key (0000000000000001) matches no call: no folder for it.
+                const DWORD other = GetFileAttributesW((cache + L"\\mesh_dump_0000000000000001").c_str());
+                const bool dump_ok = other == INVALID_FILE_ATTRIBUTES && has("x2w-mesh X2W_MESH_DUMP_INPUTS: 2 key(s)") && heap_ok &&
+                                     vertices_found && index.find("entry.bin ") != std::string::npos &&
                                      index.find("root_constants.bin 512 bytes") != std::string::npos && record.size() == 12 &&
                                      index.find("call issued") != std::string::npos && has(std::string("x2w-mesh dump ") + key_text + ":");
                 std::printf("log: dump index:\n%s(vertices found %d, record %zu bytes)\n", index.c_str(), vertices_found, record.size());
                 if (!dump_ok) {
-                    std::printf("FAIL: the X2W_MESH_DUMP_INPUTS files do not match\n");
+                    std::printf("FAIL: the X2W_MESH_DUMP_INPUTS files do not match (heap buffer %d)\n", heap_ok);
+                    ++failures;
+                }
+            }
+            if (mode == "zero") {  // the control: the key is listed, but its only call has X = 0 at record time: no dump
+                const DWORD folder = GetFileAttributesW((cache + L"\\mesh_dump_" + std::wstring(key_text, key_text + 16)).c_str());
+                const bool none = folder == INVALID_FILE_ATTRIBUTES && !has(std::string("x2w-mesh dump ") + key_text + ":") &&
+                                  has("x2w-mesh X2W_MESH_DUMP_INPUTS: 2 key(s)");
+                std::printf("log: zero-group call dumped %d\n", !none);
+                if (!none) {
+                    std::printf("FAIL: a call with X = 0 was dumped\n");
                     ++failures;
                 }
             }

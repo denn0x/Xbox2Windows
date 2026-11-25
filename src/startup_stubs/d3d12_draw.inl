@@ -57,6 +57,8 @@ struct BoundPipeline {
     x2w_pipeline_state::Blend masked_blend;
     D3D12_DEPTH_STENCIL_DESC patch_ds{};
     D3D12_RASTERIZER_DESC patch_rs{};
+    // LOCAL meshrt: the title's raw rasterizer words rs was decoded from (traced-frame mesh lines).
+    std::uint32_t raw_mode = 0, raw_clip = 0;
 };
 
 // LOCAL (renderstate): counters for the decoded fixed-function state, reported every 300 frames.
@@ -73,8 +75,9 @@ const x2w_pipeline_state::Switches& switches()
 {
     static const x2w_pipeline_state::Switches s = [] {
         const auto v = x2w_pipeline_state::switches_from_env();
-        log("x2w-draw-state switches: depth %d cull %d (flip %d) blend masks %d depth clears %d (X2W_DRAW_STATE_DEPTH / _CULL / "
-            "_CULL_FLIP / _BLEND / _DEPTH_CLEAR, X2W_DRAW_STATE=0 all off)", v.depth, v.cull, v.flip, v.blend, v.depth_clear);
+        log("x2w-draw-state switches: depth %d cull %d (flip %d) blend masks %d depth clears %d depth clip %d (X2W_DRAW_STATE_DEPTH / "
+            "_CULL / _CULL_FLIP / _BLEND / _DEPTH_CLEAR / _DEPTHCLIP, X2W_DRAW_STATE=0 all off)", v.depth, v.cull, v.flip, v.blend,
+            v.depth_clear, v.depthclip);
         return v;
     }();
     return s;
@@ -1294,6 +1297,8 @@ void decode_draw_state(BoundPipeline& bound, Wrapper* pipeline, const PipelineIn
     bound.mesh_layout = words.mesh;
     bound.ds = decode_depth_stencil(words.depth, words.stencil, words.refmask, words.refmask_bf);
     bound.rs = decode_rasterizer(words.mode, words.clip, words.bias_clamp, words.bias_scale, words.bias_offset, draw_state::switches().flip);
+    bound.raw_mode = words.mode;  // LOCAL meshrt
+    bound.raw_clip = words.clip;
     bound.masked_blend = decode_blend(words.blend, words.target_mask, words.shader_mask, true, false);
     const D3D12_DEPTH_STENCIL_DESC& d = bound.derived_ds ? bound.patch_ds : bound.ds.desc;
     const bool ds_known = bound.derived_ds || bound.ds.ok;
@@ -1535,6 +1540,14 @@ bool apply_draw_state(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHI
         }
         desc.RasterizerState = r;
         changed = true;
+    } else if (s.depthclip && (bound.derived_rs || (bound.has_words && bound.rs.ok))) {
+        // LOCAL meshrt X2W_DRAW_STATE_DEPTHCLIP=1: only the decoded depth clip (shadow passes turn it off), the rest
+        // of the rasterizer stays as it was.
+        const BOOL clip = (bound.derived_rs ? bound.patch_rs : bound.rs.desc).DepthClipEnable ? TRUE : FALSE;
+        if (desc.RasterizerState.DepthClipEnable != clip) {
+            desc.RasterizerState.DepthClipEnable = clip;
+            changed = true;
+        }
     }
     return changed;
 }
@@ -1763,7 +1776,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     D3D12_GRAPHICS_PIPELINE_STATE_DESC decoded{};
     bool changed = false;
     const auto& state_switches = draw_state::switches();
-    if (state_switches.depth || state_switches.cull || state_switches.blend) {
+    if (state_switches.depth || state_switches.cull || state_switches.blend || state_switches.depthclip) {
         pipeline_desc(bound, tr, pass, dsv_format, decoded);
         changed = apply_draw_state(bound, pass, decoded, state_switches);
         if (changed) {
@@ -2772,20 +2785,47 @@ UavTextureSkip bind_uav_texture(const Pass& pass, const Translation& tr, UINT j,
 // <folder of X2W_TRAP_LOG>\mesh_dump_<key>\ (local only): srv<i>.bin = the srv's title range read at record time (the
 // bytes a record-time copy uploads; an in-place binding is read by the GPU later), entry.bin = the entry constants as
 // set (u32 each), record.bin = the indirect record (d3d12_mesh.inl), index.txt = one line per file. Traced frame only.
-u64 mesh_dump_key()
+// The value is a comma (or space / semicolon) separated list of up to 16 keys; each key is dumped once.
+struct MeshDumpKeys {
+    u64 keys[16] = {};
+    unsigned count = 0;
+};
+const MeshDumpKeys& mesh_dump_keys()
 {
-    static const u64 key = [] {
-        char value[32]{};
-        return GetEnvironmentVariableA("X2W_MESH_DUMP_INPUTS", value, sizeof(value)) ? _strtoui64(value, nullptr, 16) : 0ull;
+    static const MeshDumpKeys list = [] {
+        MeshDumpKeys out;
+        char value[16 * 20 + 16]{};
+        if (!GetEnvironmentVariableA("X2W_MESH_DUMP_INPUTS", value, sizeof(value))) return out;
+        for (char* p = value; *p && out.count < 16;) {
+            while (*p == ',' || *p == ' ' || *p == ';') ++p;
+            char* end = nullptr;
+            const u64 key = _strtoui64(p, &end, 16);
+            if (end == p) break;
+            if (key) out.keys[out.count++] = key;
+            p = end;
+        }
+        log("x2w-mesh X2W_MESH_DUMP_INPUTS: %u key(s)", out.count);
+        return out;
     }();
-    return key;
+    return list;
 }
-LONG mesh_dump_claimed;               // one dump per process
+u64 mesh_dump_key() { return mesh_dump_keys().count ? mesh_dump_keys().keys[0] : 0; }  // non-zero: any key wanted
+LONG mesh_dump_claimed[16];              // one dump per listed key
 thread_local std::string mesh_dump_dir;  // non-empty: this call is being dumped (folder with trailing backslash)
+// d3d12_mesh.inl: the group counts of this call's first indirect record as in title memory at record time
+// (false: no readable record). Run 113: the executed counts equal these (mesh, 063500).
+bool mesh_dump_record_groups(std::uint32_t (&xyz)[3]);
 bool mesh_dump_begin(u64 key)
 {
     mesh_dump_dir.clear();
-    if (!key || key != mesh_dump_key() || InterlockedCompareExchange(&mesh_dump_claimed, 1, 0) != 0) return false;
+    const MeshDumpKeys& list = mesh_dump_keys();
+    unsigned at = 0;
+    while (at < list.count && list.keys[at] != key) ++at;
+    if (!key || at == list.count || mesh_dump_claimed[at]) return false;
+    // Only a call that dispatches groups (X, Y and Z non-zero): the first such traced call of each key.
+    std::uint32_t xyz[3] = {};
+    if (!mesh_dump_record_groups(xyz) || !xyz[0] || !xyz[1] || !xyz[2]) return false;
+    if (InterlockedCompareExchange(&mesh_dump_claimed[at], 1, 0) != 0) return false;
     char log_path[MAX_PATH]{};
     std::string dir;
     if (GetEnvironmentVariableA("X2W_TRAP_LOG", log_path, sizeof(log_path))) {
@@ -2798,7 +2838,8 @@ bool mesh_dump_begin(u64 key)
     dir += name;
     CreateDirectoryA(dir.c_str(), nullptr);
     mesh_dump_dir = dir;
-    log("x2w-mesh dump %016llx: inputs of the first traced call to %s", static_cast<unsigned long long>(key), dir.c_str());
+    log("x2w-mesh dump %016llx: inputs of the first traced call with groups (record %u %u %u) to %s", static_cast<unsigned long long>(key),
+        xyz[0], xyz[1], xyz[2], dir.c_str());
     return true;
 }
 void mesh_dump_file(const char* file, const void* data, std::size_t bytes, const char* note)
@@ -3122,17 +3163,20 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             strides[i] = (words[1] >> 16) & 0x3fff;
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
+        const std::size_t full_bytes = bytes;  // LOCAL meshrt: the dump writes the whole range (up to 256 MiB)
         if (bytes > (16u << 20)) bytes = 16u << 20;
         if (dumping) {  // LOCAL meshrt: X2W_MESH_DUMP_INPUTS
-            char file[16], note[200];
+            char file[16], note[240];
             std::snprintf(file, sizeof(file), "srv%u.bin", i);
-            const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
-            std::snprintf(note, sizeof(note), "srv %u source %d(%d,%d) entry 0x%llx words %08x %08x %08x %08x address 0x%llx stride %u%s%s", i,
+            const std::size_t dump_bytes = full_bytes > (256u << 20) ? (256u << 20) : full_bytes;
+            const bool readable_range = address && dump_bytes && readable_window(address, dump_bytes) >= dump_bytes;
+            std::snprintf(note, sizeof(note), "srv %u source %d(%d,%d) entry 0x%llx words %08x %08x %08x %08x address 0x%llx stride %u%s%s%s", i,
                           srv.source, srv.a, srv.b, static_cast<unsigned long long>(entry), words[0], words[1], words[2], words[3],
                           static_cast<unsigned long long>(address), strides[i], readable_range ? "" : " (range not readable: no bytes)",
-                          placed.reject ? " (placed: rejected, bound null)" : "");
+                          placed.reject ? " (placed: rejected, bound null)" : "",
+                          dump_bytes != bytes ? " (binding clamped to 16 MiB; dump has the full range up to 256 MiB)" : "");
             SplitRelock relock(split, 100000 + __LINE__);
-            mesh_dump_file(file, readable_range ? reinterpret_cast<const void*>(address) : nullptr, readable_range ? bytes : 0, note);
+            mesh_dump_file(file, readable_range ? reinterpret_cast<const void*>(address) : nullptr, readable_range ? dump_bytes : 0, note);
         }
         if (const int r = range_watch_hit(address, bytes); r >= 0) {
             SplitRelock relock(split, 100000 + __LINE__);
@@ -3303,6 +3347,85 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         mesh_dump_file("entry.bin", values, tr->uds.size() * sizeof(values[0]), note);
         mesh_dump_file("root_constants.bin", pass.constants, sizeof(pass.constants),
                        "the list's 32-bit root constants as set by the title, [parameter 0-15][word 0-7] u32");
+        // The heap buffers a key reads through a root constant (mesh 063500: bit 28 set = the meshlet index comes from
+        // a heap buffer whose descriptor index is bits 0-9). Every root-constant word with bit 28 set is taken as such
+        // a reference (ASSUMED; a word that is really something else gives one extra file): heap<index>_desc.bin is
+        // the 32-byte title descriptor, heap<index>.bin the buffer it names (whole range, up to 256 MiB).
+        u64 heap_address = 0, heap_bytes = 0;
+        if (pass.source_view_heap) {
+            AcquireSRWLockShared(&note_lock);
+            for (const HeapInfo& h : heap_infos())
+                if (h.wrapper == pass.source_view_heap && h.title_cpu) heap_address = h.title_cpu, heap_bytes = u64{h.logical_count} * h.increment;
+            ReleaseSRWLockShared(&note_lock);
+        }
+        if (!heap_address) title_view_heap(pass, &heap_address, &heap_bytes);
+        std::uint32_t done_index[16];
+        unsigned done = 0;
+        for (int p = 0; p < 16 && done < 16; ++p)
+            for (int w = 0; w < 8 && done < 16; ++w) {
+                const std::uint32_t c = pass.constants[p][w];
+                if (!(c & (1u << 28))) continue;
+                const std::uint32_t index = c & 0x3ff;
+                bool again = false;
+                for (unsigned k = 0; k < done; ++k) again |= done_index[k] == index;
+                if (again) continue;
+                done_index[done++] = index;
+                char file[32], note[300];
+                const u64 slot = heap_address + u64{index} * 32;
+                const bool slot_ok = heap_address && u64{index} * 32 + 32 <= heap_bytes && readable_window(slot, 32) >= 32;
+                std::uint32_t d[8] = {};
+                if (slot_ok) std::memcpy(d, reinterpret_cast<const void*>(slot), sizeof(d));
+                std::snprintf(file, sizeof(file), "heap%u_desc.bin", index);
+                std::snprintf(note, sizeof(note), "title heap descriptor %u (root constant [%d][%d] = 0x%08x) at 0x%llx, heap 0x%llx %llu bytes%s", index,
+                              p, w, c, static_cast<unsigned long long>(slot), static_cast<unsigned long long>(heap_address),
+                              static_cast<unsigned long long>(heap_bytes), slot_ok ? "" : " (not readable: no bytes)");
+                mesh_dump_file(file, slot_ok ? d : nullptr, slot_ok ? sizeof(d) : 0, note);
+                if (!slot_ok) continue;
+                u64 at = 0;
+                std::size_t n = 0;
+                UINT stride = 0;
+                const char* how = "hardware buffer descriptor";
+                if (d[0] == view_token_magic) {  // a view the title created (as the srv table path resolves it)
+                    ViewRecord record{};
+                    AcquireSRWLockShared(&note_lock);
+                    const bool known = d[1] < view_records().size();
+                    if (known) record = view_records()[d[1]];
+                    ReleaseSRWLockShared(&note_lock);
+                    how = known ? "view token" : "view token, unknown view";
+                    if (known && record.slot == 17 && record.desc_bytes >= 12) {
+                        std::uint32_t size = 0;
+                        std::memcpy(&at, record.desc, 8);
+                        std::memcpy(&size, record.desc + 8, 4);
+                        n = size;
+                        how = "view token: constant buffer view";
+                    } else if (known && record.slot == 18 && record.desc_bytes >= 40) {
+                        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+                        std::memcpy(&view, record.desc, 40);
+                        Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
+                        if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && resource && resource->own().title_memory) {
+                            const bool typed_view = !view.Buffer.StructureByteStride && view.Format != DXGI_FORMAT_R32_TYPELESS;
+                            const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
+                                                 : typed_view ? x2w_startup::typed_buffer_format_bytes(view.Format) : 4;
+                            at = reinterpret_cast<u64>(resource->own().title_memory) + view.Buffer.FirstElement * element;
+                            n = std::size_t{view.Buffer.NumElements} * element;
+                            stride = element;
+                            how = typed_view ? "view token: typed buffer view" : "view token: buffer view";
+                        } else {
+                            how = "view token: not a buffer view of title memory";
+                        }
+                    }
+                } else {
+                    at = d[0] | (static_cast<u64>(d[1] & 0xffff) << 32);
+                    stride = (d[1] >> 16) & 0x3fff;
+                    n = static_cast<std::size_t>(stride ? stride : 1) * d[2];
+                }
+                if (n > (256u << 20)) n = 256u << 20;
+                const bool range_ok = at && n && readable_window(at, n) >= n;
+                std::snprintf(file, sizeof(file), "heap%u.bin", index);
+                std::snprintf(note, sizeof(note), "buffer of title heap descriptor %u (%s): words %08x %08x %08x %08x, address 0x%llx stride %u%s", index,
+                              how, d[0], d[1], d[2], d[3], static_cast<unsigned long long>(at), stride, range_ok ? "" : " (range not readable: no bytes)");
+                mesh_dump_file(file, range_ok ? reinterpret_cast<const void*>(at) : nullptr, range_ok ? n : 0, note);
+            }
     }
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
     if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {

@@ -18,7 +18,8 @@ void MeshMain(uint3 group : SV_GroupID, uint thread : SV_GroupThreadID, out vert
 {
     SetMeshOutputCounts(3, 1);
     const float2 p = asfloat(positions.Load2((group.x * 3 + thread) * 8));
-    verts[thread].pos = float4(p, 0.25, 1.0);
+    // Colour bit 24 (the stateclip modes): z 1.5 = beyond the far plane (z / w > 1), drawn only with depth clip off.
+    verts[thread].pos = float4(p, (colour >> 24) & 1 ? 1.5 : 0.25, 1.0);
     verts[thread].param0 = float4((colour & 255) / 255.0, ((colour >> 8) & 255) / 255.0, ((colour >> 16) & 255) / 255.0,
                                   rect == 0 ? 1.0 : 0.5);
     if (thread == 0) tris[0] = uint3(0, 1, 2);

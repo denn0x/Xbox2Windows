@@ -307,6 +307,14 @@ void report_mesh_keys(LONG frames)
 // pipeline_state_decode.h) or the nearest slot 55 part. Unset (default): the default state as before, same PSO key.
 // The state is per title pipeline (BoundPipeline), so two pipelines of one key with different state get two PSOs.
 // *fallback (when not null) receives the default desc if the decoded state changed it, for a failed creation.
+// LOCAL meshrt (X2W_MESH_DUMP_INPUTS, declared in d3d12_draw.inl): the first record's X, Y, Z in title memory, as
+// the traced-frame mesh line reads it (d3d12_indirect.inl sets mesh_trace_record for this call).
+bool mesh_dump_record_groups(std::uint32_t (&xyz)[3])
+{
+    if (!mesh_trace_record || mesh_trace_stride < 12 || !x2w_local::readable(mesh_trace_record, 12)) return false;
+    std::memcpy(xyz, mesh_trace_record, 12);
+    return true;
+}
 bool mesh_cull_flip()
 {
     static const bool flip = x2w_local::env_on("X2W_MESH_STATE_CULL_FLIP");
@@ -320,6 +328,9 @@ const x2w_pipeline_state::Switches& mesh_switches()
         // Without a rebuild: X2W_MESH_STATE_NOCULL=1 keeps the default rasterizer (cull none);
         // X2W_MESH_STATE_CULL_FLIP=1 inverts the decoded front face (apply_draw_state's flip covers slot-55 patches only).
         if (v.cull && x2w_local::env_on("X2W_MESH_STATE_NOCULL")) v.cull = false;
+        // X2W_DRAW_STATE_DEPTHCLIP=1: the decoded depth clip alone (also without X2W_MESH_STATE); cull includes it.
+        v.depthclip = x2w_local::env_on("X2W_DRAW_STATE_DEPTHCLIP");
+        if (v.depthclip) log("x2w-mesh X2W_DRAW_STATE_DEPTHCLIP=1: mesh PSOs take depth clip from the pipeline's rasterizer state");
         if (v.depth)
             log("x2w-mesh X2W_MESH_STATE=1: mesh PSOs take depth-stencil, %sblend from the pipeline's state block%s", v.cull ? "rasterizer and " : "",
                 !v.cull ? " (X2W_MESH_STATE_NOCULL: rasterizer default)" : mesh_cull_flip() ? " (X2W_MESH_STATE_CULL_FLIP: front face inverted)" : "");
@@ -351,7 +362,7 @@ void mesh_state_desc(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHIC
     desc.DSVFormat = dsv_format;
     desc.SampleDesc.Count = 1;
     const auto& s = mesh_switches();
-    if (s.depth || s.cull || s.blend) {
+    if (s.depth || s.cull || s.blend || s.depthclip) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC before = desc;
         const bool changed = apply_draw_state(bound, pass, desc, s);
         if (s.cull && mesh_cull_flip() && std::memcmp(&before.RasterizerState, &desc.RasterizerState, sizeof(desc.RasterizerState)) != 0)
@@ -441,11 +452,13 @@ void mesh_pso_compile(const Translation& tr, MeshPso& slot, const D3D12_GRAPHICS
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
     const auto& d = desc.DepthStencilState;
+    const auto& ms = mesh_switches();
     log("x2w-mesh desktop pipeline for %016llx: %u targets (format %d), dsv %d, depth %d, pixel stage %s -> 0x%08lx; state %s: depth func %d "
-        "write %d stencil %d, cull %d ccw %d, blend rt0 %d mask 0x%x; compiled in %lld ms%s", tr.key, target_count, static_cast<int>(format0),
+        "write %d stencil %d, cull %d ccw %d depthclip %d, blend rt0 %d mask 0x%x; compiled in %lld ms%s", tr.key, target_count, static_cast<int>(format0),
         static_cast<int>(desc.DSVFormat), d.DepthEnable ? 1 : 0, tr.ps ? "yes" : "none", static_cast<unsigned long>(hr),
-        decoded ? "decoded (X2W_MESH_STATE)" : "default", d.DepthFunc, d.DepthWriteMask, d.StencilEnable, desc.RasterizerState.CullMode,
-        desc.RasterizerState.FrontCounterClockwise, desc.BlendState.RenderTarget[0].BlendEnable, desc.BlendState.RenderTarget[0].RenderTargetWriteMask,
+        !decoded ? "default" : (ms.depth || ms.cull || ms.blend) ? "decoded (X2W_MESH_STATE)" : "default + depth clip decoded (X2W_DRAW_STATE_DEPTHCLIP)",
+        d.DepthFunc, d.DepthWriteMask, d.StencilEnable, desc.RasterizerState.CullMode, desc.RasterizerState.FrontCounterClockwise,
+        desc.RasterizerState.DepthClipEnable, desc.BlendState.RenderTarget[0].BlendEnable, desc.BlendState.RenderTarget[0].RenderTargetWriteMask,
         static_cast<long long>((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart), async ? " (X2W_MESH_ASYNC worker)" : "");
     if (decoded) InterlockedIncrement(&mesh_state_changed);
     if (!pso && decoded) {
@@ -746,10 +759,34 @@ void mesh_trace_call(Wrapper* self, bool drawn, const Translation* tr, const cha
     if (mesh_trace_bound) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
         u64 key = 0;
-        mesh_state_desc(*mesh_trace_bound, pass, desc, key);
+        bool decoded = false;
+        mesh_state_desc(*mesh_trace_bound, pass, desc, key, &decoded);
         const auto& d = desc.DepthStencilState;
         add(" depth %d func %d write %d stencil %d", d.DepthEnable, static_cast<int>(d.DepthFunc), d.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL,
             d.StencilEnable);
+        // The PSO's rasterizer (the desc mesh_pso creates; a failed creation falls back to the default state, see the
+        // desktop-pipeline line) and the title's words it is decoded from. D3D12 cull: 1 none, 2 front, 3 back.
+        const auto& r = desc.RasterizerState;
+        const BoundPipeline& b = *mesh_trace_bound;
+        const bool title_rs = b.derived_rs || (b.has_words && b.rs.ok);
+        add(" raster cull %d ccw %d depthclip %d bias %d/%g/%g fill %d (%s", static_cast<int>(r.CullMode), r.FrontCounterClockwise, r.DepthClipEnable,
+            r.DepthBias, r.DepthBiasClamp, r.SlopeScaledDepthBias, static_cast<int>(r.FillMode),
+            mesh_switches().cull ? (title_rs ? "from the title" : "default: title rasterizer not decoded")
+            : mesh_switches().depthclip && title_rs ? "default, depth clip from the title (X2W_DRAW_STATE_DEPTHCLIP)"
+            : "default: X2W_MESH_STATE off or NOCULL");
+        (void)decoded;
+        if (b.derived_rs)
+            add("; title: slot 55 rasterizer part");
+        else if (b.has_words)
+            add("; title PA_SU_SC_MODE_CNTL %08x PA_CL_CLIP_CNTL %08x%s%s%s", b.raw_mode, b.raw_clip, b.mesh_layout ? " mesh layout" : " vertex layout",
+                b.rs.ok ? "" : ", refused: ", b.rs.ok ? "" : (b.rs.reason ? b.rs.reason : "?"));
+        else
+            add("; no title state words");
+        if (title_rs) {  // what the title's words decode to, whether applied or not (FACE 0 = counter-clockwise front)
+            const D3D12_RASTERIZER_DESC& t = b.derived_rs ? b.patch_rs : b.rs.desc;
+            add(" -> decoded cull %d ccw %d depthclip %d bias %d", static_cast<int>(t.CullMode), t.FrontCounterClockwise, t.DepthClipEnable, t.DepthBias);
+        }
+        add("%s)", mesh_cull_flip() ? "; X2W_MESH_STATE_CULL_FLIP" : "");
     }
     if (mesh_trace_record) {
         const UINT words = mesh_trace_stride / 4 < 8 ? mesh_trace_stride / 4 : 8;
