@@ -26,6 +26,7 @@
 #include <mutex>
 #include <new>
 #include <set>
+#include <unordered_map>
 
 namespace {
 struct Backing {
@@ -664,6 +665,30 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail)
     return lost;
 }
 
+// LOCAL (xmem_work/NOTES.md, run 108): the last map or unmap of every page address, so that a consumer that finds a
+// title page unmapped (DirectStorage "destination not writable") can say whether it was never mapped, unmapped and
+// when, or is mapped now. Updated under memory.mutex by every successful map_pages_locked step.
+struct PageEvent {
+    ULONG64 tick = 0, serial = 0;
+    ULONG_PTR page = 0;
+    DWORD thread = 0;
+    unsigned char kind = 0;  // 1 map, 2 unmap
+};
+std::unordered_map<ULONG_PTR, PageEvent> page_events;
+ULONG64 page_event_serial = 0;  // one per successful map or unmap step
+ULONG64 remap_gaps = 0;        // addresses unmapped and mapped again in one call (P -> Q): a VirtualQuery from another
+                               // thread inside that call sees them uncommitted
+
+void note_events(const std::map<ULONG_PTR, ULONG_PTR>& batch, unsigned char kind) noexcept
+{
+    const ULONG64 tick = GetTickCount64(), serial = ++page_event_serial;
+    const DWORD thread = GetCurrentThreadId();
+    try {
+        for (const auto& [address, page] : batch) page_events[address] = PageEvent{tick, serial, page, thread, kind};
+    } catch (const std::bad_alloc&) {
+    }
+}
+
 // LOCAL (xmem_work/NOTES.md): one line for a refused page mapping or unmapping, with everything needed to name the
 // cause: the check that refused it or each Windows call's own error, what Windows shows at the address, what the
 // registry holds there, and the state of the slabs. Called with memory.mutex held; error is left as the last error.
@@ -775,6 +800,7 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
             }
             for (const auto& [address, page] : batch)
                 ++memory.backings.at(page).views;
+            note_events(batch, 1);
             memory.views.merge(batch);
         } else {
             // Unmap every run that holds a page of the batch, then map the surviving pages of those
@@ -811,6 +837,7 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
             }
             const bool refused = error != ERROR_SUCCESS;
             if (!refused) {
+                note_events(batch, 2);
                 for (const auto& [address, page] : batch) {
                     --memory.backings.at(page).views;
                     memory.views.erase(address);
@@ -957,6 +984,7 @@ BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* p
             if (live != memory.views.end()) {
                 if (live->second == page) continue;
                 unmap.push_back(address);
+                ++remap_gaps;
             }
             map_at.push_back(address);
             map_page.push_back(page);
@@ -1305,6 +1333,54 @@ extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allo
         return nullptr;
     }
     return reservation;
+}
+
+// LOCAL export (run 108): what the stand-in knows about the 64 KiB page at address, answered under memory.mutex, so it
+// waits for any map or unmap call in progress and never sees the gap inside a remap. TRUE when the page has a view
+// now. event_kind: 0 never mapped or unmapped by the stand-in, 1 last event a map, 2 last event an unmap; age_ms since
+// that event; serial counts map/unmap steps (a consumer compares two answers); remaps counts P -> Q remaps so far.
+extern "C" BOOL WINAPI x2w_xmem_page_event(const void* address, ULONG* event_kind, ULONG64* page, ULONG* thread,
+                                           ULONG64* age_ms, ULONG64* serial, ULONG64* remaps)
+{
+    const auto at = reinterpret_cast<ULONG_PTR>(address) & ~(ULONG_PTR{page_bytes} - 1);
+    const std::lock_guard guard(memory.mutex);
+    const auto event = page_events.find(at);
+    const PageEvent e = event != page_events.end() ? event->second : PageEvent{};
+    if (event_kind) *event_kind = e.kind;
+    if (page) *page = e.page;
+    if (thread) *thread = e.thread;
+    if (age_ms) *age_ms = e.tick ? GetTickCount64() - e.tick : 0;
+    if (serial) *serial = e.serial;
+    if (remaps) *remaps = remap_gaps;
+    return memory.views.count(at) != 0;
+}
+
+// LOCAL export (run 108): copies bytes to destination under memory.mutex when every byte of [destination,
+// destination + capacity) is committed read-write there, and returns TRUE; FALSE (nothing written) otherwise.
+// For a consumer whose own check found a title page unmapped: inside one map call a remap (page P -> Q) unmaps and
+// maps the address again, and a VirtualQuery from another thread in between sees it uncommitted. Under the mutex no
+// xmem call is in progress, so the answer is the settled one and the copy cannot meet that gap.
+extern "C" BOOL WINAPI x2w_xmem_write_settled(void* destination, const void* data, SIZE_T bytes, SIZE_T capacity)
+{
+    if (!destination || (bytes && !data) || bytes > capacity) return FALSE;
+    const auto start = reinterpret_cast<ULONG_PTR>(destination);
+    if (capacity > std::numeric_limits<ULONG_PTR>::max() - start) return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    for (ULONG_PTR cursor = start; cursor < start + capacity;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+            return FALSE;
+        const DWORD protect = info.Protect & 0xFF;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
+            protect != PAGE_EXECUTE_WRITECOPY)
+            return FALSE;
+        const ULONG_PTR end = reinterpret_cast<ULONG_PTR>(info.BaseAddress) + info.RegionSize;
+        if (end <= cursor) return FALSE;
+        cursor = end;
+    }
+    std::memcpy(destination, data, bytes);
+    return TRUE;
 }
 
 // LOCAL export: the section (a 256 MiB slab, see section_for) and byte offset behind a mapped title

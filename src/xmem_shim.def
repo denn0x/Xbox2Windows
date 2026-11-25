@@ -19,3 +19,5 @@ EXPORTS
     x2w_xmem_memory_stats @17
     x2w_xmem_reserved_ranges @18
     x2w_xmem_pool_run @19
+    x2w_xmem_page_event @20
+    x2w_xmem_write_settled @21
