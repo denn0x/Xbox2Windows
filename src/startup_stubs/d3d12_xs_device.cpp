@@ -2290,6 +2290,23 @@ void summarise_traced_targets(ID3D12CommandQueue* queue)
             log("x2w-frame target %zu %s %p %llux%u fmt %d draws %d: non-zero texels %.4f, mean byte %.2f", n, all[n].snap ? "snapshot" : "end", static_cast<void*>(all[n].first),
                 static_cast<unsigned long long>(desc.Width), desc.Height, desc.Format, all[n].second,
                 texels ? double(nonzero) / texels : 0.0, texels && texel ? double(sum) / (texels * texel) : 0.0);
+            // LOCAL (scene): raw texels on a 3x3 grid (at 1/6, 3/6, 5/6 of width and height), so a flat colour
+            // and where it sits can be read per target without an image dump.
+            if (texel && texel <= 16 && rows) {
+                char text[9 * 36 + 1]{};
+                std::size_t used = 0;
+                for (UINT gy = 1; gy < 6; gy += 2)
+                    for (UINT gx = 1; gx < 6; gx += 2) {
+                        const UINT y = static_cast<UINT>(UINT64{rows} * gy / 6);
+                        const UINT64 x = desc.Width * gx / 6;
+                        const auto* at = static_cast<const unsigned char*>(mapped) + footprint.Offset + UINT64{y} * footprint.Footprint.RowPitch + x * texel;
+                        if (used + 2 * texel + 2 < sizeof(text)) {
+                            for (UINT b = 0; b < texel; ++b) used += std::snprintf(text + used, sizeof(text) - used, "%02x", at[b]);
+                            used += std::snprintf(text + used, sizeof(text) - used, " ");
+                        }
+                    }
+                log("x2w-frame target %zu texels 3x3 (rows top to bottom, raw bytes): %s", n, text);
+            }
             const D3D12_RANGE none{0, 0};
             readback->Unmap(0, &none);
         }
@@ -5146,11 +5163,22 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             if (targets) summarise_traced_targets(static_cast<ID3D12CommandQueue*>(self->own().real));
             summarise_indirect_calls();
             busy_end = 0;
-        } else if (busy && !busy_end && dispatched >= busy && frame >= busy_next) {
-            log("x2w-frame ---- begin busy frame %ld (previous frame: %ld dispatches)", frame + 1, dispatched);
-            InterlockedExchange(&trace_frame_active, 1);
-            busy_end = frame + 1;
-            busy_next = frame + 3000;
+        } else if (busy && !busy_end && frame >= busy_next) {
+            // LOCAL (scene): X2W_D3D12_TRACE_BUSY_AFTER=n delays the traced frame by n frames after the first busy
+            // frame (the scene's first frames are black while its pipelines still compile).
+            static const LONG after = [] {
+                char value[16]{};
+                return GetEnvironmentVariableA("X2W_D3D12_TRACE_BUSY_AFTER", value, sizeof(value)) ? std::atol(value) : 0L;
+            }();
+            static LONG busy_seen;
+            if (!busy_seen && dispatched >= busy) busy_seen = frame;
+            if (busy_seen && frame >= busy_seen + after) {
+                log("x2w-frame ---- begin busy frame %ld (previous frame: %ld dispatches; first busy frame %ld)", frame + 1, dispatched, busy_seen);
+                InterlockedExchange(&trace_frame_active, 1);
+                busy_end = frame + 1;
+                busy_next = frame + 3000;
+                busy_seen = 0;
+            }
         }
     }
     bool shown_in_window = false;

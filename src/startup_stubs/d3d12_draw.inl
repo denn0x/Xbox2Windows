@@ -2315,6 +2315,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
+            // LOCAL (scene): in a traced frame, every texture a draw samples, by resource, so a pass's inputs can be
+            // matched against the "x2w-frame draw ... target <ptr>" lines of the passes that wrote them.
+            if (trace_frame_active) {
+                const D3D12_RESOURCE_DESC td = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
+                log("x2w-frame srv %016llx %u texture %p %llux%u fmt %d (view fmt %d)", tr->key, i, static_cast<void*>(texture),
+                    static_cast<unsigned long long>(td.Width), td.Height, td.Format, desc.Format);
+            }
             const bool wrong_1d_resource = texture && srv.kind == 4 &&
                 (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || texture->GetDesc().DepthOrArraySize != 1);
             if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) || wrong_1d_resource)) {
@@ -2485,6 +2492,16 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             log("x2w-draw   %016llx srv %u buffer source %d(%d,%d): entry 0x%llx words %08x %08x %08x %08x -> address 0x%llx, %zu bytes, stride %u: %s [%s]",
                 tr->key, i, srv.source, srv.a, srv.b, entry, words[0], words[1], words[2], words[3], address, bytes, strides[i],
                 have ? "bound" : "NULL", head);
+        }
+        // LOCAL (scene): in a traced frame, the whole constant block (up to 512 bytes), so a draw's world and
+        // view-projection matrices can be read. Same bytes as bound: copied at record time.
+        if (trace_frame_active && have && bytes > 48) {
+            for (std::size_t at = 0; at < bytes && at < 512; at += 256) {  // 256 bytes per line (log lines hold 1.5 KiB)
+                char part[3 * 256 + 4] = "";
+                const std::size_t n = bytes - at < 256 ? bytes - at : 256;
+                hex_text(reinterpret_cast<const void*>(address + at), n, part, sizeof(part));
+                log("x2w-frame srv-bytes %016llx %u +%zu of %zu: %s", tr->key, i, at, bytes, part);
+            }
         }
     }
     static LONG checks;
