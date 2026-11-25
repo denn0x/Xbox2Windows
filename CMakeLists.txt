@@ -817,6 +817,19 @@ foreach(backend IN ITEMS warp hardware)
     endforeach()
 endforeach()
 
+# LOCAL indirect: reserved-buffer tiles onto CreateHeap heaps (exact) and onto opened file-mapping heaps (refused by
+# the runtime, device removed: the X2W_RANGE_ALIAS gate in d3d12_range_alias.inl relies on it).
+add_executable(tile_mapping_shared_heap_check tests/tile_mapping_shared_heap_check.cpp)
+target_compile_features(tile_mapping_shared_heap_check PRIVATE cxx_std_17)
+target_link_libraries(tile_mapping_shared_heap_check PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS plain shared)
+        add_test(NAME tile_mapping_${mode}_heap_${backend} COMMAND tile_mapping_shared_heap_check ${backend} ${mode})
+        add_test(NAME tile_mapping_${mode}_heap_nodebug_${backend} COMMAND tile_mapping_shared_heap_check ${backend} ${mode} nodebug)
+        set_tests_properties(tile_mapping_${mode}_heap_${backend} tile_mapping_${mode}_heap_nodebug_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
+
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp
     tests/descriptor_heap_paging.cpp)
