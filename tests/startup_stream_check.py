@@ -11,10 +11,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools/startup"))
 import gfx2hlsl
 
 
+V_MOV_V0_ONE = 0x7e0002f2  # v_mov_b32 v0, 1.0
+
+
 def container(stage, words=None):
-    # One straight-line export (pos0 or mrt0) followed by s_endpgm and section padding.
+    # One straight-line export (pos0 or mrt0) followed by s_endpgm and section padding. The pixel stage first sets
+    # v0 = 1.0: its entry VGPRs are SPI inputs, and a stream request carries no SPI input layout, so a pixel stage
+    # that exports an entry VGPR is refused (gfx2hlsl 6f5a7071; the negative control below keeps that form).
     target = 12 if stage == 1 else 0
-    words = words if words is not None else [0xf800080f | target << 4, 0, 0xbf810000]
+    if words is None:
+        words = ([] if stage == 1 else [V_MOV_V0_ONE]) + [0xf800080f | target << 4, 0, 0xbf810000]
     code = struct.pack("<%dI" % len(words), *words)
     extent = (40 + len(code) + 4 + 15) & ~15
     image = bytearray(248 + extent)
@@ -74,7 +80,15 @@ def run(directory, consumer):
     translate()
     assert "Unexpected shader stage" in (cache / (bad + ".fail")).read_text()
     assert not (cache / (bad + ".txt")).exists()
-    print("WARP stream request, stage order, compiled VS/PS, truncated and swapped controls passed")
+    # Negative control: the pixel stage exporting its entry VGPR v0 directly is refused, not translated as 0.
+    entry = container(0, [0xf800080f, 0, 0xbf810000])
+    raw = "%016x" % gfx2hlsl.pipeline_key(vs, entry, root.read_bytes())
+    for ext, data in ((".a", vs), (".b", entry), (".root", root.read_bytes())):
+        (cache / ("req_" + raw + ext)).write_bytes(data)
+    translate()
+    assert "reads entry VGPR v0" in (cache / (raw + ".fail")).read_text()
+    assert not (cache / (raw + ".txt")).exists()
+    print("WARP stream request, stage order, compiled VS/PS, truncated, swapped and entry-VGPR controls passed")
 
 
 if __name__ == "__main__":
