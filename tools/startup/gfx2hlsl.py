@@ -1468,6 +1468,66 @@ class Stage:
         self.emit('a = %s;' % address)
         self.emit(call if self.exec_known else 'if (exec & 1) %s' % call)
 
+    def format_store(self, ops, mods, count, name):
+        """buffer_store_format_{x,xy,xyz,xyzw} to a typed buffer UAV, behind X2W_DRAW_FEATURES=uav,uavfmt.
+
+        The format is in the V# word 3 [18:12], known only at draw time: `udsrc <n> uavword3 <i>` gives it, and
+        `udsrc <n> uavstride <i>` the V# stride (word 1 [29:16]) that idxen multiplies the index by (RDNA 2 ISA,
+        MUBUF addressing: base + soffset + offset + stride * index (+ the offen VGPR)). x2w_fmt_store writes data
+        component c to format channel c; only formats whose channels are all 32 bits (codes 20-22, 62-64, 72-77:
+        the bits are stored as given) are written, any other format stores nothing. ASSUMED, not measured: DST_SEL
+        does not reorder a store (LLVM lowers the store intrinsic with the data in channel order), and the index
+        is in range (num_records not checked, as for the raw stores). The lane's store runs only where exec holds."""
+        if not {'uav', 'uavfmt'} <= set(getattr(self.pipe, 'features', ())):
+            raise Unsupported(name)
+        for m in mods:
+            if not (m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:')):
+                raise Unsupported('%s modifier %s' % (name, m))
+        key = self.descriptor(ops[2])
+        if key[0][0] not in ('table', 'root'):
+            raise Unsupported('%s through %s' % (name, key[0][0]))
+        if key in self.pipe.modified:
+            raise Unsupported('%s through a modified descriptor' % name)
+        u = self.pipe.uav(key)
+        index = int(u[1:])
+        base, w3 = self.pipe.ud(('uavbase', index)), self.pipe.ud(('uavword3', index))
+        offset = sum(int(m[7:], 0) for m in mods if m.startswith('offset:'))
+        soff = ops[3]
+        parts = ['ud%d' % base]
+        if re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', soff):
+            offset += int(soff, 0)
+        else:
+            parts.append(self.u(soff))
+        vaddr = reg_range(ops[1])
+        if 'idxen' in mods and 'offen' in mods:
+            if not vaddr or vaddr[2] != vaddr[1] + 1:
+                raise Unsupported('%s idxen offen address %s' % (name, ops[1]))
+            parts += ['v%d * ud%d' % (vaddr[1], self.pipe.ud(('uavstride', index))), self.u('v%d' % vaddr[2])]
+        elif 'idxen' in mods:
+            parts.append('%s * ud%d' % (self.u(ops[1]), self.pipe.ud(('uavstride', index))))
+        elif 'offen' in mods:
+            parts.append(self.u(ops[1]))
+        data = reg_range(ops[0])
+        if not data or data[2] - data[1] + 1 != count:
+            raise Unsupported('%s data %s' % (name, ops[0]))
+        values = [self.u('v%d' % (data[1] + i)) for i in range(count)] + ['0u'] * (4 - count)
+        self.pipe.notes.add('typed UAV store (x2w_fmt_store: 32-bit channel formats only)')
+        call = 'x2w_fmt_store(%s, a, ud%d, uint4(%s), %du);' % (u, w3, ', '.join(values), count)
+        self.emit('a = %s;' % ' + '.join(parts + ['%d' % offset]))
+        self.emit(call if self.exec_known else 'if (exec & 1) %s' % call)
+
+    def op_buffer_store_format_x(self, ops, mods):
+        self.format_store(ops, mods, 1, 'buffer_store_format_x')
+
+    def op_buffer_store_format_xy(self, ops, mods):
+        self.format_store(ops, mods, 2, 'buffer_store_format_xy')
+
+    def op_buffer_store_format_xyz(self, ops, mods):
+        self.format_store(ops, mods, 3, 'buffer_store_format_xyz')
+
+    def op_buffer_store_format_xyzw(self, ops, mods):
+        self.format_store(ops, mods, 4, 'buffer_store_format_xyzw')
+
     def op_buffer_store_dword(self, ops, mods):
         self.buffer_store(ops, mods, 1, 'buffer_store_dword')
 
@@ -2837,6 +2897,16 @@ def buf_format_helper_table():
 # The table form: fxc 10.0.26100 took 432.6 s for a vertex stage with two calls of the per-format chain and 0.6 s with
 # this one (translator_work NOTES round 5). buf_format_helper stays as the reference the check compares against.
 HELPERS['x2w_fmt_load'] = buf_format_helper_table()
+HELPERS['x2w_fmt_store'] = '\n'.join([
+    'void x2w_fmt_store(RWByteAddressBuffer b, uint a, uint w3, uint4 v, uint m) {',
+    '    uint f = (w3 >> 12) & 127u;',
+    '    uint n = (f >= 20u && f <= 22u) ? 1u : (f >= 62u && f <= 64u) ? 2u : (f >= 72u && f <= 74u) ? 3u :',
+    '             (f >= 75u && f <= 77u) ? 4u : 0u;',
+    '    n = min(n, m);',
+    '    if (n > 0u) b.Store(a, v.x);',
+    '    if (n > 1u) b.Store(a + 4u, v.y);',
+    '    if (n > 2u) b.Store(a + 8u, v.z);',
+    '    if (n > 3u) b.Store(a + 12u, v.w); }'])
 HELPERS['x2w_fma_exact'] = ('float x2w_fma_exact(float a, float b, float c) '
                             '{ return (float)fma((double)a, (double)b, (double)c); }')
 HELPERS['x2w_mad_precise'] = ('float x2w_mad_precise(float a, float b, float c) '
@@ -2963,7 +3033,7 @@ SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
 # with `udsrc <n> uavbase <i>` for buffer stores), heapwords (`heapwords 1`: a resource-heap view's synthesized
 # descriptor words from vdesc, for buffer_load_format_* through a heap descriptor; needs heap and bufword3).
 # Off by default until a build with the runtime side is announced.
-KNOWN_DRAW_FEATURES = frozenset(('heap', 'bufword3', 'uav', 'heapwords'))
+KNOWN_DRAW_FEATURES = frozenset(('heap', 'bufword3', 'uav', 'heapwords', 'uavfmt'))
 
 
 def draw_features():
