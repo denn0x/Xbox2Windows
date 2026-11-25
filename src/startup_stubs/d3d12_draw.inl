@@ -3168,13 +3168,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (dumping) {  // LOCAL meshrt: X2W_MESH_DUMP_INPUTS
             char file[16], note[240];
             std::snprintf(file, sizeof(file), "srv%u.bin", i);
-            const std::size_t dump_bytes = full_bytes > (256u << 20) ? (256u << 20) : full_bytes;
-            const bool readable_range = address && dump_bytes && readable_window(address, dump_bytes) >= dump_bytes;
-            std::snprintf(note, sizeof(note), "srv %u source %d(%d,%d) entry 0x%llx words %08x %08x %08x %08x address 0x%llx stride %u%s%s%s", i,
+            // A root srv has no size (the binding takes up to 64 KiB): the dump takes the readable window up to 16 MiB.
+            // Any range is cut to its readable part (the note says so) instead of dropped.
+            const std::size_t wanted = srv.source == 2 ? (16u << 20) : full_bytes > (256u << 20) ? (256u << 20) : full_bytes;
+            const std::size_t dump_bytes = address && wanted ? static_cast<std::size_t>(readable_window(address, wanted)) : 0;
+            const bool readable_range = dump_bytes != 0;
+            std::snprintf(note, sizeof(note), "srv %u source %d(%d,%d) entry 0x%llx words %08x %08x %08x %08x address 0x%llx stride %u bound %zu%s%s%s", i,
                           srv.source, srv.a, srv.b, static_cast<unsigned long long>(entry), words[0], words[1], words[2], words[3],
-                          static_cast<unsigned long long>(address), strides[i], readable_range ? "" : " (range not readable: no bytes)",
+                          static_cast<unsigned long long>(address), strides[i], bytes, readable_range ? "" : " (range not readable: no bytes)",
                           placed.reject ? " (placed: rejected, bound null)" : "",
-                          dump_bytes != bytes ? " (binding clamped to 16 MiB; dump has the full range up to 256 MiB)" : "");
+                          srv.source == 2 ? " (root srv: readable window up to 16 MiB)"
+                          : dump_bytes && dump_bytes < wanted ? " (cut to the readable part)"
+                          : dump_bytes != bytes ? " (binding clamped to 16 MiB; dump has the full range up to 256 MiB)" : "");
             SplitRelock relock(split, 100000 + __LINE__);
             mesh_dump_file(file, readable_range ? reinterpret_cast<const void*>(address) : nullptr, readable_range ? dump_bytes : 0, note);
         }
@@ -3348,9 +3353,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         mesh_dump_file("root_constants.bin", pass.constants, sizeof(pass.constants),
                        "the list's 32-bit root constants as set by the title, [parameter 0-15][word 0-7] u32");
         // The heap buffers a key reads through a root constant (mesh 063500: bit 28 set = the meshlet index comes from
-        // a heap buffer whose descriptor index is bits 0-9). Every root-constant word with bit 28 set is taken as such
-        // a reference (ASSUMED; a word that is really something else gives one extra file): heap<index>_desc.bin is
-        // the 32-byte title descriptor, heap<index>.bin the buffer it names (whole range, up to 256 MiB).
+        // a heap buffer whose descriptor index is bits 0-9). Each root constant the translation reads (a `udsrc ..
+        // rootconst p w` entry) with bit 28 set is taken as such a reference (ASSUMED; a word that is really something
+        // else gives one extra file); other root-constant words are not scanned (floats near 1 have bit 28 set).
+        // heap<index>_desc.bin is the 32-byte title descriptor, heap<index>.bin the buffer it names (its readable
+        // part, up to 256 MiB).
         u64 heap_address = 0, heap_bytes = 0;
         if (pass.source_view_heap) {
             AcquireSRWLockShared(&note_lock);
@@ -3361,8 +3368,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (!heap_address) title_view_heap(pass, &heap_address, &heap_bytes);
         std::uint32_t done_index[16];
         unsigned done = 0;
-        for (int p = 0; p < 16 && done < 16; ++p)
-            for (int w = 0; w < 8 && done < 16; ++w) {
+        for (std::size_t u = 0; u < tr->uds.size() && done < 16; ++u) {
+                const Translation::Ud& ud = tr->uds[u];
+                if (ud.kind != Translation::root_constant || ud.a < 0 || ud.a >= 16 || ud.b < 0 || ud.b >= 8) continue;
+                const int p = ud.a, w = ud.b;
                 const std::uint32_t c = pass.constants[p][w];
                 if (!(c & (1u << 28))) continue;
                 const std::uint32_t index = c & 0x3ff;
@@ -3420,7 +3429,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     n = static_cast<std::size_t>(stride ? stride : 1) * d[2];
                 }
                 if (n > (256u << 20)) n = 256u << 20;
-                const bool range_ok = at && n && readable_window(at, n) >= n;
+                if (at && n) n = static_cast<std::size_t>(readable_window(at, n));  // the readable part
+                const bool range_ok = at && n;
                 std::snprintf(file, sizeof(file), "heap%u.bin", index);
                 std::snprintf(note, sizeof(note), "buffer of title heap descriptor %u (%s): words %08x %08x %08x %08x, address 0x%llx stride %u%s", index,
                               how, d[0], d[1], d[2], d[3], static_cast<unsigned long long>(at), stride, range_ok ? "" : " (range not readable: no bytes)");

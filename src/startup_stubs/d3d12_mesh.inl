@@ -329,7 +329,7 @@ const x2w_pipeline_state::Switches& mesh_switches()
         // X2W_MESH_STATE_CULL_FLIP=1 inverts the decoded front face (apply_draw_state's flip covers slot-55 patches only).
         if (v.cull && x2w_local::env_on("X2W_MESH_STATE_NOCULL")) v.cull = false;
         // X2W_DRAW_STATE_DEPTHCLIP=1: the decoded depth clip alone (also without X2W_MESH_STATE); cull includes it.
-        v.depthclip = x2w_local::env_on("X2W_DRAW_STATE_DEPTHCLIP");
+        v.depthclip = draw_state::switches().depthclip;  // parsed with the others: X2W_DRAW_STATE=0 turns it off too
         if (v.depthclip) log("x2w-mesh X2W_DRAW_STATE_DEPTHCLIP=1: mesh PSOs take depth clip from the pipeline's rasterizer state");
         if (v.depth)
             log("x2w-mesh X2W_MESH_STATE=1: mesh PSOs take depth-stencil, %sblend from the pipeline's state block%s", v.cull ? "rasterizer and " : "",

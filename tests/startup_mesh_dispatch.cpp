@@ -368,7 +368,9 @@ int main(int argc, char** argv)
                         "\nsmpheap 2048 1 fallback 2047\n" + fma + "stage mesh\nms 3 3 1\n"
             : uavtex ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\nuav 0 tex2d table 1 " +
                            std::to_string(2 * view_increment) + "\n" + fma + "stage mesh\nms 3 3 1\n"
-                  : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\n" + fma + "stage mesh\nms 3 3 1\n";
+                  // statez: entry value 2 = root constant 0.1 (the dump's bit-28 heap reference; MeshMain ignores it).
+                  : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\n" + std::string(mode == "statez" ? "udsrc 2 rootconst 0 1\n" : "") +
+                        "srv 0 buf table 1 0\n" + fma + "stage mesh\nms 3 3 1\n";
         const std::wstring base = cache + L"\\" + hex_key(key);
         if (!(words ? write_file(base + L".ms.cso", startup_mesh_heap_ms, sizeof(startup_mesh_heap_ms))
                     : write_file(base + L".ms.cso", startup_mesh_ms, sizeof(startup_mesh_ms))) ||
@@ -673,9 +675,10 @@ int main(int argc, char** argv)
     invoke(list, 36, 1, view_gpu);                                         // SetGraphicsRootDescriptorTable(1, heap start)
     invoke(list, 40, 2, 1, arg(&colour), 0);                               // SetGraphicsRoot32BitConstants(2, 1, &colour, 0)
     if (words) invoke(list, 40, 0, 1, arg(&shader_slot), 0);                 // SetGraphicsRoot32BitConstants(0, 1, &slot, 0): entry value 2
-    // statez: root constant [0][1] = bit 28 + heap index 0 (srv 0's view, the vertices): the dump's heap buffer case.
-    const std::uint32_t heap_reference = 0x10000000u;
-    if (mode == "statez") invoke(list, 40, 0, 1, arg(&heap_reference), 1);  // SetGraphicsRoot32BitConstants(0, 1, &ref, 1)
+    // statez: root constant [0][1] (read by the translation) = bit 28 + heap index 0 (srv 0's view, the vertices): the
+    // dump's heap buffer case. [0][2] = bit 28 + index 3 is NOT read by the translation (the control): no heap3 files.
+    const std::uint32_t heap_reference[2] = {0x10000000u, 0x10000003u};
+    if (mode == "statez") invoke(list, 40, 0, 2, arg(heap_reference), 1);  // SetGraphicsRoot32BitConstants(0, 2, refs, 1)
     invoke(list, 25, arg(pipeline));                                       // SetPipelineState (the mesh pipeline)
     invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);               // ExecuteIndirect(mesh signature, 1, args, 0)
     if (mode == "async") {  // the worker's PSO line, then a second call
@@ -1072,7 +1075,8 @@ int main(int argc, char** argv)
                 // The heap buffer named by root constant [0][1] (bit 28, index 0): the vertices again, and its descriptor.
                 const std::string heap0 = read_all(dump + L"heap0.bin"), heap0_desc = read_all(dump + L"heap0_desc.bin");
                 const bool heap_ok = heap0.size() == sizeof(vertices) && std::memcmp(heap0.data(), vertices, sizeof(vertices)) == 0 &&
-                                     heap0_desc.size() == 32 && index.find("(root constant [0][1] = 0x10000000)") != std::string::npos;
+                                     heap0_desc.size() == 32 && index.find("(root constant [0][1] = 0x10000000)") != std::string::npos &&
+                                     index.find("heap3") == std::string::npos;
                 // The list's other key (0000000000000001) matches no call: no folder for it.
                 const DWORD other = GetFileAttributesW((cache + L"\\mesh_dump_0000000000000001").c_str());
                 const bool dump_ok = other == INVALID_FILE_ATTRIBUTES && has("x2w-mesh X2W_MESH_DUMP_INPUTS: 2 key(s)") && heap_ok &&
