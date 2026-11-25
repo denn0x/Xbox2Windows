@@ -355,7 +355,28 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         invoke(list, 12, 3, 1);
         last = 2;
     }
+    // X2W_TEST_FRAME_COPY=reuse: execute the first list, wait, and record the second half of the frame on the same
+    // list after Reset (startup_frame_copy.cpp).
+    char copy_mode[8] = "";
+    GetEnvironmentVariableA("X2W_TEST_FRAME_COPY", copy_mode, sizeof(copy_mode));
+    const bool copy_reuse = std::strcmp(copy_mode, "reuse") == 0;
+    if (copy_reuse) {
+        if (const int rc = submit(1)) return rc;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(frame.rtv_heap, 9))};
+        if (FAILED(static_cast<HRESULT>(invoke(frame.allocator, 8))) ||
+            FAILED(static_cast<HRESULT>(invoke(list, 139, arg(frame.allocator))))) return 35;
+        invoke(list, 50, 1, arg(&rtv));
+        invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        invoke(list, 25, arg(pso));
+        extern int draw_frame_copies_again(void*, UINT, UINT);
+        if (const int result = draw_frame_copies_again(list, width, height)) return result;
+        last = 2;
+    }
     if (const int rc = submit(last)) return rc;
+    if (copy_reuse) {
+        extern int write_ring_counters();
+        if (const int result = write_ring_counters()) return result;
+    }
     if (GetEnvironmentVariableW(L"X2W_TEST_DRAW_UAV", nullptr, 0)) {
         extern void report_uav_stores();
         report_uav_stores();

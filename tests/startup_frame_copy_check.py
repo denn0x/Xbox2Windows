@@ -86,6 +86,47 @@ def check(directory, consumer, backend):
     if not has(lines, "is free yet; the copy fails") or not has(lines, "not issued at frame"):
         raise AssertionError("wrap cap: missing the refusal / draw-not-issued log lines")
     print(f"{backend} wrap cap: left red, right not drawn (clear colour); refusal and draw-not-issued logged")
+
+    # Reuse across two submits: list B binds list A's cached red copy (chunk 0, fence passed) again, then 64 fresh
+    # copies recycle A's chunks. Chunk 0 must be pinned again by that cache hit, so B's red draw reads its own bytes.
+    def counters(folder):
+        path = directory / folder / "ring.txt"
+        if not path.exists():
+            raise AssertionError(f"{folder}: no ring counters written")
+        return {k: int(v) for k, v in (line.split("=") for line in path.read_text().split())}
+
+    def reuse(folder, env):
+        target = directory / folder / "ring.txt"
+        return run(directory, consumer, backend, "reuse", folder, {**ring, "X2W_TEST_RING_COUNTERS": str(target), **env})
+
+    pixels, lines = reuse("reuse_chain", {})
+    if pixels is None:
+        return 77
+    c = counters("reuse_chain")
+    chunk = 16 << 10
+    if pixels != RED * 8 * 4:
+        raise AssertionError(f"reuse chain: actual {pixels.hex()} expected all red; counters {c}")
+    if c["repinned"] < 1 or not has(lines, "first cached copy bound again from a chunk waiting for its fences"):
+        raise AssertionError(f"reuse chain: the cache hit did not re-pin a fenced chunk; counters {c}")
+    if c["reserved"] <= c["made"] * chunk:
+        raise AssertionError(f"reuse chain: no chunk was recycled (reserved {c['reserved']} bytes in {c['made']} chunks)")
+    if c["refused"]:
+        raise AssertionError(f"reuse chain: copies refused; counters {c}")
+    print(f"{backend} reuse chain: 32 pixels red (the second list's cache hit kept its chunk); {c['reserved'] >> 10} KiB "
+          f"reserved in {c['made']} chunks of 16 KiB (recycled), re-pinned {c['repinned']}")
+
+    # Negative control: without the re-pin the recycled chunk 0 is overwritten by fillers before list B executes.
+    pixels, lines = reuse("reuse_norepin", {"X2W_UPLOAD_RING_TEST_NO_REPIN": "1"})
+    if pixels is None:
+        return 77
+    c = counters("reuse_norepin")
+    right = b"".join(pixels[row * 32 + 16: row * 32 + 32] for row in range(4))
+    if right == RED * 16:
+        raise AssertionError(f"reuse no-repin (negative control): the right half is still red; the control did not trip; counters {c}")
+    if c["repinned"]:
+        raise AssertionError(f"reuse no-repin: re-pinned {c['repinned']} although the switch is set")
+    print(f"{backend} reuse no-repin (negative control): right half {right[:4].hex()} instead of red; "
+          f"{c['reserved'] >> 10} KiB in {c['made']} chunks")
     return 0
 
 

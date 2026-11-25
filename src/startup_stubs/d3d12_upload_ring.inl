@@ -48,7 +48,7 @@ struct UploadRing {
     std::unordered_map<Wrapper*, RingList> lists;
     // Counters (since the start; the report line also gives the change since the last line).
     u64 reserved = 0, refused_cap = 0, refused_cap_bytes = 0, refused_size = 0, overwritten = 0, overwritten_uses = 0,
-        would_wrap = 0, reexecuted = 0, made = 0, released = 0, peak_in_use = 0, cache_stale = 0, draws_refused = 0, unfenced = 0;
+        would_wrap = 0, reexecuted = 0, made = 0, released = 0, peak_in_use = 0, cache_stale = 0, draws_refused = 0, unfenced = 0, repinned = 0;
     u64 last_reserved = 0;
     LONG last_report_frame = 0;
 };
@@ -313,8 +313,23 @@ bool ring_touch(const RingTag& tag)
     // Same generation = not recycled since the copy was made; a recycled chunk is free or in use again.
     const bool same = c && c->buffer && c->generation == tag.generation && c->state != RingChunk::free_;
     if (!same) ++r.cache_stale;
-    if (same) c->last_use = ++r.seq;
+    // Fixtures only: X2W_UPLOAD_RING_TEST_NO_REPIN=1 skips the re-pin (the negative control of the reuse case).
+    static const bool no_repin = ring_env("X2W_UPLOAD_RING_TEST_NO_REPIN", 0) != 0;
+    bool first_repin = false;
+    if (same) {
+        c->last_use = ++r.seq;
+        // A chunk waiting for its fences is pinned again: the list binding it now may not have executed yet, and the
+        // fence snapshot was taken before this use. The next poll checks it against the lists again.
+        if (c->state == RingChunk::fenced && !no_repin) {
+            c->state = RingChunk::in_use;
+            c->waits.clear();
+            first_repin = !r.repinned++;
+        }
+    }
     ReleaseSRWLockExclusive(&r.lock);
+    if (first_repin)
+        log("x2w-upload ring: first cached copy bound again from a chunk waiting for its fences (frame %ld): the chunk is in use "
+            "again until the list binding it has executed", frame_number);
     return same || r.legacy;  // legacy: as before, the cache trusts its offset (stale hits are only counted)
 }
 
@@ -398,7 +413,8 @@ void ring_submitted(const std::vector<Wrapper*>& lists)
 }
 
 // Fixtures (export x2w_upload_ring_test, after the file's namespace): counters by index (0 reserved, 1 refused at
-// the cap, 2 overwritten bytes, 3 would-wrap bytes, 4 chunks with a buffer, 5 stale cache hits, 6 legacy).
+// the cap, 2 overwritten bytes, 3 would-wrap bytes, 4 chunks with a buffer, 5 stale cache hits, 6 legacy, 7 draws
+// not issued, 8 chunks made, 9 fenced chunks re-pinned by a cache hit).
 unsigned long long upload_ring_counter(int what)
 {
     UploadRing& r = upload_ring_state();
@@ -413,6 +429,8 @@ unsigned long long upload_ring_counter(int what)
     case 5: v = r.cache_stale; break;
     case 6: v = r.legacy; break;
     case 7: v = r.draws_refused; break;
+    case 8: v = r.made; break;
+    case 9: v = r.repinned; break;
     default: break;
     }
     ReleaseSRWLockShared(&r.lock);
