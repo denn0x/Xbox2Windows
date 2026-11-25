@@ -171,7 +171,7 @@ def selects_and_halves():
     check('v_min_f16 with a negated source refused', refused('v_min_f16_e64 v1, -v2, v3'))
     w = [0x7e000000 | 5 << 17 | 0xa << 9 | 262]
     check('v_cvt_f16_f32 keeps D[31:16] (gfx10)', asm_of(w) == 'v_cvt_f16_f32_e32 v5, v6' and
-          'v5 = (v5 & 0xffff0000u) | f32tof16(F(v6));' in lines(w)[1])
+          'v5 = (v5 & 0xffff0000u) | x2w_f32tof16_rne(F(v6));' in lines(w)[1])
     w = [0xcc000000 | 0x11 << 16 | 1 << 14 | 3, 259 | 0xff << 9 | 1 << 27, 0x7bef]
     check('v_pk_min_f16 op_sel_hi:[1,0] prints', asm_of(w) == 'v_pk_min_f16 v3, v3, 0x7bef op_sel_hi:[1,0]')
     check('  low from both low halves, high from v3.hi and the literal low half',
@@ -571,7 +571,7 @@ def mixes():
          'abs on a low-half f16 source, clamp on the f32 result'),
         (mix_word(0x21, 1, (242, 258, 240), op_sel_hi=4),
          'v_fma_mixlo_f16 v1, 1.0, v2, 0.5 op_sel_hi:[0,0,1]',
-         'v1 = (v1 & 0xffff0000u) | f32tof16(1.0 * F(v2) + f16tof32(0x3800u));',
+         'v1 = (v1 & 0xffff0000u) | x2w_f32tof16_rne(1.0 * F(v2) + f16tof32(0x3800u));',
          'an inline 0.5 read as f16 is 0x3800 (not the low half of the f32 0x3f000000)'),
     ]
     for words, want_asm, want_text, label in cases:

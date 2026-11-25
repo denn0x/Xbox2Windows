@@ -2386,7 +2386,9 @@ class Stage:
 
     def to_f16(self, expr):
         """An f32 value rounded to binary16 under the current MODE[3:2] (see op_s_round_mode)."""
-        return ('x2w_f32tof16_rtz(%s)' if self.round16 == 3 else 'f32tof16(%s)') % expr
+        # HLSL f32tof16 rounds toward zero on WARP and on an RX 9070 XT (MEASURED, startup_round_mode_check), so
+        # nearest even (MODE[3:2] = 0) needs its own helper.
+        return ('x2w_f32tof16_rtz(%s)' if self.round16 == 3 else 'x2w_f32tof16_rne(%s)') % expr
 
     def op_v_fma_mix_f32(self, ops, mods):
         self.mix(ops, mods, 'f32')
@@ -2778,7 +2780,7 @@ VEC_U = {
     'v_med3_u32': (3, 'max(min({0}, {1}), min(max({0}, {1}), {2}))'),
     'v_med3_i32': (3, 'uint(max(min(int({0}), int({1})), min(max(int({0}), int({1})), int({2}))))'),
     'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'),
-    'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
+    'v_cvt_f16_f32': (1, 'x2w_f32tof16_rne(F({0}))'),  # nearest even (MODE 0; check_round16 refuses other modes)
     'v_bfe_u32': (3, '({0} >> ({1} & 31)) & ((1u << ({2} & 31)) - 1)'), 'v_mad_u32_u24': (3, '({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}'),
     'v_lshl_add_u32': (3, '({0} << ({1} & 31)) + {2}'), 'v_add_lshl_u32': (3, '({0} + {1}) << ({2} & 31)'), 'v_add3_u32': (3, '{0} + {1} + {2}'),
     'v_or3_b32': (3, '{0} | {1} | {2}'), 'v_xor3_b32': (3, '{0} ^ {1} ^ {2}'),'v_and_or_b32': (3, '({0} & {1}) | {2}'), 'v_lshl_or_b32': (3, '({0} << ({1} & 31)) | {2}'),
@@ -2837,6 +2839,15 @@ HELPERS = {
     # back to 0x7bff; a NaN or an exactly representable value stays (the compare is false).
     'x2w_f32tof16_rtz': ('uint x2w_f32tof16_rtz(float x) { uint h = f32tof16(x); '
                          'return abs(f16tof32(h)) > abs(x) ? h - 1u : h; }'),
+    # binary16 rounding to nearest even (MODE[3:2] = 0): t = the toward-zero result (as x2w_f32tof16_rtz, inlined so
+    # the helper stands alone), u = the next value away from zero (0x7c00 counts as 65536, the first value past the
+    # range, so 65520 and above round to inf); the nearer wins, a tie goes to the even one. The two distances are
+    # exact in f32 (Sterbenz: |x| lies within [lo, 2 lo] of the f16 neighbours, or lo is 0). inf and NaN stay.
+    'x2w_f32tof16_rne': ('uint x2w_f32tof16_rne(float x) { uint t = f32tof16(x); float a = abs(x); '
+                         'if (abs(f16tof32(t)) > a) t -= 1u; if ((t & 0x7c00u) == 0x7c00u) return t; '
+                         'float lo = abs(f16tof32(t)); if (a == lo) return t; uint u = t + 1u; '
+                         'float hi = (u & 0x7fffu) == 0x7c00u ? 65536.0 : abs(f16tof32(u)); '
+                         'float dl = a - lo, dh = hi - a; return (dh < dl || (dh == dl && (t & 1u) != 0u)) ? u : t; }'),
     'x2w_class_f16':'uint x2w_class_f16(uint x, uint mask) { return (mask >> %s) & 1u; }' % CLASS_F16,
     # The words of a 64-bit shift of (l, h) by n[5:0]. HLSL masks shift counts to five bits, so a count of 0
     # (where 32 - n would wrap to a shift by 0) and counts of 32..63 are separate cases.

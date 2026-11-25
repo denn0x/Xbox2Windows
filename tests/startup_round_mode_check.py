@@ -15,11 +15,12 @@ packed words to mrt0. The expected words are computed here by truncating the f32
 the helper's step-back); three of the values round differently to nearest even. v_interp_p2_f16 (the stage of
 startup_interp_f16_check with s_round_mode 0xc first) is checked as text.
 
-Controls: without the s_round_mode handler the stage refuses as before; the same stage without s_round_mode keeps
-f32tof16; the drawn words do not match the nearest-even words (the comparison separates the roundings); the helper's
-rule matches truncation on the CPU whether f32tof16 rounds to nearest even or toward zero. MEASURED on WARP (fxc
-ps_5_1 and dxc ps_6_0): f32tof16 alone rounds these values toward zero (70000 -> 0x7bff), so on WARP the draw
-passes with or without the step-back; the CPU check is what exercises it. s_round_mode 0x1 (f32 toward +inf), 0x4 (f16 toward
+Without s_round_mode (MODE 0) the same stage rounds to nearest even through x2w_f32tof16_rne, and its draw must give
+the nearest-even words. MEASURED (fxc ps_5_1 and dxc ps_6_0, WARP and an RX 9070 XT): HLSL f32tof16 alone rounds
+these values toward zero (70000 -> 0x7bff), which is why both helpers exist; the draw prints that as information.
+Controls: without the s_round_mode handler the stage refuses as before; the toward-zero stage does not match the
+nearest-even words (the comparison separates the roundings); both helpers' rules are checked on the CPU over f32tof16
+modelled toward zero and nearest even (the draw cannot exercise the toward-zero helper's step-back there). s_round_mode 0x1 (f32 toward +inf), 0x4 (f16 toward
 +inf) and one after a branch are refused; an f16 instruction that rounds and is not lowered for the mode (the SDWA
 v_cvt_f16_f32) is refused under 0xc and accepted without it.
 """
@@ -109,6 +110,49 @@ def refused(ps, text):
     raise AssertionError('accepted, expected %r' % text)
 
 
+def f16_value(h):
+    return float('inf') * (-1 if h & 0x8000 else 1) if h & 0x7fff == 0x7c00 else struct.unpack('<e', struct.pack('<H', h))[0]
+
+
+def rne_helper(bits, f32tof16):
+    """x2w_f32tof16_rne statement by statement, over a model of the adapter's f32tof16."""
+    x = struct.unpack('<f', struct.pack('<I', bits))[0]
+    t, a = f32tof16(bits), abs(x)
+    if abs(f16_value(t)) > a:
+        t -= 1
+    if t & 0x7c00 == 0x7c00:
+        return t
+    lo = abs(f16_value(t))
+    if a == lo:
+        return t
+    u = t + 1
+    hi = 65536.0 if u & 0x7fff == 0x7c00 else abs(f16_value(u))
+    dl, dh = a - lo, hi - a
+    return u if dh < dl or (dh == dl and t & 1) else t
+
+
+def check_rne_rule():
+    """x2w_f32tof16_rne against Python's binary16 (struct 'e', round to nearest even, OverflowError past 65519.99)
+    for f32tof16 modelled both ways: toward zero (MEASURED on WARP and an RX 9070 XT) and nearest even. The cases
+    cover normal, subnormal (2^-24 .. 2^-14) and overflow (65504 .. 2^17) results and the exact ties."""
+    import random
+    rng = random.Random(2)
+    def truncate(bits):  # toward zero, for any finite value (subnormals and overflow included)
+        h = f16_nearest(bits)
+        x = struct.unpack('<f', struct.pack('<I', bits))[0]
+        return h - 1 if abs(f16_value(h)) > abs(x) else h
+    ties = [struct.unpack('<I', struct.pack('<f', (f16_value(h) + f16_value(h + 1)) / 2))[0] for h in range(1, 0x7bff, 97)]
+    cases = list(VALUES) + ties + [0x477fe000, 0x477ff000, 0xc77ff000] + [
+        rng.getrandbits(1) << 31 | rng.randrange(103, 144) << 23 | rng.getrandbits(23) for _ in range(30000)]
+    for bits in cases:
+        want = f16_nearest(bits)
+        for name, base in (('toward zero', truncate), ('nearest even', f16_nearest)):
+            got = rne_helper(bits, base)
+            assert got == want, (hex(bits), name, hex(got), hex(want))
+    print('x2w_f32tof16_rne rule: %d values (%d exact ties), f32tof16 modelled toward zero and nearest even, all '
+          'match binary16 nearest even' % (len(cases), len(ties)))
+
+
 def controls():
     asm = [a for _, _, _, a in G.decode(pixel_words(add_f16=True))]
     assert asm[0] == 's_round_mode 0xc', asm
@@ -121,8 +165,10 @@ def controls():
     assert '    v5 = (v5 & 0xffff0000u) | x2w_f32tof16_rtz(F(v12));' in ps, ps
     assert 'uint x2w_f32tof16_rtz(float x)' in ps and 'f32tof16(F(' not in ps, ps
     plain = pipe(pixel_words(mode=None)).hlsl_ps()
-    assert '    v2 = (v2 & 0xffff0000u) | f32tof16(F(v6) * 1.0 + F(0x00000000u));' in plain and 'x2w_f32tof16_rtz' not in plain, plain
+    assert '    v2 = (v2 & 0xffff0000u) | x2w_f32tof16_rne(F(v6) * 1.0 + F(0x00000000u));' in plain, plain
+    assert '    v5 = (v5 & 0xffff0000u) | x2w_f32tof16_rne(F(v12));' in plain and 'x2w_f32tof16_rtz' not in plain, plain
     assert 'x2w_f32tof16_rtz' not in pipe(pixel_words(mode=0)).hlsl_ps()  # 0: nearest even, as without it
+    check_rne_rule()
     # v_cvt_pkrtz_f16_f32 rounds toward zero in every mode (its definition), through the helper
     for m in (None, 0xc):
         g = G.decode(pixel_words(mode=m, pkrtz=True))
@@ -153,7 +199,7 @@ def controls():
     print('x2w_f32tof16_rtz rule: %d values, nearest-even and toward-zero f32tof16, %d step-backs, all match '
           'truncation' % (len(cases), stepped))
     print('s_round_mode 0xc: f16 results of fma_mix and v_cvt_f16_f32 round toward zero (x2w_f32tof16_rtz); '
-          'without it, or with 0, f32tof16')
+          'without it, or with 0, nearest even (x2w_f32tof16_rne)')
     saved = G.Stage.op_s_round_mode
     del G.Stage.op_s_round_mode
     try:
@@ -194,15 +240,19 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             if run.returncode == 0:
                 raise AssertionError('%s control: the toward-zero stage matched the nearest-even words' % kind)
             print('%s control against nearest-even words %s: mismatches as expected' % (kind, nearest), flush=True)
-            # informational, not asserted: how this adapter's f32tof16 rounds (the stage without s_round_mode).
-            # MEASURED on WARP (fxc ps_5_1): toward zero, so there the helper's step-back never fires.
-            plain = build('ps_plain', pipe(pixel_words(mode=None)).hlsl_ps(), ps_profile)
-            run = draw(renderer, adapter, vs, plain, EXPECTED)
-            print('%s f32tof16 alone (no s_round_mode): %s' % (kind, 'toward zero (matches)' if run.returncode == 0
-                                                             else 'not toward zero'), flush=True)
-            run = draw(renderer, adapter, vs, plain, nearest)
-            print('%s f32tof16 alone against nearest-even words: %s' % (kind, 'match' if run.returncode == 0
-                                                                       else 'mismatch'), flush=True)
+            # the stage without s_round_mode (MODE 0): x2w_f32tof16_rne must draw the nearest-even words
+            plain_text = pipe(pixel_words(mode=None)).hlsl_ps()
+            run = draw(renderer, adapter, vs, build('ps_plain', plain_text, ps_profile), nearest)
+            if run.returncode:
+                raise AssertionError('%s stage without s_round_mode\n%s\n%s' % (kind, run.stdout, run.stderr))
+            print('%s without s_round_mode (x2w_f32tof16_rne): %s' % (kind, nearest), flush=True)
+            # informational, not asserted: how this adapter's own f32tof16 rounds (the helpers replaced by it).
+            # MEASURED on WARP and an RX 9070 XT (fxc ps_5_1, dxc ps_6_0): toward zero.
+            raw = plain_text.replace('x2w_f32tof16_rne(F(', 'f32tof16((')
+            assert raw != plain_text
+            run = draw(renderer, adapter, vs, build('ps_raw', raw, ps_profile), EXPECTED)
+            print('%s HLSL f32tof16 alone: %s' % (kind, 'toward zero (matches the truncated words)' if run.returncode == 0
+                                                  else 'NOT toward zero'), flush=True)
 
 
 def main():

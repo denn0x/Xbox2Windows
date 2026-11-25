@@ -95,9 +95,9 @@ def controls():
            'f16tof32((v9) >> 16));' in vs, vs
     assert '    o.loparam0 = p.loparam0 + r.loparam0 - q.loparam0;' in vs, vs  # the rectangle-list corner
     for chan, d in zip('xyzw', range(2, 6)):
-        assert '    v%d = (v%d & 0xffff0000u) | f32tof16(i.loparam0.%s);' % (d, d, chan) in ps, ps
-        assert '    v%d = (v%d & 0xffffu) | (f32tof16(i.hiparam0.%s) << 16);' % (d, d, chan) in ps, ps
-    print('interp f16: VS exports loparam0/hiparam0 (f16tof32 of each half); PS packs f32tof16 of both halves')
+        assert '    v%d = (v%d & 0xffff0000u) | x2w_f32tof16_rne(i.loparam0.%s);' % (d, d, chan) in ps, ps
+        assert '    v%d = (v%d & 0xffffu) | (x2w_f32tof16_rne(i.hiparam0.%s) << 16);' % (d, d, chan) in ps, ps
+    print('interp f16: VS exports loparam0/hiparam0 (f16tof32 of each half); PS packs both halves rounded to nearest even (x2w_f32tof16_rne)')
 
     # controls
     saved = G.Stage.op_v_interp_p2_f16
@@ -107,7 +107,7 @@ def controls():
     finally:
         G.Stage.op_v_interp_p2_f16 = saved
     lost = pipe(pixel_words(hi_opsel=0)).hlsl_ps()
-    assert '(f32tof16(i.hiparam0.x) << 16)' not in lost and '    v2 = (v2 & 0xffff0000u) | f32tof16(i.hiparam0.x);' \
+    assert '(x2w_f32tof16_rne(i.hiparam0.x) << 16)' not in lost and '    v2 = (v2 & 0xffff0000u) | x2w_f32tof16_rne(i.hiparam0.x);' \
         in lost, lost
     refused(pixel_words(hi_opsel=1), 'v_interp_p2_f16 with op_sel 0x1')
     refused(pixel_words(clamp=1), 'v_interp_p2_f16 with clamp')
