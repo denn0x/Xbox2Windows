@@ -2624,7 +2624,6 @@ class Stage:
         out = []
         offsets = [b[0] for b in self.blocks]
         index = {off: i for i, off in enumerate(offsets)}
-        loops = any(t and t[0] in ('jump', 'branch') and t[-1] <= b[0] for b in self.blocks for t in [b[2]])
         if len(self.blocks) == 1:
             return ['    ' + line for line in self.blocks[0][1]]
 
@@ -2633,23 +2632,45 @@ class Stage:
                 raise Unsupported('branch into the middle of a block (+0x%x)' % off)
             return index[off]
         out.append('    uint pc = 0;')
-        if loops:
-            out.append('    [loop] for (uint guard = 0; guard < 65536 && pc != 0xffffu; ++guard) {')
+        # Only the blocks between a loop head and its back edge run inside a dispatch loop: the intervals
+        # [head, source] of the back edges, merged where they overlap. A branch out of a region goes forward (a
+        # backward one would be a back edge inside the region), so the blocks outside the regions, tested in offset
+        # order, run each at most once like the loop-free form. Same execution as one loop over all blocks; FXC
+        # takes minutes on a large dispatch loop, so the loop is kept as small as the control flow allows.
+        regions = []
+        for j, (_, _, term) in enumerate(self.blocks):
+            if term and term[0] in ('jump', 'branch') and goto(term[-1]) <= j:
+                regions.append([goto(term[-1]), j])
+        regions.sort()
+        merged = []
+        for lo, hi in regions:
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        starts = {lo: hi for lo, hi in merged}
+        inside = None
         for i, (off, lines, term) in enumerate(self.blocks):
-            out.append('    %sif (pc == %d) {' % ('else ' if loops and i else '', i))
-            out += ['        ' + line for line in lines]
+            if i in starts:
+                inside = starts[i]
+                out.append('    [loop] for (uint guard = 0; guard < 65536 && pc >= %d && pc <= %d; ++guard) {' % (i, inside))
+            indent = '    ' if inside is not None else ''
+            first = inside is not None and i in starts
+            out.append('    %s%sif (pc == %d) {' % (indent, 'else ' if inside is not None and not first else '', i))
+            out += ['        ' + indent + line for line in lines]
             nxt = i + 1 if i + 1 < len(self.blocks) else 0xffff
             if not term:
-                out.append('        pc = %d;' % nxt)
+                out.append('        %spc = %d;' % (indent, nxt))
             elif term[0] == 'end':
-                out.append('        pc = 0xffffu;')
+                out.append('        %spc = 0xffffu;' % indent)
             elif term[0] == 'jump':
-                out.append('        pc = %d;' % goto(term[1]))
+                out.append('        %spc = %d;' % (indent, goto(term[1])))
             else:
-                out.append('        pc = (%s) ? %d : %d;' % (term[1], goto(term[2]), nxt))
-            out.append('    }')
-        if loops:
-            out.append('    }')
+                out.append('        %spc = (%s) ? %d : %d;' % (indent, term[1], goto(term[2]), nxt))
+            out.append('    %s}' % indent)
+            if inside is not None and i == inside:
+                out.append('    }')
+                inside = None
         return out
 
     def declarations(self):
