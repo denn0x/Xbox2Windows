@@ -326,7 +326,28 @@ void record_trace_dispatch(Wrapper* self, u64 key, UINT x, UINT y, UINT z, bool 
         Wrapper* resource = nullptr;
         bool uav_view = false;
         char text[900];
-        if (!record_trace_image(w, text, sizeof(text), &resource, &uav_view)) return;
+        if (!record_trace_image(w, text, sizeof(text), &resource, &uav_view)) {
+            // Neither buffer nor image (refused-view marker, a view token without a usable desc, an "integer + 7 zero
+            // words" heap-index entry, a sampler, a neighbouring table's bytes): the raw words, so no entry is silent.
+            bool any = false;
+            for (int k = 0; k < 8; ++k) any |= w[k] != 0;
+            if (!any) return;
+            int n = std::snprintf(text, sizeof(text), "other: words %08x %08x %08x %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            if (w[0] == view_token_magic) {
+                ViewRecord record{};
+                AcquireSRWLockShared(&note_lock);
+                const bool known = w[1] < view_records().size();
+                if (known) record = view_records()[w[1]];
+                ReleaseSRWLockShared(&note_lock);
+                if (known) std::snprintf(text + n, sizeof(text) - n, " (view token: slot %u, desc %u bytes, resource 0x%llx)", record.slot, record.desc_bytes,
+                                         static_cast<unsigned long long>(record.resource));
+                else std::snprintf(text + n, sizeof(text) - n, " (view token: unknown view)");
+            } else if (w[0] == 0x52463258u) {
+                std::snprintf(text + n, sizeof(text) - n, " (refused-view marker)");
+            } else if (w[0] && !(w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7])) {
+                std::snprintf(text + n, sizeof(text) - n, " (integer + 7 zero words: a heap index?)");
+            }
+        }
         const bool uav = uav_view || label == 'U';
         char line[1100];
         std::snprintf(line, sizeof(line), "x2w-frame cx-img #%ld key %016llx %c p%d+0x%x%s: %s", seq, static_cast<unsigned long long>(key), label, param,
@@ -363,6 +384,33 @@ void record_trace_dispatch(Wrapper* self, u64 key, UINT x, UINT y, UINT z, bool 
     std::vector<std::string> heap_lines;
     {
         const TraceHeap heap = record_trace_heap(pass);
+        // Skipped dispatches: the raw root arguments and the heap used, so the index / base mapping can be checked
+        // offline (a constant equal to the heap's low 32 bits, or to a table's, is marked).
+        if (!executed) {
+            char line[1400];
+            int n = std::snprintf(line, sizeof(line), "x2w-frame cx-root #%ld key %016llx: heap 0x%llx (low 0x%08x) count %u increment %u;", seq,
+                                  static_cast<unsigned long long>(key), static_cast<unsigned long long>(heap.base), static_cast<std::uint32_t>(heap.base),
+                                  heap.count, heap.increment);
+            for (int p = 0; p < 16 && n < static_cast<int>(sizeof(line)) - 160; ++p) {
+                const int kind = pass.compute_kind[p];
+                if (!kind) continue;
+                if (kind != 1) {
+                    n += std::snprintf(line + n, sizeof(line) - n, " p%d kind %d 0x%llx (low 0x%08x);", p, kind,
+                                       static_cast<unsigned long long>(pass.compute_address[p]), static_cast<std::uint32_t>(pass.compute_address[p]));
+                    continue;
+                }
+                n += std::snprintf(line + n, sizeof(line) - n, " p%d constants %u:", p, pass.compute_count[p]);
+                for (UINT w = 0; w < pass.compute_count[p] && w < 16 && n < static_cast<int>(sizeof(line)) - 40; ++w) {
+                    const std::uint32_t c = pass.compute_constants[p][w];
+                    bool table_low = false;
+                    for (int q = 0; q < 16; ++q) table_low |= pass.compute_kind[q] == 5 && c && c == static_cast<std::uint32_t>(pass.compute_address[q]);
+                    n += std::snprintf(line + n, sizeof(line) - n, " %08x%s", c,
+                                       heap.base && c == static_cast<std::uint32_t>(heap.base) ? "(=heap low)" : table_low ? "(=table low)" : "");
+                }
+                n += std::snprintf(line + n, sizeof(line) - n, ";");
+            }
+            heap_lines.push_back(line);
+        }
         unsigned looked = 0;
         std::uint32_t seen[8];
         for (int p = 0; p < 16 && heap.base && looked < 8; ++p) {
@@ -593,8 +641,46 @@ void record_trace_report(ID3D12CommandQueue* queue)
         }
         ++d->calls;
     }
-    std::size_t in_skipped = 0, in_run_only = 0, in_none = 0, shown = 0;
+    std::size_t in_skipped = 0, in_run_only = 0, in_none = 0, shown = 0, in_skipped_entry = 0;
     std::vector<std::string> later;  // lines without a skipped overlap, shown after the ones with
+    // Reverse view: per skipped dispatch range, the mesh reads that overlap it (not capped by the per-read lines).
+    struct ByRange { const TracedRange* r; LONG dispatches = 0; std::size_t reads = 0; LONG calls = 0; u64 keys[4] = {}; unsigned nkeys = 0; u64 overlap = 0; };
+    std::vector<ByRange> by_range;
+    // Skipped ranges that overlap any mesh read, merged per (key, label, param, offset, range); dispatches = how many
+    // skipped dispatches bound that same range.
+    for (const TracedRange& r : ranges) {
+        if (r.executed) continue;
+        bool overlaps = false;
+        for (const Read& d : distinct) overlaps |= !(r.hi <= d.r.lo || r.lo >= d.r.hi);
+        if (!overlaps) continue;
+        ByRange* b = nullptr;
+        for (ByRange& e : by_range)
+            if (e.r->key == r.key && e.r->label == r.label && e.r->param == r.param && e.r->offset == r.offset && e.r->lo == r.lo && e.r->hi == r.hi) b = &e;
+        if (!b) {
+            by_range.push_back({&r});
+            b = &by_range.back();
+        }
+        ++b->dispatches;
+    }
+    for (const Read& d : distinct) {
+        bool entry_hit = false;
+        for (const ByRange& b : by_range) entry_hit |= b.r->label != 'R' && !(b.r->hi <= d.r.lo || b.r->lo >= d.r.hi);
+        in_skipped_entry += entry_hit;
+    }
+    // Reads and calls per range.
+    for (ByRange& b : by_range) {
+        for (const Read& d : distinct) {
+            if (b.r->hi <= d.r.lo || b.r->lo >= d.r.hi) continue;
+            ++b.reads;
+            b.calls += d.calls;
+            const u64 lo = b.r->lo > d.r.lo ? b.r->lo : d.r.lo, hi = b.r->hi < d.r.hi ? b.r->hi : d.r.hi;
+            b.overlap += hi - lo;
+            bool known = false;
+            for (unsigned k = 0; k < b.nkeys; ++k) known |= b.keys[k] == d.r.key;
+            if (!known && b.nkeys < 4) b.keys[b.nkeys++] = d.r.key;
+        }
+    }
+    std::stable_sort(by_range.begin(), by_range.end(), [](const ByRange& x, const ByRange& y) { return x.r->label != 'R' && y.r->label == 'R'; });
     for (const Read& d : distinct) {
         // Overlapping dispatch ranges, merged per (key, label, param, offset, range, state): skipped first.
         struct Hit { const TracedRange* r; LONG dispatches; bool before; };
@@ -644,9 +730,22 @@ void record_trace_report(ID3D12CommandQueue* queue)
         }
     }
     for (std::size_t k = 0; k < later.size() && shown < 64; ++k, ++shown) log("%s", later[k].c_str());
+    // The reverse view, table / heap entries first, then root windows (R: a readable window, not a size).
+    for (std::size_t k = 0; k < by_range.size() && k < 256; ++k) {
+        const ByRange& b = by_range[k];
+        char keys[96] = "";
+        int n = 0;
+        for (unsigned j = 0; j < b.nkeys; ++j) n += std::snprintf(keys + n, sizeof(keys) - n, "%s%016llx", j ? " " : "", static_cast<unsigned long long>(b.keys[j]));
+        log("x2w-frame mesh-read by-range key %016llx %c p%d+0x%x 0x%llx %llu bytes, %s, %ld dispatches (first #%ld)%s: %zu distinct mesh reads, %ld calls, "
+            "overlap %llu bytes, mesh keys %s%s",
+            static_cast<unsigned long long>(b.r->key), b.r->label, b.r->param, b.r->offset, static_cast<unsigned long long>(b.r->lo),
+            static_cast<unsigned long long>(b.r->hi - b.r->lo), b.r->state, b.dispatches, b.r->seq, b.r->label == 'R' ? " (root window)" : "", b.reads,
+            b.calls, static_cast<unsigned long long>(b.overlap), keys, b.nkeys == 4 ? " ..." : "");
+    }
+    if (by_range.size() > 256) log("x2w-frame mesh-read by-range: %zu more not shown", by_range.size() - 256);
     if (!mesh_reads.empty())
-        log("x2w-frame mesh-read totals: %zu reads, %zu distinct ranges: %zu inside a skipped dispatch's range, %zu run dispatches only, %zu bound by no "
-            "dispatch of this frame (%zu lines shown)",
-            mesh_reads.size(), distinct.size(), in_skipped, in_run_only, in_none, shown);
+        log("x2w-frame mesh-read totals: %zu reads, %zu distinct ranges: %zu inside a skipped dispatch's range (%zu inside a skipped table / heap entry, "
+            "%zu only inside a skipped root window), %zu run dispatches only, %zu bound by no dispatch of this frame (%zu lines shown, %zu skipped ranges hit)",
+            mesh_reads.size(), distinct.size(), in_skipped, in_skipped_entry, in_skipped - in_skipped_entry, in_run_only, in_none, shown, by_range.size());
 }
 extern "C" __declspec(dllexport) void x2w_d3d12_record_trace_report() { record_trace_report(nullptr); }  // fixtures, after their fence

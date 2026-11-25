@@ -693,6 +693,8 @@ int main(int argc, char** argv)
         const Word other = arg(other_memory);
         const std::uint32_t vsharp[8] = {static_cast<std::uint32_t>(other), static_cast<std::uint32_t>(other >> 32) & 0xffff, 64, 0};
         std::memcpy(reinterpret_cast<void*>(view_cpu + 4 * view_increment), vsharp, sizeof(vsharp));
+        const std::uint32_t integer[8] = {5};  // slot 5: "integer + 7 zero words" (neither buffer nor image: an `other` line)
+        std::memcpy(reinterpret_cast<void*>(view_cpu + 5 * view_increment), integer, sizeof(integer));
     }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -1181,13 +1183,27 @@ int main(int argc, char** argv)
                               key_text, static_cast<unsigned long long>(vertex_address));
                 const std::string verdict = apart ? "run dispatches only" : "INSIDE a skipped dispatch's range";
                 const std::size_t srv_ok = count_of(srv_read + verdict), heap_ok = count_of(heap_read + verdict);
-                const std::size_t totals = count_of(apart ? "2 distinct ranges: 0 inside a skipped dispatch's range" : "2 distinct ranges: 2 inside a skipped dispatch's range");
+                const std::size_t totals = count_of(apart ? "2 distinct ranges: 0 inside a skipped dispatch's range (0 inside a skipped table / heap entry, 0 only"
+                                                          : "2 distinct ranges: 2 inside a skipped dispatch's range (2 inside a skipped table / heap entry, 0 only");
+                // The reverse view: rectrace, the table V# entry and the heap entry of the cull pass, each with both reads; apart: none.
+                char by_entry[160], by_heap[160];
+                std::snprintf(by_entry, sizeof(by_entry), " ? p2+0x0 0x%llx 48 bytes, skipped: c62 table argument, 2 dispatches (first #2): 2 distinct mesh reads, 2 calls",
+                              static_cast<unsigned long long>(vertex_address));
+                std::snprintf(by_heap, sizeof(by_heap), " H p3+0x0 0x%llx 48 bytes, skipped: c62 table argument, 2 dispatches (first #2): 2 distinct mesh reads, 2 calls",
+                              static_cast<unsigned long long>(vertex_address));
+                const std::size_t by_lines = count_of("x2w-frame mesh-read by-range ");
+                const bool by_ok = apart ? by_lines == 0 : by_lines == 2 && count_of(by_entry) == 1 && count_of(by_heap) == 1;
+                // cx-root: once per skipped dispatch, with the heap and the raw constants; the integer entry's `other` line.
+                const std::size_t root_lines = count_of(apart ? " p3 constants 2: 00000004 00000100;" : " p3 constants 2: 00000000 00000100;");
+                const std::size_t root_heap = count_of(" count 8 increment " + std::to_string(view_increment) + "; p0 kind 4 ");
+                const std::size_t other_lines = img_lines(": other: words 00000005 00000000 00000000 00000000 00000000 00000000 00000000 00000000 (integer + 7 zero words");
                 std::printf("log: rectrace cull lines %zu, images srv %zu uav %zu raw T# %zu, content none %zu / uav writer %zu, heap line %zu, "
-                            "mesh reads srv %zu heap %zu, totals %zu\n",
-                            cull_lines, srv_images, uav_images, raw_images, no_writer, uav_writer, heap_lines, srv_ok, heap_ok, totals);
+                            "mesh reads srv %zu heap %zu, totals %zu, by-range %zu (%d), cx-root %zu (heap %zu), other %zu\n",
+                            cull_lines, srv_images, uav_images, raw_images, no_writer, uav_writer, heap_lines, srv_ok, heap_ok, totals, by_lines, by_ok,
+                            root_lines, root_heap, other_lines);
                 // Two dispatches x 3 image entries; the first sees no writer, the second names the first's UAV.
                 if (cull_lines != 2 || srv_images != 2 || uav_images != 2 || raw_images != 2 || no_writer != 3 || uav_writer != 3 || !heap_lines ||
-                    srv_ok != 1 || heap_ok != 1 || totals != 1) {
+                    srv_ok != 1 || heap_ok != 1 || totals != 1 || !by_ok || root_lines != 2 || root_heap != 2 || other_lines != 2) {
                     std::printf("FAIL: the X2W_MESH_RECORD_TRACE lines do not match mode %s\n", mode.c_str());
                     ++failures;
                 }
