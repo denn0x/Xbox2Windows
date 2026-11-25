@@ -141,6 +141,48 @@ def smem_offset(tok):
     return '0' if tok == 'off' else tok
 
 
+SGPR_NAMES = {'vcc_lo': (106,), 'vcc_hi': (107,), 'vcc': (106, 107), 'm0': (124,)}
+# SALU forms whose first operand is written and not read (D = f(S0, S1)); others that name D first also read it
+# (s_addk_i32, s_mulk_i32, s_cmovk_i32, s_cmov_*, s_bitset*, s_movrel*) or do not write it (compares, stores).
+SALU_NO_DST = ('s_cmp', 's_bitcmp', 's_cbranch', 's_branch', 's_store', 's_buffer_store', 's_atomic', 's_buffer_atomic',
+               's_scratch_store', 's_waitcnt', 's_nop', 's_setpc', 's_setreg', 's_sendmsg', 's_endpgm', 's_clause',
+               's_inst_prefetch', 's_dcache', 's_barrier', 's_sleep', 's_set', 's_ttrace', 's_icache', 's_denorm',
+               's_round', 's_trap', 's_decperflevel', 's_incperflevel', 's_code_end')
+SALU_READS_DST = ('s_addk', 's_mulk', 's_cmovk', 's_cmov_', 's_bitset', 's_movrel', 's_getreg')
+
+
+def sgpr_access(name, asm):
+    """(SGPRs read, SGPRs written) by one instruction, vcc and m0 included, exec and SCC left out.
+
+    Conservative where the form is not listed: a register operand that is not known to be written only counts as
+    read, so a caller that refuses on a read never misses one."""
+    def regs(tok):
+        r = reg_range(tok)
+        if r:
+            return set(range(r[1], r[2] + 1)) if r[0] == 's' else set()
+        return set(SGPR_NAMES.get(tok, ()))
+    _, ops, _ = parse(asm)
+    reads, writes = set(), set()
+    for t in ops:
+        reads |= regs(t)
+    first = regs(ops[0]) if ops else set()
+    base = re.sub(r'_(e32|e64|sdwa|dpp)$', '', name)
+    if name.startswith('s_'):
+        if not name.startswith(SALU_NO_DST) and not name.startswith(SALU_READS_DST):
+            writes, reads = first, reads - first if ops[1:] and not any(regs(t) & first for t in ops[1:]) else reads
+    elif (base in ('v_readfirstlane_b32', 'v_readlane_b32') or
+          (base.startswith('v_cmp_') and name.endswith(('_e64', '_sdwa')))) and first:
+        writes = first
+        reads = set().union(*(regs(t) for t in ops[1:])) if ops[1:] else set()
+    if name.startswith('v_cmp_') and name.endswith('_e32'):
+        writes |= {106}
+    if name.startswith('v_') and name.endswith('_e32') and re.search(r'cndmask|addc|subb|_co_|div_fmas', name):
+        reads |= {106, 107}
+    if name.startswith('s_cbranch_vcc'):
+        reads |= {106, 107}
+    return reads, writes
+
+
 def sopk_simm(tok):
     """A SOPK SIMM16 operand sign-extended to 32 bits, as a hex token (upstream #2116, open). Refuses anything that
     is not a 16-bit literal."""
@@ -179,6 +221,7 @@ class Stage:
         self.attrs = {}           # pixel: attr index -> 'linear' | 'flat' | 'half'
         self.uses_pos = False
         self.masks = set()        # scalar registers currently holding lane masks
+        self.splat = set()        # scalar registers holding 0 or 0xffffffff, a value every lane's bit agrees on
         self.uses_q = False       # the uint2 temporary of the 64-bit operations
         self.used_h = set()       # heap descriptor offsets h<k> this stage assigns (manifest `heap 1`)
         self.written_v = set()    # VGPRs assigned so far in program order
@@ -394,6 +437,7 @@ class Stage:
 
         Any write ends n's life as a lane mask; a caller that writes a mask marks it again after this call."""
         getattr(self, 'masks', set()).discard(n)  # (the tests' bare stages have no mask set)
+        getattr(self, 'splat', set()).discard(n)
         if sym is not None:
             self.sym[n] = sym
             if sym[0] != 'const':
@@ -518,6 +562,7 @@ class Stage:
                 # Lane invariance is not merged across edges for VGPRs; at a loop head the linear state misses the
                 # back edges, so every SGPR becomes suspect until it is written again.
                 self.uniform_v.clear()
+                self.splat.clear()
                 self.partial_uniform.clear()
                 self.a_invariant = False
                 if not all(src < off for src in sources[off]):
@@ -825,8 +870,19 @@ class Stage:
             def lane_mask(t):
                 r = reg_range(t)
                 return t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or bool(r and r[0] == 's' and r[1] in self.masks)
+            def per_lane(t):
+                # a value whose bit i is lane i's: a mask, or 0 / 0xffffffff (every bit the same)
+                r = reg_range(t)
+                return (lane_mask(t) or t in ('0', '-1') or
+                        bool(r and r[0] == 's' and r[1] in getattr(self, 'splat', ())))
             if lane_mask(dname) or any(lane_mask(t) for t in srcs):
-                raise Unsupported('%s on a lane mask' % base)
+                if not all(per_lane(t) for t in srcs):
+                    raise Unsupported('%s on a lane mask' % base)
+                # Every operand's bit i is lane i's, so the lane's own bit of ~(a op b) is ~(a_i op b_i), which the
+                # one-lane value below gives (as for s_not_b32). SCC is not: lanes outside the wave's active set
+                # (0 in a compare result) are 1 after the complement. No SCC is written, so check_scc refuses any
+                # read of it.
+                scc = None
         if dname == 'm0':
             return None
         syms = [self.sym.get(reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else None for t in srcs]
@@ -1021,6 +1077,8 @@ class Stage:
             raise Unsupported('s_cselect into %s' % low[0])
         d = reg_range(low[0])[1]
         self.set_s(d, '(%s) & 1' % expr if pair else expr)
+        if not pair and {low[1], low[2]} <= {'-1', '0'} and hasattr(self, 'splat'):
+            self.splat.add(d)
         if pair:
             self.masks.add(d)
             self.set_s(d + 1, '0u')
@@ -1678,11 +1736,118 @@ class Stage:
         if self.exec_known and src and src[0] == 's' and self.sym.get(src[1]) == ('fixed_buffer_word',):
             self.uniform_v.add(dst)
 
+    WATERFALL_CROSS_LANE = re.compile(r'_dpp$|permlane|readlane|writelane|readfirstlane|^s_store|^s_buffer_store|'
+                                      r'^s_atomic|^s_buffer_atomic|^s_scratch|^s_sendmsg|^s_endpgm|^s_setpc|^s_getpc|'
+                                      r'^s_swappc|^s_dcache|^exp|^s_movrel|^v_movrel|^s_setreg|^ds_gws|^s_barrier')
+
+    def waterfall(self, s, v):
+        """Check that the v_readfirstlane_b32 s<s>, v<v> at self.pc heads a waterfall loop the one-lane model runs
+        exactly as the hardware runs it for this lane; raise Unsupported otherwise.
+
+        The form (LLVM SIInstrInfo.cpp emitLoadScalarOpsFromVGPRLoop, wave32), measured in the title's bindless
+        texture reads:
+            H:  v_readfirstlane_b32 sN, vM
+                v_cmpx_eq_u32/i32  sN, vM          exec = the lanes holding that value
+                ...body...
+                s_andn2_wrexec_b32 sX, sX          exec = sX & ~exec (sX: lanes not done yet), SCC = exec != 0
+                s_cbranch_scc1 H
+        Hardware runs the body once per distinct vM value; a lane is active in exactly the iteration whose sN is
+        its own vM. The one-lane model takes sN = this lane's vM, so its single active iteration is that one, and
+        the wrexec then leaves this lane's exec bit 0 as hardware does. That holds when:
+        - the body is straight-line (no other branch, no branch into it) and makes no cross-lane read or scalar
+          side effect (scalar stores, messages, exports): iterations for other lanes only run SALU work;
+        - every SGPR the body writes, sX apart, is written before it is read in the body (no loop-carried value;
+          sX's own bit is this lane's pending bit in both models);
+        - none of those SGPRs is read after the loop before it is written again: their hardware values belong to
+          the last lane serviced, the model's to this lane.
+        """
+        index = {off: i for i, (off, _, _, _) in enumerate(self.ins)}
+        h = index[self.pc]
+        if h + 1 >= len(self.ins):
+            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        _, _, cname, casm = self.ins[h + 1]
+        _, cops, cmods = parse(casm)
+        if (not re.fullmatch(r'v_cmpx_eq_[iu]32_e(32|64)', cname) or cmods or
+                sorted(cops) != sorted(['s%d' % s, 'v%d' % v])):
+            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        # The loop head is the readfirstlane or a run of waits / nops just above it (LLVM places the wait for the
+        # index VGPR's load at the head when the load is outstanding).
+        t = h
+        while t > 0 and self.ins[t - 1][2] in ('s_waitcnt', 's_nop'):
+            t -= 1
+        heads = {off for off, _, _, _ in self.ins[t:h + 1]}
+        back = [i for i, (off, _, name, asm) in enumerate(self.ins)
+                if i > h and name.startswith(('s_cbranch', 's_branch'))
+                and int(parse(asm)[1][0].split('_')[1], 16) in heads]
+        if len(back) != 1 or self.ins[back[0]][2] != 's_cbranch_scc1':
+            raise Unsupported('waterfall loop without one s_cbranch_scc1 back edge')
+        b = back[0]
+        t = index[int(parse(self.ins[b][3])[1][0].split('_')[1], 16)]
+        wname, wasm = self.ins[b - 1][2], self.ins[b - 1][3]
+        wops = parse(wasm)[1]
+        wide = wname == 's_andn2_wrexec_b64'
+        if (wname not in ('s_andn2_wrexec_b32', 's_andn2_wrexec_b64') or len(wops) != 2 or wops[0] != wops[1] or
+                not reg_range(wops[0]) or reg_range(wops[0])[0] != 's' or
+                reg_range(wops[0])[2] - reg_range(wops[0])[1] != int(wide)):
+            raise Unsupported('waterfall loop not closed by s_andn2_wrexec')
+        pending = set(range(reg_range(wops[0])[1], reg_range(wops[0])[2] + 1))
+        inner = {off for off, _, _, _ in self.ins[t + 1:b + 1]}
+        for off, _, name, asm in self.ins:
+            if name.startswith(('s_cbranch', 's_branch')):
+                target = int(parse(asm)[1][0].split('_')[1], 16)
+                if target in inner or (off in inner and off != self.ins[b][0]):
+                    raise Unsupported('waterfall loop with another branch')
+        body = self.ins[t:b + 1]
+        body_writes = set().union(*(sgpr_access(n, a)[1] for _, _, n, a in body))
+        written = set()
+        for off, _, name, asm in body:
+            if off != self.pc and self.WATERFALL_CROSS_LANE.search(name):
+                raise Unsupported('waterfall loop body with %s' % name)
+            reads, writes = sgpr_access(name, asm)
+            if 124 in reads | writes:
+                raise Unsupported('waterfall loop body uses m0')
+            carried = (reads - written) & body_writes
+            if carried - pending:
+                raise Unsupported('waterfall loop carries s%d' % min(carried - pending))
+            written |= writes
+        live = written - pending
+        # Every path from the loop exit: each of these SGPRs is written before any read.
+        stack, seen = [(b + 1, frozenset(live))], set()
+        while stack:
+            i, regs = stack.pop()
+            while regs and i < len(self.ins) and (i, regs) not in seen:
+                seen.add((i, regs))
+                off, _, name, asm = self.ins[i]
+                reads, writes = sgpr_access(name, asm)
+                if reads & regs:
+                    raise Unsupported('s%d read after its waterfall loop' % min(reads & regs))
+                regs = regs - writes
+                if name == 's_endpgm' or name.startswith(('s_setpc', 's_swappc')):
+                    break
+                if name.startswith(('s_cbranch', 's_branch')):
+                    target = index.get(int(parse(asm)[1][0].split('_')[1], 16))
+                    if target is None:
+                        raise Unsupported('waterfall exit path leaves the program')
+                    stack.append((target, regs))
+                    if name == 's_branch':
+                        break
+                i += 1
+
     def op_v_readfirstlane_b32(self, ops, mods):
         # D = S0 of the first active lane (AMD RDNA 2 ISA; LLVM selects it for a VGPR-to-SGPR copy of a value the
         # divergence analysis found uniform, SIFixSGPRCopies). With a lane-invariant source (see set_v) every
         # lane's own value is that value. Branches are allowed: invariance is cleared at every branch target.
         src, dst = reg_range(ops[1]), reg_range(ops[0])
+        offsets = [off for off, _, _, _ in getattr(self, 'ins', ())]
+        here = getattr(self, 'pc', None)
+        following = self.ins[offsets.index(here) + 1][2] if here in offsets[:-1] else ''
+        if (not mods and dst and dst[0] == 's' and dst[1] == dst[2] and src and src[0] == 'v' and src[1] == src[2]
+                and src[1] not in self.uniform_v and getattr(self, 'partial_uniform', {}).get(src[1]) is None
+                and following.startswith('v_cmpx_eq_')):
+            # a waterfall loop head (see waterfall): this lane's own value
+            self.waterfall(dst[1], src[1])
+            self.set_s(dst[1], self.u(ops[1]))
+            return
         partial = getattr(self, 'partial_uniform', {}).get(src[1]) if src and src[0] == 'v' else None
         if (not mods and dst and dst[0] == 's' and partial is not None and
                 partial[3] == getattr(self, 'exec_writes', 0)):
