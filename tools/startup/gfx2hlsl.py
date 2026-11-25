@@ -837,10 +837,10 @@ class Stage:
                 for t in srcs):
             # a lane mask is one bit per lane in the one-lane model: its high half has no per-lane value
             raise Unsupported('s_pack_hh_b32_b16 of a lane mask')
-        if base.startswith('s_bcnt') and any(t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or
+        if base.startswith(('s_bcnt', 's_ff0', 's_ff1')) and any(t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or
                                              (reg_range(t) and reg_range(t)[0] == 's' and reg_range(t)[1] in self.masks)
                                              for t in srcs):
-            # a lane count: the one-lane model keeps only this lane's bit of a mask
+            # a lane count or a lane index: the one-lane model keeps only this lane's bit of a mask
             raise Unsupported('%s of a lane mask' % base)
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
@@ -2513,6 +2513,10 @@ SCA = {
     # s_bcnt0/1_i32_b32: the count of zero / one bits of S0; SCC = (D != 0) (AMD RDNA 2 ISA SOP1, LLVM
     # SOPInstructions.td: Defs = [SCC]).
     's_bcnt1_i32_b32': ('countbits({0})', '$ != 0'), 's_bcnt0_i32_b32': ('32u - countbits({0})', '$ != 0'),
+    # s_ff1/s_ff0_i32_b32: the index of the lowest one / zero bit of S0, -1 when there is none; SCC unchanged (AMD
+    # RDNA 2 ISA SOP1; LLVM SOPInstructions.td has no SCC def; it selects AMDGPUffbl_b32 = cttz_zero_undef with
+    # the -1 result). HLSL firstbitlow returns 0xffffffff for 0 as well.
+    's_ff1_i32_b32': ('firstbitlow({0})', None), 's_ff0_i32_b32': ('firstbitlow(~{0})', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
     's_mul_hi_u32': ('x2w_mul_hi_u32({0}, {1})', None),
