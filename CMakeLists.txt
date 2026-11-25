@@ -722,7 +722,7 @@ target_compile_features(startup_mesh_dispatch PRIVATE cxx_std_17)
 target_link_libraries(startup_mesh_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
     foreach(mode IN ITEMS gpu derived zero huge off missing depth words16 words32 wordsraw fmaprecise fmabad notargets rtvuint smpheap smpheapswap
-            statez statezge statezoff statecull stateculloff statedepth)
+            statez statezge statezoff statecull stateculloff statedepth statecullflip statecullnone statezrepeat)
         add_test(NAME startup_mesh_dispatch_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
         set(mesh_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
         if(NOT mode STREQUAL "off")

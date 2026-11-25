@@ -172,8 +172,12 @@ int main(int argc, char** argv)
     if (mode != "gpu" && mode != "derived" && mode != "zero" && mode != "huge" && mode != "off" && mode != "missing" && mode != "depth" &&
         mode != "words16" && mode != "words32" && mode != "wordsraw" && mode != "fmaprecise" && mode != "fmabad" && mode != "notargets" &&
         mode != "rtvuint" && mode != "smpheap" && mode != "smpheapswap" && mode != "statez" && mode != "statezge" && mode != "statezoff" &&
-        mode != "statecull" && mode != "stateculloff" && mode != "statedepth")
+        mode != "statecull" && mode != "stateculloff" && mode != "statedepth" && mode != "statecullflip" && mode != "statecullnone" &&
+        mode != "statezrepeat")
         return 2;
+    // statecullflip: X2W_MESH_STATE_CULL_FLIP=1, the other triangle culled; statecullnone: X2W_MESH_STATE_NOCULL=1, both
+    // drawn. statezrepeat: 32 calls with render target + depth, then 32 with the render target only: exactly two PSO
+    // lines (dsv 40, dsv 0), i.e. the calls after the first of each pass take the PSO kept with the binding.
     // state modes: the slot-57 record carries a state block A in the mesh layout (A+0x004 = 6, fields 0x54 later).
     // statez / statezge / statezoff: render target + D32 depth cleared to 0.5; DB_DEPTH_CONTROL test + write, LESS
     // (statez, statezoff) or GEQUAL (statezge); the triangles are at z 0.25. statecull / stateculloff: cull back, the
@@ -185,6 +189,9 @@ int main(int argc, char** argv)
     const bool zmode = mode.compare(0, 6, "statez") == 0;  // render target and depth target
     const bool cullmode = mode.compare(0, 9, "statecull") == 0;
     if (state_on) SetEnvironmentVariableW(L"X2W_MESH_STATE", L"1");
+    if (mode == "statecullflip") SetEnvironmentVariableW(L"X2W_MESH_STATE_CULL_FLIP", L"1");
+    if (mode == "statecullnone") SetEnvironmentVariableW(L"X2W_MESH_STATE_NOCULL", L"1");
+    const bool repeat = mode == "statezrepeat";
     // smpheap / smpheapswap: the pixel stage samples title sampler-heap entry 65 (`smpheap 2048 1 fallback 2047`);
     // entry 65 is point and 64 linear (smpheap), or the other way round (smpheapswap, the control).
     const bool smp = mode.compare(0, 7, "smpheap") == 0;
@@ -568,6 +575,11 @@ int main(int argc, char** argv)
     if (words) invoke(list, 40, 0, 1, arg(&heap_slot), 0);                 // SetGraphicsRoot32BitConstants(0, 1, &slot, 0): entry value 2
     invoke(list, 25, arg(pipeline));                                       // SetPipelineState (the mesh pipeline)
     invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);               // ExecuteIndirect(mesh signature, 1, args, 0)
+    if (repeat) {
+        for (int i = 1; i < 32; ++i) invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);
+        invoke(list, 50, 1, arg(&target_handle));                          // OMSetRenderTargets(1, &rtv): no depth view
+        for (int i = 0; i < 32; ++i) invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);
+    }
     invoke(list, 9);                                                       // Close
     void* lists[] = {list};
     invoke(queue, 10, 1, arg(lists));
@@ -601,7 +613,7 @@ int main(int argc, char** argv)
         ++failures;
     }
     const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || smp || mode == "statez" || mode == "statezoff" ||
-                                mode == "stateculloff" || (!words_skip && (mode == "words16" || mode == "words32"));
+                                mode == "stateculloff" || mode == "statecullnone" || repeat || (!words_skip && (mode == "words16" || mode == "words32"));
     // RGBA8 little-endian: R c0, G 40, B ff, A ff. words modes: G = the FORMAT code in vdesc word 3 (29 = 0x1d, 64 = 0x40).
     // smpheap: entry 65 point -> texel 0 (red ff0000ff); smpheapswap: entry 65 linear at u = 0.375 -> 0.75 red + 0.25
     // blue (R bf, B 40, A ff; filtering precision allows +-3 per channel).
@@ -636,8 +648,9 @@ int main(int argc, char** argv)
         // statecull: MODE CULL_BACK + FACE 0 decodes to D3D12_CULL_MODE_BACK + FrontCounterClockwise TRUE. As seen on
         // the target (+y up), the left triangle (-0.9,-0.9) (-0.9,0.9) (-0.1,0) is clockwise = back face: culled; the
         // right one (last two vertices swapped) is counter-clockwise = front: drawn. stateculloff draws both.
-        const std::uint32_t want_right = mode == "statecull" ? drawn : want;
-        const std::uint32_t want_left = mode == "statecull" ? 0u : want;
+        // statecullflip: front face inverted, so the left triangle is drawn and the right one culled.
+        const std::uint32_t want_right = mode == "statecull" ? drawn : mode == "statecullflip" ? 0u : want;
+        const std::uint32_t want_left = mode == "statecull" ? 0u : mode == "statecullflip" ? drawn : want;
         if (!matches(pixels[0], want_left) || !matches(pixels[1], want_right) || pixels[2] != 0) {
             std::printf("FAIL: expected left %08x right %08x, outside 00000000\n", want_left, want_right);
             ++failures;
@@ -648,7 +661,7 @@ int main(int argc, char** argv)
         if (!read_pixels(desktop.Get(), observer, depth_target.Get(), true, at, depth_words)) return 15;
         float values[3];
         std::memcpy(values, depth_words.data(), sizeof(values));
-        check_depth(values, 0.5f, mode == "statez");
+        check_depth(values, 0.5f, mode == "statez" || repeat);
     }
 
     // The log: the per-key lines and the debug layer.
@@ -710,6 +723,25 @@ int main(int argc, char** argv)
         std::printf("log: X2W_MESH_STATE line %d, PSO with decoded state %d\n", switch_line, decoded_line);
         if (switch_line != state_on || decoded_line != state_on) {
             std::printf("FAIL: the X2W_MESH_STATE lines do not match mode %s\n", mode.c_str());
+            ++failures;
+        }
+        const bool flip_line = has("(X2W_MESH_STATE_CULL_FLIP: front face inverted)");
+        const bool nocull_line = has("(X2W_MESH_STATE_NOCULL: rasterizer default)");
+        if (flip_line != (mode == "statecullflip") || nocull_line != (mode == "statecullnone")) {
+            std::printf("FAIL: flip line %d / nocull line %d do not match mode %s\n", flip_line, nocull_line, mode.c_str());
+            ++failures;
+        }
+        // PSO lines of the key: one per pass signature. statezrepeat: 64 calls in two passes -> exactly two lines.
+        const std::string pso_line = std::string("x2w-mesh desktop pipeline for ") + key_text + ": ";
+        int pso_lines = 0;
+        for (std::size_t p = log.find(pso_line); p != std::string::npos; p = log.find(pso_line, p + 1)) ++pso_lines;
+        const bool both_passes = has(pso_line + "1 targets (format 28), dsv 40,") && has(pso_line + "1 targets (format 28), dsv 0,");
+        std::printf("log: PSO lines for the key %d%s\n", pso_lines, repeat ? (both_passes ? " (dsv 40 and dsv 0)" : " (not both passes)") : "");
+        // The binding's PSO serves the calls after the first of a pass: the once-per-process line, only with repeats.
+        const bool reused = has(std::string("x2w-mesh pipeline ") + key_text + ": PSO kept with the binding reused");
+        std::printf("log: binding PSO reused line %d\n", reused);
+        if (pso_lines != (repeat ? 2 : 1) || (repeat && !both_passes) || reused != repeat) {
+            std::printf("FAIL: PSO lines do not match mode %s\n", mode.c_str());
             ++failures;
         }
     }

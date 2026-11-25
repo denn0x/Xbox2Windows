@@ -304,12 +304,22 @@ void report_mesh_keys(LONG frames)
 // pipeline_state_decode.h) or the nearest slot 55 part. Unset (default): the default state as before, same PSO key.
 // The state is per title pipeline (BoundPipeline), so two pipelines of one key with different state get two PSOs.
 // *fallback (when not null) receives the default desc if the decoded state changed it, for a failed creation.
+bool mesh_cull_flip()
+{
+    static const bool flip = x2w_local::env_on("X2W_MESH_STATE_CULL_FLIP");
+    return flip;
+}
 const x2w_pipeline_state::Switches& mesh_switches()
 {
     static const x2w_pipeline_state::Switches s = [] {
         x2w_pipeline_state::Switches v;
         if (x2w_local::env_on("X2W_MESH_STATE")) v.depth = v.cull = v.blend = true;
-        if (v.depth) log("x2w-mesh X2W_MESH_STATE=1: mesh PSOs take depth-stencil, rasterizer and blend from the pipeline's state block");
+        // Without a rebuild: X2W_MESH_STATE_NOCULL=1 keeps the default rasterizer (cull none);
+        // X2W_MESH_STATE_CULL_FLIP=1 inverts the decoded front face (apply_draw_state's flip covers slot-55 patches only).
+        if (v.cull && x2w_local::env_on("X2W_MESH_STATE_NOCULL")) v.cull = false;
+        if (v.depth)
+            log("x2w-mesh X2W_MESH_STATE=1: mesh PSOs take depth-stencil, %sblend from the pipeline's state block%s", v.cull ? "rasterizer and " : "",
+                !v.cull ? " (X2W_MESH_STATE_NOCULL: rasterizer default)" : mesh_cull_flip() ? " (X2W_MESH_STATE_CULL_FLIP: front face inverted)" : "");
         return v;
     }();
     return s;
@@ -341,6 +351,8 @@ void mesh_state_desc(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHIC
     if (s.depth || s.cull || s.blend) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC before = desc;
         const bool changed = apply_draw_state(bound, pass, desc, s);
+        if (s.cull && mesh_cull_flip() && std::memcmp(&before.RasterizerState, &desc.RasterizerState, sizeof(desc.RasterizerState)) != 0)
+            desc.RasterizerState.FrontCounterClockwise = !desc.RasterizerState.FrontCounterClockwise;
         if (decoded) *decoded = changed;
         if (changed && fallback) *fallback = before;
     }
@@ -581,6 +593,10 @@ bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list)
     }
     const u64 signature = mesh_pass_signature(pass);
     ID3D12PipelineState* pso = binding.pso && binding.pso_signature == signature ? binding.pso : nullptr;
+    static volatile LONG reuse_logged;  // once per process: the first call served by the PSO kept with the binding
+    if (pso && !reuse_logged && InterlockedExchange(&reuse_logged, 1) == 0)
+        log("x2w-mesh pipeline %016llx: PSO kept with the binding reused (no state desc, hash or mesh_lock for this call; logged once)",
+            static_cast<unsigned long long>(binding.key.key));
     if (!pso) {
         pso = mesh_pso(e, *binding.bound, pass);
         if (pso) {
