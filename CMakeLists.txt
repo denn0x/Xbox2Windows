@@ -734,7 +734,7 @@ foreach(backend IN ITEMS warp hardware)
     endforeach()
     # LOCAL meshrt: the same calls in a traced frame (x2w-frame mesh lines, targets noted for the read-back with
     # snapshots); the runs above are the controls (no line, nothing noted).
-    foreach(mode IN ITEMS statez notargets)
+    foreach(mode IN ITEMS statez notargets zero)
         add_test(NAME startup_mesh_dispatch_trace_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
         set_tests_properties(startup_mesh_dispatch_trace_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_MESH=1;X2W_D3D12_TRACE_ALL=1;X2W_D3D12_TRACE_TARGETS=1")

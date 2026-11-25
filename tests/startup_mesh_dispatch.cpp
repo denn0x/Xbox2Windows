@@ -79,6 +79,7 @@ using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) unsigned x2w_d3d12_traced_targets(unsigned* out, unsigned capacity);
 extern "C" __declspec(dllimport) int x2w_d3d12_summarise_traced_targets();
+extern "C" __declspec(dllimport) void x2w_d3d12_mesh_stats_report();
 
 namespace {
 using Word = std::uint64_t;
@@ -341,6 +342,13 @@ int main(int argc, char** argv)
     if (!no_ps) key = fnv(pixel_code, sizeof(pixel_code), key);
     key = fnv(mesh_code, sizeof(mesh_code), key);
     key = fnv(title_blob->GetBufferPointer(), title_blob->GetBufferSize(), key);
+    {  // trace_statez: X2W_MESH_DUMP_INPUTS=<this key> (read by the stand-in at the first traced mesh call)
+        char traced_now[8]{}, key_hex[24];
+        if (mode == "statez" && GetEnvironmentVariableA("X2W_D3D12_TRACE_ALL", traced_now, sizeof(traced_now)) && traced_now[0] == '1') {
+            std::snprintf(key_hex, sizeof(key_hex), "%016llx", static_cast<unsigned long long>(key));
+            SetEnvironmentVariableA("X2W_MESH_DUMP_INPUTS", key_hex);
+        }
+    }
     std::printf("mesh key %016llx\n", static_cast<unsigned long long>(key));
     if (mode != "missing") {
         // words modes: no srv line; the vertices are reached through the title heap slot in entry value 2.
@@ -949,9 +957,13 @@ int main(int argc, char** argv)
                        frame_line.find(": no targets") != std::string::npos && notes == 0;
         } else if (mode == "statez") {  // drawn: RGBA8 target and D32 depth target, LESS + write (decoded), both noted once
             trace_ok = frame_line.find(std::string("x2w-frame mesh drawn key ") + key_text + " targets 1 [0 ") == 0 &&
-                       frame_line.find(" 32x32 fmt 28] dsv ") != std::string::npos && frame_line.find(" fmt 40 viewport 0.0 0.0 32.0 32.0 depth 0.00-1.00 scissor 0 0 32 32 depth 1 func 2 write 1 stencil ") != std::string::npos &&
+                       frame_line.find(" 32x32 fmt 28] dsv ") != std::string::npos && frame_line.find(" fmt 40 (32x32 res fmt 40, last clear depth 0.5 stencil 0 flags 0x1 frame ") != std::string::npos &&
+                       frame_line.find(") query #0 viewport 0.0 0.0 32.0 32.0 depth 0.00-1.00 scissor 0 0 32 32 depth 1 func 2 write 1 stencil ") != std::string::npos &&
                        frame_line.find(" record (max count 1, stride ") != std::string::npos &&
                        notes == 2 && noted[0] == 32 && noted[1] == 32 && noted[2] == 28 && noted[3] == 1 && noted[4] == 32 && noted[6] == 40 && noted[7] == 1;
+        } else if (mode == "zero") {  // issued with 0 groups (the stats control): a drawn line with a query, the target noted
+            trace_ok = frame_line.find(std::string("x2w-frame mesh drawn key ") + key_text + " targets 1 [0 ") == 0 &&
+                       frame_line.find(" query #0 ") != std::string::npos && notes == 1 && noted[2] == 28 && noted[3] == 1;
         } else {
             trace_ok = false;  // no trace expectation for this mode
         }
@@ -963,6 +975,7 @@ int main(int argc, char** argv)
         // statez: target 0 (RGBA8, drawn: some texels non-zero) and target 1 (D32, cleared to 0.5 and drawn at 0.25:
         // non-zero); notargets: no target line. Then the debug-layer check below covers the read-back too.
         if (traced) {
+            x2w_d3d12_mesh_stats_report();  // the GPU work is complete (the pixels were read back above)
             x2w_d3d12_summarise_traced_targets();
             std::ifstream again(log_path, std::ios::binary);
             const std::string after{std::istreambuf_iterator<char>(again), {}};
@@ -980,10 +993,56 @@ int main(int argc, char** argv)
             const bool read_ok = mode == "statez"
                 ? t0.find(" snapshot ") != std::string::npos && t0.find(" 32x32 fmt 28 draws 1:") != std::string::npos && nonzero_share(t0) > 0.0 &&
                       t1.find(" snapshot ") != std::string::npos && t1.find(" 32x32 fmt 40 draws 1:") != std::string::npos && nonzero_share(t1) > 0.0
+                : mode == "zero" ? t0.find(" snapshot ") != std::string::npos && t0.find(" 32x32 fmt 28 draws 1:") != std::string::npos && nonzero_share(t0) == 0.0
                 : t0.empty();
             if (!read_ok || bad) {
                 std::printf("FAIL: the traced-target read-back does not match mode %s\n", mode.c_str());
                 ++failures;
+            }
+            // Pipeline statistics: statez's call has query #0 and a stats line with clipped primitives and pixel
+            // invocations (two triangles drawn); notargets is refused before the bind: no query, no stats line.
+            const std::string stats = line_of(std::string("x2w-frame mesh stats #0 key ") + key_text + ": ");
+            const auto number_after = [](const std::string& line, const char* label) -> long long {
+                const std::size_t p = line.find(label);
+                return p == std::string::npos ? -1 : std::atoll(line.c_str() + p + std::strlen(label));
+            };
+            const long long c_prims = number_after(stats, "clipper invocations "), ps = number_after(stats, "PS invocations ");
+            const std::size_t clip_at = stats.find("clipper invocations ");
+            const long long c_primitives = clip_at == std::string::npos ? -1 : number_after(stats.substr(clip_at), " primitives ");
+            const long long ms_primitives = stats.find("MS invocations ") != std::string::npos ? number_after(stats, " primitives ") : -2;
+            std::printf("log: stats \"%s\" (clipper invocations %lld primitives %lld, PS %lld, MS primitives %lld; -2: no MS counts)\n",
+                        stats.c_str(), c_prims, c_primitives, ps, ms_primitives);
+            const bool stats_ok = mode == "statez"
+                ? frame_line.find(" query #0") != std::string::npos && c_primitives >= 1 && ps >= 1 && (ms_primitives == -2 || ms_primitives >= 1)
+                : mode == "zero" ? !stats.empty() && c_prims == 0 && c_primitives == 0 && ps == 0 && (ms_primitives == -2 || ms_primitives == 0)
+                : stats.empty() && after.find("x2w-frame mesh stats #") == std::string::npos;
+            if (!stats_ok) {
+                std::printf("FAIL: the pipeline statistics do not match mode %s\n", mode.c_str());
+                ++failures;
+            }
+            // X2W_MESH_DUMP_INPUTS (statez): the dump folder next to the log, the vertex srv bytes equal to the test's
+            // vertices, entry constants, root constants and the 12-byte record of an issued call.
+            if (mode == "statez") {
+                const std::wstring dump = cache + L"\\mesh_dump_" + std::wstring(key_text, key_text + 16) + L"\\";
+                const auto read_all = [](const std::wstring& path) {
+                    std::ifstream f(path, std::ios::binary);
+                    return std::string{std::istreambuf_iterator<char>(f), {}};
+                };
+                const std::string index = read_all(dump + L"index.txt");
+                bool vertices_found = false;
+                for (int s = 0; s < 8 && !vertices_found; ++s) {
+                    const std::string bytes = read_all(dump + L"srv" + std::to_wstring(s) + L".bin");
+                    vertices_found = bytes.size() == sizeof(vertices) && std::memcmp(bytes.data(), vertices, sizeof(vertices)) == 0;
+                }
+                const std::string record = read_all(dump + L"record.bin");
+                const bool dump_ok = vertices_found && index.find("entry.bin ") != std::string::npos &&
+                                     index.find("root_constants.bin 512 bytes") != std::string::npos && record.size() == 12 &&
+                                     index.find("call issued") != std::string::npos && has(std::string("x2w-mesh dump ") + key_text + ":");
+                std::printf("log: dump index:\n%s(vertices found %d, record %zu bytes)\n", index.c_str(), vertices_found, record.size());
+                if (!dump_ok) {
+                    std::printf("FAIL: the X2W_MESH_DUMP_INPUTS files do not match\n");
+                    ++failures;
+                }
             }
             log_tail = after.substr(log.size() < after.size() ? log.size() : after.size());
         }

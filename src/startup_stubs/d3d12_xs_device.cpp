@@ -2957,6 +2957,27 @@ bool depth_target_cleared(const ID3D12Resource* resource)
     ReleaseSRWLockShared(&cleared_depth_lock);
     return found;
 }
+// LOCAL meshrt: the last forwarded clear of each depth resource (record time), for the traced-frame mesh lines.
+struct DepthClearValue {
+    float depth = 0;
+    UINT stencil = 0, flags = 0;
+    LONG frame = 0;
+};
+std::unordered_map<const ID3D12Resource*, DepthClearValue>& depth_clear_values()
+{
+    static std::unordered_map<const ID3D12Resource*, DepthClearValue> m;
+    return m;
+}
+bool last_depth_clear(const ID3D12Resource* resource, DepthClearValue* out)
+{
+    if (!resource) return false;
+    AcquireSRWLockShared(&cleared_depth_lock);
+    const auto found = depth_clear_values().find(resource);
+    const bool known = found != depth_clear_values().end();
+    if (known) *out = found->second;
+    ReleaseSRWLockShared(&cleared_depth_lock);
+    return known;
+}
 LONG depth_clears[5];  // [0] forwarded, [1] list not open, [2] view not a known depth view, [3] depth value outside [0, 1], [4] nothing left to clear
 void __stdcall list_clear_depth(Wrapper* self, u64 handle, UINT flags, float depth, UINT stencil, UINT rect_count, const D3D12_RECT* rects)
 {
@@ -2992,6 +3013,15 @@ void __stdcall list_clear_depth(Wrapper* self, u64 handle, UINT flags, float dep
     if (clear & D3D12_CLEAR_FLAG_DEPTH) {
         AcquireSRWLockExclusive(&cleared_depth_lock);
         cleared_depth_targets().insert(target);
+        ReleaseSRWLockExclusive(&cleared_depth_lock);
+    }
+    {  // LOCAL meshrt: the value, for the traced-frame mesh lines (one map store per forwarded clear)
+        AcquireSRWLockExclusive(&cleared_depth_lock);
+        DepthClearValue& v = depth_clear_values()[target];
+        if (clear & D3D12_CLEAR_FLAG_DEPTH) v.depth = depth;
+        if (clear & D3D12_CLEAR_FLAG_STENCIL) v.stencil = stencil & 0xFF;
+        v.flags = clear;
+        v.frame = frame_number;
         ReleaseSRWLockExclusive(&cleared_depth_lock);
     }
     InterlockedIncrement(&depth_clears[0]);
@@ -5266,6 +5296,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }();
         static LONG busy_end, busy_next;
         const LONG dispatched = InterlockedExchange(&frame_dispatches, 0);
+        mesh_stats_present(frame);  // LOCAL meshrt: traced mesh calls' pipeline statistics, 8 presents after the traced frame
         if (busy && busy_end && frame == busy_end) {
             InterlockedExchange(&trace_frame_active, 0);
             log("x2w-frame ---- end busy frame %ld", frame);

@@ -608,6 +608,101 @@ thread_local bool mesh_binding_now;  // inside draw_translated for the mesh call
 // GPU may write them later) and, when not drawn, the skip reason. Nothing of this runs outside a traced frame.
 thread_local u64 mesh_trace_key;              // the binding's key for this call (0: none yet)
 thread_local const BoundPipeline* mesh_trace_bound;
+thread_local LONG mesh_trace_query = -1;      // this call's pipeline statistics slot, or -1
+
+// LOCAL meshrt: pipeline statistics of the traced frame's issued mesh calls. One query per call (BeginQuery before the
+// ExecuteIndirect, EndQuery + ResolveQueryData into a readback buffer after it), PIPELINE_STATISTICS1 when the device
+// reports MeshShaderPipelineStatsSupported (MS invocations / primitives), else PIPELINE_STATISTICS (no MS counts). The
+// results are read 8 presents after the traced frame ends (no GPU wait; mesh_stats_present), or by the fixture export.
+// "x2w-frame mesh stats #slot key K: ..." per slot. Capacity 4096 calls per traced frame; later calls get no query.
+struct MeshStats {
+    ID3D12QueryHeap* heap = nullptr;
+    ID3D12Resource* readback = nullptr;
+    bool v1 = false;     // PIPELINE_STATISTICS1
+    bool failed = false;
+    UINT capacity = 0;
+};
+SRWLOCK mesh_stats_lock = SRWLOCK_INIT;
+MeshStats mesh_stats;
+LONG mesh_stats_next;      // slots handed out since the last report
+LONG mesh_stats_due;       // frame at which to report (0: none pending)
+u64 mesh_stats_keys[4096];
+bool mesh_stats_ready()
+{
+    AcquireSRWLockShared(&mesh_stats_lock);
+    const bool ready = mesh_stats.heap != nullptr, failed = mesh_stats.failed;
+    ReleaseSRWLockShared(&mesh_stats_lock);
+    if (ready || failed) return ready;
+    AcquireSRWLockExclusive(&mesh_stats_lock);
+    if (!mesh_stats.heap && !mesh_stats.failed) {
+        ID3D12Device* device = device_of(the_device);
+        D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9{};
+        mesh_stats.v1 = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &options9, sizeof(options9))) &&
+                        options9.MeshShaderPipelineStatsSupported;
+        mesh_stats.capacity = 4096;
+        const D3D12_QUERY_HEAP_DESC desc{mesh_stats.v1 ? D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1 : D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+                                         mesh_stats.capacity, 0};
+        D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, u64{mesh_stats.capacity} * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1),
+                                   1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
+        const HRESULT hq = device->CreateQueryHeap(&desc, IID_PPV_ARGS(&mesh_stats.heap));
+        const HRESULT hb = SUCCEEDED(hq) ? device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                                          nullptr, IID_PPV_ARGS(&mesh_stats.readback)) : hq;
+        if (FAILED(hb)) {
+            if (mesh_stats.heap) mesh_stats.heap->Release();
+            mesh_stats.heap = nullptr;
+            mesh_stats.failed = true;
+        }
+        log("x2w-mesh pipeline statistics for traced mesh calls: %s (MeshShaderPipelineStatsSupported %d) -> 0x%08lx / 0x%08lx",
+            mesh_stats.failed ? "unavailable" : mesh_stats.v1 ? "PIPELINE_STATISTICS1" : "PIPELINE_STATISTICS (no MS counts)", mesh_stats.v1 ? 1 : 0,
+            static_cast<unsigned long>(hq), static_cast<unsigned long>(hb));
+    }
+    const bool made = mesh_stats.heap != nullptr;
+    ReleaseSRWLockExclusive(&mesh_stats_lock);
+    return made;
+}
+D3D12_QUERY_TYPE mesh_stats_type() { return mesh_stats.v1 ? D3D12_QUERY_TYPE_PIPELINE_STATISTICS1 : D3D12_QUERY_TYPE_PIPELINE_STATISTICS; }
+UINT mesh_stats_size() { return mesh_stats.v1 ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1) : sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS); }
+// Prints every slot's numbers and frees the slots. The GPU work of those calls must be complete.
+void mesh_stats_report()
+{
+    const LONG used = InterlockedExchange(&mesh_stats_next, 0);
+    InterlockedExchange(&mesh_stats_due, 0);
+    if (!mesh_stats.readback || used <= 0) return;
+    const LONG count = used < static_cast<LONG>(mesh_stats.capacity) ? used : static_cast<LONG>(mesh_stats.capacity);
+    void* mapped = nullptr;
+    const D3D12_RANGE range{0, static_cast<SIZE_T>(count) * mesh_stats_size()};
+    if (FAILED(mesh_stats.readback->Map(0, &range, &mapped))) return;
+    std::uint64_t sums[5] = {}, zero_ps = 0, zero_clip = 0;
+    for (LONG i = 0; i < count; ++i) {
+        D3D12_QUERY_DATA_PIPELINE_STATISTICS1 s{};
+        std::memcpy(&s, static_cast<const unsigned char*>(mapped) + std::size_t(i) * mesh_stats_size(), mesh_stats_size());
+        if (mesh_stats.v1)
+            log("x2w-frame mesh stats #%ld key %016llx: MS invocations %llu primitives %llu, clipper invocations %llu primitives %llu, PS invocations %llu",
+                i, static_cast<unsigned long long>(mesh_stats_keys[i]), s.MSInvocations, s.MSPrimitives, s.CInvocations, s.CPrimitives, s.PSInvocations);
+        else
+            log("x2w-frame mesh stats #%ld key %016llx: (no MS counts) clipper invocations %llu primitives %llu, PS invocations %llu",
+                i, static_cast<unsigned long long>(mesh_stats_keys[i]), s.CInvocations, s.CPrimitives, s.PSInvocations);
+        const std::uint64_t v[5] = {s.MSInvocations, s.MSPrimitives, s.CInvocations, s.CPrimitives, s.PSInvocations};
+        for (int k = 0; k < 5; ++k) sums[k] += v[k];
+        zero_clip += s.CPrimitives == 0;
+        zero_ps += s.PSInvocations == 0;
+    }
+    const D3D12_RANGE none{0, 0};
+    mesh_stats.readback->Unmap(0, &none);
+    log("x2w-frame mesh stats total over %ld calls (%ld asked): MS invocations %llu primitives %llu, clipper invocations %llu primitives %llu, "
+        "PS invocations %llu; calls with 0 clipper primitives %llu, with 0 PS invocations %llu", count, used, sums[0], sums[1], sums[2], sums[3],
+        sums[4], zero_clip, zero_ps);
+}
+// queue_present, every present: the traced frame has ended (trace_frame_active 0) -> report 8 presents later.
+void mesh_stats_present(LONG frame)
+{
+    if (trace_frame_active || !mesh_stats_next) return;
+    const LONG due = mesh_stats_due;
+    if (!due) InterlockedCompareExchange(&mesh_stats_due, frame + 8, 0);
+    else if (frame >= due) mesh_stats_report();
+}
+extern "C" __declspec(dllexport) void x2w_d3d12_mesh_stats_report() { mesh_stats_report(); }  // fixtures, after their fence
 void mesh_trace_call(Wrapper* self, bool drawn, const Translation* tr, const char* why)
 {
     const Pass& pass = pass_of(self);
@@ -629,6 +724,16 @@ void mesh_trace_call(Wrapper* self, bool drawn, const Translation* tr, const cha
             static_cast<int>(pass.target_formats[i]));
     }
     add(" dsv %p fmt %d%s", static_cast<void*>(pass.dsv_resource), static_cast<int>(pass.dsv_format), pass.dsv_read_only ? " read-only" : "");
+    if (pass.dsv_resource) {
+        DepthClearValue clear;
+        const D3D12_RESOURCE_DESC dd = pass.dsv_resource->GetDesc();
+        add(" (%llux%u res fmt %d", static_cast<unsigned long long>(dd.Width), dd.Height, static_cast<int>(dd.Format));
+        if (last_depth_clear(pass.dsv_resource, &clear))
+            add(", last clear depth %g stencil %u flags 0x%x frame %ld)", clear.depth, clear.stencil, clear.flags, clear.frame);
+        else
+            add(", no forwarded clear)");
+    }
+    if (mesh_trace_query >= 0) add(" query #%ld", mesh_trace_query);
     if (pass.viewport_set)
         add(" viewport %.1f %.1f %.1f %.1f depth %.2f-%.2f", pass.viewport0.TopLeftX, pass.viewport0.TopLeftY, pass.viewport0.Width,
             pass.viewport0.Height, pass.viewport0.MinDepth, pass.viewport0.MaxDepth);
@@ -802,11 +907,35 @@ bool mesh_hook(Wrapper* self, ID3D12GraphicsCommandList* list)
     if (mesh_ready.list != self || !mesh_ready.pso || !list) return false;
     mesh_binding_now = true;
     const LONG64 t0 = mesh_now();
+    // LOCAL meshrt: traced frame: a pipeline statistics query around the call (mesh_stats_ready).
+    mesh_trace_query = -1;
+    if (trace_frame_active && mesh_stats_ready()) {
+        const LONG slot = InterlockedIncrement(&mesh_stats_next) - 1;
+        if (slot < static_cast<LONG>(mesh_stats.capacity)) {
+            mesh_trace_query = slot;
+            mesh_stats_keys[slot] = mesh_trace_key;
+            list->BeginQuery(mesh_stats.heap, mesh_stats_type(), static_cast<UINT>(slot));
+        }
+    }
     const bool issued = draw_translated(self, false, 0, 0, 0, 0, 0);
+    if (mesh_trace_query >= 0) {
+        list->EndQuery(mesh_stats.heap, mesh_stats_type(), static_cast<UINT>(mesh_trace_query));
+        list->ResolveQueryData(mesh_stats.heap, mesh_stats_type(), static_cast<UINT>(mesh_trace_query), 1, mesh_stats.readback,
+                               u64{static_cast<UINT>(mesh_trace_query)} * mesh_stats_size());
+    }
     InterlockedAdd64(&mesh_bind_ticks, mesh_now() - t0);
     InterlockedIncrement64(&mesh_bind_calls);
     mesh_binding_now = false;
     if (trace_frame_active) mesh_trace_call(self, issued, mesh_ready.tr, "bind refused by draw_translated");
+    if (!mesh_dump_dir.empty()) {  // LOCAL meshrt: X2W_MESH_DUMP_INPUTS: the record of the dumped call, then done
+        const UINT bytes = mesh_trace_stride * (mesh_trace_max ? mesh_trace_max : 1);
+        const bool readable_record = mesh_trace_record && bytes && bytes <= 65536 && x2w_local::readable(mesh_trace_record, bytes);
+        char note[160];
+        std::snprintf(note, sizeof(note), "indirect record(s) in title memory at record time: max count %u, stride %u; call %s", mesh_trace_max,
+                      mesh_trace_stride, issued ? "issued" : "NOT issued (bind refused)");
+        mesh_dump_file("record.bin", readable_record ? mesh_trace_record : nullptr, readable_record ? bytes : 0, note);
+        mesh_dump_dir.clear();
+    }
     MeshEntry* e = mesh_ready.entry;
     mesh_ready = {};
     if (!issued) {

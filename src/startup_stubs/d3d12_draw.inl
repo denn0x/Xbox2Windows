@@ -2672,6 +2672,54 @@ UavTextureSkip bind_uav_texture(const Pass& pass, const Translation& tr, UINT j,
     return tex_ok;
 }
 
+// LOCAL meshrt: X2W_MESH_DUMP_INPUTS=<key hex>: the inputs of the FIRST traced mesh call of that key go to files in
+// <folder of X2W_TRAP_LOG>\mesh_dump_<key>\ (local only): srv<i>.bin = the srv's title range read at record time (the
+// bytes a record-time copy uploads; an in-place binding is read by the GPU later), entry.bin = the entry constants as
+// set (u32 each), record.bin = the indirect record (d3d12_mesh.inl), index.txt = one line per file. Traced frame only.
+u64 mesh_dump_key()
+{
+    static const u64 key = [] {
+        char value[32]{};
+        return GetEnvironmentVariableA("X2W_MESH_DUMP_INPUTS", value, sizeof(value)) ? _strtoui64(value, nullptr, 16) : 0ull;
+    }();
+    return key;
+}
+LONG mesh_dump_claimed;               // one dump per process
+thread_local std::string mesh_dump_dir;  // non-empty: this call is being dumped (folder with trailing backslash)
+bool mesh_dump_begin(u64 key)
+{
+    mesh_dump_dir.clear();
+    if (!key || key != mesh_dump_key() || InterlockedCompareExchange(&mesh_dump_claimed, 1, 0) != 0) return false;
+    char log_path[MAX_PATH]{};
+    std::string dir;
+    if (GetEnvironmentVariableA("X2W_TRAP_LOG", log_path, sizeof(log_path))) {
+        dir = log_path;
+        const std::size_t slash = dir.find_last_of("\\/");
+        dir = slash == std::string::npos ? std::string() : dir.substr(0, slash + 1);
+    }
+    char name[48];
+    std::snprintf(name, sizeof(name), "mesh_dump_%016llx\\", static_cast<unsigned long long>(key));
+    dir += name;
+    CreateDirectoryA(dir.c_str(), nullptr);
+    mesh_dump_dir = dir;
+    log("x2w-mesh dump %016llx: inputs of the first traced call to %s", static_cast<unsigned long long>(key), dir.c_str());
+    return true;
+}
+void mesh_dump_file(const char* file, const void* data, std::size_t bytes, const char* note)
+{
+    if (mesh_dump_dir.empty()) return;
+    const std::string path = mesh_dump_dir + file;
+    bool written = false;
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        written = (!bytes || !data || std::fwrite(data, 1, bytes, f) == bytes);
+        std::fclose(f);
+    }
+    if (FILE* index = std::fopen((mesh_dump_dir + "index.txt").c_str(), "ab")) {
+        std::fprintf(index, "%s %zu bytes%s: %s\n", file, bytes, written ? "" : " (WRITE FAILED)", note);
+        std::fclose(index);
+    }
+}
+
 // LOCAL (scene): the key and refusal of the latest draw on this thread, for the traced-frame draw lines.
 thread_local u64 last_draw_key;
 thread_local const char* last_draw_why;
@@ -2796,6 +2844,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     if (vertex_first < 0) vertex_first = 0;
+    const bool dumping = mesh && trace_frame_active && mesh_dump_key() && mesh_dump_begin(tr->key);  // LOCAL meshrt
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -2963,6 +3012,16 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
         if (bytes > (16u << 20)) bytes = 16u << 20;
+        if (dumping) {  // LOCAL meshrt: X2W_MESH_DUMP_INPUTS
+            char file[16], note[200];
+            std::snprintf(file, sizeof(file), "srv%u.bin", i);
+            const bool readable_range = address && bytes && readable_window(address, bytes) >= bytes;
+            std::snprintf(note, sizeof(note), "srv %u source %d(%d,%d) entry 0x%llx words %08x %08x %08x %08x address 0x%llx stride %u%s%s", i,
+                          srv.source, srv.a, srv.b, static_cast<unsigned long long>(entry), words[0], words[1], words[2], words[3],
+                          static_cast<unsigned long long>(address), strides[i], readable_range ? "" : " (range not readable: no bytes)",
+                          placed.reject ? " (placed: rejected, bound null)" : "");
+            mesh_dump_file(file, readable_range ? reinterpret_cast<const void*>(address) : nullptr, readable_range ? bytes : 0, note);
+        }
         if (const int r = range_watch_hit(address, bytes); r >= 0) {
             static LONG shown;
             if (first_calls(shown, 16) && range_watch_line(r))
@@ -3105,6 +3164,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (first_calls(shown, 1))
                 log("x2w-draw-rt bufword3 first use: pipeline %016llx entry value %zu = word 3 of srv %d = 0x%08x", tr->key, i, ud.a, values[i]);
         }
+    }
+    if (dumping) {  // LOCAL meshrt: X2W_MESH_DUMP_INPUTS: the entry constants as set, their kinds, and the raw root constants
+        char note[600];
+        int used = std::snprintf(note, sizeof(note), "entry constants (root parameter 0), kind(a,b) per value:");
+        for (std::size_t i = 0; i < tr->uds.size() && used > 0 && used < static_cast<int>(sizeof(note)) - 24; ++i)
+            used += std::snprintf(note + used, sizeof(note) - used, " %d(%d,%d)", static_cast<int>(tr->uds[i].kind), tr->uds[i].a, tr->uds[i].b);
+        mesh_dump_file("entry.bin", values, tr->uds.size() * sizeof(values[0]), note);
+        mesh_dump_file("root_constants.bin", pass.constants, sizeof(pass.constants),
+                       "the list's 32-bit root constants as set by the title, [parameter 0-15][word 0-7] u32");
     }
     // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
     if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
