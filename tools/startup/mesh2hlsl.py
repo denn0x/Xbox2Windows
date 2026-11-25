@@ -1936,7 +1936,8 @@ def compile_hlsl(path, profile, out):
 def translate_to(out_dir, key, ms_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='',
                  user_sgpr=MESH_USER_SGPR, ps_hw_inputs=None, vs_out_cntl=None):
     """Writes <key>.ms.hlsl, <key>.ps.hlsl, the .cso files and <key>.txt (last), or <key>.fail.
-    ps_hw_inputs: the pixel stage's (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR), or None (entry-VGPR reads refused).
+    ps_hw_inputs: the pixel stage's (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR[, launch FLOAT_MODE]), or None (entry-VGPR
+    reads refused). The FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12) is the optional third .psin field.
     vs_out_cntl: the pipeline's PA_CL_VS_OUT_CNTL (what a pos1 export carries), or None (pos1 refused)."""
     name = os.path.join(out_dir, '%016x' % key)
     try:

@@ -227,9 +227,11 @@ class Stage:
         self.written_v = set()    # VGPRs assigned so far in program order
         self.entry_reads = {}     # VGPR read before any write (its entry value) -> offset of the first such read
         self.pc = 0
-        # MODE.round[3:2], the f16/f64 rounding (see op_s_round_mode); 0 (round to nearest even) at launch is ASSUMED:
-        # the translator does not read SPI_SHADER_PGM_RSRC1 FLOAT_MODE.
+        # MODE.round[3:2], the f16/f64 rounding (see op_s_round_mode). A pixel stage starts it from the launch
+        # FLOAT_MODE when the request passes it (launch_mode); otherwise 0 (nearest even) at launch is ASSUMED.
         self.round16 = 0
+        if kind == 'ps':
+            self.launch_mode(getattr(pipe, 'ps_float_mode', None))
         self.setup_entry()
         self.translate()
 
@@ -653,9 +655,9 @@ class Stage:
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
-        if base.startswith('s_setreg') and 'HW_REG_MODE' in asm and self.uses_round_mode:
-            # a MODE write the tracking of op_s_round_mode would miss (none in the measured programs)
-            raise Unsupported('%s writes MODE in a program that uses s_round_mode' % base)
+        if base.startswith('s_setreg') and 'HW_REG_MODE' in asm and (self.uses_round_mode or self.round16):
+            # a MODE write the tracking of op_s_round_mode / launch_mode would miss (none in the measured programs)
+            raise Unsupported('%s writes MODE in a program that uses s_round_mode or a non-zero launch mode' % base)
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
                     's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
@@ -2369,6 +2371,21 @@ class Stage:
                               % value)
         self.round16 = value >> 2
 
+    # FLOAT_MODE denorm bits [7:4] the lowering matches: f32 denormals flushed ([5:4] = 0), f16/f64 kept ([7:6] = 3).
+    # D3D flushes f32 denormals in shader arithmetic and keeps f16 ones; the 1,500 measured mesh sets are all 0xc_.
+    LAUNCH_DENORM = 0xc0
+
+    def launch_mode(self, mode):
+        """Start the pixel stage's MODE from its launch FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12; the layout
+        of MODE[7:0]: round f32 [1:0], round f16/f64 [3:2], denorm f32 [5:4], denorm f16/f64 [7:6], LLVM SIDefines.h
+        FP_ROUND_* / FP_DENORM_*, Mesa aco_ir.h float_mode). None (not passed): MODE 0 rounding is assumed."""
+        if mode is None:
+            return
+        if mode & 0xf0 != self.LAUNCH_DENORM or mode & 3 or (mode >> 2 & 3) not in (0, 3):
+            raise Unsupported('launch FLOAT_MODE %#04x (only f32 nearest even, f16/f64 nearest even or toward zero, '
+                              'denorm %#04x)' % (mode, self.LAUNCH_DENORM))
+        self.round16 = mode >> 2 & 3
+
     def check_round16(self, name):
         """Under f16/f64 round toward zero: refuse an f16/f64 instruction that rounds and is not lowered for it.
 
@@ -3239,8 +3256,11 @@ class Pipeline:
         is that pixel."""
         self.packed_position_vgpr = None
         self.ps_input_layout = None
+        # The pixel stage's launch FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12), the third .psin field, or None
+        # when the request does not carry it (then MODE 0 rounding is assumed, as before; see Stage.launch_mode).
+        self.ps_float_mode = ps_hw_inputs[2] if ps_hw_inputs is not None and len(ps_hw_inputs) > 2 else None
         if ps_hw_inputs is not None:
-            ena, addr = ps_hw_inputs
+            ena, addr = ps_hw_inputs[:2]
             self.ps_input_layout = layout = ps_input_layout(ena, addr)
             self.ps_input_ena = ena
             if ena >> POS_FIXED_PT & 1:
@@ -3720,7 +3740,10 @@ def clip_vector_width(cntl, vals):
 
 
 def read_ps_inputs(path):
-    """(ENA, ADDR) from a request's optional .psin file, 'spi_ps_input 1 <ENA hex8> <ADDR hex8>', or None.
+    """(ENA, ADDR[, FLOAT_MODE]) from a request's optional .psin file,
+    'spi_ps_input 1 <ENA hex8> <ADDR hex8>[ <FLOAT_MODE hex8>]', or None. FLOAT_MODE is the pixel stage's launch
+    MODE[7:0] (SPI_SHADER_PGM_RSRC1_PS bits 19:12; for a mesh pipeline u32 at state block A + 0x04c, bits 19:12);
+    without it MODE 0 rounding is assumed (Stage.launch_mode).
 
     The runtime writes it beside the request (it is not part of the key); without one the pixel stage's SPI
     input layout is unknown and a read of an input VGPR is refused.
@@ -3729,10 +3752,17 @@ def read_ps_inputs(path):
         return None
     with open(path, encoding='ascii') as file:
         text = file.read(256)
-    m = re.fullmatch(r'spi_ps_input 1 ([0-9a-f]{8}) ([0-9a-f]{8})\n(?:vs_input 1 [0-3] [0-9a-f]{8}\n)?', text)
+    m = re.fullmatch(r'spi_ps_input 1 ([0-9a-f]{8}) ([0-9a-f]{8})( [0-9a-f]{8})?\n(?:vs_input 1 [0-3] [0-9a-f]{8}\n)?',
+                     text)
     if not m:
         raise Unsupported('invalid SPI input file')
-    return int(m.group(1), 16), int(m.group(2), 16)
+    if m.group(3) is None:
+        return int(m.group(1), 16), int(m.group(2), 16)
+    # optional third field: the pixel stage's launch FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12), 8 hex digits
+    mode = int(m.group(3), 16)
+    if mode > 0xff:
+        raise Unsupported('invalid SPI input file')
+    return int(m.group(1), 16), int(m.group(2), 16), mode
 
 
 def main():

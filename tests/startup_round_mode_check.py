@@ -23,6 +23,10 @@ nearest-even words (the comparison separates the roundings); both helpers' rules
 modelled toward zero and nearest even (the draw cannot exercise the toward-zero helper's step-back there). s_round_mode 0x1 (f32 toward +inf), 0x4 (f16 toward
 +inf) and one after a branch are refused; an f16 instruction that rounds and is not lowered for the mode (the SDWA
 v_cvt_f16_f32) is refused under 0xc and accepted without it.
+
+The launch FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12, the optional third .psin field) starts MODE: 0xcc rounds
+f16 toward zero without any s_round_mode, 0xc0 and a request without the field round to nearest even; other modes are
+refused. Control: with launch_mode disabled the 0xcc stage stays nearest even. The draw also checks the 0xcc stage.
 """
 import struct
 import sys
@@ -97,13 +101,14 @@ def pixel_words(mode=0xc, branch=False, add_f16=False, pkrtz=False):
     return w + bytes.fromhex('0f1800f802030405') + bytes.fromhex('000081bf')  # exp mrt0 v2..v5 done vm
 
 
-def pipe(ps):
-    return G.Pipeline(VS_WORDS, ps, root_blob())
+def pipe(ps, launch=None):
+    """launch: the pixel stage's FLOAT_MODE passed with its SPI inputs (ENA = ADDR = PERSP_CENTER), or None."""
+    return G.Pipeline(VS_WORDS, ps, root_blob(), ps_hw_inputs=None if launch is None else (2, 2, launch))
 
 
-def refused(ps, text):
+def refused(ps, text, launch=None):
     try:
-        pipe(ps).hlsl_ps()
+        pipe(ps, launch).hlsl_ps()
     except G.Unsupported as error:
         assert text in str(error), (text, str(error))
         return
@@ -219,6 +224,57 @@ def controls():
     assert 'v14 = ' in pipe(pixel_words(mode=None, add_f16=True)).hlsl_ps()
     print('controls: refused without the handler; 0x1, 0x4 and after a branch refused; the SDWA v_cvt_f16_f32 (not lowered for the mode) refused under 0xc, '
           'accepted without it')
+    launch_controls()
+
+
+def launch_controls():
+    """The launch FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12, the optional third .psin field)."""
+    # 0xcc (the 262 measured mesh pairs): the stage WITHOUT s_round_mode rounds toward zero from launch
+    text = pipe(pixel_words(mode=None), launch=0xcc).hlsl_ps()
+    assert '    v5 = (v5 & 0xffff0000u) | x2w_f32tof16_rtz(F(v12));' in text and 'x2w_f32tof16_rne' not in text, text
+    # 0xc0 (the rest) and None (not passed): nearest even, the text of the stage without a launch mode
+    plain = pipe(pixel_words(mode=None)).hlsl_ps()
+    assert pipe(pixel_words(mode=None), launch=0xc0).hlsl_ps() == plain
+    assert 'x2w_f32tof16_rtz(F(v12))' not in plain
+    # s_round_mode 0 after a 0xcc launch switches back to nearest even
+    assert 'x2w_f32tof16_rtz(F(v12))' not in pipe(pixel_words(mode=0), launch=0xcc).hlsl_ps()
+    # an f16 op not lowered for toward zero is refused under a 0xcc launch alone (no s_round_mode), accepted at 0xc0
+    refused(pixel_words(mode=None, add_f16=True), 'v_cvt_f16_f32_sdwa under s_round_mode f16/f64 toward zero',
+            launch=0xcc)
+    # (with an SPI layout the SDWA preserve's read of v14's entry value is refused for that reason instead)
+    refused(pixel_words(mode=None, add_f16=True), 'reads entry VGPR v14', launch=0xc0)
+    # a MODE write after a non-zero launch mode is refused (the tracking would miss it)
+    setreg = struct.pack('<II', 0xb0000000 | 0x15 << 23 | (1 | 3 << 11), 0xc)
+    refused(setreg + pixel_words(mode=None), 's_setreg_imm32_b32 writes MODE', launch=0xcc)
+    # refused launch modes: f32 not nearest even, f16 toward +inf, other denorm settings
+    for bad in (0xcd, 0xc4, 0xf0, 0x0c, 0x00):
+        refused(pixel_words(mode=None), 'launch FLOAT_MODE %#04x' % bad, launch=bad)
+    # negative control: without launch_mode the 0xcc stage is nearest even (the check above would fail)
+    saved = G.Stage.launch_mode
+    G.Stage.launch_mode = lambda self, mode: None
+    try:
+        assert 'x2w_f32tof16_rne(F(v12))' in pipe(pixel_words(mode=None), launch=0xcc).hlsl_ps()
+    finally:
+        G.Stage.launch_mode = saved
+    # the .psin line: two fields as before, a third FLOAT_MODE field, malformed ones refused
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / 'r.psin'
+        for text_in, want in (('spi_ps_input 1 00000002 00000002\n', (2, 2)),
+                              ('spi_ps_input 1 00000002 00000002 000000cc\n', (2, 2, 0xcc)),
+                              ('spi_ps_input 1 00008802 00008802 000000c0\nvs_input 1 0 00000000\n', (0x8802, 0x8802, 0xc0))):
+            path.write_text(text_in, newline='')
+            assert G.read_ps_inputs(str(path)) == want, (text_in, G.read_ps_inputs(str(path)))
+        for bad_in in ('spi_ps_input 1 00000002 00000002 cc\n', 'spi_ps_input 1 00000002 00000002 00000100\n',
+                       'spi_ps_input 1 00000002 00000002  000000cc\n'):
+            path.write_text(bad_in, newline='')
+            try:
+                G.read_ps_inputs(str(path))
+            except G.Unsupported as error:
+                assert 'invalid SPI input file' in str(error)
+            else:
+                raise AssertionError('accepted %r' % bad_in)
+    print('launch FLOAT_MODE: 0xcc rounds f16 toward zero without s_round_mode, 0xc0 and not passed nearest even; '
+          '0xcd 0xc4 0xf0 0x0c 0x00 refused; without launch_mode 0xcc stays nearest even (control); .psin third field parsed')
 
 
 def check_draw(dxc, renderer, adapter, fxc=None):
@@ -246,6 +302,12 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             if run.returncode:
                 raise AssertionError('%s stage without s_round_mode\n%s\n%s' % (kind, run.stdout, run.stderr))
             print('%s without s_round_mode (x2w_f32tof16_rne): %s' % (kind, nearest), flush=True)
+            # the stage without s_round_mode under launch FLOAT_MODE 0xcc: toward zero again
+            run = draw(renderer, adapter, vs, build('ps_launch', pipe(pixel_words(mode=None), launch=0xcc).hlsl_ps(),
+                                                    ps_profile), EXPECTED)
+            if run.returncode:
+                raise AssertionError('%s launch FLOAT_MODE 0xcc\n%s\n%s' % (kind, run.stdout, run.stderr))
+            print('%s launch FLOAT_MODE 0xcc, no s_round_mode: %s' % (kind, EXPECTED), flush=True)
             # informational, not asserted: how this adapter's own f32tof16 rounds (the helpers replaced by it).
             # MEASURED on WARP and an RX 9070 XT (fxc ps_5_1, dxc ps_6_0): toward zero.
             raw = plain_text.replace('x2w_f32tof16_rne(F(', 'f32tof16((')
