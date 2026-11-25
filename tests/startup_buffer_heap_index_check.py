@@ -78,7 +78,9 @@ def check(directory, consumer, backend):
     _, image, log = results["membuf-refused"]
     line = re.search(r"^x2w-frame srv-heapbuf .*$", log, re.M)
     if columns(image) != {IDENTITY} or "membuf entry words: 52463258" not in log or not line \
-            or "(refused: null_address)" not in line.group(0):
+            or "(refused: null_address)" not in line.group(0) \
+            or not re.search(r"refused view: fmt \d+ layout 0x[0-9a-f]+ dim 1 mips \d+ [1-9]\d*x1x1 address 0x0 unreadable, detile: -$",
+                             line.group(0)):
         raise AssertionError(f"membuf-refused: pixels {image[:32].hex()}, line {line.group(0) if line else None}\n{log[-4000:]}")
     _, image, log = results["membuf-off"]
     if columns(image) != {IDENTITY} or "membuf entry words: 00000001 00000000 00000000 00000000" not in log \

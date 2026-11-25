@@ -9,7 +9,8 @@ every level and slice, compares it with the pattern, and writes red = no mismatc
 Cases: the run 102 refusal classes (layout 0x105 BC1 mip chain, 0x10a BC1 array mip chain, 0x100 R16G16B16A16_FLOAT)
 and the 17^3 RGBA16F 3D LUT (0x105, 5 mips).
 Negative controls: the switch off (the call is refused, the view stays null, mismatches); the 0x105 bytes described as
-0x109 (wrong layout, mismatches).
+0x109 (wrong layout, mismatches). Declined (DECLINED): refused with the switch on; the census class, the decline
+counters and the class's first-call line name why detiling declined.
 """
 from pathlib import Path
 import subprocess
@@ -31,6 +32,10 @@ CASES = [
     ("bc3_256_9mips_4k_s", 0x105, TEX2D, BC3_UNORM, 256, 256, 1, 9),
     ("rgba16f_17cubed_3d_5mips", 0x105, TEX3D, RGBA16F, 17, 17, 17, 5),
     ("rgba16f_100x60_3mips_linear", 0x100, TEX2D, RGBA16F, 100, 60, 1, 3),
+]
+# Refused with the switch on, and the decline the census names.
+DECLINED = [
+    (("bc1_132_8mips_4k_s", 0x105, TEX2D, BC1_UNORM, 132, 132, 1, 8), "bc mip chain"),
 ]
 
 
@@ -152,6 +157,19 @@ def check(root, consumer, backend, layout_check):
                              f"{'x2w-memsrv detiled memory SRV' in log}")
     print(f"{backend}: controls: switch off: {bad} of {PIXELS} pixels mismatch, 2 refusals; "
           f"0x105 bytes as 0x109: {bad_layout} of {PIXELS} pixels mismatch")
+    # Refusals that the switch declines name the reason (census class, decline counters, the class's first call).
+    for case, decline in DECLINED:
+        surface = root / f"{case[0]}.bin"
+        write_surface(layout_check, case, surface)
+        bad_declined, _, log = run(root / f"declined_{case[0]}", consumer, backend, case, surface, True)
+        classes = [line for line in log.splitlines() if line.startswith("x2w-texcensus   2 x ")]
+        counters = census_line(log, "detile declines of refused texture calls")
+        first = [line for line in log.splitlines() if "new refusal class" in line]
+        if (not bad_declined or "x2w-memsrv detiled" in log or not classes or f"detile: {decline}" not in classes[-1]
+                or f"{decline} 2" not in counters or len(first) != 1 or f"detile: {decline};" not in first[0]):
+            raise AssertionError(f"{case[0]}: declined control: {bad_declined} mismatches, classes {classes[-1:]}, counters {counters!r}, "
+                                 f"first-call lines {first}")
+        print(f"{backend}: {case[0]}: refused, detile declined ({decline}): {classes[-1].removeprefix('x2w-texcensus   ')}")
     return 0
 
 

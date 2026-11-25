@@ -427,8 +427,9 @@ UINT detile_element_bytes(DXGI_FORMAT f, bool& bc)
     }
     }
 }
-x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r)
+x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r, bool* chain_refused)
 {
+    if (chain_refused) *chain_refused = false;
     bool bc = false;
     const UINT bytes = detile_element_bytes(r.Format, bc);
     const UINT layout = static_cast<UINT>(r.Layout);
@@ -451,21 +452,33 @@ x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r)
         for (UINT i = 1; i < mips && i < 32; ++i) {
             const auto d3d = [i](UINT v) { return ((v >> i ? v >> i : 1u) + 3) / 4; };
             const auto chain = [i](UINT v) { return (((v + 3) / 4) + (1u << i) - 1) >> i; };
-            if (d3d(w) != chain(w) || d3d(h) != chain(h)) return x2w_startup::gfx10::Layout(~0u, false, 0, 0, 0, 0, 0);
+            if (d3d(w) != chain(w) || d3d(h) != chain(h)) {
+                if (chain_refused) *chain_refused = true;
+                return x2w_startup::gfx10::Layout(~0u, false, 0, 0, 0, 0, 0);
+            }
         }
     return x2w_startup::gfx10::Layout(layout - 0x100, r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D, bytes,
                                       bc ? (w + 3) / 4 : w, bc ? (h + 3) / 4 : h, r.DepthOrArraySize, r.MipLevels ? r.MipLevels : 1);
 }
-bool detile_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v, u64 address)
+// Why detile_srv does not take the call, as an index into detile_declines (d3d12_draw.inl); 0 when it does.
+// check_memory false (a null address): the description alone, 11 ("would detile") when it passes.
+unsigned detile_decline(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v, u64 address, bool check_memory = true)
 {
     // Only what the tiled paths take (supports_memory_srv: single-mip tiled_bc_srv forms, the bc64 chains) is left
     // to them; a tiled_bc_srv description they refuse (a BC7 0x105 mip chain, run 102: 3929 calls) is detiled here.
-    if (!console_swizzle(r) || supports_memory_srv(r, v) || xg_announced(address)) return false;
+    if (!console_swizzle(r)) return 1;
+    if (supports_memory_srv(r, v)) return 2;
+    if (check_memory && xg_announced(address)) return 3;
     D3D12_RESOURCE_DESC as_linear = r;
     as_linear.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;  // (tiled_bc_srv / bc64 need a console layout: false here)
-    if (!linear_memory_srv(as_linear, v)) return false;
-    const auto l = detile_layout(r);
-    return l.valid && l.size <= (1ull << 30) && x2w_local::readable(reinterpret_cast<const void*>(address), static_cast<std::size_t>(l.size));
+    if (!linear_memory_srv(as_linear, v)) return 4;
+    bool chain_refused = false;
+    const auto l = detile_layout(r, &chain_refused);
+    if (!l.valid) return chain_refused ? 6 : 5;
+    if (l.size > (1ull << 30)) return 7;
+    if (!check_memory) return 11;
+    if (!x2w_local::readable(reinterpret_cast<const void*>(address), static_cast<std::size_t>(l.size))) return 8;
+    return 0;
 }
 
 // LOCAL (video): X2W_MEMORY_SRV_BUFFER=1. A memory buffer view (slot 70 SRV, slot 71 UAV) whose address
@@ -598,9 +611,14 @@ void log_refusal_classes(const char* when)  // refusal_census_mutex held
     log("x2w-texcensus slot70 refusals %lld (%s, cumulative), %zu classes, top classes:", refusal_census_total, when, sorted.size());
     for (std::size_t i = 0; i < sorted.size() && i < 24; ++i) {
         const u64 k = sorted[i].second;
-        log("x2w-texcensus   %lld x %s dim %llu layout 0x%llx fmt %llu %s %s %s", sorted[i].first,
+        // "zero" = readable, first 256 bytes zero (before the decline split, run 112 and earlier: zero or unreadable).
+        const u64 decline = (k >> 31) & 15;
+        char why[48] = "";
+        if (decline) std::snprintf(why, sizeof why, " detile: %s", decline < std::size(detile_declines) ? detile_declines[decline] : "?");
+        log("x2w-texcensus   %lld x %s dim %llu layout 0x%llx fmt %llu %s %s %s%s", sorted[i].first,
             (k & 15) < std::size(census_reasons) ? census_reasons[k & 15] : "other", (k >> 4) & 15, (k >> 8) & 0x1ff, (k >> 20) & 0xff,
-            (k >> 28) & 1 ? "mips>1" : "mips=1", (k >> 29) & 1 ? "announced" : "not-announced", (k >> 30) & 1 ? "nonzero" : "zero");
+            (k >> 28) & 1 ? "mips>1" : "mips=1", (k >> 29) & 1 ? "announced" : "not-announced",
+            !((k >> 35) & 1) ? "unreadable" : (k >> 30) & 1 ? "nonzero" : "zero", why);
     }
 }
 // Called with the 300-frame draw census line (d3d12_draw.inl), so a title run's scene window is the difference of
@@ -622,7 +640,31 @@ void census_memory_srv_outcome(int outcome)
     for (LONG64 n : memory_srv_outcomes) total += n;
     if (census_every_event() || (total >= 1024 && (total & (total - 1)) == 0)) log_memory_srv_outcomes("threshold");
 }
-void census_refusal(const char* reason, const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input)
+// The memory at a refused call's address: its first 256 bytes readable, and any of them nonzero.
+struct RefusedMemory {
+    bool readable = false, nonzero = false;
+};
+RefusedMemory refused_memory(u64 address)
+{
+    RefusedMemory m;
+    if (address && x2w_local::readable(reinterpret_cast<const void*>(address), 256)) {
+        m.readable = true;
+        const auto* bytes = reinterpret_cast<const unsigned char*>(address);
+        for (int i = 0; i < 256 && !m.nonzero; ++i) m.nonzero = bytes[i] != 0;
+    }
+    return m;
+}
+LONG64 detile_decline_counts[std::size(detile_declines)];
+// decline: detile_decline's verdict (detile_declines, d3d12_draw.inl; 0 = not asked). Key bits: reason 0-3, dimension
+// 4-7, layout 8-16, format 20-27, mips > 1 28, announced 29, nonzero 30, decline 31-34, first 256 bytes readable 35.
+// The memory of a refused call, read once for the census and the marker (and not at all when both are off).
+RefusedMemory refused_call_memory(const MemoryShaderResourceView* input)
+{
+    if (!texture_census_on() && !buffer_heap_index_on()) return {};
+    return x2w_local::readable(input, sizeof(*input)) ? refused_memory(input->address) : RefusedMemory{};
+}
+void census_refusal(const char* reason, const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, unsigned decline,
+                    const RefusedMemory& memory)
 {
     if (!texture_census_on()) return;
     census_memory_srv_outcome(mso_refused);
@@ -631,19 +673,41 @@ void census_refusal(const char* reason, const D3D12_RESOURCE_DESC* resource, con
     const bool resource_ok = x2w_local::readable(resource, sizeof(*resource));
     const bool input_ok = x2w_local::readable(input, sizeof(*input));
     const u64 address = input_ok ? input->address : 0;
-    bool nonzero = false;
-    if (address && x2w_local::readable(reinterpret_cast<const void*>(address), 256)) {
-        const auto* bytes = reinterpret_cast<const unsigned char*>(address);
-        for (int i = 0; i < 256 && !nonzero; ++i) nonzero = bytes[i] != 0;
-    }
+    if (decline >= std::size(detile_declines)) decline = 0;
     const u64 dim = resource_ok && resource->Dimension >= 0 && resource->Dimension <= 4 ? resource->Dimension : 7;
     const u64 layout = resource_ok ? (static_cast<UINT>(resource->Layout) & 0x1ff) : 0x1ff;
     const u64 format = resource_ok ? (static_cast<UINT>(resource->Format) & 0xff) : 0xff;
     const u64 chain = resource_ok && resource->MipLevels > 1;
-    const u64 key = r | dim << 4 | layout << 8 | format << 20 | chain << 28 | u64{address && xg_announced(address)} << 29 | u64{nonzero} << 30;
+    const u64 key = r | dim << 4 | layout << 8 | format << 20 | chain << 28 | u64{address && xg_announced(address)} << 29 |
+                    u64{memory.nonzero} << 30 | u64{decline} << 31 | u64{memory.readable} << 35;
+    if (decline) {
+        InterlockedIncrement64(&detile_decline_counts[decline]);
+        LONG64 n = 0;
+        for (LONG64 c : detile_decline_counts) n += c;
+        if (census_every_event() || (n & (n - 1)) == 0) {
+            char parts[512];
+            int used = 0;
+            for (std::size_t i = 1; i < std::size(detile_declines); ++i)
+                used += std::snprintf(parts + used, sizeof(parts) - used, "%s%s %lld", i > 1 ? ", " : "", detile_declines[i], detile_decline_counts[i]);
+            log("x2w-texcensus detile declines of refused texture calls %lld (X2W_MEMORY_SRV_DETILE): %s", n, parts);
+        }
+    }
     std::lock_guard lock(refusal_census_mutex);
-    ++refusal_census[key];
+    const bool fresh = ++refusal_census[key] == 1;
     const LONG64 total = ++refusal_census_total;
+    // The first call of each class (at most 96 classes): every field, the layout's size and how much of it is readable.
+    static LONG described_classes;
+    if (fresh && resource_ok && input_ok && first_calls(described_classes, 96)) {
+        char resource_text[224], view_text[256];
+        x2w_startup::report_resource(resource_text, sizeof(resource_text), resource);
+        x2w_startup::report_view(view_text, sizeof(view_text), &input->view);
+        const auto l = detile_layout(*resource);
+        const std::size_t want = l.valid ? static_cast<std::size_t>((std::min)(l.size, u64{1} << 30)) : 0;
+        log("x2w-texcensus new refusal class: %s res{%s} view{%s} address 0x%llx; detile: %s; memory %s; console layout %llu bytes, %zu "
+            "readable from the address", reason, resource_text, view_text, address, detile_declines[decline],
+            !memory.readable ? "unreadable" : memory.nonzero ? "nonzero" : "zero", l.valid ? l.size : 0ull,
+            want && address ? readable_window(address, want) : 0);
+    }
     if (census_every_event() || (total >= 256 && (total & (total - 1)) == 0)) log_refusal_classes("threshold");
 }
 
@@ -697,14 +761,29 @@ void log_refused_memory_srv(const char* what, const char* reason, const D3D12_RE
     log("%s", line);
 }
 
-// LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1. A refused call writes {refused_view_magic, reason code, 0...} into its
-// title destination (d3d12_draw.inl) and clears the slot's shadow id. That is what the slot would otherwise keep: the
-// title's free-list link, or a stale token, which copies spread into draw tables.
-void mark_refused_destination(u64 destination, const char* reason)
+// LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1. A refused call writes {refused_view_magic, reason code, description}
+// into its title destination (describe_marker, d3d12_draw.inl, has the word layout) and clears the slot's shadow id.
+// That is what the slot would otherwise keep: the title's free-list link, or a stale token, which copies spread into
+// draw tables. The description travels with the title's copies, so a draw's null entry names the refused call.
+void mark_refused_destination(u64 destination, const char* reason, const D3D12_RESOURCE_DESC* resource,
+                              const MemoryShaderResourceView* input, unsigned decline, const RefusedMemory& memory)
 {
     if (!buffer_heap_index_on() || !destination || !title_backed(destination, 32) || !x2w_local::writable(reinterpret_cast<void*>(destination), 32))
         return;
-    const std::uint32_t marker[8] = {refused_view_magic, refusal_code(reason), 0, 0, 0, 0, 0, 0};
+    std::uint32_t marker[8] = {refused_view_magic, refusal_code(reason), 1u << 31, 0, 0, 0, 0, 0};
+    if (x2w_local::readable(resource, sizeof(*resource))) {
+        const auto& r = *resource;
+        marker[2] |= (static_cast<UINT>(r.Format) & 0xff) | (static_cast<UINT>(r.Layout) & 0x1ff) << 8 |
+                     (static_cast<UINT>(r.Dimension) & 7) << 17 | (r.MipLevels < 15 ? r.MipLevels : 15u) << 20 | (decline & 15) << 24;
+        marker[3] = r.Width > 0xffffffffull ? 0xffffffffu : static_cast<std::uint32_t>(r.Width);
+        marker[4] = r.Height;
+        marker[5] = r.DepthOrArraySize;
+    }
+    if (x2w_local::readable(input, sizeof(*input))) {
+        marker[5] |= std::uint32_t{memory.readable} << 16 | std::uint32_t{memory.nonzero} << 17;
+        marker[6] = static_cast<std::uint32_t>(input->address);
+        marker[7] = static_cast<std::uint32_t>(input->address >> 32);
+    }
     std::memcpy(reinterpret_cast<void*>(destination), marker, sizeof(marker));
     if (const u64 desktop = desktop_cpu_handle(destination)) {
         AcquireSRWLockExclusive(&note_lock);
@@ -808,9 +887,17 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     }
     // LOCAL (textures): X2W_MEMORY_SRV_DETILE (detile_srv above); after the linear and announced forms, before the
     // refusal checks, so every path that took a call before still takes it.
-    if (described && memory_srv_detile_on() && detile_srv(*resource, input->view, input->address) && memory_srv_destination(destination)) {
+    // decline: why it did not, for the refusal logs (detile_declines); 0 when not asked (switch off, a buffer).
+    unsigned decline = 0;
+    if (memory_srv_detile_on() && destination && x2w_local::readable(resource, sizeof(*resource)) &&
+        x2w_local::readable(input, sizeof(*input)) && resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        decline = detile_decline(*resource, input->view, input->address, input->address != 0);
+        if (!decline && !memory_srv_destination(destination)) decline = 9;
+    }
+    if (described && memory_srv_detile_on() && resource->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !decline) {
         Wrapper* texture = existing_memory_texture(input->address, *resource);
         if (!texture) texture = publish_linear_texture(self, input->address, *resource, true);
+        if (!texture) decline = 10;
         if (texture) {
             static LONG shown;
             if (first_calls(shown, 16))
@@ -825,8 +912,9 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     }
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         if (first_calls(refused, noop_census_enabled() ? 2048 : 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
-        census_refusal(reason, resource, input);
-        mark_refused_destination(destination, reason);
+        const RefusedMemory memory = refused_call_memory(input);
+        census_refusal(reason, resource, input, decline, memory);
+        mark_refused_destination(destination, reason, resource, input, decline, memory);
         return;
     }
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -855,8 +943,9 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             if (first_calls(refused, noop_census_enabled() ? 2048 : 8))
                 log_refused_memory_srv("unavailable buffer at the supplied address", "buffer_unavailable",
                                        resource, input, destination);
-            census_refusal("buffer_unavailable", resource, input);
-            mark_refused_destination(destination, "buffer_unavailable");
+            const RefusedMemory memory = refused_call_memory(input);
+            census_refusal("buffer_unavailable", resource, input, 0, memory);
+            mark_refused_destination(destination, "buffer_unavailable", resource, input, 0, memory);
             return;
         }
         census_memory_srv_outcome(mso_buffer);
@@ -868,8 +957,9 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (!texture) {
         if (first_calls(refused, noop_census_enabled() ? 2048 : 8))
             log_refused_memory_srv("unavailable texture at the supplied base and layout", "texture_unavailable", resource, input, destination);
-        census_refusal("texture_unavailable", resource, input);
-        mark_refused_destination(destination, "texture_unavailable");
+        const RefusedMemory memory = refused_call_memory(input);
+        census_refusal("texture_unavailable", resource, input, decline, memory);
+        mark_refused_destination(destination, "texture_unavailable", resource, input, decline, memory);
         return;
     }
     census_memory_srv_outcome(mso_tiled);

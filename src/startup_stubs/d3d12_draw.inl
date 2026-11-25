@@ -515,6 +515,7 @@ void note_descriptor_watch(LONG frame)
 // LOCAL (video): X2W_DRAW_NULL_TEXTURE_LOG=1 logs the first null texture binding of each pipeline key
 // and srv (at most 96 lines) with the 8 descriptor words, to find which draws lose their texture
 // and whether the title wrote a hardware descriptor there instead of a view the wrapper made.
+bool refused_marker_description(const std::uint32_t* w, char* out, std::size_t size);  // below
 void note_null_texture(u64 key, UINT srv, u64 entry, const std::uint32_t* words, x2w_local::NullCause cause)
 {
     static const bool on = [] {
@@ -533,6 +534,11 @@ void note_null_texture(u64 key, UINT srv, u64 entry, const std::uint32_t* words,
     log("x2w-draw null texture %016llx srv %u cause %s frame %ld: entry 0x%llx words %08x %08x %08x %08x %08x %08x %08x %08x", key, srv,
         x2w_local::null_cause_names[static_cast<int>(cause)], frame_number, entry, words[0], words[1], words[2], words[3], words[4],
         words[5], words[6], words[7]);
+    // LOCAL (textures): X2W_BUFFER_HEAP_INDEX's refused-view marker, with the description of the refused call.
+    if (char marker[256]; refused_marker_description(words, marker, sizeof marker)) {
+        log("x2w-draw null texture %016llx srv %u: %s", key, srv, marker);
+        return;
+    }
     // Runs 84/87: such entries hold a small integer N and seven zero words. Run 87 showed that the
     // heap holding the entry has the value M+1 at every untouched index M: the title's free list. So
     // the entry is a copy of slot N-1 while that slot was free. Show slots N-1 and N of that heap
@@ -707,6 +713,33 @@ const char* refusal_name(std::uint32_t code)
     ReleaseSRWLockShared(&refusal_names_lock);
     return name;
 }
+// Why X2W_MEMORY_SRV_DETILE did not take a refused texture call (d3d12_memory_srv.inl detile_decline); 0 = not asked
+// (switch off, or not a texture description).
+const char* const detile_declines[] = {"-", "not console-swizzled", "a tiled path's form", "announced", "view form",
+    "layout or element size", "bc mip chain", "over 1 GiB", "unreadable", "destination", "publish failed", "would detile"};
+// The marker's description words (mark_refused_destination): word 2 = bit 31 | format | layout << 8 | dimension << 17 |
+// min(mips, 15) << 20 | detile decline << 24, word 3 = width, word 4 = height, word 5 = depth or array size | first 256
+// bytes readable << 16 | nonzero << 17, words 6/7 = the address. Bit 31 keeps word 2 out of the token slot range.
+void describe_marker(const std::uint32_t* w, char* out, std::size_t size)
+{
+    if (!(w[2] >> 31)) {
+        std::snprintf(out, size, "no description");
+        return;
+    }
+    const unsigned decline = (w[2] >> 24) & 15;
+    std::snprintf(out, size, "fmt %u layout 0x%x dim %u mips %u %ux%ux%u address 0x%llx %s, detile: %s", w[2] & 0xff, (w[2] >> 8) & 0x1ff,
+                  (w[2] >> 17) & 7, (w[2] >> 20) & 15, w[3], w[4], w[5] & 0xffff, u64{w[7]} << 32 | w[6],
+                  !((w[5] >> 16) & 1) ? "unreadable" : (w[5] >> 17) & 1 ? "nonzero" : "zero",
+                  decline < std::size(detile_declines) ? detile_declines[decline] : "?");
+}
+bool refused_marker_description(const std::uint32_t* w, char* out, std::size_t size)
+{
+    if (w[0] != refused_view_magic) return false;
+    char d[160];
+    describe_marker(w, d, sizeof d);
+    std::snprintf(out, size, "refused: %s; %s", refusal_name(w[1]), d);
+    return true;
+}
 bool free_link_words(const std::uint32_t* w)
 {
     if (w[0] == refused_view_magic) return true;
@@ -739,11 +772,17 @@ void log_buffer_link(u64 key, UINT srv, u64 entry, const std::uint32_t* words)
         }
         break;
     }
-    char kind[80];
-    if (words[0] == refused_view_magic) std::snprintf(kind, sizeof kind, "refused: %s", refusal_name(words[1]));
-    else std::snprintf(kind, sizeof kind, "%s", words[1] || words[2] ? "freed token" : "free link");
-    log("x2w-frame srv-heapbuf %016llx %u frame %ld: entry 0x%llx words %08x %08x %08x %08x (%s) is %s; %s; %s; bound null", key, srv, frame_number,
-        entry, words[0], words[1], words[2], words[3], kind, where, slots[0], slots[1]);
+    char kind[80], described[192] = "";
+    if (words[0] == refused_view_magic) {
+        std::snprintf(kind, sizeof kind, "refused: %s", refusal_name(words[1]));
+        char d[160];
+        describe_marker(words, d, sizeof d);
+        std::snprintf(described, sizeof described, "; refused view: %s", d);
+    } else {
+        std::snprintf(kind, sizeof kind, "%s", words[1] || words[2] ? "freed token" : "free link");
+    }
+    log("x2w-frame srv-heapbuf %016llx %u frame %ld: entry 0x%llx words %08x %08x %08x %08x (%s) is %s; %s; %s; bound null%s", key, srv, frame_number,
+        entry, words[0], words[1], words[2], words[3], kind, where, slots[0], slots[1], described);
 }
 
 u64 fnv_bytes(const void* data, std::size_t bytes, u64 hash = 1469598103934665603ull)
@@ -1996,7 +2035,7 @@ u64 hash_memory(const unsigned char* data, std::size_t bytes)
     for (std::size_t i = words * 8; i < bytes; ++i) h = (h ^ data[i]) * 0x100000001b3ull;
     return h;
 }
-x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r);  // d3d12_memory_srv.inl (X2W_MEMORY_SRV_DETILE)
+x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r, bool* chain_refused = nullptr);  // d3d12_memory_srv.inl (X2W_MEMORY_SRV_DETILE)
 void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 {
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);

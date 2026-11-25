@@ -40,6 +40,7 @@ struct Shape {
     unsigned elem;  // bytes per element
     unsigned w, h, d, mips;  // elements (4x4 blocks for BC), depth or array size
     unsigned bc;    // 0, or the BC number for the pixel-form addrlib check (pixel size = 4 * elements)
+    unsigned pw = 0, ph = 0;  // BC: the pixel size when it is not 4 * elements (mip-0 blocks ceil(pixels / 4))
 };
 
 // The measured refusal shapes (runs 97/98, layout 0x105 and 0x100), then wider coverage of the four tiled modes.
@@ -79,6 +80,14 @@ const Shape shapes[] = {
     {"bc1_256x128x2_8mips_64k_d", 10, false, 8, 64, 32, 2, 8, 1},
     {"bc3_256_9mips_4k_s", 5, false, 16, 64, 64, 1, 9, 3},  // a tiled_bc_srv description the tiled paths refuse (mips)
     {"rgba16f_100x60_3mips_linear", 0, false, 8, 100, 60, 1, 3, 0},
+    // BC chains whose pixel sizes are not multiples of 4 << mip: D3D's per-level block count (ceil(max(1, pixels >> i) /
+    // 4)) is below the ceiling-halved one at some level. The pixel form (pw x ph) must place every level as the element
+    // form does. Run 112's refused BC7 0x105 chain (512x1056, 8 mips: 4 rows of blocks at mip 6 in D3D, 5 in the chain),
+    // a 0x10a BC7 chain, and the two WARP detile draws (BC1 0x105, BC3 0x10a array).
+    {"bc7_512x1056_8mips_4k_s", 5, false, 16, 128, 264, 1, 8, 7, 512, 1056},
+    {"bc7_1000x600_10mips_64k_d", 10, false, 16, 250, 150, 1, 10, 7, 1000, 600},
+    {"bc1_132_8mips_4k_s", 5, false, 8, 33, 33, 1, 8, 1, 132, 132},
+    {"bc3_132x68x2_8mips_64k_d", 10, false, 16, 33, 17, 2, 8, 3, 132, 68},
 };
 
 unsigned ceil_shift(unsigned v, unsigned s) { return (v + (1u << s) - 1) >> s; }
@@ -364,8 +373,8 @@ ADDR_E_RETURNCODE info(ADDR_HANDLE lib, const Shape& s, ADDR2_COMPUTE_SURFACE_IN
     in.resourceType = s.is3d ? ADDR_RSRC_TEX_3D : ADDR_RSRC_TEX_2D;
     in.format = pixels ? bc_format(s.bc) : element_format(s.elem);
     in.bpp = pixels ? 0 : s.elem * 8;
-    in.width = pixels ? s.w * 4 : s.w;
-    in.height = pixels ? s.h * 4 : s.h;
+    in.width = pixels ? (s.pw ? s.pw : s.w * 4) : s.w;
+    in.height = pixels ? (s.ph ? s.ph : s.h * 4) : s.h;
     in.numSlices = s.d;
     in.numMipLevels = s.mips;
     in.numSamples = 1;
