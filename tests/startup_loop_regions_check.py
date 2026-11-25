@@ -23,9 +23,14 @@ LIMIT = 300
 
 class Fake:
     body = G.Stage.body
+    LOOP_PASSES = 10 ** 6  # the trace comparison checks the control flow; the bound is checked on its own
 
     def __init__(self, blocks):
         self.blocks = blocks
+
+
+class Bounded(Fake):
+    LOOP_PASSES = G.Stage.LOOP_PASSES
 
 
 def make(rng, n):
@@ -77,9 +82,9 @@ def parse(lines):
     items, cur, loop = [], None, None
     for line in lines:
         s = line.strip()
-        m = re.match(r'\[loop\] for \(uint guard = 0; guard < 65536 && pc >= (\d+) && pc <= (\d+); \+\+guard\) \{', s)
+        m = re.match(r'\[loop\] for \(uint guard = 0; guard < (\d+)u && pc >= (\d+) && pc <= (\d+); \+\+guard\) \{', s)
         if m:
-            loop = ('loop', int(m.group(1)), int(m.group(2)), [])
+            loop = ('loop', int(m.group(2)), int(m.group(3)), [], int(m.group(1)))
             items.append(loop)
             continue
         m = re.match(r'(?:else )?if \(pc == (\d+)\) \{', s)
@@ -103,7 +108,7 @@ def run_pc(line, i, conds):
     return 0xffff if line == 'pc = 0xffffu;' else int(re.fullmatch(r'pc = (\d+);', line).group(1))
 
 
-def emitted(lines, conds, loops=True):
+def emitted(lines, conds, loops=True, limit=LIMIT):
     trace, pc = [], 0
 
     def block(b):
@@ -112,12 +117,12 @@ def emitted(lines, conds, loops=True):
         pc = run_pc(b[1], b[0], conds)
     for item in parse(lines):
         if item[0] == 'block':
-            if pc == item[1][0] and len(trace) < LIMIT:
+            if pc == item[1][0] and len(trace) < limit:
                 block(item[1])
         else:
-            _, lo, hi, members = item
+            _, lo, hi, members, bound = item
             guard = 0
-            while lo <= pc <= hi and guard < 65536 and len(trace) < LIMIT:
+            while lo <= pc <= hi and guard < bound and len(trace) < limit:
                 guard += 1
                 for _, b in members:
                     if pc == b[0]:
@@ -148,11 +153,31 @@ def main():
     measured[20] = (0x140, ['x;'], ('branch', 'scc', 0x130))
     lines = Fake(measured).body()
     heads = [x.strip() for x in lines if '[loop]' in x]
-    assert heads == ['[loop] for (uint guard = 0; guard < 65536 && pc >= 12 && pc <= 12; ++guard) {',
-                     '[loop] for (uint guard = 0; guard < 65536 && pc >= 19 && pc <= 20; ++guard) {'], heads
+    assert heads == ['[loop] for (uint guard = 0; guard < 1000000u && pc >= 12 && pc <= 12; ++guard) {',
+                     '[loop] for (uint guard = 0; guard < 2000000u && pc >= 19 && pc <= 20; ++guard) {'], heads
+    # The real bound: 64 passes through each region. Adversarial graphs whose loops never exit (a block jumping
+    # to itself, a two-block cycle, a branch that is always taken) end after at most 64 * blocks visits (pc is
+    # then still inside the region, so the later blocks are skipped: a wrong result, not a hang); negative
+    # control: without the bound the trace runs into the 10000-visit cut.
+    always = lambda block: True  # noqa: E731
+    spins = {
+        'self jump': [(0x0, ['a;'], None), (0x10, ['b;'], ('jump', 0x10)), (0x20, ['c;'], ('end',))],
+        'cycle': [(0x0, ['a;'], None), (0x10, ['b;'], None), (0x20, ['c;'], ('jump', 0x10)), (0x30, ['d;'], ('end',))],
+        'taken branch': [(0x0, ['a;'], ('branch', 'c0', 0x0)), (0x10, ['d;'], ('end',))],
+    }
+    for name, graph in spins.items():
+        lines = Bounded(graph).body()
+        bounds = [int(re.search(r'guard < (\d+)u', x).group(1)) for x in lines if '[loop]' in x]
+        size = len(graph) - (2 if name != 'taken branch' else 1)
+        assert bounds == [64 * size], (name, bounds)
+        trace = emitted(lines, always, limit=10 ** 7)
+        assert len(trace) <= 64 * size + 2, (name, len(trace))
+        unbounded = emitted(Fake(graph).body(), always, limit=10 ** 4)
+        assert len(unbounded) == 10 ** 4, name
     print('loop_regions: %d random graphs run the same block trace as one dispatch loop (%d with loops; the '
           'one-pass negative control differs on %d); loop-free graph has no loop; two waterfall loops get two '
-          'loops of 1 and 2 blocks' % (3000, looped, differ))
+          'loops of 1 and 2 blocks; 3 never-exiting loops stop after 64 passes (the unbounded control runs '
+          'into the cut)' % (3000, looped, differ))
 
 
 if __name__ == '__main__':

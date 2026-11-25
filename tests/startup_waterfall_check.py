@@ -14,6 +14,9 @@
    The translation: the readfirstlane emits s13 = v46 at a loop head of this form (b32, and the wave64 b64 form
    with an s_waitcnt head); refused without the v_cmpx_eq, with a loop-carried SGPR, with an SGPR read after the
    loop, with another branch or a scalar store in the body, and without the wrexec close.
+   One pass: the emitted form runs the body once (the proven loop's s_cbranch_scc1 becomes fall-through). The
+   one-lane model with one pass equals the wave on every lane; with a wrong index (the negative control) the looped
+   one-lane form never exits, the one-pass form ends (a wrong value, not a hang).
 2. s_nor_b32 of a mask SGPR: the lane's bit of ~(a | b) is ~(a_i | b_i) (value checked over the four bit pairs);
    no SCC is written (inactive lanes are 1 after the complement), so a following s_cbranch_scc1 is refused.
 """
@@ -56,10 +59,19 @@ def wave(index, exec_, s12, heap):
             return v44
 
 
-def one_lane(own, active, s12bit, heap, first_lane_index=None):
-    """The same loop in the one-lane model: exec is this lane's bit; readfirstlane gives own (or a forced index)."""
+def one_lane(own, active, s12bit, heap, first_lane_index=None, passes=4):
+    """The same loop in the one-lane model: exec is this lane's bit; readfirstlane gives own (or a forced index).
+    passes=1 is the emitted form: the body once, the back edge dropped."""
     v44, exec_, s25 = None, active, active
-    for _ in range(4):
+    for _ in range(passes):
+        if passes == 1:
+            s13 = own if first_lane_index is None else first_lane_index
+            exec_ &= int(s13 == own)
+            desc = heap[(s13 << 5) >> 5]
+            s13, exec_ = exec_, s12bit & exec_
+            if exec_:
+                v44 = desc
+            return v44
         s13 = own if first_lane_index is None else first_lane_index
         exec_ &= int(s13 == own)
         desc = heap[(s13 << 5) >> 5]
@@ -85,7 +97,11 @@ def semantics():
         hw = wave(index, exec_, s12, heap)
         for l in range(32):
             assert hw[l] == one_lane(index[l], exec_ >> l & 1, s12 >> l & 1, heap), (index, hex(exec_), l)
+            assert hw[l] == one_lane(index[l], exec_ >> l & 1, s12 >> l & 1, heap, passes=1), (index, l)
         trials += 1
+    # the looped one-lane form never exits under a wrong index (the hang shape); the one-pass form ends regardless
+    assert one_lane(5, 1, 1, heap, first_lane_index=3) == 'no exit'
+    assert one_lane(5, 1, 1, heap, first_lane_index=3, passes=1) is None
     index = [3] + [5] * 31
     hw = wave(index, 0xffffffff, 0xffffffff, heap)
     assert any(hw[l] != one_lane(index[l], 1, 1, heap, first_lane_index=index[0]) for l in range(32))
@@ -126,7 +142,26 @@ def refused(ins, pc, why):
     raise AssertionError('accepted: ' + why)
 
 
+def one_pass():
+    """The proven loop's s_cbranch_scc1 is emitted as fall-through (no back edge, so no dispatch loop); an
+    s_cbranch_scc1 elsewhere, or in a stage where no waterfall was proven, is still a branch."""
+    ins = build(LOOP)
+    back = [(o, t) for o, _, n, t in ins if n == 's_cbranch_scc1'][0]
+    s = stage([])
+    s.ins, s.pc, s.lines = ins, 0x100, []
+    s.uniform_v, s.partial_uniform = set(), {}
+    s.one('v_readfirstlane_b32', 'v_readfirstlane_b32 s13, v46')
+    s.pc, s.lines = back[0], []
+    assert s.one('s_cbranch_scc1', back[1]) is None and 'not taken' in s.lines[0], s.lines
+    s.pc = back[0] + 8
+    assert s.one('s_cbranch_scc1', back[1]) == ('branch', 'scc', 0x100)
+    fresh = stage([])
+    fresh.pc, fresh.lines = back[0], []
+    assert fresh.one('s_cbranch_scc1', back[1]) == ('branch', 'scc', 0x100)
+
+
 def translation():
+    one_pass()
     assert readfirstlane(build(LOOP), 0x100) == ['s13 = v46;']
     wide = ['s_waitcnt vmcnt(0)', 'v_readfirstlane_b32 s10, v28', 'v_cmpx_eq_i32_e32 s10, v28',
             's_lshl_b32 s10, s10, 5', 's_load_dwordx8 s[48:55], s[30:31], s10', 's_waitcnt lgkmcnt(0)',
@@ -202,7 +237,8 @@ def main():
     nor()
     print('waterfall: wave and one-lane models agree on %d random (index, exec, s12) patterns x 32 lanes; '
           'lane-0 readfirstlane caught (negative control); b32 and b64 forms translate to sN = vM; %d controls '
-          'refused; s_nor_b32 of a mask is the lane bit with no SCC (SCC read refused)' % (trials, controls))
+          'refused; one pass (back edge dropped) matches the wave on every lane and ends under a wrong index where the '
+          'looped form never exits; s_nor_b32 of a mask is the lane bit with no SCC (SCC read refused)' % (trials, controls))
 
 
 if __name__ == '__main__':

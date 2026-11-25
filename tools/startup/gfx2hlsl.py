@@ -548,7 +548,8 @@ class Stage:
         self.cf_first = min([off for off, n, name, asm in self.ins if name.startswith('s_cbranch') or name == 's_branch']
                             + list(targets) + [1 << 32])
         self.blocks = []          # (offset, [lines], terminator)
-        self.execz_snaps = []     # the snapshots on taken s_cbranch_execz edges (see merge)
+        self.waterfall_back = set()  # back edges of proven waterfall loops, emitted as fall-through (waterfall)
+        self.execz_snaps = []    # the snapshots on taken s_cbranch_execz edges (see merge)
         self.uniform_v = set()    # VGPRs proven to hold one value in every lane (see set_v)
         self.partial_uniform = {}  # VGPRs holding one value in every lane active at their write (see set_v)
         self.shadow_v = set()     # shadow variables xvN that v_readfirstlane_b32 introduced
@@ -662,6 +663,9 @@ class Stage:
             return ('end',)
         if base == 's_branch':
             return ('jump', int(ops[0].split('_')[1], 16))
+        if base == 's_cbranch_scc1' and getattr(self, 'pc', None) in getattr(self, 'waterfall_back', ()):
+            self.lines.append('// waterfall back edge: not taken for this lane (one pass, see waterfall)')
+            return None
         if base.startswith('s_cbranch_'):
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
                     'execz': '(exec & 1) == 0', 'execnz': '(exec & 1) != 0'}[base[10:]]
@@ -1980,6 +1984,13 @@ class Stage:
                     if name == 's_branch':
                         break
                 i += 1
+        # One pass: the lane's own iteration is the only one in which it is active, and it leaves the loop with its
+        # exec bit 0, so for this lane the back edge is never taken. Emitting it as a branch would leave a loop
+        # whose model condition repeats the first pass exactly (the one-lane state is the same each time), so a
+        # body that does not restore exec would spin until a guard; without the edge it runs once.
+        if not hasattr(self, 'waterfall_back'):
+            self.waterfall_back = set()
+        self.waterfall_back.add(self.ins[b][0])
 
     def op_v_readfirstlane_b32(self, ops, mods):
         # D = S0 of the first active lane (AMD RDNA 2 ISA; LLVM selects it for a VGPR-to-SGPR copy of a value the
@@ -2619,6 +2630,8 @@ class Stage:
         return None
 
     # ---- output ------------------------------------------------------------------------------
+    LOOP_PASSES = 64
+
     def body(self):
         """Statements of the whole program as structured HLSL."""
         out = []
@@ -2653,7 +2666,10 @@ class Stage:
         for i, (off, lines, term) in enumerate(self.blocks):
             if i in starts:
                 inside = starts[i]
-                out.append('    [loop] for (uint guard = 0; guard < 65536 && pc >= %d && pc <= %d; ++guard) {' % (i, inside))
+                # A hard bound so that a wrong lowering costs a wrong pixel, never a GPU timeout: LOOP_PASSES
+                # passes through the region (one block visit per guard step). ASSUMED enough for the title's loops.
+                out.append('    [loop] for (uint guard = 0; guard < %du && pc >= %d && pc <= %d; ++guard) {'
+                           % (self.LOOP_PASSES * (inside - i + 1), i, inside))
             indent = '    ' if inside is not None else ''
             first = inside is not None and i in starts
             out.append('    %s%sif (pc == %d) {' % (indent, 'else ' if inside is not None and not first else '', i))
