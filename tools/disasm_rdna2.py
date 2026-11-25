@@ -1677,6 +1677,49 @@ def _decode_vop2_dpp(w1: int, vdst: int, vsrc1: int, src0: int, op: int, op_name
     return (8, dpp_name, asm, comment)
 
 
+def _decode_vopc_dpp(w1: int, vsrc1: int, src0: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
+    """Decode a GFX10 VOPC DPP8 (src0=233/234) or DPP16 (src0=250) 8-byte instruction.
+
+    The second dword has the VOP2 DPP layout (src0 VGPR [7:0], DPP16 control [16:8], fi 18, bound_ctrl 19, src0
+    neg/abs 20/21, src1 neg/abs 22/23, bank_mask [27:24], row_mask [31:28]; DPP8 lane selects [31:8]); the result
+    goes to VCC (v_cmp) or EXEC (v_cmpx), as in the e32 form. LLVM 15 does not decode VOPC DPP for GFX10 (LLVM has
+    VOPC DPP from GFX11 on, printed `v_cmp_<op>_dpp vcc_lo, ...`, the spelling used here). Evidence for GFX10:
+    compiled pixel programs carry VOPC words with src0 250 followed by a dword of this layout (fi and bound_ctrl
+    set, row/bank masks 0xf, a quad_perm control) and read VCC afterwards. 64-bit compares are refused, as are
+    float modifiers on integer compares and src1 modifiers on v_cmp_class."""
+    is_dpp8 = src0 in (233, 234)
+    form = "DPP8" if is_dpp8 else "DPP16"
+    kind = "vopc_dpp8" if is_dpp8 else "vopc_dpp16"
+    if op_name.startswith("v_vopc_") or op_name.endswith(("_f64_e32", "_i64_e32", "_u64_e32")):
+        return (8, kind, f"{op_name} <unsupported {form}>", f"VOPC {form} is not supported for this opcode")
+    base = op_name[:-4] if op_name.endswith("_e32") else op_name
+    dpp_name = f"{base}_dpp"
+    is_float = base.endswith(("_f32", "_f16")) and "_class_" not in base
+    src0_vgpr = w1 & 0xff
+    if is_dpp8:
+        ctrl = _format_dpp8_ctrl(w1, 1 if src0 == 234 else 0)
+        src0_str, src1_str = f"v{src0_vgpr}", f"v{vsrc1}"
+    else:
+        dpp_ctrl_str = _format_dpp16_ctrl((w1 >> 8) & 0x1ff)
+        if dpp_ctrl_str is None:
+            return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid GFX10 DPP16 control")
+        fi, bound_ctrl = (w1 >> 18) & 1, (w1 >> 19) & 1
+        src0_neg, src0_abs, src1_neg, src1_abs = ((w1 >> b) & 1 for b in (20, 21, 22, 23))
+        if not is_float and (src0_neg or src0_abs or src1_neg or src1_abs):
+            return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid VOPC DPP16 modifier")
+        if "_class_" in base and (src1_neg or src1_abs):
+            return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid VOPC DPP16 modifier")
+        src0_str = _format_operand_modifiers(f"v{src0_vgpr}", src0_abs, src0_neg)
+        src1_str = _format_operand_modifiers(f"v{vsrc1}", src1_abs, src1_neg)
+        ctrl = (f"{dpp_ctrl_str} row_mask:0x{(w1 >> 28) & 0xf:x} bank_mask:0x{(w1 >> 24) & 0xf:x}"
+                f"{' bound_ctrl:1' if bound_ctrl else ''}{' fi:1' if fi else ''}")
+    if base.startswith("v_cmpx_"):
+        asm = f"{dpp_name} {src0_str}, {src1_str} {ctrl}"
+    else:
+        asm = f"{dpp_name} vcc_lo, {src0_str}, {src1_str} {ctrl}"
+    return (8, dpp_name, asm, comment)
+
+
 def _vop_extension(data: bytes, offset: int, encoding: str, op_name: str, src0: int) -> tuple[int, str, str, str]:
     """Consume a DPP8, DPP16 or SDWA instruction as one 8-byte record; its operands are not decoded."""
     form = VOP_EXTENSION_FORMS[src0]
@@ -2555,6 +2598,11 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 return _decode_vopc_sdwa(w1, vsrc1, op_name, comment)
             literal, = struct.unpack_from("<I", data, offset + 4)
             length = 8
+        if src0 in (233, 234, 250):
+            if offset + 8 > len(data):
+                return (4, "vopc_truncated", f"{op_name} <truncated>", "Incomplete VOPC DPP")
+            w1, = struct.unpack_from("<I", data, offset + 4)
+            return _decode_vopc_dpp(w1, vsrc1, src0, op_name, comment)
         wide0 = op_name.endswith(("_f64_e32", "_i64_e32", "_u64_e32"))
         wide1 = wide0 and "_class_" not in op_name
         if literal is not None:

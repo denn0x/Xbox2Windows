@@ -1819,7 +1819,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_image_sample_c COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_c_check.py")
     # Pixel-stage lowerings of mesh pairs (gfx2hlsl): translation checks with negative controls.
-    foreach(check IN ITEMS scalar_pack_hh quad_dpp spi_input mesh_spi_input image_sample_b image_sample_d interp_f16 round_mode front_face quad_divergent scalar_const_fold sample_c_preclamp sample_c_border)
+    foreach(check IN ITEMS scalar_pack_hh quad_dpp spi_input mesh_spi_input image_sample_b image_sample_d interp_f16 round_mode front_face quad_divergent scalar_const_fold sample_c_preclamp sample_c_border vopc_dpp)
         add_test(NAME startup_${check} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_${check}_check.py")
         set_tests_properties(startup_${check} PROPERTIES TIMEOUT 120)
