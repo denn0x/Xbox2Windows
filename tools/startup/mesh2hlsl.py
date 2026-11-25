@@ -1978,12 +1978,38 @@ def is_mesh(code):
 
 
 def translate_request(out_dir, key):
-    """A mesh pipeline request req_<key>.{a,b,root}: whichever blob is the mesh stage, the other the pixel stage."""
+    """A mesh pipeline request req_<key>.{a,b,root}: whichever blob is the mesh stage, the other the pixel stage.
+
+    An RTV variant (the draw path's contract, gfx2hlsl.translate_request; the mesh runtime publishes it when a bound
+    target is integer or 32-bit float, d3d12_mesh.inl): req_<key>.rtv holds `rtv1 <base key> <DXGI formats>` with
+    key = fnv(that text); the blobs are the base request's, checked against the base key; the pixel exports take
+    the target formats (Pipeline.mrt_kind) and the manifest carries the rtv1 line. A variant of a depth-only
+    pipeline is refused (the runtime takes the base translation for any target there)."""
     base = os.path.join(out_dir, 'req_%016x' % key)
+    request, formats, base_key = '', (), key
+    if os.path.isfile(base + '.rtv'):
+        try:
+            with open(base + '.rtv', encoding='ascii') as file:
+                request = file.read(256)
+        except (OSError, UnicodeError) as error:
+            return 'unreadable: %s' % error
+        if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or G.fnv(request.encode('ascii')) != key:
+            return 'unsupported: invalid RTV variant request'
+        base_key, *formats = map(int, request.split()[1:])
+        if base_key > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
+            return 'unsupported: invalid RTV variant values'
+        formats = tuple(formats)
+        base = os.path.join(out_dir, 'req_%016x' % base_key)
     try:
         a, b, root = (open(base + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
     except OSError as error:
         return 'unreadable: %s' % error
+    if request:
+        if G.pipeline_key(a, b, root) != base_key:
+            return 'unsupported: RTV variant source key mismatch'
+        if not (a and b):
+            return 'unsupported: RTV variant of a mesh pipeline without a pixel stage'
+    rtv = {'rtv_formats': formats, 'rtv_request': request} if request else {}
     # optional req_<key>.vsout `pa_cl_vs_out_cntl 1 <hex8>` (not part of the key): what a pos1 export carries
     try:
         cntl = G.read_vs_out(base + '.vsout')
@@ -1997,9 +2023,9 @@ def translate_request(out_dir, key):
     except Unsupported as reason:
         return 'unsupported: %s' % reason
     if a and b and is_mesh(b) and not is_mesh(a):
-        return translate_to(out_dir, key, b, a, root, ps_hw_inputs=ps_hw_inputs, vs_out_cntl=cntl)
+        return translate_to(out_dir, key, b, a, root, ps_hw_inputs=ps_hw_inputs, vs_out_cntl=cntl, **rtv)
     if a and b and is_mesh(a) and not is_mesh(b):
-        return translate_to(out_dir, key, a, b, root, ps_hw_inputs=ps_hw_inputs, vs_out_cntl=cntl)
+        return translate_to(out_dir, key, a, b, root, ps_hw_inputs=ps_hw_inputs, vs_out_cntl=cntl, **rtv)
     return 'not a mesh pipeline'
 
 
