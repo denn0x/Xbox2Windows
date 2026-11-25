@@ -247,7 +247,8 @@ class MeshStage(G.Stage):
         # (body() gives each block one). Running it with every lane off is what skipping does: vector writes,
         # exports, LDS writes and stores stay guarded by exec, and the restore gives each wave with no active lane
         # its scalars from before the range back.
-        barrier_at = [b[0] for b in self.blocks if b[2] and b[2][0] == 'barrier']
+        # (lane-mask SCC publish barriers are left out: 28020dea lets the uniform skip jump over those)
+        barrier_at = [b[0] for b in self.blocks if b[2] and b[2][0] == 'barrier' and b[2][1:2] != ('lane-scc',)]
         blocks = []
         for b in self.blocks:
             if b[2] and b[2][0] == 'barrier' and len(b[2]) > 1 and b[2][1] == 'wave-branch':
