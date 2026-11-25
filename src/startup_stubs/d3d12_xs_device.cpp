@@ -29,6 +29,7 @@
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
+#include "startup_stubs/gfx10_layout.h"  // LOCAL (textures): X2W_MEMORY_SRV_DETILE
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
 #include "startup_stubs/placed_build.h"
@@ -101,7 +102,10 @@ struct WrapperOwn {
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
-    bool linear_memory_srv; // LOCAL (video): texture made by X2W_MEMORY_SRV_LINEAR; 1D/3D ones are uploaded too.
+    bool linear_memory_srv : 1; // LOCAL (video): texture made by X2W_MEMORY_SRV_LINEAR; 1D/3D ones are uploaded too.
+    bool detiled_memory_srv : 1; // LOCAL (textures): with linear_memory_srv, its title memory is console-swizzled
+                                 // (X2W_MEMORY_SRV_DETILE, gfx10_layout.h) and upload_texture detiles it. A bit
+                                 // field next to linear_memory_srv keeps WrapperOwn's size.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)

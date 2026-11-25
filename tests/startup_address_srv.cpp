@@ -2,8 +2,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <vector>
 
 using Word = std::uint64_t;
@@ -268,6 +270,51 @@ int draw_announced_srvs(ID3D12Device* desktop, void* guest, void* list)
     std::array<std::uint32_t, 16> sampler_words{};
     for (unsigned i = 0; i < sampler_words.size(); ++i) sampler_words[i] = 0x61000000u + i;
     invoke(guest, 61, ptr(sampler_words.data()), 0x5150, 1);
+    return 0;
+}
+
+// LOCAL (textures): one memory SRV of a console-swizzled texture (X2W_MEMORY_SRV_DETILE). X2W_TEST_DETILE_SRV names
+// the surface bytes (tests/gfx10_layout_check.cpp --write-tiled, synthetic), X2W_TEST_DETILE_DESC its description
+// "<layout> <dimension> <format> <width> <height> <depth or array size> <mips>" (layout in hex). The memory is
+// 64 KiB-aligned and was not announced by the XG stand-in; the view covers every level (and slice).
+int draw_detile_srvs(void* guest, void* list)
+{
+    wchar_t path[MAX_PATH]{};
+    char desc_text[128]{};
+    const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_DETILE_SRV", path, MAX_PATH);
+    if (!length || length >= MAX_PATH || !GetEnvironmentVariableA("X2W_TEST_DETILE_DESC", desc_text, sizeof desc_text)) return 43;
+    unsigned layout = 0, dimension = 0, format = 0, width = 0, height = 0, depth = 0, mips = 0;
+    if (std::sscanf(desc_text, "%x %u %u %u %u %u %u", &layout, &dimension, &format, &width, &height, &depth, &mips) != 7) return 43;
+    std::ifstream input(path, std::ios::binary);
+    const std::vector<char> bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>{}};
+    if (bytes.empty()) return 43;
+    // 64 KiB-aligned, with 1 MiB of zero slack so a wrong (larger) layout in a control stays readable.
+    void* memory = VirtualAlloc(nullptr, bytes.size() + (1u << 20), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!memory) return 44;
+    std::memcpy(memory, bytes.data(), bytes.size());
+    const D3D12_RESOURCE_DESC desc{static_cast<D3D12_RESOURCE_DIMENSION>(dimension), 0, width, height, static_cast<UINT16>(depth),
+        static_cast<UINT16>(mips), static_cast<DXGI_FORMAT>(format), {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(layout),
+        D3D12_RESOURCE_FLAG_NONE};
+    ViewAt v{};
+    v.address = ptr(memory);
+    v.view.Format = desc.Format;
+    v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        v.view.Texture3D.MipLevels = mips;
+    } else if (depth > 1) {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        v.view.Texture2DArray.MipLevels = mips;
+        v.view.Texture2DArray.ArraySize = depth;
+    } else {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.view.Texture2D.MipLevels = mips;
+    }
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);  // the same view again: the first desktop texture is reused
+    invoke(list, 12, 3, 1);
     return 0;
 }
 

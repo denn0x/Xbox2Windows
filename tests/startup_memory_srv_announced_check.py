@@ -83,15 +83,15 @@ def check(root, consumer, backend):
     if len(refusals) != 2 or not all("layout=0x105" in line for line in refusals):
         raise AssertionError("switch on: expected the two unannounced calls refused:\n" + "\n".join(refusals))
     unannounced = "2 x unsupported_description dim 3 layout 0x105 fmt 28 mips>1 not-announced nonzero"
-    check_census(log, "switch on, census", "linear 0, announced-linear 6, tiled/bc64 0, buffer 0, stand-in buffer 0, refused 2",
-                 [unannounced], "real 8 (linear memory srv 8, tiled address 0, other 0), null; real by format 28:8")
+    check_census(log, "switch on, census", "linear 0, announced-linear 6, tiled/bc64 0, buffer 0, stand-in buffer 0, detiled 0, refused 2",
+                 [unannounced], "real 8 (linear memory srv 8, tiled address 0, other 0, detiled 0), null; real by format 28:8")
     # Census without the announced switch: all 8 calls refused (6 at announced addresses), 8 null bindings.
     census_off, census_log = run(census_dir, consumer, backend, False, census=True)
     if census_off != bytes(4 * 8 * 4):
         raise AssertionError(f"census, switch off: expected null views (all zero), got {census_off.hex()}")
-    check_census(census_log, "census, switch off", "linear 0, announced-linear 0, tiled/bc64 0, buffer 0, stand-in buffer 0, refused 8",
+    check_census(census_log, "census, switch off", "linear 0, announced-linear 0, tiled/bc64 0, buffer 0, stand-in buffer 0, detiled 0, refused 8",
                  ["6 x unsupported_description dim 3 layout 0x105 fmt 28 mips>1 announced nonzero", unannounced],
-                 "real 0 (linear memory srv 0, tiled address 0, other 0), null cause2:8; real by format")
+                 "real 0 (linear memory srv 0, tiled address 0, other 0, detiled 0), null cause2:8; real by format")
     off, off_log = run(off_dir, consumer, backend, False)
     if off != bytes(4 * 8 * 4):
         raise AssertionError(f"switch off: expected null views (all zero), got {off.hex()}")
