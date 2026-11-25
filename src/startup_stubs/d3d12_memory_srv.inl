@@ -453,8 +453,9 @@ void __stdcall device_memory_uav(Wrapper* self, const D3D12_RESOURCE_DESC* resou
 
 // LOCAL (textures): X2W_TEXTURE_CENSUS=1 counts every slot-70 outcome, and every refusal by its class (reason,
 // resource dimension, layout, format, mip chain or not, XG-announced address or not, first 256 bytes non-zero or
-// not), past the 2048-line refusal cap. Lines: "x2w-texcensus slot70 calls N: ..." at powers of two from 1024 and
-// "x2w-texcensus slot70 refusals N, top classes:" (up to 24 classes) at powers of two from 256.
+// not), past the 2048-line refusal cap (these lines have no cap of their own). Lines, all cumulative:
+// "x2w-texcensus slot70 calls N (...)" and "x2w-texcensus slot70 refusals N (...), top classes:" (up to 24 classes)
+// with every 300-frame draw census line, and also at powers of two (calls from 1024, refusals from 256).
 enum MemorySrvOutcome { mso_linear, mso_announced, mso_tiled, mso_buffer, mso_standin, mso_refused, mso_count };
 const char* const memory_srv_outcome_names[mso_count] = {"linear", "announced-linear", "tiled/bc64", "buffer", "stand-in buffer", "refused"};
 LONG64 memory_srv_outcomes[mso_count];
@@ -463,14 +464,54 @@ std::unordered_map<u64, LONG64> refusal_census;
 LONG64 refusal_census_total;
 const char* const census_reasons[] = {"null_destination", "unreadable_resource", "unreadable_view", "null_address",
     "unsupported_description", "destination_outside_view_heaps", "buffer_unavailable", "texture_unavailable"};
+bool census_every_event();
 bool texture_census_on()
 {
     static const bool on = [] {
         const bool v = x2w_local::env_on("X2W_TEXTURE_CENSUS");
-        if (v) log("x2w-texcensus X2W_TEXTURE_CENSUS=1: slot-70 outcomes and refusal classes, draw texture bindings real/null every 300 frames");
+        if (v) log("x2w-texcensus X2W_TEXTURE_CENSUS=1: slot-70 outcomes and refusal classes, draw texture bindings real/null; "
+                   "all cumulative, every 300 frames%s", census_every_event() ? " and after every event (X2W_TEXTURE_CENSUS_EVERY=1)" : "");
         return v;
     }();
     return on;
+}
+// X2W_TEXTURE_CENSUS_EVERY=1 (tests): the cumulative lines after every counted event instead of at the thresholds.
+bool census_every_event()
+{
+    static const bool on = x2w_local::env_on("X2W_TEXTURE_CENSUS_EVERY");
+    return on;
+}
+void log_memory_srv_outcomes(const char* when)
+{
+    LONG64 total = 0;
+    for (LONG64 n : memory_srv_outcomes) total += n;
+    log("x2w-texcensus slot70 calls %lld (%s, cumulative): linear %lld, announced-linear %lld, tiled/bc64 %lld, buffer %lld, stand-in buffer %lld, "
+        "refused %lld", total, when, memory_srv_outcomes[0], memory_srv_outcomes[1], memory_srv_outcomes[2], memory_srv_outcomes[3],
+        memory_srv_outcomes[4], memory_srv_outcomes[5]);
+}
+void log_refusal_classes(const char* when)  // refusal_census_mutex held
+{
+    std::vector<std::pair<LONG64, u64>> sorted;
+    for (const auto& [k, n] : refusal_census) sorted.emplace_back(n, k);
+    std::sort(sorted.begin(), sorted.end(), std::greater<>());
+    log("x2w-texcensus slot70 refusals %lld (%s, cumulative), %zu classes, top classes:", refusal_census_total, when, sorted.size());
+    for (std::size_t i = 0; i < sorted.size() && i < 24; ++i) {
+        const u64 k = sorted[i].second;
+        log("x2w-texcensus   %lld x %s dim %llu layout 0x%llx fmt %llu %s %s %s", sorted[i].first,
+            (k & 15) < std::size(census_reasons) ? census_reasons[k & 15] : "other", (k >> 4) & 15, (k >> 8) & 0x1ff, (k >> 20) & 0xff,
+            (k >> 28) & 1 ? "mips>1" : "mips=1", (k >> 29) & 1 ? "announced" : "not-announced", (k >> 30) & 1 ? "nonzero" : "zero");
+    }
+}
+// Called with the 300-frame draw census line (d3d12_draw.inl), so a title run's scene window is the difference of
+// two reports.
+void report_memory_srv_census(long frame)
+{
+    if (!texture_census_on()) return;
+    char when[32];
+    std::snprintf(when, sizeof(when), "frame %ld", frame);
+    log_memory_srv_outcomes(when);
+    std::lock_guard lock(refusal_census_mutex);
+    log_refusal_classes(when);
 }
 void census_memory_srv_outcome(int outcome)
 {
@@ -478,10 +519,7 @@ void census_memory_srv_outcome(int outcome)
     InterlockedIncrement64(&memory_srv_outcomes[outcome]);
     LONG64 total = 0;
     for (LONG64 n : memory_srv_outcomes) total += n;
-    if (total >= 1024 && (total & (total - 1)) == 0)
-        log("x2w-texcensus slot70 calls %lld: linear %lld, announced-linear %lld, tiled/bc64 %lld, buffer %lld, stand-in buffer %lld, refused %lld",
-            total, memory_srv_outcomes[0], memory_srv_outcomes[1], memory_srv_outcomes[2], memory_srv_outcomes[3], memory_srv_outcomes[4],
-            memory_srv_outcomes[5]);
+    if (census_every_event() || (total >= 1024 && (total & (total - 1)) == 0)) log_memory_srv_outcomes("threshold");
 }
 void census_refusal(const char* reason, const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input)
 {
@@ -505,17 +543,7 @@ void census_refusal(const char* reason, const D3D12_RESOURCE_DESC* resource, con
     std::lock_guard lock(refusal_census_mutex);
     ++refusal_census[key];
     const LONG64 total = ++refusal_census_total;
-    if (total < 256 || (total & (total - 1)) != 0) return;
-    std::vector<std::pair<LONG64, u64>> sorted;
-    for (const auto& [k, n] : refusal_census) sorted.emplace_back(n, k);
-    std::sort(sorted.begin(), sorted.end(), std::greater<>());
-    log("x2w-texcensus slot70 refusals %lld, %zu classes, top classes:", total, sorted.size());
-    for (std::size_t i = 0; i < sorted.size() && i < 24; ++i) {
-        const u64 k = sorted[i].second;
-        log("x2w-texcensus   %lld x %s dim %llu layout 0x%llx fmt %llu %s %s %s", sorted[i].first,
-            (k & 15) < std::size(census_reasons) ? census_reasons[k & 15] : "other", (k >> 4) & 15, (k >> 8) & 0x1ff, (k >> 20) & 0xff,
-            (k >> 28) & 1 ? "mips>1" : "mips=1", (k >> 29) & 1 ? "announced" : "not-announced", (k >> 30) & 1 ? "nonzero" : "zero");
-    }
+    if (census_every_event() || (total >= 256 && (total & (total - 1)) == 0)) log_refusal_classes("threshold");
 }
 
 // LOCAL (textures): device slot 61 is a no-op that the title calls instead of CreateSampler (slot 22, never called
@@ -525,7 +553,10 @@ void census_refusal(const char* reason, const D3D12_RESOURCE_DESC* resource, con
 // first 16 calls with 64 bytes at rdx (the description, whatever its form) and still does nothing.
 u64 __stdcall device_slot61_census(Wrapper* self, u64 rdx, u64 r8, u64 r9)
 {
-    (void)self;
+    if (noop_census_enabled()) {  // what the no-op it replaces still reports
+        const u64 args[8] = {reinterpret_cast<u64>(self), rdx, r8, r9, 0, 0, 0, 0};
+        noop_census_note(device_kind, 61, args, reinterpret_cast<u64>(_ReturnAddress()) - reinterpret_cast<u64>(GetModuleHandleW(nullptr)));
+    }
     static LONG calls;
     if (first_calls(calls, 16)) {
         char hex[200] = "unreadable";

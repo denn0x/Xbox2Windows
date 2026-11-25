@@ -30,19 +30,49 @@ def expected_on():
                  for c in (texel(effective[x], 0, x % 2, y) if y < 2 else texel(effective[x], 1, 0, 0)))
 
 
-def run(directory, consumer, backend, switch):
+def run(directory, consumer, backend, switch, census=False):
+    # draw_texture sets X2W_D3D12_DEVICE_NOOP=1 (as title runs do): device slot 61, which the test calls last, is
+    # the no-op unless the census replaces it.
     modes = {"X2W_TEST_ANNOUNCED_SRV": "1", "X2W_TRAP_LOG": str(directory / "trap.log")}
     if switch:
         modes["X2W_MEMORY_SRV_ANNOUNCED"] = "1"
+    if census:
+        modes["X2W_TEXTURE_CENSUS"] = "1"
+        modes["X2W_TEXTURE_CENSUS_EVERY"] = "1"
     pixels = draw_texture(directory, consumer, backend, HLSL, modes)
     return pixels, (directory / "trap.log").read_text(errors="replace") if pixels is not None else ""
 
 
+def last_census(log, prefix):
+    lines = [line for line in log.splitlines() if line.startswith("x2w-texcensus " + prefix)]
+    return lines[-1] if lines else ""
+
+
+def check_census(log, label, slot70, refusal_classes, draws):
+    """The last cumulative X2W_TEXTURE_CENSUS lines of a run (X2W_TEXTURE_CENSUS_EVERY=1)."""
+    want_calls = f"slot70 calls 8 (threshold, cumulative): {slot70}"
+    if want_calls not in last_census(log, "slot70 calls"):
+        raise AssertionError(f"{label}: last slot-70 census line {last_census(log, 'slot70 calls')!r}, expected {want_calls!r}")
+    lines = log.splitlines()
+    head = max(i for i, line in enumerate(lines) if line.startswith("x2w-texcensus slot70 refusals"))
+    classes = [line.removeprefix("x2w-texcensus   ") for line in lines[head + 1:head + 1 + len(refusal_classes)]]
+    if classes != refusal_classes:
+        raise AssertionError(f"{label}: refusal classes {classes}, expected {refusal_classes}")
+    want_draws = f"draw textures binding (cumulative): {draws}"
+    if want_draws not in last_census(log, "draw textures"):
+        raise AssertionError(f"{label}: last draw census line {last_census(log, 'draw textures')!r}, expected {want_draws!r}")
+    words = " ".join(f"{0x61000000 + i:08x}" for i in range(16))
+    slot61 = [line for line in lines if line.startswith("x2w-texcensus Device::slot61")]
+    if len(slot61) != 1 or "r8=0x5150 r9=0x1 words " + words not in slot61[0]:
+        raise AssertionError(f"{label}: slot-61 lines {slot61}")
+
+
 def check(root, consumer, backend):
-    on_dir, off_dir = root / "on", root / "off"
+    on_dir, off_dir, census_dir = root / "on", root / "off", root / "census"
     on_dir.mkdir()
     off_dir.mkdir()
-    actual, log = run(on_dir, consumer, backend, True)
+    census_dir.mkdir()
+    actual, log = run(on_dir, consumer, backend, True, census=True)
     if actual is None:
         return 77
     if actual != expected_on():
@@ -52,14 +82,27 @@ def check(root, consumer, backend):
     refusals = [line for line in log.splitlines() if "Device::slot70" in line and "reason=" in line]
     if len(refusals) != 2 or not all("layout=0x105" in line for line in refusals):
         raise AssertionError("switch on: expected the two unannounced calls refused:\n" + "\n".join(refusals))
+    unannounced = "2 x unsupported_description dim 3 layout 0x105 fmt 28 mips>1 not-announced nonzero"
+    check_census(log, "switch on, census", "linear 0, announced-linear 6, tiled/bc64 0, buffer 0, stand-in buffer 0, refused 2",
+                 [unannounced], "real 8 (linear memory srv 8, tiled address 0, other 0), null; real by format 28:8")
+    # Census without the announced switch: all 8 calls refused (6 at announced addresses), 8 null bindings.
+    census_off, census_log = run(census_dir, consumer, backend, False, census=True)
+    if census_off != bytes(4 * 8 * 4):
+        raise AssertionError(f"census, switch off: expected null views (all zero), got {census_off.hex()}")
+    check_census(census_log, "census, switch off", "linear 0, announced-linear 0, tiled/bc64 0, buffer 0, stand-in buffer 0, refused 8",
+                 ["6 x unsupported_description dim 3 layout 0x105 fmt 28 mips>1 announced nonzero", unannounced],
+                 "real 0 (linear memory srv 0, tiled address 0, other 0), null cause2:8; real by format")
     off, off_log = run(off_dir, consumer, backend, False)
     if off != bytes(4 * 8 * 4):
         raise AssertionError(f"switch off: expected null views (all zero), got {off.hex()}")
     off_refusals = [line for line in off_log.splitlines() if "Device::slot70" in line and "reason=" in line]
     if len(off_refusals) != 8:
         raise AssertionError(f"switch off: {len(off_refusals)} refusal lines, expected 8")
+    if "x2w-texcensus" in off_log:
+        raise AssertionError("census off: x2w-texcensus lines logged")
     print(f"{backend}: announced 0x105 views drawn (2 mips, 32 RGBA pixels exact), unannounced refused; "
-          "switch off: 8 refusals, null views")
+          "switch off: 8 refusals, null views; census counts exact (8 real / 8 null, refusal classes, slot 61), "
+          "census off: no census lines, slot 61 no-op")
     return 0
 
 

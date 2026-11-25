@@ -284,27 +284,39 @@ void report_draw_rt()  // draw_lock held
 
 // LOCAL (textures): X2W_TEXTURE_CENSUS=1 (d3d12_memory_srv.inl). Table texture srvs of translated draws, counted
 // by outcome: bound to a real texture (by where the texture came from, and by desktop format) or null (by cause).
-// One "x2w-texcensus draw textures" line every 300 frames, cumulative.
+// One "x2w-texcensus draw textures" line every 300 frames (with the slot-70 lines), cumulative; with
+// X2W_TEXTURE_CENSUS_EVERY=1 also after every counted binding.
 bool texture_census_on();
+bool census_every_event();
+void report_memory_srv_census(long frame);
 enum TextureSource { ts_linear_srv, ts_tiled_address, ts_other, ts_count };
 LONG64 census_real[ts_count], census_null[x2w_local::null_cause_count], census_real_format[128];
 LONG census_report_frame = -1;
+void log_texture_census(const char* when);
 void census_texture_binding(Wrapper* resource, ID3D12Resource* texture, x2w_local::NullCause cause)
 {
     if (!texture_census_on()) return;
     if (!texture) {
         InterlockedIncrement64(&census_null[static_cast<int>(cause)]);
-        return;
+    } else {
+        const int source = resource && resource->own().linear_memory_srv ? ts_linear_srv
+                         : resource && resource->own().tiled_address_srv ? ts_tiled_address : ts_other;
+        InterlockedIncrement64(&census_real[source]);
+        InterlockedIncrement64(&census_real_format[static_cast<UINT>(texture->GetDesc().Format) & 127]);
     }
-    const int source = resource && resource->own().linear_memory_srv ? ts_linear_srv
-                     : resource && resource->own().tiled_address_srv ? ts_tiled_address : ts_other;
-    InterlockedIncrement64(&census_real[source]);
-    InterlockedIncrement64(&census_real_format[static_cast<UINT>(texture->GetDesc().Format) & 127]);
+    if (census_every_event()) log_texture_census("binding");
 }
 void report_texture_census()  // draw_lock held
 {
     if (!texture_census_on() || frame_number % 300 || frame_number == census_report_frame) return;
     census_report_frame = frame_number;
+    char when[32];
+    std::snprintf(when, sizeof(when), "frame %ld", frame_number);
+    log_texture_census(when);
+    report_memory_srv_census(frame_number);
+}
+void log_texture_census(const char* when)
+{
     char formats[512] = "";
     int used = 0;
     for (int f = 0; f < 128 && used < 480; ++f)
@@ -313,8 +325,8 @@ void report_texture_census()  // draw_lock held
     used = 0;
     for (int c = 0; c < x2w_local::null_cause_count && used < 230; ++c)
         if (census_null[c]) used += std::snprintf(nulls + used, sizeof(nulls) - used, " cause%d:%lld", c, census_null[c]);
-    log("x2w-texcensus draw textures frame %ld: real %lld (linear memory srv %lld, tiled address %lld, other %lld), null%s; real by format%s",
-        frame_number, census_real[0] + census_real[1] + census_real[2], census_real[0], census_real[1], census_real[2], nulls, formats);
+    log("x2w-texcensus draw textures %s (cumulative): real %lld (linear memory srv %lld, tiled address %lld, other %lld), null%s; real by format%s",
+        when, census_real[0] + census_real[1] + census_real[2], census_real[0], census_real[1], census_real[2], nulls, formats);
 }
 
 void count_null_binding(x2w_local::NullCause cause)

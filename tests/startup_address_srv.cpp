@@ -264,6 +264,10 @@ int draw_announced_srvs(ID3D12Device* desktop, void* guest, void* list)
         invoke(list, 22, 1, ptr(&strip));
         invoke(list, 12, 3, 1);
     }
+    // Device slot 61 (the title's sampler call, a no-op): with X2W_TEXTURE_CENSUS=1 its arguments are logged.
+    std::array<std::uint32_t, 16> sampler_words{};
+    for (unsigned i = 0; i < sampler_words.size(); ++i) sampler_words[i] = 0x61000000u + i;
+    invoke(guest, 61, ptr(sampler_words.data()), 0x5150, 1);
     return 0;
 }
 
