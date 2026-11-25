@@ -1916,68 +1916,6 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             desc.Height, slices, mips, desc.Format, static_cast<const void*>(memory), total >> 10, announced ? " (announced write)" : "");
 }
 
-// LOCAL (textures): X2W_HEAP_TEXTURE_UPLOAD=1. Heap (bindless) draws read the view-id region that fill_views
-// (d3d12_compute.inl) fills with texture_view(..., prepare = false), so a texture that only the heap references was
-// never uploaded nor moved to a shader-resource state. note_heap_texture (fill_views, each new SRV record) lists the
-// plain textures; upload_heap_textures (each heap draw, after fill_views) visits the list round-robin, once a frame,
-// with upload_texture (which skips unchanged textures itself), until X2W_HEAP_TEXTURE_BUDGET_KIB were uploaded
-// (default 65536) or 512 textures were visited, and moves each texture it uploaded to ALL_SHADER_RESOURCE (pixel and
-// non-pixel stages: plain and mesh heap draws, meshrt 012000). The others stay as they are (COMMON between lists,
-// promoted on first read). No new copies: each upload fills the desktop texture the title texture already has.
-// draw_lock held for both.
-bool heap_texture_upload_on()
-{
-    static const bool on = [] {
-        const bool v = x2w_local::env_on("X2W_HEAP_TEXTURE_UPLOAD");
-        if (v) log("x2w-draw X2W_HEAP_TEXTURE_UPLOAD=1: textures referenced by heap views are uploaded (budgeted, once a frame)");
-        return v;
-    }();
-    return on;
-}
-std::vector<Wrapper*> heap_textures;
-std::unordered_set<Wrapper*> heap_texture_set;
-std::size_t heap_texture_cursor;
-LONG heap_texture_frame = -1;
-LONG heap_textures_uploaded;
-void note_heap_texture(const ViewRecord& record)
-{
-    if (!heap_texture_upload_on() || record.slot != 18) return;
-    Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
-    if (!resource || resource->own().kind != resource_kind || !resource->own().real || !resource->own().title_memory) return;
-    const D3D12_RESOURCE_DESC desc = static_cast<ID3D12Resource*>(resource->own().real)->GetDesc();
-    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) return;
-    if (heap_texture_set.insert(resource).second) heap_textures.push_back(resource);
-}
-void upload_heap_textures(Wrapper* self)
-{
-    if (!heap_texture_upload_on() || heap_textures.empty() || heap_texture_frame == frame_number || !recording(self)) return;
-    heap_texture_frame = frame_number;
-    static const LONG budget_kib = [] {
-        char value[16]{};
-        const LONG v = GetEnvironmentVariableA("X2W_HEAP_TEXTURE_BUDGET_KIB", value, sizeof value) ? std::atol(value) : 0L;
-        return v > 0 ? v : 65536L;
-    }();
-    const LONG start_kib = texture_bytes_uploaded;
-    UINT uploaded = 0;
-    for (std::size_t visited = 0; visited < heap_textures.size() && visited < 512 && texture_bytes_uploaded - start_kib < budget_kib; ++visited) {
-        Wrapper* resource = heap_textures[heap_texture_cursor++ % heap_textures.size()];
-        if (InterlockedCompareExchange(&resource->own().refs, 0, 0) <= 0) continue;  // released: left alone
-        auto* texture = static_cast<ID3D12Resource*>(resource->own().real);
-        const LONG before = textures_uploaded;
-        upload_texture(self, resource, texture);
-        if (textures_uploaded == before) continue;
-        require_state(self, texture, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
-        ++uploaded;
-    }
-    if (!uploaded) return;
-    const LONG n = InterlockedExchangeAdd(&heap_textures_uploaded, static_cast<LONG>(uploaded)) + static_cast<LONG>(uploaded);
-    static LONG shown;
-    if (first_calls(shown, 8))
-        log("x2w-draw heap textures: frame %ld uploaded %u (%ld KiB) of %zu listed; %ld uploaded so far", frame_number, uploaded,
-            texture_bytes_uploaded - start_kib, heap_textures.size(), n);
-}
-
 // Per-draw dumps (X2W_DRAW_DUMP_FRAME=<frame>, X2W_DRAW_DUMP_DIR=<folder>): during that frame, render
 // target 0 is copied to a readback buffer after each translated draw (at most 48).
 // Poll the fence of the queue that actually executed the recording before writing its image.

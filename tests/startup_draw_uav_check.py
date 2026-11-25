@@ -70,21 +70,6 @@ HEAP_HLSL = (
 )
 
 
-# LOCAL (textures): heap texture modes (fixture mode heaptex) and their X2W_HEAP_TEXTURE_UPLOAD value (None: unset).
-# The pixel stage reads the view id from heapmem and texel (x, y) of that view's Texture2D (heap kind 0).
-HEAP_TEXTURE_MODES = {"heaptex": "1", "heaptex-off": None}
-HEAP_TEXTURE_HLSL = (
-    "ByteAddressBuffer heapmem : register(t0, space1);\n"
-    "ByteAddressBuffer vinfo : register(t1, space1);\n"
-    "Texture2D<float4> heaptex2d[720008] : register(t0, space2);\n"
-    "uint vid(uint h) { return heapmem.Load(h) == 0x56573258u ? heapmem.Load(h + 4) : 0xffffffffu; }\n"
-    "float4 main(float4 p : SV_Position) : SV_Target {\n"
-    "  uint i = vid(0);\n"
-    "  uint k = i < 90000u ? 8u + 8u * i : 0u;\n"
-    "  return heaptex2d[NonUniformResourceIndex(k)].Load(int3(uint2(p.xy), 0));\n"
-    "}\n"
-)
-
 COPY_ENV = {"copy-same": "gpu", "copy-two": "gpu", "copy-twice": "gpu", "copy-none": "gpu", "copy-cpu": "1"}
 
 
@@ -96,12 +81,9 @@ def run_mode(directory, consumer, backend, mode):
     ps.write_bytes(pixel(False))
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                X2W_D3D12_DEBUG="0", X2W_D3D12_DEVICE_NOOP="1", X2W_SHADER_CACHE=str(cache),
-               X2W_TEST_DRAW_UAV="copy-same" if mode == "copy-cpu" else "heaptex" if mode in HEAP_TEXTURE_MODES else mode,
-               X2W_TRAP_LOG=str(directory / mode / "trap.log"))
+               X2W_TEST_DRAW_UAV="copy-same" if mode == "copy-cpu" else mode, X2W_TRAP_LOG=str(directory / mode / "trap.log"))
     if mode in COPY_ENV:
         env["X2W_D3D12_COPY_BUFFER"] = COPY_ENV[mode]
-    if HEAP_TEXTURE_MODES.get(mode):
-        env["X2W_HEAP_TEXTURE_UPLOAD"] = HEAP_TEXTURE_MODES[mode]
     args = [consumer, vs, ps, root]
     subprocess.run(args, env=env, check=True)
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
@@ -114,8 +96,6 @@ def run_mode(directory, consumer, backend, mode):
         lines, hlsl = ["uav 0 tex2d table 0 0"], TEX_HLSL
     elif mode == "heap":
         lines, hlsl = ["heap 1"], HEAP_HLSL
-    elif mode in HEAP_TEXTURE_MODES:  # LOCAL (textures): tests/startup_heap_texture_check.py
-        lines, hlsl = ["heap 1"], HEAP_TEXTURE_HLSL
     else:
         base = mode == "uavbase"
         lines = ["uav 0 buf table 0 0", "srv 0 buf table 0 32" if mode in COPY_ENV else "srv 0 buf table 0 0", f"udsrc {count} uavword3 0", f"udsrc {count + 1} bufword3 0"]
