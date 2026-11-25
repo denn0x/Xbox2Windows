@@ -716,7 +716,7 @@ const char* refusal_name(std::uint32_t code)
 // Why X2W_MEMORY_SRV_DETILE did not take a refused texture call (d3d12_memory_srv.inl detile_decline); 0 = not asked
 // (switch off, or not a texture description).
 const char* const detile_declines[] = {"-", "not console-swizzled", "a tiled path's form", "announced", "view form",
-    "layout or element size", "bc mip chain", "over 1 GiB", "unreadable", "destination", "publish failed", "would detile"};
+    "layout or element size", "(6: bc mip chain, retired)", "over 1 GiB", "unreadable", "destination", "publish failed", "would detile"};
 // The marker's description words (mark_refused_destination): word 2 = bit 31 | format | layout << 8 | dimension << 17 |
 // min(mips, 15) << 20 | detile decline << 24, word 3 = width, word 4 = height, word 5 = depth or array size | first 256
 // bytes readable << 16 | nonzero << 17, words 6/7 = the address. Bit 31 keeps word 2 out of the token slot range.
@@ -2035,7 +2035,7 @@ u64 hash_memory(const unsigned char* data, std::size_t bytes)
     for (std::size_t i = words * 8; i < bytes; ++i) h = (h ^ data[i]) * 0x100000001b3ull;
     return h;
 }
-x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r, bool* chain_refused = nullptr);  // d3d12_memory_srv.inl (X2W_MEMORY_SRV_DETILE)
+x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r);  // d3d12_memory_srv.inl (X2W_MEMORY_SRV_DETILE)
 void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
 {
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);

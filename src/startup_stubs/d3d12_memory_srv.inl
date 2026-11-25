@@ -427,9 +427,8 @@ UINT detile_element_bytes(DXGI_FORMAT f, bool& bc)
     }
     }
 }
-x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r, bool* chain_refused)
+x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r)
 {
-    if (chain_refused) *chain_refused = false;
     bool bc = false;
     const UINT bytes = detile_element_bytes(r.Format, bc);
     const UINT layout = static_cast<UINT>(r.Layout);
@@ -444,19 +443,13 @@ x2w_startup::gfx10::Layout detile_layout(const D3D12_RESOURCE_DESC& r, bool* cha
         return x2w_startup::gfx10::Layout(~0u, false, 0, 0, 0, 0, 0);  // invalid
     const UINT w = static_cast<UINT>(r.Width), h = r.Height;
     // A BC mip's block count is ceil(max(1, pixels >> i) / 4) in D3D; the layout halves the block count of mip 0
-    // (ceil). They differ for some sizes that are not multiples of 4 << i (9 pixels: 1 block at mip 1, 2 in the
-    // chain), and which one the console uses there is not checked (gfx10_layout_check has block-sized shapes
-    // only), so such chains stay refused.
-    const UINT mips = r.MipLevels ? r.MipLevels : 1;
-    if (bc)
-        for (UINT i = 1; i < mips && i < 32; ++i) {
-            const auto d3d = [i](UINT v) { return ((v >> i ? v >> i : 1u) + 3) / 4; };
-            const auto chain = [i](UINT v) { return (((v + 3) / 4) + (1u << i) - 1) >> i; };
-            if (d3d(w) != chain(w) || d3d(h) != chain(h)) {
-                if (chain_refused) *chain_refused = true;
-                return x2w_startup::gfx10::Layout(~0u, false, 0, 0, 0, 0, 0);
-            }
-        }
+    // (ceil). They differ for sizes that are not multiples of 4 << i (run 112's refused BC7 0x105 chain, 512x1056:
+    // 4 block rows at mip 6 in D3D, 5 in the chain). These chains were refused until the placement was measured:
+    // addrlib given the pixel size places every level exactly as the element form (tests/gfx10_layout_check.cpp
+    // --addrlib, bc7_512x1056_8mips_4k_s and bc7_1000x600_10mips_64k_d). The D3D count never exceeds the chain's
+    // (ceil(floor(p / 2^i) / 4) <= ceil(ceil(p / 4) / 2^i)), and upload_texture reads the desktop footprint's extents
+    // at layout addresses, so the extra edge row or column of the chain is not read. ASSUMED: the title's texels
+    // of a D3D level are the chain level's first rows and columns (what a GPU sampling the console T# reads).
     return x2w_startup::gfx10::Layout(layout - 0x100, r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D, bytes,
                                       bc ? (w + 3) / 4 : w, bc ? (h + 3) / 4 : h, r.DepthOrArraySize, r.MipLevels ? r.MipLevels : 1);
 }
@@ -472,9 +465,8 @@ unsigned detile_decline(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURC
     D3D12_RESOURCE_DESC as_linear = r;
     as_linear.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;  // (tiled_bc_srv / bc64 need a console layout: false here)
     if (!linear_memory_srv(as_linear, v)) return 4;
-    bool chain_refused = false;
-    const auto l = detile_layout(r, &chain_refused);
-    if (!l.valid) return chain_refused ? 6 : 5;
+    const auto l = detile_layout(r);
+    if (!l.valid) return 5;
     if (l.size > (1ull << 30)) return 7;
     if (!check_memory) return 11;
     if (!x2w_local::readable(reinterpret_cast<const void*>(address), static_cast<std::size_t>(l.size))) return 8;

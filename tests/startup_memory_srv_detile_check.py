@@ -7,7 +7,8 @@ gfx10_layout.h's own address, which checks the plumbing only and is reported as 
 every level and slice, compares it with the pattern, and writes red = no mismatch, green = elements checked.
 
 Cases: the run 102 refusal classes (layout 0x105 BC1 mip chain, 0x10a BC1 array mip chain, 0x100 R16G16B16A16_FLOAT)
-and the 17^3 RGBA16F 3D LUT (0x105, 5 mips).
+and the 17^3 RGBA16F 3D LUT (0x105, 5 mips); BC chains with partial edge blocks (BC1 132x132 0x105, BC3 132x68x2 0x10a:
+the D3D block count is below the chain's at mip 3; run 112's BC7 512x1056 0x105 class).
 Negative controls: the switch off (the call is refused, the view stays null, mismatches); the 0x105 bytes described as
 0x109 (wrong layout, mismatches). Declined (DECLINED): refused with the switch on; the census class, the decline
 counters and the class's first-call line name why detiling declined.
@@ -32,10 +33,14 @@ CASES = [
     ("bc3_256_9mips_4k_s", 0x105, TEX2D, BC3_UNORM, 256, 256, 1, 9),
     ("rgba16f_17cubed_3d_5mips", 0x105, TEX3D, RGBA16F, 17, 17, 17, 5),
     ("rgba16f_100x60_3mips_linear", 0x100, TEX2D, RGBA16F, 100, 60, 1, 3),
+    # BC chains whose D3D block counts fall below the ceiling-halved chain at some level (132: 4 blocks at mip 3 in
+    # D3D, 5 in the chain; 68: 2 at mip 3, 3 in the chain), refused by a guard until run 112 (BC7 512x1056 0x105).
+    ("bc1_132_8mips_4k_s", 0x105, TEX2D, BC1_UNORM, 132, 132, 1, 8),
+    ("bc3_132x68x2_8mips_64k_d", 0x10A, TEX2D, BC3_UNORM, 132, 68, 2, 8),
 ]
-# Refused with the switch on, and the decline the census names.
+# Refused with the switch on, and the decline the census names: 4-byte elements in a D mode (chip-dependent equation).
 DECLINED = [
-    (("bc1_132_8mips_4k_s", 0x105, TEX2D, BC1_UNORM, 132, 132, 1, 8), "bc mip chain"),
+    (("bc1_132_8mips_4k_s", 0x106, TEX2D, 28, 64, 64, 1, 1), "layout or element size"),
 ]
 
 
@@ -157,6 +162,13 @@ def check(root, consumer, backend, layout_check):
                              f"{'x2w-memsrv detiled memory SRV' in log}")
     print(f"{backend}: controls: switch off: {bad} of {PIXELS} pixels mismatch, 2 refusals; "
           f"0x105 bytes as 0x109: {bad_layout} of {PIXELS} pixels mismatch")
+    # The same control for the chains with partial edge blocks (one per layout): bytes placed for 0x105 / 0x10a,
+    # described as 0x109.
+    for case in CASES[-2:]:
+        bad_wrong, _, log = run(root / f"wrong_{case[0]}", consumer, backend, case, root / f"{case[0]}.bin", True, 0x109)
+        if not bad_wrong or "x2w-memsrv detiled memory SRV" not in log:
+            raise AssertionError(f"{case[0]} as 0x109: {bad_wrong} mismatching pixels (expected some)")
+        print(f"{backend}: control: {case[0]} bytes (0x{case[1]:x}) as 0x109: {bad_wrong} of {PIXELS} pixels mismatch")
     # Refusals that the switch declines name the reason (census class, decline counters, the class's first call).
     for case, decline in DECLINED:
         surface = root / f"{case[0]}.bin"
