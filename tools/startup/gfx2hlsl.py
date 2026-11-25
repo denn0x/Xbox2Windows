@@ -407,14 +407,56 @@ class Stage:
             self.uniform_v.add(n)
         partial = getattr(self, 'partial_uniform', None)
         if partial is not None:
+            shadow = None if self.exec_known else self.partial_shadow(expr)
             partial.pop(n, None)
-            partial_ok = not self.exec_known and self.lane_invariant(expr)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
-        if partial is not None and partial_ok:
+        if partial is not None and shadow is not None:
             # Written in the active lanes only, from a lane-invariant value: every lane active now holds that value.
             # Kept with the emitted line so v_readfirstlane_b32 can take the value for every lane (see there).
-            partial[n] = (self.lines, len(self.lines) - 1, expr, getattr(self, 'exec_writes', 0))
+            partial[n] = {'lines': self.lines, 'at': len(self.lines) - 1, 'n': n, 'expr': shadow[0], 'deps': shadow[1],
+                          'epoch': getattr(self, 'exec_writes', 0), 'done': False}
+
+    def partial_shadow(self, expr):
+        """(shadow expression, entries it reads) when expr has one value in every lane active now; else None.
+
+        Lane-invariant names qualify, and so does a VGPR written in the active lanes from such a value with exec
+        not written since (partial_uniform, same epoch): that VGPR is replaced by its shadow xvN, which holds the
+        value in every lane (a lane inactive at the write kept an older VGPR value; its shadow is computed from
+        the same scalars). This is the scalar recompute of upstream PR #2203 in the one-lane model: the value the
+        first active lane reads is rebuilt from the scalar expression chain that defined it, so a chain such as
+        the unsigned-division reciprocal (v_cvt_f32_u32 v1, sN; v_rcp_f32 v1, v1; v_mul_f32 v1, k, v1;
+        v_cvt_u32_f32 v1, v1; v_readfirstlane_b32) under a narrowed exec is read by every lane."""
+        partial = self.partial_uniform
+        epoch = getattr(self, 'exec_writes', 0)
+        deps = []
+
+        def sub(m):
+            k = int(m.group(1))
+            if k in self.uniform_v:
+                return m.group(0)
+            entry = partial.get(k)
+            if entry is None or entry['epoch'] != epoch:
+                raise Unsupported('not partial')
+            deps.append(entry)
+            return 'xv%d' % k
+        try:
+            shadow = re.sub(r'\bv(\d+)\b', sub, expr)
+        except Unsupported:
+            return None
+        return (shadow, deps) if self.lane_invariant(shadow) else None
+
+    def materialize_shadow(self, entry):
+        """Rewrite a partial_uniform write (and the writes its shadow reads) to also assign its shadow xvN in every
+        lane, in program order, at the write itself."""
+        if entry['done']:
+            return
+        for dep in entry['deps']:
+            self.materialize_shadow(dep)
+        n = entry['n']
+        entry['lines'][entry['at']] = 'xv%d = %s; if (exec & 1) v%d = xv%d;' % (n, entry['expr'], n, n)
+        self.shadow_v.add(n)
+        entry['done'] = True
 
     def set_vf(self, n, expr, mods=()):
         # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
@@ -2097,16 +2139,14 @@ class Stage:
             return
         partial = getattr(self, 'partial_uniform', {}).get(src[1]) if src and src[0] == 'v' else None
         if (not mods and dst and dst[0] == 's' and partial is not None and
-                partial[3] == getattr(self, 'exec_writes', 0)):
-            # The source was written, in the lanes active then, from a lane-invariant value, and exec has not been
-            # written since: the first active lane holds that value. Lanes inactive now kept an older VGPR value,
-            # but the SGPR is the wave's, so every lane takes the value itself, from a shadow assigned in all lanes
-            # at the write. (With no active lane the hardware reads lane 0; that case is not modelled.)
-            lines, at, expr, _ = partial
-            n = src[1]
-            lines[at] = 'xv%d = %s; if (exec & 1) v%d = xv%d;' % (n, expr, n, n)
-            self.shadow_v.add(n)
-            self.set_s(dst[1], 'xv%d' % n)
+                partial['epoch'] == getattr(self, 'exec_writes', 0)):
+            # The source was written, in the lanes active then, from a lane-invariant value (or a chain of such
+            # writes, see partial_shadow), and exec has not been written since: the first active lane holds that
+            # value. Lanes inactive now kept an older VGPR value, but the SGPR is the wave's, so every lane takes the
+            # value itself, from shadows assigned in all lanes at the writes. (With no active lane the hardware
+            # reads lane 0; that case is not modelled.)
+            self.materialize_shadow(partial)
+            self.set_s(dst[1], 'xv%d' % src[1])
             return
         if (mods or not self.exec_known or not dst or dst[0] != 's' or
                 not src or src[0] != 'v' or src[1] not in self.uniform_v):
