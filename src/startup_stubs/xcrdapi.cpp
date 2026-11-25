@@ -171,6 +171,53 @@ static bool destination_writable(const void* destination, std::size_t bytes)
     return true;
 }
 
+// LOCAL (out/gamerun/xmem_work/NOTES.md, run 108): a destination that destination_writable refused is tried once more
+// through xmem (x2w_xmem_write_settled: check + copy under xmem's lock, so not inside the gap of a page remap that
+// another thread's map call is making). When it stays refused, one line says what Windows and xmem know about the
+// first unwritable page: never mapped by xmem, last unmapped (when, by which thread), or mapped by xmem's record.
+static bool write_destination_settled(void* destination, const void* data, std::size_t bytes, std::size_t capacity)
+{
+    using WriteSettled = BOOL(WINAPI*)(void*, const void*, SIZE_T, SIZE_T);
+    using PageEvent = BOOL(WINAPI*)(const void*, ULONG*, ULONG64*, ULONG*, ULONG64*, ULONG64*, ULONG64*);
+    static const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+    static const auto write_settled =
+        xmem ? reinterpret_cast<WriteSettled>(GetProcAddress(xmem, "x2w_xmem_write_settled")) : nullptr;
+    static const auto page_event = xmem ? reinterpret_cast<PageEvent>(GetProcAddress(xmem, "x2w_xmem_page_event")) : nullptr;
+    static volatile LONG served = 0, dropped = 0;
+    if (write_settled && write_settled(destination, data, bytes, capacity)) {
+        const LONG n = InterlockedIncrement(&served);
+        if (n <= 16 || (n & (n - 1)) == 0)
+            x2w_local::logf("x2w-dstorage   destination %p+0x%zx was not writable at first, writable once xmem had settled: "
+                            "read served (#%ld)", destination, capacity, n);
+        return true;
+    }
+    const auto start = reinterpret_cast<std::uintptr_t>(destination);
+    std::uintptr_t bad = start;
+    for (std::uintptr_t at = start & ~std::uintptr_t{0xFFFF}; at < start + capacity; at += 0x10000) {
+        const std::uintptr_t from = at < start ? start : at;
+        const std::uintptr_t to = at + 0x10000 < start + capacity ? at + 0x10000 : start + capacity;
+        if (!destination_writable(reinterpret_cast<const void*>(from), to - from)) {
+            bad = from;
+            break;
+        }
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    VirtualQuery(reinterpret_cast<const void*>(bad), &info, sizeof(info));
+    ULONG kind = 0, thread = 0;
+    ULONG64 page = 0, age = 0, serial = 0, remaps = 0;
+    const BOOL view = page_event ? page_event(reinterpret_cast<const void*>(bad), &kind, &page, &thread, &age, &serial, &remaps)
+                                 : FALSE;
+    x2w_local::logf("x2w-dstorage   destination %p+0x%zx stays not writable (#%ld): first bad page %p state 0x%lx type 0x%lx "
+                    "protect 0x%lx allocation %p | xmem: %s, last event %s page 0x%llx thread %lu %llu ms ago (step %llu), "
+                    "%llu remaps so far", destination, capacity, InterlockedIncrement(&dropped), reinterpret_cast<void*>(bad),
+                    info.State, info.Type, info.Protect, info.AllocationBase,
+                    !page_event ? "no x2w_xmem_page_event" : view ? "view recorded" : "no view recorded",
+                    kind == 1 ? "map" : kind == 2 ? "UNMAP" : "none (never mapped or unmapped by xmem)",
+                    static_cast<unsigned long long>(page), thread, static_cast<unsigned long long>(age),
+                    static_cast<unsigned long long>(serial), static_cast<unsigned long long>(remaps));
+    return false;
+}
+
 // Return the exact queued requests that continue this stream in this submission, in queue order.
 // Status entries are skipped, and any unrelated request, submission boundary, or non-matching
 // source/offset ends the continuation chain.
@@ -940,6 +987,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 // byte is written, so a refusal leaves every page untouched.
                 if (destination_writable(destination, destination_capacity)) {
                     std::memcpy(destination, data, decode_length);
+                } else if (write_destination_settled(destination, data, decode_length, destination_capacity)) {
+                    // served after xmem settled (logged there)
                 } else {
                     outcome = "destination not writable";
                     data = nullptr;
