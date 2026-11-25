@@ -21,7 +21,7 @@ these values toward zero (70000 -> 0x7bff), which is why both helpers exist; the
 Controls: without the s_round_mode handler the stage refuses as before; the toward-zero stage does not match the
 nearest-even words (the comparison separates the roundings); both helpers' rules are checked on the CPU over f32tof16
 modelled toward zero and nearest even (the draw cannot exercise the toward-zero helper's step-back there). s_round_mode 0x1 (f32 toward +inf), 0x4 (f16 toward
-+inf) and one after a branch are refused; an f16 instruction that rounds and is not lowered for the mode (the SDWA
++inf) are refused; one after a branch is lowered when every path sets it, refused when a path skips it; an f16 instruction that rounds and is not lowered for the mode (the SDWA
 v_cvt_f16_f32) is refused under 0xc and accepted without it.
 
 The launch FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12, the optional third .psin field) starts MODE: 0xcc rounds
@@ -81,10 +81,12 @@ def mix(op, vdst, src0):
 ROUND_MODE = 0xbfa40000  # SOPP opcode 0x24 (rdna2_tools_check: 0900a4bf is s_round_mode 0x9)
 
 
-def pixel_words(mode=0xc, branch=False, add_f16=False, pkrtz=False):
+def pixel_words(mode=0xc, branch=False, add_f16=False, pkrtz=False, skip=False):
     w = b''
     if branch:
         w += struct.pack('<I', 0xbf840000)  # s_cbranch_scc0 to the next instruction: control flow before the mode
+    if skip:
+        w += struct.pack('<I', 0xbf850001)  # s_cbranch_scc1 over the next dword (the s_round_mode): a path skips it
     if mode is not None:
         w += struct.pack('<I', ROUND_MODE | mode)
     w += b''.join(v_mov_literal(6 + i, v) for i, v in enumerate(VALUES))
@@ -221,7 +223,21 @@ def controls():
     refused(pixel_words(mode=0x1), 's_round_mode 0x1 (only f32 nearest even')
     refused(pixel_words(mode=0x4), 's_round_mode 0x4 (only f32 nearest even')
     assert G.decode(pixel_words(branch=True))[0][3].startswith('s_cbranch_scc0')
-    refused(pixel_words(branch=True), 's_round_mode 0xc after the straight-line entry')
+    # after a branch that every path follows to the mode: the mode is known (round_mode_flow), lowered toward zero
+    assert 'x2w_f32tof16_rtz(F(v12))' in pipe(pixel_words(branch=True)).hlsl_ps()
+    # a path that skips the s_round_mode reaches the f16 ops with launch 0 and 3: refused
+    assert G.decode(pixel_words(skip=True))[0][3].startswith('s_cbranch_scc1')
+    refused(pixel_words(skip=True), 'v_fma_mixlo_f16 at 0x')
+    refused(pixel_words(skip=True), 'reached under MODE f16 roundings [0, 3] (the translation uses 3)')
+    # ... and with the launch mode 0xcc both paths bring toward zero: accepted
+    assert 'x2w_f32tof16_rtz(F(v12))' in pipe(pixel_words(skip=True), launch=0xcc).hlsl_ps()
+    # negative control: without round_mode_flow the skipped path is lowered as toward zero (wrong for it)
+    saved_flow = G.Stage.round_mode_flow
+    G.Stage.round_mode_flow = lambda self: {}
+    try:
+        assert 'x2w_f32tof16_rtz(F(v12))' in pipe(pixel_words(skip=True)).hlsl_ps()
+    finally:
+        G.Stage.round_mode_flow = saved_flow
     # s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 4), 12 (SOPK 0x15) after the mode: a MODE write the tracking misses
     setreg = struct.pack('<II', 0xb0000000 | 0x15 << 23 | (1 | 3 << 11), 0xc)
     assert G.decode(setreg)[0][3] == 's_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 4), 12'
@@ -229,7 +245,7 @@ def controls():
     refused(w[:4] + setreg + w[4:], 's_setreg_imm32_b32 writes MODE in a program that uses s_round_mode')
     refused(pixel_words(add_f16=True),'v_cvt_f16_f32_sdwa under s_round_mode f16/f64 toward zero (not lowered)')
     assert 'v14 = ' in pipe(pixel_words(mode=None, add_f16=True)).hlsl_ps()
-    print('controls: refused without the handler; 0x1, 0x4 and after a branch refused; the SDWA v_cvt_f16_f32 (not lowered for the mode) refused under 0xc, '
+    print('controls: refused without the handler; 0x1, 0x4 refused; after a branch lowered, skipped on a path refused (control without the flow); the SDWA v_cvt_f16_f32 (not lowered for the mode) refused under 0xc, '
           'accepted without it')
     launch_controls()
 

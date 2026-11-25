@@ -549,6 +549,7 @@ class Stage:
         self.has_loop = any(src >= t for t, srcs in sources.items() for src in srcs)
         self.cf_first = min([off for off, n, name, asm in self.ins if name.startswith('s_cbranch') or name == 's_branch']
                             + list(targets) + [1 << 32])
+        self.mode_at = self.round_mode_flow() if self.kind == 'ps' and self.uses_round_mode else {}
         self.blocks = []          # (offset, [lines], terminator)
         self.waterfall_back = set()  # back edges of proven waterfall loops, emitted as fall-through (waterfall)
         self.execz_snaps = []    # the snapshots on taken s_cbranch_execz edges (see merge)
@@ -674,9 +675,18 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
+        modes = self.mode_at.get(self.pc) if self.mode_at else None
+        if modes is not None and self.rounds16(name):
+            # the MODE[3:2] values that reach this instruction on every path (round_mode_flow)
+            if '?' in modes:
+                raise Unsupported('%s: f16/f64 rounding with the launch FLOAT_MODE not passed (.psin third field)'
+                                  % name)
+            if modes != {self.round16}:
+                raise Unsupported('%s at %#x reached under MODE f16 roundings %s (the translation uses %d)'
+                                  % (name, self.pc, sorted(modes, key=str), self.round16))
         if self.round16:
             self.check_round16(name)
-        elif self.launch_unknown:
+        elif self.launch_unknown and modes is None:
             self.check_launch_known(name)
         if base.endswith('_dpp'):
             return self.quad_dpp(base[:-len('_dpp')], ops, mods)
@@ -2372,6 +2382,7 @@ class Stage:
     round16 = 0  # the class defaults, for a Stage built without __init__ (the operand-count probe)
     uses_round_mode = False
     launch_unknown = False  # a pixel stage built without its launch FLOAT_MODE (launch_mode)
+    mode_at = {}            # offset -> MODE[3:2] values reaching it (round_mode_flow), for stages with s_round_mode
     quad_divergent = has_loop = False
 
     def op_s_round_mode(self, ops, mods):
@@ -2381,9 +2392,8 @@ class Stage:
         if self.kind != 'ps':
             # only pixel stages are checked for f16 emitters that bypass to_f16 (mesh2hlsl's d16 image packing does)
             raise Unsupported('s_round_mode in a %s stage' % self.kind)
-        if self.pc >= self.cf_first:
-            raise Unsupported('s_round_mode %#x after the straight-line entry (at %#x, control flow from %#x)'
-                              % (value, self.pc, self.cf_first))
+        # After control flow the layout-order value set here can differ from what some path brings to a later
+        # instruction; round_mode_flow finds the values per instruction and one() refuses a mismatch.
         if value & ~0xf or value & 3 or (value >> 2) not in (0, 3):
             raise Unsupported('s_round_mode %#x (only f32 nearest even with f16/f64 nearest even or toward zero)'
                               % value)
@@ -2406,6 +2416,34 @@ class Stage:
             raise Unsupported('launch FLOAT_MODE %#04x (only f32 nearest even, f16/f64 nearest even or toward zero, '
                               'denorm %#04x)' % (mode, self.LAUNCH_DENORM))
         self.round16 = mode >> 2 & 3
+
+    def round_mode_flow(self):
+        """offset -> the set of MODE[3:2] values (0, 3, or '?' for the unknown launch value, 'x' after an
+        s_round_mode op_s_round_mode refuses) that reach it on some path from the entry. Paths follow fall-through
+        and branch targets, loops included; only s_round_mode changes the value (s_setreg of MODE is refused)."""
+        info = {off: (name, asm) for off, n, name, asm in self.ins}
+        order = [ins[0] for ins in self.ins]
+        following = dict(zip(order, order[1:]))
+        at = {order[0]: {'?' if self.launch_unknown else self.round16}} if order else {}
+        todo = list(at)
+        while todo:
+            off = todo.pop()
+            name, asm = info[off]
+            out = at[off]
+            if name == 's_round_mode':
+                ops = parse(asm)[1]
+                value = int(ops[0], 0) if ops and re.fullmatch(r'(0x[0-9a-f]+|\d+)', ops[0]) else -1
+                out = {value >> 2} if 0 <= value <= 0xf and not value & 3 and value >> 2 in (0, 3) else {'x'}
+            if name == 's_endpgm':
+                continue
+            nxt = [] if name == 's_branch' else [following[off]] if off in following else []
+            if name.startswith('s_cbranch') or name == 's_branch':
+                nxt.append(int(parse(asm)[1][0].split('_')[1], 16))
+            for t in nxt:
+                if t in info and not out <= at.get(t, set()):
+                    at[t] = at.get(t, set()) | out
+                    todo.append(t)
+        return at
 
     def check_round16(self, name):
         """Under f16/f64 round toward zero: refuse an f16/f64 instruction that rounds and is not lowered for it.
