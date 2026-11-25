@@ -676,6 +676,8 @@ class Stage:
             return self.export(asm)
         if self.round16:
             self.check_round16(name)
+        elif self.launch_unknown:
+            self.check_launch_known(name)
         if base.endswith('_dpp'):
             return self.quad_dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
@@ -2354,6 +2356,7 @@ class Stage:
     ROUND16_LOWERED = ('v_fma_mixlo_f16', 'v_fma_mixhi_f16', 'v_cvt_f16_f32', 'v_interp_p2_f16')
     round16 = 0  # the class defaults, for a Stage built without __init__ (the operand-count probe)
     uses_round_mode = False
+    launch_unknown = False  # a pixel stage built without its launch FLOAT_MODE (launch_mode)
     quad_divergent = has_loop = False
 
     def op_s_round_mode(self, ops, mods):
@@ -2370,6 +2373,7 @@ class Stage:
             raise Unsupported('s_round_mode %#x (only f32 nearest even with f16/f64 nearest even or toward zero)'
                               % value)
         self.round16 = value >> 2
+        self.launch_unknown = False  # MODE[3:2] is known from here on
 
     # FLOAT_MODE denorm bits [7:4] the lowering matches: f32 denormals flushed ([5:4] = 0), f16/f64 kept ([7:6] = 3).
     # D3D flushes f32 denormals in shader arithmetic and keeps f16 ones; the 1,500 measured mesh sets are all 0xc_.
@@ -2378,8 +2382,10 @@ class Stage:
     def launch_mode(self, mode):
         """Start the pixel stage's MODE from its launch FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12; the layout
         of MODE[7:0]: round f32 [1:0], round f16/f64 [3:2], denorm f32 [5:4], denorm f16/f64 [7:6], LLVM SIDefines.h
-        FP_ROUND_* / FP_DENORM_*, Mesa aco_ir.h float_mode). None (not passed): MODE 0 rounding is assumed."""
+        FP_ROUND_* / FP_DENORM_*, Mesa aco_ir.h float_mode). None (not passed): f16/f64 rounding before an
+        s_round_mode is refused (check_launch_known)."""
         if mode is None:
+            self.launch_unknown = True
             return
         if mode & 0xf0 != self.LAUNCH_DENORM or mode & 3 or (mode >> 2 & 3) not in (0, 3):
             raise Unsupported('launch FLOAT_MODE %#04x (only f32 nearest even, f16/f64 nearest even or toward zero, '
@@ -2392,14 +2398,24 @@ class Stage:
         Exact whatever the mode: the f16 -> f32 widening, compares (no result rounding), v_interp_p1ll_f16 and
         v_fma_mix_f32 (f32 results, MODE[1:0]), f16 min/max (the result is an operand), v_cvt_pkrtz_f16_f32 (its
         rounding is toward zero by definition)."""
-        if not re.search(r'f16|f64', name):
-            return
-        bare = re.sub(r'_(e32|e64|sdwa|dpp)$', '', name)
-        if bare.startswith(self.ROUND16_EXACT):
+        if not self.rounds16(name):
             return
         if re.sub(r'_(e32|e64)$', '', name) in self.ROUND16_LOWERED:
             return
         raise Unsupported('%s under s_round_mode f16/f64 toward zero (not lowered)' % name)
+
+    def rounds16(self, name):
+        """An f16/f64 instruction whose result depends on MODE[3:2] (not in ROUND16_EXACT)."""
+        if not re.search(r'f16|f64', name):
+            return False
+        return not re.sub(r'_(e32|e64|sdwa|dpp)$', '', name).startswith(self.ROUND16_EXACT)
+
+    def check_launch_known(self, name):
+        """A pixel stage whose launch FLOAT_MODE was not passed: refuse an instruction whose result depends on
+        MODE[3:2] before an s_round_mode sets it. The launch value is not 0 in general (MEASURED: 0xcc, f16 toward
+        zero, in 262 of 1412 mesh pixel stages and 1015 of 3124 draw requests), so neither rounding can be assumed."""
+        if self.rounds16(name):
+            raise Unsupported('%s: f16/f64 rounding with the launch FLOAT_MODE not passed (.psin third field)' % name)
 
     def to_f16(self, expr):
         """An f32 value rounded to binary16 under the current MODE[3:2] (see op_s_round_mode)."""
@@ -3257,8 +3273,11 @@ class Pipeline:
         self.packed_position_vgpr = None
         self.ps_input_layout = None
         # The pixel stage's launch FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12), the third .psin field, or None
-        # when the request does not carry it (then MODE 0 rounding is assumed, as before; see Stage.launch_mode).
+        # when the request does not carry it (then f16 rounding before s_round_mode is refused; Stage.launch_mode).
+        # (None, None, mode) passes the mode without an SPI input layout.
         self.ps_float_mode = ps_hw_inputs[2] if ps_hw_inputs is not None and len(ps_hw_inputs) > 2 else None
+        if ps_hw_inputs is not None and ps_hw_inputs[0] is None:
+            ps_hw_inputs = None
         if ps_hw_inputs is not None:
             ena, addr = ps_hw_inputs[:2]
             self.ps_input_layout = layout = ps_input_layout(ena, addr)
@@ -3645,6 +3664,10 @@ def translate_request(out_dir, key):
         dumped = dumped_state(name) if ps_hw_inputs is None or vs_out_cntl is None else (None, None)
         if ps_hw_inputs is None and dumped[0] is not None:
             ps_hw_inputs = (dumped[0], dumped[0])  # ADDR assumed equal to ENA (no ADDR field located)
+        if ps_hw_inputs is None or len(ps_hw_inputs) == 2:
+            mode = dumped_float_mode(name)  # the launch FLOAT_MODE, when the .psin does not carry it
+            if mode is not None:
+                ps_hw_inputs = tuple(ps_hw_inputs or (None, None)) + (mode,)
         if vs_out_cntl is None:
             vs_out_cntl = dumped[1]
         if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
@@ -3699,6 +3722,33 @@ def dumped_state(name):
         enas.add(struct.unpack_from('<H', blob, VSREGS_PS_INPUT_ENA)[0] if len(blob) >= VSREGS_PS_INPUT_ENA + 2 else None)
         cntls.add(struct.unpack_from('<I', blob, VSREGS_VS_OUT_CNTL)[0] if len(blob) >= VSREGS_VS_OUT_CNTL + 4 else None)
     return (enas.pop() if len(enas) == 1 else None), (cntls.pop() if len(cntls) == 1 else None)
+
+
+# The pixel stage's SPI_SHADER_PGM_RSRC1 at block A + 0x04c (the second RSRC1/RSRC2 pair; the first, +0x038, is the
+# vertex stage's). FLOAT_MODE = bits 19:12. Measured on the dumps, not documented: in the mesh layout FLOAT_MODE is 0
+# exactly for the 88 sets without a pixel stage; in the draw layout (+0x004 == 4, 3124 requests) +0x038 is 0xc0 in
+# all of them, and +0x04c is 0xcc in 1015 pixel stages, every one with f16 rounding and none with s_round_mode, and
+# 0xc0 in the rest, among them all 424 that execute s_round_mode themselves (the mesh sets show the same split).
+VSREGS_PS_RSRC1 = 0x4c
+
+
+def dumped_float_mode(name):
+    """The pixel stage's launch FLOAT_MODE from <name>.vsregs (or the agreeing per-state dumps), else None."""
+    paths = [name + '.vsregs'] if os.path.isfile(name + '.vsregs') else []
+    if not paths:
+        folder, base = os.path.split(name)
+        try:
+            paths = [os.path.join(folder, n) for n in os.listdir(folder or '.')
+                     if re.fullmatch(re.escape(os.path.basename(base)) + r'\.[0-9a-f]{8}\.vsregs', n)]
+        except OSError:
+            paths = []
+    modes = set()
+    for path in paths:
+        with open(path, 'rb') as file:
+            blob = file.read(0x400)
+        modes.add(struct.unpack_from('<I', blob, VSREGS_PS_RSRC1)[0] >> 12 & 0xff if len(blob) >= VSREGS_PS_RSRC1 + 4
+                  else None)
+    return modes.pop() if len(modes) == 1 else None
 
 
 def read_vs_out(path):

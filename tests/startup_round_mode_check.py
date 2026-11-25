@@ -101,12 +101,19 @@ def pixel_words(mode=0xc, branch=False, add_f16=False, pkrtz=False):
     return w + bytes.fromhex('0f1800f802030405') + bytes.fromhex('000081bf')  # exp mrt0 v2..v5 done vm
 
 
-def pipe(ps, launch=None):
-    """launch: the pixel stage's FLOAT_MODE passed with its SPI inputs (ENA = ADDR = PERSP_CENTER), or None."""
-    return G.Pipeline(VS_WORDS, ps, root_blob(), ps_hw_inputs=None if launch is None else (2, 2, launch))
+NOT_PASSED = 'not passed'
+# SPI inputs: PERSP_SAMPLE/CENTER/CENTROID, LINEAR_SAMPLE/CENTER, POS_X..W, FRONT_FACE (v0..v14; the SDWA preserve of
+# add_f16 reads v14, front_face). The stage overwrites the others before reading them.
+ENA = 0x1f37
 
 
-def refused(ps, text, launch=None):
+def pipe(ps, launch=0xc0):
+    """launch: the pixel stage's FLOAT_MODE passed as the third SPI input field, or NOT_PASSED (two fields)."""
+    return G.Pipeline(VS_WORDS, ps, root_blob(),
+                      ps_hw_inputs=(ENA, ENA) if launch == NOT_PASSED else (ENA, ENA, launch))
+
+
+def refused(ps, text, launch=0xc0):
     try:
         pipe(ps, launch).hlsl_ps()
     except G.Unsupported as error:
@@ -227,22 +234,61 @@ def controls():
     launch_controls()
 
 
+def check_dumped_float_mode():
+    """gfx2hlsl.dumped_float_mode: u32 at state block A + 0x04c, bits 19:12, from <name>.vsregs or the per-state
+    dumps <name>.<8 hex>.vsregs when they agree; and translate_request's use of it (.psin without the field)."""
+    def block(mode, size=0x100):
+        b = bytearray(size)
+        if size >= 0x50:
+            struct.pack_into('<I', b, 0x4c, mode << 12 | 0x2c0041)  # other RSRC1 fields set, must not leak
+        return bytes(b)
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / 'a.vsregs').write_bytes(block(0xcc))
+        (d / 'b.vsregs').write_bytes(block(0xc0))
+        (d / 'c.vsregs').write_bytes(block(0xcc, 0x40))  # too short
+        (d / 'e.00000001.vsregs').write_bytes(block(0xcc))
+        (d / 'e.00000002.vsregs').write_bytes(block(0xcc))
+        (d / 'f.00000001.vsregs').write_bytes(block(0xcc))
+        (d / 'f.00000002.vsregs').write_bytes(block(0xc0))  # disagreeing per-state dumps
+        got = {n: G.dumped_float_mode(str(d / n)) for n in 'abcefg'}
+        assert got == {'a': 0xcc, 'b': 0xc0, 'c': None, 'e': 0xcc, 'f': None, 'g': None}, got
+    print('dumped_float_mode: 0xcc, 0xc0, short block None, agreeing per-state dumps 0xcc, disagreeing None, none None')
+
+
 def launch_controls():
     """The launch FLOAT_MODE (SPI_SHADER_PGM_RSRC1_PS bits 19:12, the optional third .psin field)."""
     # 0xcc (the 262 measured mesh pairs): the stage WITHOUT s_round_mode rounds toward zero from launch
     text = pipe(pixel_words(mode=None), launch=0xcc).hlsl_ps()
     assert '    v5 = (v5 & 0xffff0000u) | x2w_f32tof16_rtz(F(v12));' in text and 'x2w_f32tof16_rne' not in text, text
-    # 0xc0 (the rest) and None (not passed): nearest even, the text of the stage without a launch mode
-    plain = pipe(pixel_words(mode=None)).hlsl_ps()
-    assert pipe(pixel_words(mode=None), launch=0xc0).hlsl_ps() == plain
-    assert 'x2w_f32tof16_rtz(F(v12))' not in plain
+    # 0xc0 (the rest): nearest even
+    plain = pipe(pixel_words(mode=None), launch=0xc0).hlsl_ps()
+    assert 'x2w_f32tof16_rne(F(v12))' in plain and 'x2w_f32tof16_rtz(F(v12))' not in plain
     # s_round_mode 0 after a 0xcc launch switches back to nearest even
     assert 'x2w_f32tof16_rtz(F(v12))' not in pipe(pixel_words(mode=0), launch=0xcc).hlsl_ps()
     # an f16 op not lowered for toward zero is refused under a 0xcc launch alone (no s_round_mode), accepted at 0xc0
     refused(pixel_words(mode=None, add_f16=True), 'v_cvt_f16_f32_sdwa under s_round_mode f16/f64 toward zero',
             launch=0xcc)
-    # (with an SPI layout the SDWA preserve's read of v14's entry value is refused for that reason instead)
-    refused(pixel_words(mode=None, add_f16=True), 'reads entry VGPR v14', launch=0xc0)
+    assert 'v14 = ' in pipe(pixel_words(mode=None, add_f16=True), launch=0xc0).hlsl_ps()
+    # not passed (a two-field .psin): an f16 rounding before any s_round_mode is refused; after s_round_mode 0xc or 0
+    # the mode is known; v_cvt_pkrtz_f16_f32 (toward zero by definition) needs no mode
+    refused(pixel_words(mode=None), 'v_fma_mixlo_f16: f16/f64 rounding with the launch FLOAT_MODE not passed',
+            launch=NOT_PASSED)
+    assert pipe(pixel_words(mode=0xc), launch=NOT_PASSED).hlsl_ps() == pipe(pixel_words(mode=0xc)).hlsl_ps()
+    assert pipe(pixel_words(mode=0), launch=NOT_PASSED).hlsl_ps() == pipe(pixel_words(mode=0)).hlsl_ps()
+    only_pkrtz = pixel_words(mode=None, pkrtz=True)
+    only_pkrtz = only_pkrtz[:only_pkrtz.index(mix(0x21, 2, 6))] + only_pkrtz[-16:]  # v_movs, pkrtz, exp, s_endpgm
+    # (ENA PERSP_CENTER + POS_X..W: the export of v2..v5, not written here, reads the position)
+    assert 'x2w_f32tof16_rtz(F(v6)) | (x2w_f32tof16_rtz(F(v7)) << 16)' in G.Pipeline(
+        VS_WORDS, only_pkrtz, root_blob(), ps_hw_inputs=(0xf02, 0xf02)).hlsl_ps()
+    # negative control: without check_launch_known the not-passed stage is accepted (and lowered as nearest even)
+    saved = G.Stage.check_launch_known
+    G.Stage.check_launch_known = lambda self, name: None
+    try:
+        assert 'x2w_f32tof16_rne(F(v12))' in pipe(pixel_words(mode=None), launch=NOT_PASSED).hlsl_ps()
+    finally:
+        G.Stage.check_launch_known = saved
+    check_dumped_float_mode()
     # a MODE write after a non-zero launch mode is refused (the tracking would miss it)
     setreg = struct.pack('<II', 0xb0000000 | 0x15 << 23 | (1 | 3 << 11), 0xc)
     refused(setreg + pixel_words(mode=None), 's_setreg_imm32_b32 writes MODE', launch=0xcc)
@@ -273,7 +319,7 @@ def launch_controls():
                 assert 'invalid SPI input file' in str(error)
             else:
                 raise AssertionError('accepted %r' % bad_in)
-    print('launch FLOAT_MODE: 0xcc rounds f16 toward zero without s_round_mode, 0xc0 and not passed nearest even; '
+    print('launch FLOAT_MODE: 0xcc rounds f16 toward zero without s_round_mode, 0xc0 nearest even, not passed refused before s_round_mode; '
           '0xcd 0xc4 0xf0 0x0c 0x00 refused; without launch_mode 0xcc stays nearest even (control); .psin third field parsed')
 
 

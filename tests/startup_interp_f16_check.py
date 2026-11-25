@@ -67,7 +67,7 @@ def pixel_words(hi_opsel=8, clamp=0):
 
 
 def pipe(ps):
-    return G.Pipeline(vertex_words(), ps, root_blob())
+    return G.Pipeline(vertex_words(), ps, root_blob(), ps_hw_inputs=(None, None, 0xc0))  # launch FLOAT_MODE 0xc0
 
 
 def refused(ps, text):
@@ -119,7 +119,7 @@ def controls():
     compr_vs = vs.replace(plain_exp, struct.pack('<I', 0xf800020f | 1 << 10) + bytes.fromhex('06070000'))
     assert [a for _, _, _, a in G.decode(compr_vs)][-2] == 'exp param0 v6, v6, v7, v7 compr', G.decode(compr_vs)
     try:
-        G.Pipeline(compr_vs, pixel_words(), root_blob())
+        G.Pipeline(compr_vs, pixel_words(), root_blob(), ps_hw_inputs=(None, None, 0xc0))
         raise AssertionError('compr export read as halves accepted')
     except G.Unsupported as error:
         assert 'binary16 interpolation of attribute [0] exported with compr' in str(error), error
@@ -146,7 +146,7 @@ def controls():
     saved = M.MeshStage
     M.MeshStage = StubMesh
     try:
-        kept = M.MeshPipeline(b'', pixel_words(), root_blob()).hlsl_ms()
+        kept = M.MeshPipeline(b'', pixel_words(), root_blob(), ps_hw_inputs=(None, None, 0xc0)).hlsl_ms()
         dropped = M.MeshPipeline(b'', LINEAR_PS_WORDS, root_blob()).hlsl_ms()
     finally:
         M.MeshStage = saved

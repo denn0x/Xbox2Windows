@@ -42,6 +42,7 @@ class FakePipe:
     root = {'params': [{'type': 0}], 'flags': 0}
     sampler_heap = False
     uses_sampler_heap = False
+    ps_float_mode = 0xc0  # the pixel stage's launch FLOAT_MODE (a .psin third field 000000c0): MODE 0 rounding
 
     def __init__(self):
         self.resources, self.samplers, self.modified, self.notes = {}, {}, set(), set()
