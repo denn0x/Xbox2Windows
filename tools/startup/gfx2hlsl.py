@@ -141,6 +141,15 @@ def smem_offset(tok):
     return '0' if tok == 'off' else tok
 
 
+def sopk_simm(tok):
+    """A SOPK SIMM16 operand sign-extended to 32 bits, as a hex token (upstream #2116, open). Refuses anything that
+    is not a 16-bit literal."""
+    if not re.fullmatch(r'0x[0-9a-f]{1,4}|\d+', tok) or int(tok, 0) > 0xffff:
+        raise Unsupported('SOPK immediate %s' % tok)
+    value = int(tok, 0)
+    return '0x%08x' % ((value - 0x10000 if value & 0x8000 else value) & 0xffffffff)
+
+
 def smem_imm_refuse(base, ops, mods):
     """Refuse a negative SMEM immediate offset (upstream #1984 / ed7d09a4). OFFSET[20:0] is signed on RDNA 2:
     disasm_rdna2 prints a negative one as -0x.., an older decoder as 0x100000..0x1fffff; either would otherwise
@@ -781,6 +790,9 @@ class Stage:
             r = reg_range(tok)
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
+        if base == 's_movk_i32':
+            # D.i32 = signext(SIMM16) (RDNA 2 ISA SOPK; LLVM s16imm); disasm_rdna2 prints the field unsigned.
+            srcs = [sopk_simm(srcs[0])]
         dname = low(ops[0])
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         if word_complement:
@@ -2534,7 +2546,17 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 self.emit('scc = %s;' % (cast % op).format(self.u(ops[0]), self.u(ops[1])))
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
-        setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make())
+
+        def _make_k(op=_op, cast=_cast, signed=_typ == 'i32'):
+            # s_cmpk_*_i32 compares with signext(SIMM16), s_cmpk_*_u32 with SIMM16 zero-extended (LLVM s16imm /
+            # u16imm); the disassembler prints the field unsigned either way.
+            def handler(self, ops, mods):
+                if len(ops) != 2 or mods:
+                    raise Unsupported('s_cmpk with %s %s' % (ops, mods))
+                imm = sopk_simm(ops[1]) if signed else ops[1]
+                self.emit('scc = %s;' % (cast % op).format(self.u(ops[0]), self.u(imm)))
+            return handler
+        setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make_k())
 
 
 def parse_root(blob):
