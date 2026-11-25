@@ -3161,7 +3161,7 @@ std::unordered_map<Wrapper*, ID3D12PipelineState*>& compute_psos()
 LONG compute_executed, compute_skipped_args;
 // LOCAL: dispatch outcomes since the last 300-frame report, by path and reason (report_dispatches).
 enum ComputeOutcome { co_c62_run, co_c62_table_arg, co_c62_unmapped, co_c67_run, co_c67_off, co_c67_other_key, co_c67_untranslated,
-                      co_c67_heap, co_not_run, co_cx_skip, co_rawaddr_run, co_c67_unresolved, co_count };
+                      co_c67_heap, co_not_run, co_cx_skip, co_rawaddr_run, co_c67_unresolved, co_c67_compiling /* X2W_CX_ASYNC */, co_count };
 LONG compute_outcomes[co_count];    // compute_lock; counted with the per-key count by execute_dispatch
 thread_local int dispatch_outcome;  // set on this thread by the path that handled the dispatch
 
@@ -3478,7 +3478,7 @@ void complete_c67_request(u64 key, Wrapper* pipeline, const PipelineInfo* info, 
 // The compute key of the pipeline bound on list self (also used by indirect dispatches).
 u64 compute_key_for(Wrapper* pipeline);
 bool prewarm_enabled();      // d3d12_compute.inl
-void prewarm_compute(u64 key);
+bool prewarm_compute(u64 key, bool front = false);
 u64 compute_key_of(Wrapper* self)
 {
     Pass& pass = pass_of(self);
@@ -3570,11 +3570,11 @@ void report_dispatches()
     log("x2w-render dispatch keys (300 frames): %zu keys in %d lines", all.size(), lines);
     log("x2w-compute dispatches (300 frames): executed %ld skipped %ld; slot-62 desktop pipeline executed %ld skipped %ld "
         "(table argument %ld, unmapped root address %ld); translated executed %ld skipped %ld (X2W_CX_OFF %ld, not a slot-67 key %ld, "
-        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF); X2W_CX_SKIP skipped %ld; raw-address executed %ld; translated skipped, entry value unresolved %ld",
-        o[co_c62_run] + o[co_c67_run] + o[co_rawaddr_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap] + o[co_cx_skip] + o[co_c67_unresolved],
+        "no translation %ld, heap or vinfo %ld); not run %ld (no list or pipeline, or X2W_COMPUTE_OFF); X2W_CX_SKIP skipped %ld; raw-address executed %ld; translated skipped, entry value unresolved %ld; translated skipped while compiling (X2W_CX_ASYNC) %ld",
+        o[co_c62_run] + o[co_c67_run] + o[co_rawaddr_run], o[co_c62_table_arg] + o[co_c62_unmapped] + o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap] + o[co_cx_skip] + o[co_c67_unresolved] + o[co_c67_compiling],
         o[co_c62_run], o[co_c62_table_arg] + o[co_c62_unmapped], o[co_c62_table_arg], o[co_c62_unmapped], o[co_c67_run],
         o[co_c67_off] + o[co_c67_other_key] + o[co_c67_untranslated] + o[co_c67_heap], o[co_c67_off], o[co_c67_other_key], o[co_c67_untranslated],
-        o[co_c67_heap], o[co_not_run], o[co_cx_skip], o[co_rawaddr_run], o[co_c67_unresolved]);
+        o[co_c67_heap], o[co_not_run], o[co_cx_skip], o[co_rawaddr_run], o[co_c67_unresolved], o[co_c67_compiling]);
     if (c67_checked)
         log("x2w-cx requests (this run): %ld keys without .done checked, %ld sets completed (.done written), %ld parts written, "
             "%ld incomplete (no .meta or .regs at creation), %ld with a failed write; incomplete ones are retried next run",
@@ -5301,6 +5301,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         }
         rawaddr_report();  // LOCAL raw-address shaders (d3d12_rawaddr.inl)
         report_srv_copies();  // LOCAL stall: X2W_DRAW_SRV_STATS / X2W_DRAW_SRV_IN_PLACE (d3d12_draw.inl)
+        report_cx_async();    // LOCAL stall: X2W_CX_ASYNC (d3d12_compute.inl)
         log("x2w-d3d12 heartbeat: %ld frames presented in %.1f s (%.1f fps overall); frame waits by type %ld/%ld/%ld/%ld, "
             "%lld ms slept", frame, (now - started) / 1000.0, frame * 1000.0 / (now - started ? now - started : 1),
             frame_waits[0], frame_waits[1], frame_waits[2], frame_waits[3], static_cast<long long>(frame_wait_ms));

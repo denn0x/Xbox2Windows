@@ -135,6 +135,18 @@ LONG cx_ready, cx_missing, cx_dispatched, cx_null_res, cx_bad_uav;
 void load_compute(u64 key, ComputeTranslation& tr)
 {
     tr.state = 2;
+    // LOCAL stall, fixtures only: X2W_CX_TEST_HOLD_EVENT=<name> holds every load until the named event is set
+    // (at most 20 s), so a test can issue a dispatch while its pipeline is deliberately not ready.
+    {
+        wchar_t hold[128];
+        const DWORD n = GetEnvironmentVariableW(L"X2W_CX_TEST_HOLD_EVENT", hold, 128);
+        if (n && n < 128)
+            if (const HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, hold)) {
+                const DWORD waited = WaitForSingleObject(event, 20000);
+                CloseHandle(event);
+                log("x2w-cx %016llx: load held by X2W_CX_TEST_HOLD_EVENT (%s)", key, waited == WAIT_OBJECT_0 ? "released" : "timed out");
+            }
+    }
     wchar_t path[MAX_PATH];
     std::string manifest;
     if (!cache_path(path, L"", key, L".cs.txt") || !read_text(path, manifest)) {
@@ -725,7 +737,32 @@ std::deque<u64>& prewarm_queue()
     static std::deque<u64> q;
     return q;
 }
+std::unordered_set<u64>& prewarm_keys()  // every key ever queued (prewarm_lock): each is queued once
+{
+    static std::unordered_set<u64> s;
+    return s;
+}
 LONG cx_prewarm_queued, cx_prewarm_done;
+// LOCAL stall: X2W_CX_ASYNC=1. A dispatch whose pipeline is not loaded yet is skipped (outcome co_c67_compiling,
+// "skipped while compiling") and its key goes to the front of the prewarm queue; the recording thread never
+// compiles and never waits for a compile. A skipped dispatch is dropped, not replayed later. Counted per key here
+// (compute_load_lock), outside ComputeTranslation, which loaded_compute overwrites when a load completes.
+struct CxAsync {
+    LONG skipped = 0;         // since the run started
+    LONG since_report = 0;    // since the last report_cx_async
+    ULONGLONG first_skip = 0;  // GetTickCount64 of the first skip
+};
+std::unordered_map<u64, CxAsync>& cx_async_keys()
+{
+    static std::unordered_map<u64, CxAsync> m;
+    return m;
+}
+bool cx_async()
+{
+    static const bool on = x2w_local::env_on("X2W_CX_ASYNC") && !x2w_local::env_on("X2W_CX_COMPILE_LOCKED");
+    return on;
+}
+// The prewarm workers. A key with skipped dispatches logs when it is ready.
 DWORD WINAPI prewarm_thread(void*)
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -735,9 +772,18 @@ DWORD WINAPI prewarm_thread(void*)
         const u64 key = prewarm_queue().front();
         prewarm_queue().pop_front();
         ReleaseSRWLockExclusive(&prewarm_lock);
-        loaded_compute(key);
+        const int state = loaded_compute(key).state;
         const LONG n = InterlockedIncrement(&cx_prewarm_done);
         if (n <= 4 || n % 200 == 0) log("x2w-cx prewarm %ld of %ld queued pipelines loaded (latest %016llx)", n, cx_prewarm_queued, key);
+        if (cx_async()) {
+            AcquireSRWLockExclusive(&compute_load_lock);
+            const auto found = cx_async_keys().find(key);
+            const CxAsync seen = found != cx_async_keys().end() ? found->second : CxAsync{};
+            ReleaseSRWLockExclusive(&compute_load_lock);
+            if (seen.skipped)
+                log("x2w-cx %016llx %s (X2W_CX_ASYNC) %llu ms after its first skipped dispatch; %ld dispatches skipped while compiling",
+                    key, state == 1 ? "ready" : "unavailable", static_cast<unsigned long long>(GetTickCount64() - seen.first_skip), seen.skipped);
+        }
     }
 }
 bool prewarm_enabled()
@@ -746,9 +792,12 @@ bool prewarm_enabled()
                             x2w_local::env_on("X2W_CX_OFF") || x2w_local::env_on("X2W_COMPUTE_OFF");
     return !off;
 }
-void prewarm_compute(u64 key)
+// Queues `key` for the workers once. `front`: a dispatch needs it now (X2W_CX_ASYNC); a key still waiting in the
+// queue moves to the front. With X2W_CX_ASYNC the workers run even under X2W_CX_PREWARM_OFF (then only demanded
+// keys are queued). False: the key cannot be queued (prewarm off, or not a loadable slot-67 key).
+bool prewarm_compute(u64 key, bool front)
 {
-    if (!prewarm_enabled() || (key >> 56) != 0x67 || !(key & 0x00ffffffffffffffull)) return;
+    if ((!prewarm_enabled() && !(front && cx_async())) || (key >> 56) != 0x67 || !(key & 0x00ffffffffffffffull)) return false;
     static const int threads = [] {
         char value[4]{};
         const DWORD n = GetEnvironmentVariableA("X2W_CX_PREWARM_THREADS", value, sizeof(value));
@@ -756,15 +805,88 @@ void prewarm_compute(u64 key)
         count = count < 1 ? 1 : count > 4 ? 4 : count;
         for (int i = 0; i < count; ++i)
             if (const HANDLE t = CreateThread(nullptr, 0, prewarm_thread, nullptr, 0, nullptr)) CloseHandle(t);
-        log("x2w-cx prewarm: %d background threads", count);
+        log("x2w-cx prewarm: %d background threads%s", count,
+            cx_async() ? "; X2W_CX_ASYNC=1: a dispatch of a pipeline not loaded yet is skipped, never compiled or waited for on its thread" : "");
         return count;
     }();
     (void)threads;
-    InterlockedIncrement(&cx_prewarm_queued);
     AcquireSRWLockExclusive(&prewarm_lock);
-    prewarm_queue().push_back(key);
+    const bool fresh = prewarm_keys().insert(key).second;
+    if (fresh) {
+        ++cx_prewarm_queued;
+        if (front) prewarm_queue().push_front(key);
+        else prewarm_queue().push_back(key);
+    } else if (front) {
+        std::deque<u64>& q = prewarm_queue();
+        for (auto it = q.begin(); it != q.end(); ++it)
+            if (*it == key) {
+                q.erase(it);
+                q.push_front(key);
+                break;
+            }  // not in the queue: a worker is loading it or has loaded it
+    }
     ReleaseSRWLockExclusive(&prewarm_lock);
-    WakeConditionVariable(&prewarm_wanted);
+    if (fresh) WakeConditionVariable(&prewarm_wanted);
+    return true;
+}
+// X2W_CX_ASYNC: the translation of `key` if its load has finished (state 1 ready or 2 unavailable), else nullptr
+// after counting the skip and queueing the key at the front. A key the workers cannot take is loaded here as before.
+ComputeTranslation* ready_compute(u64 key)
+{
+    AcquireSRWLockExclusive(&compute_load_lock);
+    ComputeTranslation& tr = compute_translations()[key];
+    if (tr.state == 1 || tr.state == 2) {
+        ReleaseSRWLockExclusive(&compute_load_lock);
+        return &tr;
+    }
+    CxAsync& a = cx_async_keys()[key];
+    const bool first = !a.skipped;
+    if (first) a.first_skip = GetTickCount64();
+    ++a.skipped;
+    ++a.since_report;
+    ReleaseSRWLockExclusive(&compute_load_lock);
+    if (!prewarm_compute(key, true)) {
+        AcquireSRWLockExclusive(&compute_load_lock);
+        --a.skipped, --a.since_report;  // element references survive rehashing
+        ReleaseSRWLockExclusive(&compute_load_lock);
+        return &loaded_compute(key);
+    }
+    static LONG logged;
+    if (first && first_calls(logged, 32))
+        log("x2w-cx %016llx: pipeline not loaded yet, dispatch skipped and the key queued first for the prewarm workers (X2W_CX_ASYNC)", key);
+    return nullptr;
+}
+// Heartbeat (every 5 s): the dispatches skipped while compiling since the last report, per key.
+void report_cx_async()
+{
+    if (!cx_async()) return;
+    std::vector<std::pair<u64, LONG>> keys;
+    LONG total = 0, all_time = 0;
+    AcquireSRWLockExclusive(&compute_load_lock);
+    for (auto& entry : cx_async_keys()) {
+        all_time += entry.second.skipped;
+        if (!entry.second.since_report) continue;
+        keys.push_back({entry.first, entry.second.since_report});
+        total += entry.second.since_report;
+        entry.second.since_report = 0;
+    }
+    ReleaseSRWLockExclusive(&compute_load_lock);
+    AcquireSRWLockShared(&prewarm_lock);
+    const std::size_t waiting = prewarm_queue().size();
+    ReleaseSRWLockShared(&prewarm_lock);
+    if (!total) return;
+    std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    char line[1400];
+    int n = std::snprintf(line, sizeof(line), "x2w-cx dispatches skipped while compiling since the last report (X2W_CX_ASYNC): %ld over %zu keys "
+                          "(%ld this run; %zu keys waiting in the prewarm queue):", total, keys.size(), all_time, waiting);
+    for (const auto& k : keys) {
+        if (n > static_cast<int>(sizeof(line)) - 40) {
+            n += std::snprintf(line + n, sizeof(line) - n, " ...");
+            break;
+        }
+        n += std::snprintf(line + n, sizeof(line) - n, " %016llx=%ld", k.first, k.second);
+    }
+    log("%s", line);
 }
 
 // Runs a dispatch through the translation of compute key `key`. False: not translated (or no list).
@@ -779,7 +901,12 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     Pass& pass = pass_of(self);
     // LOCAL: X2W_CX_COMPILE_LOCKED=1 restores the old order (compile while holding draw_lock), for comparison.
     static const bool compile_locked = x2w_local::env_on("X2W_CX_COMPILE_LOCKED");
-    ComputeTranslation* ready = compile_locked ? nullptr : &loaded_compute(key);
+    // LOCAL stall: X2W_CX_ASYNC=1 skips a dispatch whose pipeline is not loaded yet (ready_compute).
+    ComputeTranslation* ready = compile_locked ? nullptr : cx_async() ? ready_compute(key) : &loaded_compute(key);
+    if (!compile_locked && !ready) {
+        dispatch_outcome = co_c67_compiling;
+        return false;
+    }
     lock_draw(200000 + __LINE__);
     if (!ready) {
         ready = &compute_translations()[key];

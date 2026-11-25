@@ -733,6 +733,27 @@ foreach(backend IN ITEMS warp hardware)
     endforeach()
 endforeach()
 
+# LOCAL stall: a translated slot-67 dispatch while its pipeline is held back (d3d12_compute.inl, X2W_CX_ASYNC).
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CountMain -Vn startup_cx_async_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_async.hlsl"
+    DEPENDS tests/startup_cx_async.hlsl VERBATIM)
+add_executable(startup_cx_async tests/startup_cx_async.cpp "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h")
+target_include_directories(startup_cx_async PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(startup_cx_async PRIVATE cxx_std_17)
+target_link_libraries(startup_cx_async PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(mode IN ITEMS async sync)
+        add_test(NAME startup_cx_async_${mode}_${backend} COMMAND startup_cx_async ${backend} ${mode})
+        set(cx_async_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+        if(mode STREQUAL "async")
+            set(cx_async_env "${cx_async_env};X2W_CX_ASYNC=1")
+        endif()
+        set_tests_properties(startup_cx_async_${mode}_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${cx_async_env}")
+    endforeach()
+endforeach()
+
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp
     tests/descriptor_heap_paging.cpp)
