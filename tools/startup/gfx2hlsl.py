@@ -1530,8 +1530,15 @@ class Stage:
         if words is None:
             raise Unsupported('%s with a sampler that is not constant' % base)
         import pixel_aot
+        checked = list(words)
+        if how == 'c_lz' and (words[2] >> 28) == 1:
+            # Word 2 bit 28 is MIP_POINT_PRECLAMP (Mesa gfx10-rsrc.json SQ_IMG_SAMP_WORD2): it changes how a point
+            # mip filter clamps the LOD before rounding it to a level. c_lz samples level zero with MIN_LOD 0 (the
+            # decoder refuses any other MIN_LOD), so no LOD reaches the mip selection and the bit cannot change the
+            # result (ASSUMED from the field name and placement; not measured on hardware). Bits 29-31 stay refused.
+            checked[2] &= ~(1 << 28)
         try:
-            pixel_aot.comparison_sampler_state(tuple(words))
+            pixel_aot.comparison_sampler_state(tuple(checked))
         except ValueError as error:
             raise Unsupported('%s sampler: %s' % (base, error))
         tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2da' if array else 'tex2d')
