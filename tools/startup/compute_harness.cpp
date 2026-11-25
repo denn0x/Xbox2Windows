@@ -109,6 +109,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: compute_harness <cfg.txt> [--debug] | --caps\n");
         return 2;
     }
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash must not lose the progress lines
     const bool caps_only = std::string(argv[1]) == "--caps";
     bool debug = false;
     for (int i = 2; i < argc; ++i) debug |= std::string(argv[i]) == "--debug";
@@ -308,9 +309,11 @@ int main(int argc, char** argv) {
         // empty views (kinds 4 and 7 only: the harness builds buffer heaps) and the listed ids' views
         for (UINT k = 0; k < 8; ++k) srv_view(nullptr, 0, 0, at(region + k));
         uav_view(nullptr, 0, 0, at(region + 7));
-        for (const auto& v : hviews) {
-            srv_view(nullptr, 0, 0, at(region + 8 + 8 * v.id + 4));
-            uav_view(nullptr, 0, 0, at(region + 8 + 8 * v.id + 7));
+        // every id's buffer slots start null: the translation indexes the heap with whatever id heapmem holds (any
+        // id < 90000), and an unwritten descriptor is undefined (WARP crashed with an access violation on one)
+        for (UINT id = 0; id < 90000; ++id) {
+            srv_view(nullptr, 0, 0, at(region + 8 + 8 * id + 4));
+            uav_view(nullptr, 0, 0, at(region + 8 + 8 * id + 7));
         }
         for (const auto& v : hviews) {
             if (v.offset + v.bytes > res_size[v.res]) { std::fprintf(stderr, "hview %u past its resource\n", v.id); return 2; }
