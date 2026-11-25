@@ -1,6 +1,7 @@
 #include <windows.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -25,7 +26,16 @@
 //            must be red. X2W_UPLOAD_RING_TEST_NO_REPIN=1 (negative control) skips the re-pin on the cache hit.
 //            X2W_TEST_RING_COUNTERS=<file> receives the ring counters (x2w_upload_ring_test) after the second list.
 namespace {
-alignas(256) float frame_constants[64] = {1.0f, 0.0f, 0.0f, 1.0f};
+// LOCAL stall: one constant buffer and one view heap backing per drawing thread (X2W_TEST_THREADS in
+// startup_stream_consumer); the first thread to draw uses slot 0, as a single-threaded run always did.
+constexpr int frame_slots = 8;
+alignas(256) float frame_constants_by_slot[frame_slots][64];
+std::atomic<int> next_frame_slot{0};
+int frame_slot()
+{
+    thread_local const int slot = next_frame_slot.fetch_add(1) % frame_slots;
+    return slot;
+}
 alignas(256) float filler_constants[64] = {};
 void* reuse_heap = nullptr;
 StreamWord reuse_table = 0, reuse_step = 0;
@@ -55,10 +65,15 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
     const bool reuse = !std::strcmp(mode, "reuse");
     if (!changed && !wrap && !reuse && std::strcmp(mode, "same")) return 2;
 
-    float* const constants = frame_constants;
+    const int slot = frame_slot();
+    float* const constants = frame_constants_by_slot[slot];
+    std::memset(constants, 0, sizeof(frame_constants_by_slot[slot]));
+    constants[0] = 1.0f;  // red; set on every call, as "changed" leaves blue here for the next repeat
+    constants[3] = 1.0f;
     const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT entries = (32 + increment - 1) / increment + (reuse ? 2 : 0);
-    static std::vector<unsigned char> views;
+    static std::vector<unsigned char> views_by_slot[frame_slots];
+    std::vector<unsigned char>& views = views_by_slot[slot];
     views.assign(static_cast<std::size_t>(entries) * increment, 0);
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
@@ -71,7 +86,7 @@ int draw_frame_copies(ID3D12Device* desktop, void* guest, void* list, UINT width
                                            reinterpret_cast<std::uintptr_t>(&heap))))) return 41;
     const StreamWord cpu = invoke(heap, 9);
     if (cpu != reinterpret_cast<std::uintptr_t>(views.data())) return 42;
-    const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(frame_constants), sizeof(frame_constants)};
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC view{reinterpret_cast<std::uintptr_t>(constants), sizeof(frame_constants_by_slot[slot])};
     invoke(guest, 17, reinterpret_cast<std::uintptr_t>(&view), cpu);  // CreateConstantBufferView
     const StreamWord table = invoke(heap, 10);
     if (!table) return 43;

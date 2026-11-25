@@ -8,6 +8,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <thread>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -87,6 +88,12 @@ static bool create_slot57(void* device, const char* vs_path, const char* ps_path
     pipeline = nullptr;
     return SUCCEEDED(reinterpret_cast<Create>((*static_cast<void***>(device))[57])(device, desc, __uuidof(ID3D12PipelineState), &pipeline)) &&
            pipeline;
+}
+
+static UINT env_uint(const wchar_t* name)
+{
+    wchar_t value[16] = L"";
+    return GetEnvironmentVariableW(name, value, 16) ? static_cast<UINT>(std::wcstoul(value, nullptr, 10)) : 0u;
 }
 
 int main(int argc, char** argv)
@@ -177,6 +184,28 @@ int main(int argc, char** argv)
         const int rc = check_stream_draw(adapter.Get(), device, pso, argv[5], nullptr, format);
         release_placed_vertices(true);
         return rc;
+    }
+    // LOCAL stall: X2W_TEST_THREADS=<n> (2-8) with X2W_TEST_REPEAT=<k>: n threads each record, submit and read back k
+    // frames on their own list and queue at the same time (one shared device and pipeline), pixels in <out>.t<thread>
+    // (the last frame); the first failing return code wins. With X2W_DRAW_LOCK_TIMES the lock-times report is
+    // written at the end (export x2w_draw_lock_times_test op 1).
+    if (const UINT threads = env_uint(L"X2W_TEST_THREADS"); threads >= 2 && threads <= 8 && !bc7.blocks) {
+        const UINT repeat = env_uint(L"X2W_TEST_REPEAT") ? env_uint(L"X2W_TEST_REPEAT") : 1;
+        std::vector<std::thread> workers;
+        std::vector<int> results(threads, 0);
+        for (UINT t = 0; t < threads; ++t)
+            workers.emplace_back([&, t] {
+                const std::string out = std::string(argv[5]) + ".t" + std::to_string(t);
+                for (UINT k = 0; k < repeat && !results[t]; ++k)
+                    results[t] = check_stream_draw(adapter.Get(), device, pso, out.c_str(), nullptr, format, export_word, two_targets);
+            });
+        for (auto& w : workers) w.join();
+        using LockTimes = std::uint64_t(WINAPI*)(int, std::uint64_t, std::uint64_t);
+        if (const HMODULE xs = GetModuleHandleW(L"d3d12_xs.dll"))
+            if (const auto report = reinterpret_cast<LockTimes>(GetProcAddress(xs, "x2w_draw_lock_times_test"))) report(1, 0, 0);
+        for (int r : results)
+            if (r) return r;
+        return 0;
     }
     return check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format, export_word, two_targets);
 }

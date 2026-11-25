@@ -357,6 +357,26 @@ void release_exclusive_timed(PSRWLOCK lock)
     ReleaseSRWLockExclusive(lock);
 }
 #define ReleaseSRWLockExclusive(lock) release_exclusive_timed(lock)
+// LOCAL stall: X2W_DRAW_LOCK_SPLIT=1 (default off). draw_translated holds draw_lock for the lookups, the PSO, the
+// sampler heap, the heap-view fill and the uav binding as before, then releases it for the srv loop and takes it
+// again only around the calls that touch process-wide state (texture binds, null-binding counters, gpu_written,
+// frame_copy, range watch, mesh dumps, the device check) and for the recording tail (SetPipelineState .. Draw).
+// What runs unlocked: the index range scan, readable_window probes, entry reads, view_records (note_lock),
+// buffer view creation into this call's own ring slots, desktop_range (own lock), placed-stream copies
+// (reserve_upload_ring has its own lock), require_state / window_read_state (this list's own states), log lines.
+bool draw_lock_split()
+{
+    static const bool on = x2w_local::env_on("X2W_DRAW_LOCK_SPLIT");
+    return on;
+}
+// Takes draw_lock for its scope when `split` (the lock is not held then); nothing otherwise (it is held).
+struct SplitRelock {
+    bool split;
+    SplitRelock(bool s, int line) : split(s) { if (split) lock_draw(line); }
+    ~SplitRelock() { if (split) ReleaseSRWLockExclusive(&draw_lock); }
+    SplitRelock(const SplitRelock&) = delete;
+    SplitRelock& operator=(const SplitRelock&) = delete;
+};
 // Fixture hook (startup_draw_lock_times): op 0 takes draw_lock at site 999000 + b, holds it a microseconds (spin)
 // and releases it; op 1 writes the report now ("fixture").
 extern "C" __declspec(dllexport) u64 WINAPI x2w_draw_lock_times_test(int op, u64 a, u64 b)
@@ -2859,6 +2879,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
+    const bool split = draw_lock_split();  // LOCAL stall: X2W_DRAW_LOCK_SPLIT
+    if (split) ReleaseSRWLockExclusive(&draw_lock);
     std::uint32_t strides[32] = {}, word3[32] = {};
     // Only the vertices this draw can reference are copied: [vertex_first, vertex_first + vertex_count).
     // The shader adds the "base vertex" entry value to the vertex index, so that value is biased by
@@ -2883,7 +2905,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     if (vertex_first < 0) vertex_first = 0;
-    const bool dumping = mesh && trace_frame_active && mesh_dump_key() && mesh_dump_begin(tr->key);  // LOCAL meshrt
+    bool dumping = false;
+    if (mesh && trace_frame_active && mesh_dump_key()) {
+        SplitRelock relock(split, 100000 + __LINE__);
+        dumping = mesh_dump_begin(tr->key);  // LOCAL meshrt
+    }
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -2918,6 +2944,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                    srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
             // LOCAL (video): X2W_DRAW_TEXTURE_HEAP_INDEX=1 reads an "integer + 7 zero words" entry as an
             // index into the heap that holds the entry (HYPOTHESIS from run 84, see note_null_texture).
+            SplitRelock relock(split, 100000 + __LINE__);  // the rest of the texture bind (memcut revive, uploads, counters)
             if (entry_ok && words[0] != view_token_magic) resolve_heap_index(tr->key, i, entry, words);
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
@@ -3010,7 +3037,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             InterlockedIncrement(words[0] == refused_view_magic ? &buffer_refused_views : &buffer_links);
             if (buffer_heap_index_on()) {
                 static LONG link_lines;
-                if (trace_frame_active || first_calls(link_lines, 32)) log_buffer_link(tr->key, i, entry, words);
+                if (trace_frame_active || first_calls(link_lines, 32)) {
+                    SplitRelock relock(split, 100000 + __LINE__);  // reads heap shadow arrays outside note_lock
+                    log_buffer_link(tr->key, i, entry, words);
+                }
                 InterlockedIncrement(&buffer_links_nulled);
                 std::memset(words, 0, sizeof(words));
                 word3[i] = 0;
@@ -3059,9 +3089,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                           srv.source, srv.a, srv.b, static_cast<unsigned long long>(entry), words[0], words[1], words[2], words[3],
                           static_cast<unsigned long long>(address), strides[i], readable_range ? "" : " (range not readable: no bytes)",
                           placed.reject ? " (placed: rejected, bound null)" : "");
+            SplitRelock relock(split, 100000 + __LINE__);
             mesh_dump_file(file, readable_range ? reinterpret_cast<const void*>(address) : nullptr, readable_range ? bytes : 0, note);
         }
         if (const int r = range_watch_hit(address, bytes); r >= 0) {
+            SplitRelock relock(split, 100000 + __LINE__);
             static LONG shown;
             if (first_calls(shown, 16) && range_watch_line(r))
                 log("x2w-watch 0x%llx: draw %016llx srv %u reads 0x%llx (%zu bytes) frame %ld", range_watch_address(r), tr->key, i, address, bytes,
@@ -3076,6 +3108,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             buffer_facts.token_magic = entry_ok && words[0] == view_token_magic;
             buffer_facts.token_known = buffer_token_known;
             buffer_facts.bound = bound;
+            SplitRelock relock(split, 100000 + __LINE__);
             count_null_binding(x2w_local::classify_null_binding(buffer_facts));
         };
         if (placed.reject || (placed.owner && !InterlockedCompareExchange(&placed.owner->own().refs, 0, 0))) {
@@ -3130,7 +3163,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 log("x2w-draw   %016llx srv %u: 0x%llx (%zu bytes) not bound in place: %s; copied as before", tr->key, i, address, bytes,
                     in_window ? "window offset not 16-aligned" : "no single desktop window (desktop_range)");
         }
-        if (address && bytes && !gpu_written().empty() && gpu_written_overlaps(address, bytes)) {
+        bool gpu_written_range = false;
+        if (address && bytes) {
+            SplitRelock relock(split, 100000 + __LINE__);
+            gpu_written_range = !gpu_written().empty() && gpu_written_overlaps(address, bytes);
+        }
+        if (gpu_written_range) {
             // LOCAL draw-rt: a translated draw or a GPU copy stores into this range: read it in place, not from a record-time copy.
             ID3D12Resource* window = nullptr;
             u64 at = 0;
@@ -3151,13 +3189,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // X2W_BUFFER_HEAP_INDEX) counts in its own class, so its record-time copies are measured apart.
         frame_copy_class = srv.source == 0 && entry && words[0] && words[0] != view_token_magic ? 3 : mesh ? 2 : 1;
         ID3D12Resource* chunk = nullptr;  // LOCAL memcut: the upload ring chunk of the copy
-        bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset, &chunk);
-        frame_copy_class = 0;
+        bool have = false;
+        if (address && bytes && readable_window(address, bytes) >= bytes) {
+            SplitRelock relock(split, 100000 + __LINE__);
+            have = frame_copy(address, bytes, &offset, &chunk);
+        }
+        frame_copy_class = 0;  // thread_local: no lock needed
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
         // slot the title leaves empty here; why is not known yet.
         static const bool identity_for_null = x2w_local::env_on("X2W_DRAW_NULL_IDENTITY");
         if (!have && identity_for_null) {
+            SplitRelock relock(split, 100000 + __LINE__);  // the shared identity array is rewritten here
             static float identity[64];
             for (int k = 0; k < 64; ++k) identity[k] = (k % 16) % 5 == 0 ? 1.0f : 0.0f;
             address = reinterpret_cast<u64>(identity);
@@ -3186,7 +3229,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     static LONG checks;
-    if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated draw views", 0);
+    if ((InterlockedIncrement(&checks) & 63) == 1) {
+        SplitRelock relock(split, 100000 + __LINE__);
+        check_device("translated draw views", 0);
+    }
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; i < tr->uds.size(); ++i) {
         const Translation::Ud& ud = tr->uds[i];
@@ -3207,6 +3253,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     if (dumping) {  // LOCAL meshrt: X2W_MESH_DUMP_INPUTS: the entry constants as set, their kinds, and the raw root constants
+        SplitRelock relock(split, 100000 + __LINE__);
         char note[600];
         int used = std::snprintf(note, sizeof(note), "entry constants (root parameter 0), kind(a,b) per value:");
         for (std::size_t i = 0; i < tr->uds.size() && used > 0 && used < static_cast<int>(sizeof(note)) - 24; ++i)
@@ -3232,6 +3279,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             pass.default_scissor_h = target.Height;
         }
     }
+    // LOCAL stall: X2W_DRAW_LOCK_SPLIT: the recording tail is under draw_lock again (released below as before).
+    if (split) lock_draw(100000 + __LINE__);
     // LOCAL draw-rt: after the srvs, which may have moved the same texture to a shader-resource state.
     for (UINT j = 0; j < m; ++j)
         if (uav_textures[j]) require_state(self, uav_textures[j], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

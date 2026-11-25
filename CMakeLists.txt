@@ -2054,6 +2054,13 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${mode}")
             set_tests_properties(startup_draw_async_${mode}_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         endforeach()
+        # LOCAL stall: two threads draw with a buffer srv at once (X2W_DRAW_LOCK_SPLIT; locked = control)
+        foreach(mode IN ITEMS split locked)
+            add_test(NAME startup_draw_lock_split_${mode}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_lock_split_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${mode}")
+            set_tests_properties(startup_draw_lock_split_${mode}_${backend} PROPERTIES TIMEOUT 150 SKIP_RETURN_CODE 77)
+        endforeach()
         add_test(NAME startup_stream_viewport_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_viewport_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
