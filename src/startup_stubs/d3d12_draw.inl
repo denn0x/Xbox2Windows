@@ -523,14 +523,17 @@ void resolve_heap_index(u64 key, UINT srv, u64 entry, std::uint32_t* words)
 // X2W_DRAW_NULL_IDENTITY fill or 18 junk bytes there. Neither is a heap index. N is the title's free-list link
 // (an untouched slot M holds M + 1, run 87). The first shape is a free slot. The second is a freed view token
 // (view id 1, slot 18) whose word 0 the free list replaced. Such a slot reaches a table when a creation into it wrote
-// nothing. MEASURED for one: the mesh keys' srv 0(0,1760) entry holds 0x34, the link of heap 0 slot 0x33, and slot 0x33
-// is the destination of a logged slot-70 buffer_unavailable refusal (509891 in run 109). ASSUMED for the rest.
+// nothing. MEASURED for two slots: the shared entry of source 0(0,1760) (mesh keys' srv 10/17/18/22) and ae41f53b srv 6
+// hold 0x34, the link of heap 0 slot 0x33; c8d5a9b7 srv 11 holds 0x1ce9, the link of slot 0x1ce8. Both slots are
+// destinations of logged slot-70 buffer_unavailable refusals (509891 in run 109). ASSUMED for the rest, including
+// the mesh keys' per-draw srv 0 (source 0(1,128)).
 // With the switch: (1) a slot-70 buffer SRV no buffer resource covers gets the X2W_MEMORY_SRV_BUFFER stand-in, so its
-// destination holds a token and the title's copies carry it (d3d12_memory_srv.inl); (2) a buffer entry still in either
-// shape is bound as a null buffer, not as an address. On the console such a V# has word 3 = 0 (no format, dst_sel 0)
-// and reads zeros. (3) The traced frame (and the first 32 outside it) logs the entry with heap slots N-1 and N and
-// their shadow ids. Counted with or without the switch: "buffer links N (nulled M)" in the totals line. Slot N is never
-// bound: it belongs to another view.
+// destination holds a token and the title's copies carry it (d3d12_memory_srv.inl); any other refused slot-70 call
+// writes the refused_view_magic marker and its reason there (mark_refused_destination). (2) A buffer entry still in
+// either link shape, or holding the marker, is bound as a null buffer, not as an address. On the console such a V# has
+// word 3 = 0 (no format, dst_sel 0) and reads zeros. (3) The traced frame (and the first 32 outside it) logs the entry
+// with heap slots N-1 and N and their shadow ids, or the refusal reason. Counted with or without the switch: "buffer
+// links L, refused-view entries R (nulled M)" in the totals line. Slot N is never bound: it belongs to another view.
 bool buffer_heap_index_on()
 {
     static const bool on = [] {
@@ -540,9 +543,31 @@ bool buffer_heap_index_on()
     }();
     return on;
 }
-LONG buffer_links, buffer_links_nulled;
+LONG buffer_links, buffer_links_nulled, buffer_refused_views;
+// With the switch, a slot-70 call that is refused writes this marker and its reason's code into its destination
+// (mark_refused_destination, d3d12_memory_srv.inl), so an entry copied from it names the refusal instead of a link.
+constexpr std::uint32_t refused_view_magic = 0x52463258;  // "X2FR"
+SRWLOCK refusal_names_lock = SRWLOCK_INIT;
+const char* refusal_names[64];
+std::uint32_t refusal_code(const char* reason)
+{
+    AcquireSRWLockExclusive(&refusal_names_lock);
+    std::uint32_t code = 0;
+    while (code < 63 && refusal_names[code] && std::strcmp(refusal_names[code], reason)) ++code;
+    if (!refusal_names[code]) refusal_names[code] = reason;  // reasons are string literals
+    ReleaseSRWLockExclusive(&refusal_names_lock);
+    return code;
+}
+const char* refusal_name(std::uint32_t code)
+{
+    AcquireSRWLockShared(&refusal_names_lock);
+    const char* name = code < 64 && refusal_names[code] ? refusal_names[code] : "unknown";
+    ReleaseSRWLockShared(&refusal_names_lock);
+    return name;
+}
 bool free_link_words(const std::uint32_t* w)
 {
+    if (w[0] == refused_view_magic) return true;
     if (!w[0] || w[0] == view_token_magic || w[3]) return false;
     return (!w[1] && !w[2]) || (w[2] >= 17 && w[2] <= 22);
 }
@@ -572,8 +597,11 @@ void log_buffer_link(u64 key, UINT srv, u64 entry, const std::uint32_t* words)
         }
         break;
     }
+    char kind[80];
+    if (words[0] == refused_view_magic) std::snprintf(kind, sizeof kind, "refused: %s", refusal_name(words[1]));
+    else std::snprintf(kind, sizeof kind, "%s", words[1] || words[2] ? "freed token" : "free link");
     log("x2w-frame srv-heapbuf %016llx %u frame %ld: entry 0x%llx words %08x %08x %08x %08x (%s) is %s; %s; %s; bound null", key, srv, frame_number,
-        entry, words[0], words[1], words[2], words[3], words[1] || words[2] ? "freed token" : "free link", where, slots[0], slots[1]);
+        entry, words[0], words[1], words[2], words[3], kind, where, slots[0], slots[1]);
 }
 
 u64 fnv_bytes(const void* data, std::size_t bytes, u64 hash = 1469598103934665603ull)
@@ -2749,7 +2777,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         // LOCAL (textures): X2W_BUFFER_HEAP_INDEX (buffer_heap_index_on): a free-list buffer entry binds null.
         const bool buffer_link = srv.source == 0 && entry_ok && free_link_words(words);
         if (buffer_link) {
-            InterlockedIncrement(&buffer_links);
+            InterlockedIncrement(words[0] == refused_view_magic ? &buffer_refused_views : &buffer_links);
             if (buffer_heap_index_on()) {
                 static LONG link_lines;
                 if (trace_frame_active || first_calls(link_lines, 32)) log_buffer_link(tr->key, i, entry, words);

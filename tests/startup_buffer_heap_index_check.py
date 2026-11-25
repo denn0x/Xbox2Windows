@@ -12,6 +12,10 @@ X2W_DRAW_NULL_IDENTITY=1 is set in every mode, as in run 109: a null buffer then
   "00000001 0 0 0", and the draw reads the identity fill.
 - membuf-link (switch on, no slot-70 call): the entry is a free link and binds null (identity fill), and the log has the
   srv-heapbuf line with slots N-1 and N.
+- membuf-structured / membuf-typed (switch on): the same with a structured (stride 16) and a typed (R32_UINT) view, the
+  view forms of run 109's refusals: 99.
+- membuf-refused (switch on): the slot-70 call has a null address and is refused (null_address); its destination gets
+  the refused-view marker, the copied entry carries it, binds null, and the srv-heapbuf line names the reason.
 - In no mode does the draw read the decoy at slot N (55).
 """
 from pathlib import Path
@@ -24,7 +28,8 @@ from startup_draw_uav_check import run_mode
 IDENTITY = bytes((0, 0, 0x80, 0x3F))
 VALUE = bytes((99, 0, 0, 0))
 DECOY = bytes((55, 0, 0, 0))
-MODES = {"membuf": {"X2W_BUFFER_HEAP_INDEX": "1"}, "membuf-off": {}, "membuf-link": {"X2W_BUFFER_HEAP_INDEX": "1"}}
+ON = {"X2W_BUFFER_HEAP_INDEX": "1"}
+MODES = {"membuf": ON, "membuf-off": {}, "membuf-link": ON, "membuf-structured": ON, "membuf-typed": ON, "membuf-refused": ON}
 
 
 def columns(image):
@@ -49,6 +54,15 @@ def check(directory, consumer, backend):
     for needle in ("X2W_BUFFER_HEAP_INDEX=1", "x2w-memsrv stand-in buffer at", "membuf entry words: 56573258"):
         if needle not in log:
             raise AssertionError(f"membuf: log lacks {needle!r}\n{log[-4000:]}")
+    for mode in ("membuf-structured", "membuf-typed"):
+        _, image, log = results[mode]
+        if columns(image) != {VALUE} or "membuf entry words: 56573258" not in log:
+            raise AssertionError(f"{mode}: pixels {image[:32].hex()} (expected 99)\n{log[-4000:]}")
+    _, image, log = results["membuf-refused"]
+    line = re.search(r"^x2w-frame srv-heapbuf .*$", log, re.M)
+    if columns(image) != {IDENTITY} or "membuf entry words: 52463258" not in log or not line \
+            or "(refused: null_address)" not in line.group(0):
+        raise AssertionError(f"membuf-refused: pixels {image[:32].hex()}, line {line.group(0) if line else None}\n{log[-4000:]}")
     _, image, log = results["membuf-off"]
     if columns(image) != {IDENTITY} or "membuf entry words: 00000001 00000000 00000000 00000000" not in log \
             or "reason=buffer_unavailable" not in log or "X2W_BUFFER_HEAP_INDEX" in log:
@@ -59,7 +73,7 @@ def check(directory, consumer, backend):
             or "slot N-1 0x0 words 00000001" not in line.group(0) or "slot N 0x1 token 56573258" not in line.group(0):
         raise AssertionError(f"membuf-link: pixels {image[:32].hex()}, line {line.group(0) if line else None}\n{log[-4000:]}")
     print(f"{backend}: slot-70 buffer without a resource read through a copied entry (99) with X2W_BUFFER_HEAP_INDEX; "
-          f"switch off: link 1 copied, identity fill; free link: bound null and logged with slots N-1 / N; decoy at slot N never read")
+          f"switch off: link 1 copied, identity fill; free link: bound null and logged with slots N-1 / N; decoy at slot N never read; structured and typed views 99; a refused call's marker is carried, bound null and named")
     return 0
 
 

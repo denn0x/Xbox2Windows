@@ -130,6 +130,9 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
     Wrapper* match = nullptr;
     AcquireSRWLockShared(&note_lock);
     for (const auto& [wrapper, info] : resource_infos()) {
+        // Stand-in buffers (standin_memory_buffer: no desktop resource) are found through their own map, by address:
+        // here they would make the scan grow with every stand-in and make real buffers they overlap ambiguous.
+        if (!wrapper->own().real && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) continue;
         if (info.placement != Placement::none ||
             info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             (info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
@@ -693,6 +696,21 @@ void log_refused_memory_srv(const char* what, const char* reason, const D3D12_RE
     log("%s", line);
 }
 
+// LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1. A refused call writes {refused_view_magic, reason code, 0...} into its
+// title destination (d3d12_draw.inl) and clears the slot's shadow id. That is what the slot would otherwise keep: the
+// title's free-list link, or a stale token, which copies spread into draw tables.
+void mark_refused_destination(u64 destination, const char* reason)
+{
+    if (!buffer_heap_index_on() || !destination || !title_backed(destination, 32) || !x2w_local::writable(reinterpret_cast<void*>(destination), 32))
+        return;
+    const std::uint32_t marker[8] = {refused_view_magic, refusal_code(reason), 0, 0, 0, 0, 0, 0};
+    std::memcpy(reinterpret_cast<void*>(destination), marker, sizeof(marker));
+    if (const u64 desktop = desktop_cpu_handle(destination)) {
+        AcquireSRWLockExclusive(&note_lock);
+        if (std::uint32_t* slot = shadow_slot(desktop)) *slot = 0;
+        ReleaseSRWLockExclusive(&note_lock);
+    }
+}
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
                                  const MemoryShaderResourceView* input, u64 destination)
 {
@@ -753,6 +771,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         if (first_calls(refused, noop_census_enabled() ? 2048 : 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
         census_refusal(reason, resource, input);
+        mark_refused_destination(destination, reason);
         return;
     }
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -778,6 +797,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                 log_refused_memory_srv("unavailable buffer at the supplied address", "buffer_unavailable",
                                        resource, input, destination);
             census_refusal("buffer_unavailable", resource, input);
+            mark_refused_destination(destination, "buffer_unavailable");
             return;
         }
         census_memory_srv_outcome(mso_buffer);
@@ -790,6 +810,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         if (first_calls(refused, noop_census_enabled() ? 2048 : 8))
             log_refused_memory_srv("unavailable texture at the supplied base and layout", "texture_unavailable", resource, input, destination);
         census_refusal("texture_unavailable", resource, input);
+        mark_refused_destination(destination, "texture_unavailable");
         return;
     }
     census_memory_srv_outcome(mso_tiled);

@@ -184,7 +184,16 @@ int bind_memory_buffer_entries(void* guest, Word cpu, UINT increment)
         } v{};
         static_assert(offsetof(ViewAt, address) == 0x28 && sizeof(ViewAt) == 0x40);
         v.view = srv;
-        v.address = ptr(memory);
+        v.address = mode_is(L"membuf-refused") ? 0 : ptr(memory);  // membuf-refused: null address, refused null_address
+        if (mode_is(L"membuf-structured")) {  // as run 109's slot 0x33: structured, one record (here 4 of 16 bytes)
+            v.view.Format = DXGI_FORMAT_UNKNOWN;
+            v.view.Buffer.NumElements = 4;
+            v.view.Buffer.StructureByteStride = 16;
+            v.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        } else if (mode_is(L"membuf-typed")) {  // as run 109's first logged refusals (typed; R32_UINT here)
+            v.view.Format = DXGI_FORMAT_R32_UINT;
+            v.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        }
         invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
     }
     std::memcpy(heap_bytes + 128, heap_bytes, 32);
