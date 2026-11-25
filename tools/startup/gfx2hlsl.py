@@ -584,6 +584,16 @@ class Stage:
             args = [self.f(o) for o in ops[1:1 + arity]]
             if base in ('v_fmac_f32', 'v_mac_f32'):
                 args.append(self.f(ops[0]))
+            if base in FMA_FUSED or base in FMA_UNFUSED:
+                # The multiply-add rule (lead 000800 answer; the same rule as mesh2hlsl's): a fused op is one
+                # rounding, an unfused one rounds the product first; both made deterministic so a depth pre-pass and
+                # a colour pass of the same geometry agree bit for bit. Recorded in the manifest as `fma <rule>`.
+                pipe = getattr(self, 'pipe', None)  # the tests' bare stages have none
+                if hasattr(pipe, 'fma_rule'):
+                    pipe.fma_rule = DRAW_FMA
+                helper = 'x2w_fma_exact' if base in FMA_FUSED and DRAW_FMA == 'exact' else 'x2w_mad_precise'
+                if DRAW_FMA != 'legacy':
+                    return self.set_vf(reg_range(ops[0])[1], '%s(%s, %s, %s)' % ((helper,) + tuple(args)), mods)
             return self.set_vf(reg_range(ops[0])[1], text.format(*args), mods)
         if base in VEC_U_TO_F:
             arity, text_f = VEC_U_TO_F[base]
@@ -2197,6 +2207,17 @@ LANE_INVARIANT_NAMES = frozenset((
     'min', 'max', 'abs', 'saturate', 'sqrt', 'rsqrt', 'exp2', 'log2', 'floor', 'ceil', 'trunc', 'frac', 'round',
     'sin', 'cos', 'countbits', 'firstbitlow', 'firstbithigh', 'reversebits', 'f16tof32', 'f32tof16',
     'mul_legacy', 'med3', 'clamp', 'Load', 'true', 'false'))
+# The multiply-add rule for draw stages, X2W_DRAW_FMA: exact (default) = fused ops through fma in binary64 then one
+# rounding (the binary32 product is exact in binary64, so this is the fused result except in rare double-rounding
+# cases; needs DoublePrecisionFloatShaderOps), unfused ops as a `precise` multiply then add; precise = both through
+# the precise multiply-add (deterministic, not the console's fused value); legacy = `a * b + c` as before (the
+# compiler may fuse or not). Names differ from mesh2hlsl's x2w_fma/x2w_madp (same bodies) so a mesh pipeline, which
+# emits its own, never gets two definitions.
+FMA_FUSED = ('v_fma_f32', 'v_fmac_f32', 'v_fmamk_f32', 'v_fmaak_f32')
+FMA_UNFUSED = ('v_mad_f32', 'v_mac_f32', 'v_madmk_f32', 'v_madak_f32')
+DRAW_FMA = os.environ.get('X2W_DRAW_FMA', 'exact')
+if DRAW_FMA not in ('exact', 'precise', 'legacy'):
+    raise SystemExit('X2W_DRAW_FMA: exact, precise or legacy, not %r' % DRAW_FMA)
 # name -> (source operand count, expression); operands are floats
 VEC_F = {
     'v_add_f32': (2, '{0} + {1}'), 'v_sub_f32': (2, '{0} - {1}'), 'v_subrev_f32': (2, '{1} - {0}'),
@@ -2420,6 +2441,10 @@ def buf_format_helper_table():
 # The table form: fxc 10.0.26100 took 432.6 s for a vertex stage with two calls of the per-format chain and 0.6 s with
 # this one (translator_work NOTES round 5). buf_format_helper stays as the reference the check compares against.
 HELPERS['x2w_fmt_load'] = buf_format_helper_table()
+HELPERS['x2w_fma_exact'] = ('float x2w_fma_exact(float a, float b, float c) '
+                            '{ return (float)fma((double)a, (double)b, (double)c); }')
+HELPERS['x2w_mad_precise'] = ('float x2w_mad_precise(float a, float b, float c) '
+                              '{ precise float p = a * b; precise float r = p + c; return r; }')
 # VEC_U conversions whose result is a binary32 value, so the VOP3 output modifiers apply to it.
 FLOAT_RESULT_U = frozenset(('v_cvt_f32_u32', 'v_cvt_f32_i32', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1',
                             'v_cvt_f32_ubyte2', 'v_cvt_f32_ubyte3', 'v_cvt_f32_f16'))
@@ -2600,6 +2625,7 @@ class Pipeline:
         # --requests pass never publishes a result the runtime cannot bind yet.
         self.features = draw_features() if features is None else frozenset(features)
         self.heapvars = []    # heap descriptor k -> resource kind it is used as (None until used)
+        self.fma_rule = None  # set by the first multiply-add lowered (manifest `fma exact|precise`)
         self.draw_heapwords = False  # x2w_hword read (X2W_DRAW_FEATURES heapwords, manifest `heapwords 1`)
         self.spi_inputs(ps_hw_inputs)
         self.rtv_formats = rtv_formats
@@ -2870,6 +2896,8 @@ class Pipeline:
             lines.append('%s %d %s' % ('smpc' if comparison else 'smp', i, ' '.join('0x%x' % w for w in key[comparison:])))
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
+        if getattr(self, 'fma_rule', None) and self.fma_rule != 'legacy':
+            lines.append('fma %s' % self.fma_rule)
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
         lines.append('targets %s' % ' '.join(k[3:] for k in sorted(self.ps.exports) if k.startswith('mrt')))
         return '\n'.join(lines) + '\n'

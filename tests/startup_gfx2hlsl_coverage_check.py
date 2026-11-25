@@ -151,7 +151,7 @@ def output_modifiers():
     w = [0xd4000000 | 0x14b << 16 | 1 << 15 | 1, 258 | 259 << 9 | 0xf2 << 18 | 3 << 27 | 1 << 29]
     check('v_fma_f32 clamp div:2 printed with clamp first', asm_of(w) == 'v_fma_f32 v1, -v2, v3, 1.0 clamp div:2')
     check('  the clamp applies after the output modifier',
-          'v1 = U(saturate(((-F(v2)) * F(v3) + 1.0) * 0.5));' in lines(w)[1])
+          'v1 = U(saturate((x2w_fma_exact((-F(v2)), F(v3), 1.0)) * 0.5));' in lines(w)[1])  # fused: X2W_DRAW_FMA exact
 
 
 # ---- bit-exact selects and 16-bit results ---------------------------------------------------------------
