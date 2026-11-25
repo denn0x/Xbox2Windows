@@ -89,7 +89,10 @@ def main():
     E.check('s41 restored for a wave with no lane in the inner range', 'x2w_any[1][wave] == 0u) s41 = ' in on, '')
     off = translate(path, {'X2W_MESH_BARRIER_RANGES': '0'})
     E.check('negative control: X2W_MESH_BARRIER_RANGES=0 refuses again',
-            off.startswith('REFUSED paths cross different numbers of barriers'), off[:200])
+            # f37ad9f8 refused in barrier_count; since 28020dea (uniform skips over translator barriers) the skip
+            # check in body() refuses first, because the inner range's publish barrier is not a lane-SCC one
+            off.startswith(('REFUSED paths cross different numbers of barriers',
+                            'REFUSED s_barrier inside a group-uniform execz range')), off[:200])
     print('program written to %s (difftest: python -B difftest.py %s <harness> --groups 4 --seed 1)' % (path, path))
     if E.failures:
         print('%d check(s) failed' % len(E.failures))
