@@ -706,7 +706,7 @@ endforeach()
 
 # LOCAL meshrt: DispatchMesh ExecuteIndirect through a translated mesh pipeline (d3d12_mesh.inl, X2W_MESH=1).
 set(startup_mesh_headers)
-foreach(entry IN ITEMS "MeshMain;ms_6_5;ms" "MeshHeap;ms_6_5;heap_ms" "PixelMain;ps_6_5;ps" "PixelSampler;ps_6_5;smp_ps" "Writer;cs_6_0;writer")
+foreach(entry IN ITEMS "MeshMain;ms_6_5;ms" "MeshHeap;ms_6_5;heap_ms" "PixelMain;ps_6_5;ps" "PixelSampler;ps_6_5;smp_ps" "PixelUint;ps_6_5;uint_ps" "PixelStore;ps_6_5;store_ps" "Writer;cs_6_0;writer")
     list(GET entry 0 entry_name)
     list(GET entry 1 entry_profile)
     list(GET entry 2 entry_short)
@@ -723,7 +723,7 @@ target_compile_features(startup_mesh_dispatch PRIVATE cxx_std_17)
 target_link_libraries(startup_mesh_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
     foreach(mode IN ITEMS gpu derived zero huge off missing depth words16 words32 wordsraw fmaprecise fmabad notargets rtvuint smpheap smpheapswap
-            statez statezge statezoff statecull stateculloff statedepth statecullflip statecullnone statezrepeat statezuncleared statezlateclear async asyncone)
+            statez statezge statezoff statecull stateculloff statedepth statecullflip statecullnone statezrepeat statezuncleared statezlateclear async asyncone rtvvariant uavtex uavtexnoflag rtvnops)
         add_test(NAME startup_mesh_dispatch_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
         set(mesh_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
         if(NOT mode STREQUAL "off")

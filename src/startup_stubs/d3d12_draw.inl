@@ -1125,7 +1125,9 @@ bool needs_rtv_variant(DXGI_FORMAT format)
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
-    if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+    // LOCAL meshrt: a depth-only mesh pipeline (no pixel stage) writes no target, so any target format takes the base.
+    const bool no_pixel_output = base->state == 1 && base->ms && !base->ps;
+    if (no_pixel_output || std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
         if (manifest_retry_due(*base))
             load_translation(*base);
         return base;

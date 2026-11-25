@@ -3,7 +3,8 @@
 //   startup_mesh_dispatch <warp|hardware> <gpu|derived|zero|huge|off|missing|depth|words16|words32|wordsraw|
 //                                          fmaprecise|fmabad|notargets|rtvuint|smpheap|smpheapswap|
 //                                          statez|statezge|statezoff|statecull|stateculloff|statedepth|statecullflip|
-//                                          statecullnone|statezrepeat|statezuncleared|statezlateclear|async|asyncone>
+//                                          statecullnone|statezrepeat|statezuncleared|statezlateclear|async|asyncone|
+//                                          rtvvariant|uavtex|uavtexnoflag|rtvnops>
 // state modes (X2W_MESH_STATE, see main): statez drawn + depth 0.25 over a 0.5 clear; statezge nothing drawn, depth
 // 0.5; statezoff (switch unset) drawn, depth 0.5; statecull left (clockwise) culled, right (other winding) drawn; stateculloff
 // both drawn; statedepth (depth-only, hardware) depth 0.25 over a 1.0 clear.
@@ -14,7 +15,15 @@
 // and no unreadable entry.
 // fma line: derived has none ("fma unstated"), fmaprecise `fma precise` (drawn), fmabad `fma fused` (refused:
 // translation failed), the other modes `fma exact` (needs DoublePrecisionFloatShaderOps). notargets: no
-// OMSetRenderTargets; rtvuint: an R32_UINT target: both refused once with "call refused (...)", nothing drawn.
+// OMSetRenderTargets; rtvuint: an R32_UINT target: both refused once with "call refused (...)", nothing drawn;
+// rtvuint also checks that req_<variant>.rtv was published with "rtv1 <key> 42". rtvvariant (R32_UINT target): the
+// cache also holds the RTV variant (key fnv("rtv1 <key> 42"), manifest with that line, pixel stage PixelUint which
+// packs the colour into one uint): the PSO is built from the variant, drawn 0x00ff40c0, no refusal line.
+// rtvnops: no pixel stage (as depth) with an R32_UINT render target: issued from the base, no variant request, no refusal (hardware; WARP: capability skip, as depth).
+// uavtex / uavtexnoflag: `uav 0 tex2d table 1 <2 increments>` and pixel stage PixelStore (stores the colour to the texture
+// UAV, returns it): uavtex (RGBA8 texture with unordered access + UAV) binds the UAV and draws; uavtexnoflag (control: no
+// unordered access, an SRV) skips the call ("draw skipped: texture uav: ..." and the bind refusal). The stored texels
+// are not read back (the placed texture's desktop resource is the stand-in's).
 //   (X2W_D3D12_RENDER=1 X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_DEBUG=1; X2W_MESH=1 except mode off;
 //    the test sets X2W_SHADER_CACHE and X2W_TRAP_LOG itself)
 //
@@ -59,6 +68,8 @@
 #include "startup_mesh_ms.h"
 #include "startup_mesh_ps.h"
 #include "startup_mesh_smp_ps.h"
+#include "startup_mesh_uint_ps.h"
+#include "startup_mesh_store_ps.h"
 #include "startup_mesh_writer.h"
 
 using Microsoft::WRL::ComPtr;
@@ -174,7 +185,8 @@ int main(int argc, char** argv)
         mode != "words16" && mode != "words32" && mode != "wordsraw" && mode != "fmaprecise" && mode != "fmabad" && mode != "notargets" &&
         mode != "rtvuint" && mode != "smpheap" && mode != "smpheapswap" && mode != "statez" && mode != "statezge" && mode != "statezoff" &&
         mode != "statecull" && mode != "stateculloff" && mode != "statedepth" && mode != "statecullflip" && mode != "statecullnone" &&
-        mode != "statezrepeat" && mode != "statezuncleared" && mode != "statezlateclear" && mode != "async" && mode != "asyncone")
+        mode != "statezrepeat" && mode != "statezuncleared" && mode != "statezlateclear" && mode != "async" && mode != "asyncone" && mode != "rtvvariant" &&
+        mode != "uavtex" && mode != "uavtexnoflag" && mode != "rtvnops")
         return 2;
     // statecullflip: X2W_MESH_STATE_CULL_FLIP=1, the other triangle culled; statecullnone: X2W_MESH_STATE_NOCULL=1, both
     // drawn. statezrepeat: 32 calls with render target + depth, then 32 with the render target only: exactly two PSO
@@ -207,7 +219,9 @@ int main(int argc, char** argv)
     // entry 65 is point and 64 linear (smpheap), or the other way round (smpheapswap, the control).
     const bool smp = mode.compare(0, 7, "smpheap") == 0;
     const bool depth = mode == "depth" || mode == "statedepth";  // depth-only pipeline, depth target only
+    const bool no_ps = depth || mode == "rtvnops";  // no pixel stage (rtvnops: with an R32_UINT render target)
     const bool words = mode.compare(0, 5, "words") == 0;  // heap descriptor + vdesc (`heap 1`, `heapwords 1`)
+    const bool uavtex = mode.compare(0, 6, "uavtex") == 0;  // `uav 0 tex2d table 1 <2 increments>`, PixelStore
     UINT view_increment = 0;
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
@@ -270,7 +284,7 @@ int main(int argc, char** argv)
     // Measured on WARP 10.0.26100.9818 (2026-11-24): a mesh PSO without a pixel stage removes the device on its first
     // DispatchMesh (with depth off and with depth test/write on; with the debug layer on and off; no debug-layer
     // message before the removal). The same stream with a pixel stage draws, and hardware draws it without one.
-    if (depth && std::strcmp(argv[1], "warp") == 0) {
+    if (no_ps && std::strcmp(argv[1], "warp") == 0) {  // depth, statedepth and rtvnops
         std::printf("WARP removes the device for a mesh pipeline without a pixel stage: capability skip\n");
         return 77;
     }
@@ -319,7 +333,7 @@ int main(int argc, char** argv)
     // The key rule (board/msgs/195600_meshrt_mesh-key-rule.md): pipeline_key(a or empty, b = mesh code, root).
     constexpr char revision[] = "x2w-startup-shader-3";
     std::uint64_t key = fnv(revision, sizeof(revision) - 1);
-    if (!depth) key = fnv(pixel_code, sizeof(pixel_code), key);
+    if (!no_ps) key = fnv(pixel_code, sizeof(pixel_code), key);
     key = fnv(mesh_code, sizeof(mesh_code), key);
     key = fnv(title_blob->GetBufferPointer(), title_blob->GetBufferSize(), key);
     std::printf("mesh key %016llx\n", static_cast<unsigned long long>(key));
@@ -332,12 +346,30 @@ int main(int argc, char** argv)
             // smp: srv 1 is the table's second descriptor (the table offset is in bytes: one view increment).
             : smp ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\nsrv 1 tex2d table 1 " + std::to_string(view_increment) +
                         "\nsmpheap 2048 1 fallback 2047\n" + fma + "stage mesh\nms 3 3 1\n"
+            : uavtex ? "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\nuav 0 tex2d table 1 " +
+                           std::to_string(2 * view_increment) + "\n" + fma + "stage mesh\nms 3 3 1\n"
                   : "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\n" + fma + "stage mesh\nms 3 3 1\n";
         const std::wstring base = cache + L"\\" + hex_key(key);
         if (!(words ? write_file(base + L".ms.cso", startup_mesh_heap_ms, sizeof(startup_mesh_heap_ms))
                     : write_file(base + L".ms.cso", startup_mesh_ms, sizeof(startup_mesh_ms))) ||
-            (!depth && !(smp ? write_file(base + L".ps.cso", startup_mesh_smp_ps, sizeof(startup_mesh_smp_ps))
+            (!no_ps && !(smp ? write_file(base + L".ps.cso", startup_mesh_smp_ps, sizeof(startup_mesh_smp_ps))
+                             : uavtex ? write_file(base + L".ps.cso", startup_mesh_store_ps, sizeof(startup_mesh_store_ps))
                              : write_file(base + L".ps.cso", startup_mesh_ps, sizeof(startup_mesh_ps)))) ||
+            !write_file(base + L".txt", manifest.data(), manifest.size()))
+            return 5;
+    }
+    // RTV variant of the key for an R32_UINT target (the draw path's contract, d3d12_draw.inl translation_for_targets):
+    // request "rtv1 <key decimal> 42", variant key = fnv of the request text. rtvvariant publishes the variant (the same
+    // mesh stage, PixelUint, the manifest + the rtv1 line); rtvuint (control) publishes none and must find the
+    // stand-in's request req_<variant>.rtv with that text.
+    const std::string rtv_request = "rtv1 " + std::to_string(key) + " 42";
+    const std::uint64_t variant_key = fnv(rtv_request.data(), rtv_request.size());
+    if (mode == "rtvvariant") {
+        const std::string manifest =
+            "x2w-manifest 1\nudsrc 0 rect\nudsrc 1 rootconst 2 0\nsrv 0 buf table 1 0\nfma exact\nstage mesh\nms 3 3 1\n" + rtv_request + "\n";
+        const std::wstring base = cache + L"\\" + hex_key(variant_key);
+        if (!write_file(base + L".ms.cso", startup_mesh_ms, sizeof(startup_mesh_ms)) ||
+            !write_file(base + L".ps.cso", startup_mesh_uint_ps, sizeof(startup_mesh_uint_ps)) ||
             !write_file(base + L".txt", manifest.data(), manifest.size()))
             return 5;
     }
@@ -360,7 +392,7 @@ int main(int argc, char** argv)
     alignas(8) static unsigned char record[0x300];
     Word record_words[16] = {};
     record_words[0] = arg(title_root);
-    if (!depth) record_words[5] = arg(pixel_code), record_words[6] = sizeof(pixel_code);
+    if (!no_ps) record_words[5] = arg(pixel_code), record_words[6] = sizeof(pixel_code);
     record_words[13] = arg(mesh_code), record_words[14] = sizeof(mesh_code);
     // state modes: state block A at [1]/[2] (pipeline_state_decode.h read_words; REG_LAYOUT 2a).
     alignas(4) static unsigned char state_a[0x180];
@@ -473,7 +505,7 @@ int main(int argc, char** argv)
         if (!make_depth(target, target_handle, guest_clear ? 0.0f : 1.0f)) return 12;  // statedepth: slot 51 sets 1.0
     } else {
         // rtvuint: an integer target (R32_UINT, 4 bytes per pixel like RGBA8): the call must be refused ("rtv variant").
-        const DXGI_FORMAT format = mode == "rtvuint" ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
+        const DXGI_FORMAT format = mode == "rtvuint" || mode == "rtvvariant" || mode == "rtvnops" ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, size, size, 1, 1, format, {1, 0},
                                        D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
         const D3D12_CLEAR_VALUE clear{format, {0, 0, 0, 0}};
@@ -546,6 +578,28 @@ int main(int argc, char** argv)
         } sampler_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, sampler_count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
                             arg(sampler_words), sizeof(sampler_words)};
         if (!ok(invoke(device, 14, arg(&sampler_heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&sampler_heap)))) return 12;
+    }
+    // uavtex modes: a 32x32 RGBA8 texture placed on title memory at the table's third descriptor. uavtex: the texture
+    // allows unordered access and has an RGBA8 UAV (slot 19); uavtexnoflag (control): no unordered access, an SRV there.
+    void* uav_texture = nullptr;
+    if (uavtex) {
+        const bool flag = mode == "uavtex";
+        D3D12_RESOURCE_DESC tex{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 32, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                flag ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
+        if (!ok(invoke(device, 133, arg(memory + 0x50000), arg(&tex), D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)),
+                       arg(&uav_texture))))
+            return 12;
+        if (flag) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_UAV_DIMENSION_TEXTURE2D};
+            invoke(device, 19, arg(uav_texture), 0, arg(&view), view_cpu + 2 * view_increment);
+        } else {
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.Texture2D.MipLevels = 1;
+            invoke(device, 18, arg(uav_texture), arg(&view), view_cpu + 2 * view_increment);
+        }
     }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -646,11 +700,11 @@ int main(int argc, char** argv)
         ++failures;
     }
     const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || smp || mode == "statez" || mode == "statezoff" ||
-                                mode == "stateculloff" || mode == "statecullnone" || repeat || mode == "statezuncleared" || mode == "statezlateclear" || mode == "async" || (!words_skip && (mode == "words16" || mode == "words32"));
+                                mode == "stateculloff" || mode == "statecullnone" || repeat || mode == "statezuncleared" || mode == "statezlateclear" || mode == "async" || mode == "rtvvariant" || mode == "uavtex" || (!words_skip && (mode == "words16" || mode == "words32"));
     // RGBA8 little-endian: R c0, G 40, B ff, A ff. words modes: G = the FORMAT code in vdesc word 3 (29 = 0x1d, 64 = 0x40).
     // smpheap: entry 65 point -> texel 0 (red ff0000ff); smpheapswap: entry 65 linear at u = 0.375 -> 0.75 red + 0.25
     // blue (R bf, B 40, A ff; filtering precision allows +-3 per channel).
-    const std::uint32_t drawn = mode == "words16" ? 0xffff1dc0u : mode == "smpheap" ? 0xff0000ffu : mode == "smpheapswap" ? 0xff4000bfu : 0xffff40c0u;
+    const std::uint32_t drawn = mode == "rtvvariant" ? 0x00ff40c0u : mode == "words16" ? 0xffff1dc0u : mode == "smpheap" ? 0xff0000ffu : mode == "smpheapswap" ? 0xff4000bfu : 0xffff40c0u;
     const auto matches = [&](std::uint32_t got, std::uint32_t want) {
         if (mode != "smpheapswap" || !want) return got == want;
         for (int s = 0; s < 32; s += 8) {
@@ -713,10 +767,11 @@ int main(int argc, char** argv)
     const bool bound_ok = bound_line.find(mode == "missing" ? "(cache: missing)" : mode == "fmabad" ? "(cache: fail)" : "(cache: ok)") != std::string::npos;
     // Refusal modes: the once-per-key reason line (d3d12_mesh.inl mesh_refusal_line / load_mesh_stages).
     const std::string pipeline_line = std::string("x2w-mesh pipeline ") + key_text + ": ";
-    const bool refusal_mode = mode == "fmabad" || mode == "notargets" || mode == "rtvuint";
+    const bool refusal_mode = mode == "fmabad" || mode == "notargets" || mode == "rtvuint" || mode == "uavtexnoflag";
     const std::string reason = mode == "fmabad"      ? "translation failed (unknown fma rule \"fused\")"
                                : mode == "notargets" ? "call refused (no targets: "
                                : mode == "rtvuint"   ? "call refused (rtv variant: target formats 42;"
+                               : mode == "uavtexnoflag" ? "call refused (bind refused by draw_translated"
                                                      : "";
     const bool reason_ok = refusal_mode && has(pipeline_line + reason);
     if (refusal_mode) std::printf("log: refusal line \"%s%s\" %d\n", pipeline_line.c_str(), reason.c_str(), reason_ok);
@@ -735,6 +790,51 @@ int main(int argc, char** argv)
     int async_pso_lines = 0;
     for (std::size_t p = log.find("x2w-mesh desktop pipeline for "); p != std::string::npos; p = log.find("x2w-mesh desktop pipeline for ", p + 1)) ++async_pso_lines;
     if (async) std::printf("log: async PSO lines %d\n", async_pso_lines);
+    // RTV variants (R32_UINT target): rtvvariant finds the variant translation (key fnv("rtv1 <key> 42")) and builds the
+    // PSO from it; the rtvuint control has none, so the call is refused and req_<variant>.rtv carries the request.
+    char variant_text[24];
+    std::snprintf(variant_text, sizeof(variant_text), "%016llx", static_cast<unsigned long long>(variant_key));
+    if (mode == "rtvvariant") {
+        const bool variant_line = has(std::string("x2w-mesh pipeline ") + key_text + ": RTV variant " + variant_text + " for target formats 42 (pixel stage yes)");
+        const bool variant_pso = has(std::string("x2w-mesh desktop pipeline for ") + variant_text + ": 1 targets (format 42)");
+        const bool refused = has(std::string("x2w-mesh pipeline ") + key_text + ": call refused");
+        std::printf("log: RTV variant line %d, PSO from the variant %d, refusal line %d\n", variant_line, variant_pso, refused);
+        if (!variant_line || !variant_pso || refused) {
+            std::printf("FAIL: the RTV variant lines do not match\n");
+            ++failures;
+        }
+    }
+    if (mode == "rtvnops") {  // no variant asked for, no refusal: the call is issued with the base
+        const bool req = GetFileAttributesW((cache + L"\\req_" + hex_key(variant_key) + L".rtv").c_str()) != INVALID_FILE_ATTRIBUTES;
+        const bool refused = has(std::string("x2w-mesh pipeline ") + key_text + ": call refused");
+        std::printf("log: req_%s.rtv exists %d, refusal line %d\n", variant_text, req, refused);
+        if (req || refused) {
+            std::printf("FAIL: a depth-only pipeline asked for an RTV variant\n");
+            ++failures;
+        }
+    }
+    if (mode == "rtvuint") {
+        std::ifstream req_file(cache + L"\\req_" + hex_key(variant_key) + L".rtv", std::ios::binary);
+        std::string req{std::istreambuf_iterator<char>(req_file), {}};
+        while (!req.empty() && (req.back() == '\n' || req.back() == '\r')) req.pop_back();
+        std::printf("log: req_%s.rtv \"%s\" (want \"%s\")\n", variant_text, req.c_str(), rtv_request.c_str());
+        if (req != rtv_request) {
+            std::printf("FAIL: the RTV variant request was not published\n");
+            ++failures;
+        }
+    }
+    // uavtex: the translation has the uav table and the call binds the texture UAV (RGBA8 = format 28, mip 0);
+    // uavtexnoflag: the same line over a texture without unordered access skips the call.
+    if (uavtex) {
+        const bool table_line = has(std::string("x2w-draw-rt pipeline ") + key_text + ": 1 uavs in root parameter ");
+        const bool bound_uav = has(std::string("x2w-draw-rt   ") + key_text + " uav 0 texture: ") && has("format 28 mip 0: bound");
+        const bool skipped_uav = has(std::string("x2w-draw-rt ") + key_text + ": draw skipped: texture uav: texture without ALLOW_UNORDERED_ACCESS");
+        std::printf("log: uav table line %d, texture uav bound %d, skipped (no unordered access) %d\n", table_line, bound_uav, skipped_uav);
+        if (!table_line || bound_uav != (mode == "uavtex") || skipped_uav != (mode == "uavtexnoflag")) {
+            std::printf("FAIL: the texture uav lines do not match mode %s\n", mode.c_str());
+            ++failures;
+        }
+    }
     const bool skipped_32 = has(std::string("x2w-draw-rt ") + key_text + ": heap draw skipped: descriptor increment is not 32");
     if (words_skip) std::printf("log: heap draw skipped (increment not 32) %d\n", skipped_32);
     if (mode == "off"       ? any_mesh

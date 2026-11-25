@@ -76,6 +76,23 @@ float4 PixelMain(Vertex input) : SV_Target0
     return input.param0;
 }
 
+// PixelUint (mode rtvvariant): the RTV variant of PixelMain for an R32_UINT target, as a translator would emit it for
+// `rtv1 <key> 42`: the colour bytes of param0 packed into one uint (0x00BBGGRR when alpha is 1).
+uint4 PixelUint(Vertex input) : SV_Target0
+{
+    const uint4 c = uint4(round(saturate(input.param0) * 255.0));
+    return uint4(c.x | (c.y << 8) | (c.z << 16) | ((c.w == 255u ? 0u : c.w) << 24), 0, 0, 0);
+}
+
+// PixelStore (modes uavtex / uavtexnoflag): an image_store as the translator lowers it (`uav 0 tex2d table 1 <off>`):
+// the colour stored to texel (x, y) of the texture UAV u0 and also returned to the target.
+RWTexture2D<float4> store0 : register(u0);
+float4 PixelStore(Vertex input) : SV_Target0
+{
+    store0[uint2(input.pos.xy)] = input.param0;
+    return input.param0;
+}
+
 // Writer (a console compute pipeline, container path): root [0] UAV u0, [1] four constants b1.
 // Stores the DispatchMesh record values.xyz at byte offset values.w of u0.
 RWByteAddressBuffer target : register(u0);

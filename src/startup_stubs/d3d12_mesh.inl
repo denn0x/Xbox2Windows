@@ -428,28 +428,28 @@ ID3D12PipelineState* create_mesh_pso(const Translation& tr, const D3D12_GRAPHICS
 
 // Compiles the slot's PSO (state 3 on entry) and publishes it: state 1 (ready) or 2 (failed, kept). The line gives the
 // driver compile time (run 102: compute compiles of up to 43 s in the frame path stalled the frame).
-void mesh_pso_compile(MeshEntry& e, MeshPso& slot, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+void mesh_pso_compile(const Translation& tr, MeshPso& slot, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
                       const D3D12_GRAPHICS_PIPELINE_STATE_DESC& fallback, bool decoded, UINT target_count, DXGI_FORMAT format0, bool async)
 {
     LARGE_INTEGER t0, t1, f;
     QueryPerformanceCounter(&t0);
     HRESULT hr = E_FAIL;
-    ID3D12PipelineState* pso = create_mesh_pso(*e.tr, desc, &hr);
+    ID3D12PipelineState* pso = create_mesh_pso(tr, desc, &hr);
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
     const auto& d = desc.DepthStencilState;
     log("x2w-mesh desktop pipeline for %016llx: %u targets (format %d), dsv %d, depth %d, pixel stage %s -> 0x%08lx; state %s: depth func %d "
-        "write %d stencil %d, cull %d ccw %d, blend rt0 %d mask 0x%x; compiled in %lld ms%s", e.tr->key, target_count, static_cast<int>(format0),
-        static_cast<int>(desc.DSVFormat), d.DepthEnable ? 1 : 0, e.tr->ps ? "yes" : "none", static_cast<unsigned long>(hr),
+        "write %d stencil %d, cull %d ccw %d, blend rt0 %d mask 0x%x; compiled in %lld ms%s", tr.key, target_count, static_cast<int>(format0),
+        static_cast<int>(desc.DSVFormat), d.DepthEnable ? 1 : 0, tr.ps ? "yes" : "none", static_cast<unsigned long>(hr),
         decoded ? "decoded (X2W_MESH_STATE)" : "default", d.DepthFunc, d.DepthWriteMask, d.StencilEnable, desc.RasterizerState.CullMode,
         desc.RasterizerState.FrontCounterClockwise, desc.BlendState.RenderTarget[0].BlendEnable, desc.BlendState.RenderTarget[0].RenderTargetWriteMask,
         static_cast<long long>((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart), async ? " (X2W_MESH_ASYNC worker)" : "");
     if (decoded) InterlockedIncrement(&mesh_state_changed);
     if (!pso && decoded) {
         // The decoded state was refused by the runtime: the default state instead (NOT exercised by a test).
-        pso = create_mesh_pso(*e.tr, fallback, &hr);
+        pso = create_mesh_pso(tr, fallback, &hr);
         InterlockedIncrement(&mesh_state_fallback);
-        log("x2w-mesh desktop pipeline for %016llx: decoded state refused, default state -> 0x%08lx", e.tr->key, static_cast<unsigned long>(hr));
+        log("x2w-mesh desktop pipeline for %016llx: decoded state refused, default state -> 0x%08lx", tr.key, static_cast<unsigned long>(hr));
     }
     check_device("translated mesh CreatePipelineState", 0);
     AcquireSRWLockExclusive(&mesh_lock);
@@ -472,7 +472,7 @@ bool mesh_async()
     return on;
 }
 struct MeshPsoJob {
-    MeshEntry* e;
+    const Translation* tr;
     MeshPso* slot;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc, fallback;
     bool decoded;
@@ -482,19 +482,21 @@ struct MeshPsoJob {
 DWORD WINAPI mesh_pso_worker(void* p)
 {
     MeshPsoJob* job = static_cast<MeshPsoJob*>(p);
-    mesh_pso_compile(*job->e, *job->slot, job->desc, job->fallback, job->decoded, job->target_count, job->format0, true);
+    mesh_pso_compile(*job->tr, *job->slot, job->desc, job->fallback, job->decoded, job->target_count, job->format0, true);
     delete job;
     return 0;
 }
 
-// The PSO for (entry, state of this call), compiled once per key without draw_lock (failures are kept). With
-// X2W_MESH_ASYNC, null + *compiling while a worker compiles it.
-ID3D12PipelineState* mesh_pso(MeshEntry& e, const BoundPipeline& bound, const Pass& pass, bool* compiling = nullptr)
+// The PSO for (entry, translation, state of this call), compiled once per key without draw_lock (failures are kept).
+// tr is the entry's translation or its RTV variant (translation_for_targets). With X2W_MESH_ASYNC, null + *compiling
+// while a worker compiles it.
+ID3D12PipelineState* mesh_pso(MeshEntry& e, const Translation& tr, const BoundPipeline& bound, const Pass& pass, bool* compiling = nullptr)
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc, fallback;
     u64 key = 0;
     bool decoded = false;
     mesh_state_desc(bound, pass, desc, key, &decoded, &fallback);
+    key = fnv_bytes(&tr.key, sizeof(tr.key), key);  // a variant's PSOs never share a slot with the base's
     const bool async = mesh_async();
     AcquireSRWLockExclusive(&mesh_lock);
     MeshPso& slot = e.psos[key];
@@ -513,14 +515,14 @@ ID3D12PipelineState* mesh_pso(MeshEntry& e, const BoundPipeline& bound, const Pa
     ReleaseSRWLockExclusive(&mesh_lock);
     const DXGI_FORMAT format0 = pass.target_count ? pass.target_formats[0] : DXGI_FORMAT_UNKNOWN;
     if (async) {
-        auto* job = new MeshPsoJob{&e, &slot, desc, fallback, decoded, pass.target_count, format0};
+        auto* job = new MeshPsoJob{&tr, &slot, desc, fallback, decoded, pass.target_count, format0};
         if (QueueUserWorkItem(mesh_pso_worker, job, WT_EXECUTELONGFUNCTION)) {
             if (compiling) *compiling = true;
             return nullptr;
         }
         delete job;  // no worker: compile here
     }
-    mesh_pso_compile(e, slot, desc, fallback, decoded, pass.target_count, format0, false);
+    mesh_pso_compile(tr, slot, desc, fallback, decoded, pass.target_count, format0, false);
     AcquireSRWLockShared(&mesh_lock);
     ID3D12PipelineState* pso = slot.pso;
     ReleaseSRWLockShared(&mesh_lock);
@@ -538,6 +540,9 @@ struct MeshBinding {
     MeshEntry* entry = nullptr;               // the key's entry once it is final (ready or failed): no loaded_mesh per call
     u64 pso_signature = 0;                    // mesh_pass_signature of the pass pso was made for
     ID3D12PipelineState* pso = nullptr;       // the last PSO of this pipeline: no state desc, hash or mesh_lock per call
+    Translation* pso_tr = nullptr;            // the translation pso was made from (the entry's, or its RTV variant)
+    u64 variant_wait_signature = 0;           // RTV variant not ready for this pass signature: no draw_lock lookup ...
+    ULONGLONG variant_wait_until = 0;         // ... until this tick (1 s)
 };
 
 // Everything of the pass that mesh_state_desc / apply_draw_state read: targets, DSV format, read-only DSV, rect
@@ -643,17 +648,8 @@ bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list)
         mesh_refusal_line(e, binding.key.key, mesh_no_targets, "no targets: no render target or depth view bound by the list");
         return mesh_skip(mesh_no_targets), false;
     }
-    // Integer / 32-bit float targets need an RTV variant of the pixel stage (translation_for_targets); none exists
-    // for mesh translations yet.
-    if (std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
-        if (mesh_refusal_logged(e, mesh_rtv_variant)) return mesh_skip(mesh_rtv_variant), false;
-        char detail[160];
-        int n = std::snprintf(detail, sizeof(detail), "rtv variant: target formats");
-        for (UINT i = 0; i < pass.target_count && n < 120; ++i) n += std::snprintf(detail + n, sizeof(detail) - n, " %d", static_cast<int>(pass.target_formats[i]));
-        std::snprintf(detail + n, sizeof(detail) - n, "; integer / 32-bit float targets need a pixel-stage variant, none for mesh");
-        mesh_refusal_line(e, binding.key.key, mesh_rtv_variant, detail);
-        return mesh_skip(mesh_rtv_variant), false;
-    }
+    // A depth-only pipeline (no pixel stage) needs no variant (translation_for_targets takes the base for it).
+    const bool rtv_variant = e.tr && e.tr->ps && std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant);
     if (e.state == 4) return mesh_skip(mesh_no_translation), false;
     if (e.state != 1) return mesh_skip(mesh_failed), false;
     if (binding.attached != e.tr) {
@@ -673,18 +669,52 @@ bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list)
     }
     const u64 signature = mesh_pass_signature(pass);
     ID3D12PipelineState* pso = binding.pso && binding.pso_signature == signature ? binding.pso : nullptr;
+    Translation* tr = pso ? binding.pso_tr : e.tr;
+    if (!pso && rtv_variant) {
+        // Integer / 32-bit float targets: the pixel stage's RTV variant, the same contract as ordinary draws
+        // (translation_for_targets: key fnv("rtv1 <base key> <formats>"), request req_<variant>.rtv, manifest with the
+        // rtv1 line). draw_translated resolves the same variant entry for this call. A variant that is not ready is
+        // looked up again (under draw_lock) at most once a second per binding and pass signature.
+        if (binding.variant_wait_signature == signature && GetTickCount64() < binding.variant_wait_until) return mesh_skip(mesh_rtv_variant), false;
+        lock_draw(300000 + __LINE__);
+        tr = translation_for_targets(e.tr, pass);
+        const bool ready = tr && tr->state == 1 && tr->ms;
+        ReleaseSRWLockExclusive(&draw_lock);
+        if (!ready) {
+            AcquireSRWLockExclusive(&mesh_key_lock);
+            MeshBinding& kept = mesh_bindings()[pass.pipeline];
+            kept.variant_wait_signature = signature;
+            kept.variant_wait_until = GetTickCount64() + 1000;
+            ReleaseSRWLockExclusive(&mesh_key_lock);
+            if (!mesh_refusal_logged(e, mesh_rtv_variant)) {
+                char detail[200];
+                int n = std::snprintf(detail, sizeof(detail), "rtv variant: target formats");
+                for (UINT i = 0; i < pass.target_count && n < 120; ++i)
+                    n += std::snprintf(detail + n, sizeof(detail) - n, " %d", static_cast<int>(pass.target_formats[i]));
+                std::snprintf(detail + n, sizeof(detail) - n, "; variant %016llx %s", tr ? static_cast<unsigned long long>(tr->key) : 0ull,
+                              tr && tr->state == 1 ? "has no mesh stage" : "not translated yet (req_<variant>.rtv published)");
+                mesh_refusal_line(e, binding.key.key, mesh_rtv_variant, detail);
+            }
+            return mesh_skip(mesh_rtv_variant), false;
+        }
+        static LONG variants_logged;
+        if (first_calls(variants_logged, 256))
+            log("x2w-mesh pipeline %016llx: RTV variant %016llx for target formats %d%s (pixel stage %s)", static_cast<unsigned long long>(binding.key.key),
+                static_cast<unsigned long long>(tr->key), static_cast<int>(pass.target_formats[0]), pass.target_count > 1 ? " ..." : "", tr->ps ? "yes" : "none");
+    }
     static volatile LONG reuse_logged;  // once per process: the first call served by the PSO kept with the binding
     if (pso && !reuse_logged && InterlockedExchange(&reuse_logged, 1) == 0)
         log("x2w-mesh pipeline %016llx: PSO kept with the binding reused (no state desc, hash or mesh_lock for this call; logged once)",
             static_cast<unsigned long long>(binding.key.key));
     if (!pso) {
         bool compiling = false;
-        pso = mesh_pso(e, *binding.bound, pass, &compiling);
+        pso = mesh_pso(e, *tr, *binding.bound, pass, &compiling);
         if (compiling) return mesh_skip(mesh_compiling), false;
         if (pso) {
             AcquireSRWLockExclusive(&mesh_key_lock);
             MeshBinding& kept = mesh_bindings()[pass.pipeline];
             kept.pso = pso;
+            kept.pso_tr = tr;
             kept.pso_signature = signature;
             ReleaseSRWLockExclusive(&mesh_key_lock);
         }
@@ -693,7 +723,7 @@ bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list)
         mesh_refusal_line(e, binding.key.key, mesh_no_pso, "no PSO: CreatePipelineState failed, see its desktop pipeline line");
         return mesh_skip(mesh_no_pso), false;
     }
-    mesh_ready = {self, e.tr, pso, &e};
+    mesh_ready = {self, tr, pso, &e};
     return true;
 }
 
