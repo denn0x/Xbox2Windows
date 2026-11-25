@@ -1500,6 +1500,7 @@ class MeshPipeline(G.Pipeline):
             self.spi_reads()
             self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
             self.half = sorted(a for a, how in self.ps.attrs.items() if 'half' in how)
+            self.check_half_reads()
             missing = [a for a in self.ps.attrs if a not in self.params]
             if missing:
                 raise Unsupported('pixel stage reads attributes %s the mesh stage does not export' % missing)

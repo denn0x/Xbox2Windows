@@ -1960,6 +1960,11 @@ class Stage:
             # denormals (#1259). hlsl_vs() drops the line for attributes the pixel stage reads only
             # interpolated.
             self.emit('o.f%s = uint4(%s);' % (name, ', '.join(words)))
+            if 'compr' in flags:
+                # The words of a compressed export are not the registers' halves (each half went to its own
+                # channel), so a binary16 read of this attribute is refused (Pipeline.check_half_reads).
+                self.__dict__.setdefault('compr_params', set()).add(int(name[5:]))
+                return None
             # The binary16 halves of each word as f32, interpolated for v_interp_p2_f16 (the hardware interpolates
             # each half of the parameter word). Dropped like the flat copy when the pixel stage does not read them.
             self.emit('o.lo%s = float4(%s);' % (name, ', '.join(
@@ -2398,6 +2403,7 @@ class Pipeline:
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         self.half = sorted(a for a, how in self.ps.attrs.items() if 'half' in how)
+        self.check_half_reads()
         missing = [a for a in self.ps.attrs if a not in self.params]
         if missing:
             raise Unsupported('pixel stage reads attributes %s the vertex stage does not export' % missing)
@@ -2455,6 +2461,13 @@ class Pipeline:
             if self.ps_input_refusal:
                 break
         self.ps_entry_reads = {}  # every entry read is a lowered input (or refused above)
+
+    def check_half_reads(self):
+        """Refuse a binary16 read (v_interp_p2_f16) of an attribute the vertex/mesh stage exports with compr: its
+        loparam/hiparam copies are not written (Stage.export)."""
+        compr = sorted(set(self.half) & set(getattr(self.vs, 'compr_params', ())))
+        if compr:
+            raise Unsupported('binary16 interpolation of attribute %s exported with compr' % compr)
 
     def mrt_kind(self, slot):
         if slot >= len(self.rtv_formats):

@@ -111,6 +111,19 @@ def controls():
         in lost, lost
     refused(pixel_words(hi_opsel=1), 'v_interp_p2_f16 with op_sel 0x1')
     refused(pixel_words(clamp=1), 'v_interp_p2_f16 with clamp')
+    # A compressed param export (upstream PR #2052's form, `exp param0 v6, v6, v7, v7 compr`) puts each half in its
+    # own channel, so the words are not halves: a binary16 read of it is refused, not read as halves of f32 bits.
+    plain_exp = bytes.fromhex('0f0200f806070809')
+    vs = vertex_words()
+    assert vs.count(plain_exp) == 1
+    compr_vs = vs.replace(plain_exp, struct.pack('<I', 0xf800020f | 1 << 10) + bytes.fromhex('06070000'))
+    assert [a for _, _, _, a in G.decode(compr_vs)][-2] == 'exp param0 v6, v6, v7, v7 compr', G.decode(compr_vs)
+    try:
+        G.Pipeline(compr_vs, pixel_words(), root_blob())
+        raise AssertionError('compr export read as halves accepted')
+    except G.Unsupported as error:
+        assert 'binary16 interpolation of attribute [0] exported with compr' in str(error), error
+    assert 'i.param0' in G.Pipeline(compr_vs, LINEAR_PS_WORDS, root_blob()).hlsl_ps()  # f32 reads unaffected
     linear = pipe(LINEAR_PS_WORDS)
     assert 'loparam' not in linear.hlsl_vs() + linear.hlsl_ps() and 'hiparam' not in linear.hlsl_vs()
     # mesh pipelines: the stage's half copies are kept only for attributes the pixel stage reads as halves
@@ -139,7 +152,7 @@ def controls():
         M.MeshStage = saved
     assert 'o.loparam0 = ' in kept and 'o.hiparam0 = ' in kept and 'float4 loparam0 : LOPARAM0;' in kept, kept
     assert 'loparam0' not in dropped and 'hiparam0' not in dropped and 'o.param0 = ' in dropped, dropped
-    print('controls: refused without the p2 handler; op_sel cleared loses the high halves; op_sel 0x1 and clamp '
+    print('controls: refused without the p2 handler; op_sel cleared loses the high halves; op_sel 0x1, clamp and a compr export '
           'refused; no half copies for an f32-only reader; mesh stage keeps them only when read')
 
 
