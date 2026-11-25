@@ -2547,6 +2547,7 @@ struct Pass {
     bool targets_bound = false;
     bool topology_ok = false;
     unsigned srv_bound = 0;          // bit per root parameter with a desktop address bound
+    unsigned srv_pending = 0;        // LOCAL stall: X2W_ROOT_SRV_LAZY, root SRVs set but not copied yet
     const std::vector<RootParameter>* root = nullptr;
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
     // What the title bound, kept for draws through translated pipelines:
@@ -2663,6 +2664,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
         std::fill_n(pass.root_address, 16, 0);
     pass.root = params;
     pass.srv_bound = 0;
+    pass.srv_pending = 0;
     if (auto* list = recording(self); list && w && w->own().kind == root_signature_kind && w->own().real)
         list->SetGraphicsRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
 }
@@ -2955,15 +2957,54 @@ void __stdcall list_clear_depth(Wrapper* self, u64 handle, UINT flags, float dep
     InterlockedIncrement(&depth_clears[0]);
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
+// LOCAL stall: X2W_ROOT_SRV_LAZY=1 copies the range only when a draw on a real desktop pipeline needs it
+// (list_draw, bind_lazy_root_srvs). Translated draws and mesh calls read root_address themselves, so for
+// them the record-time 64 KiB upload per call was never read (run 104: 43,000-70,000 calls per 5 s window,
+// slot 44 1.0-1.8 s, upload ring +2.5 GiB per window; "draws 0", i.e. no real-pipeline draw).
+bool root_srv_lazy()
+{
+    static const bool on = x2w_local::env_on("X2W_ROOT_SRV_LAZY");
+    return on;
+}
+LONG root_srv_deferred, root_srv_lazy_bound;
+void bind_root_srv(Wrapper* self, ID3D12GraphicsCommandList* list, UINT parameter, u64 address);
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
-    if (parameter < 32) pass.srv_bound &= ~(1u << parameter);
+    if (parameter < 32) pass.srv_bound &= ~(1u << parameter), pass.srv_pending &= ~(1u << parameter);
     if (parameter < 16) pass.root_address[parameter] = address;
     if (!list || !pass.root || parameter >= pass.root->size() || parameter >= 32 ||
         (*pass.root)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV)
         return;
+    if (root_srv_lazy() && parameter < 16) {
+        pass.srv_pending |= 1u << parameter;
+        const LONG n = InterlockedIncrement(&root_srv_deferred);
+        if (n == 1) log("x2w-render X2W_ROOT_SRV_LAZY=1: root SRVs are copied at a real-pipeline draw only");
+        return;
+    }
+    bind_root_srv(self, list, parameter, address);
+}
+// X2W_ROOT_SRV_LAZY: before a draw on a real desktop pipeline, the root SRVs set since the root signature
+// was bound and not copied yet.
+void bind_lazy_root_srvs(Wrapper* self, ID3D12GraphicsCommandList* list)
+{
+    if (!root_srv_lazy()) return;
+    Pass& pass = pass_of(self);
+    if (!pass.root) return;
+    for (UINT p = 0; p < 16 && p < pass.root->size(); ++p)
+        if ((pass.srv_pending & (1u << p)) && (*pass.root)[p].type == D3D12_ROOT_PARAMETER_TYPE_SRV && pass.root_address[p]) {
+            pass.srv_pending &= ~(1u << p);
+            bind_root_srv(self, list, p, pass.root_address[p]);
+            const LONG n = InterlockedIncrement(&root_srv_lazy_bound);
+            if (x2w_local::first_of(n, 3))
+                log("x2w-render X2W_ROOT_SRV_LAZY: root SRV %u copied at a real-pipeline draw (%ld so far; %ld calls deferred)", p, n,
+                    root_srv_deferred);
+        }
+}
+void bind_root_srv(Wrapper* self, ID3D12GraphicsCommandList* list, UINT parameter, u64 address)
+{
+    Pass& pass = pass_of(self);
     const std::size_t bytes = readable_window(address, 0x10000);
     const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(address, bytes) : 0;
     static LONG logged;
@@ -3114,6 +3155,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
         return;
     }
     // The translated vertex shaders read their fetch table through root parameter 0.
+    if (list && pass.pipeline_real) bind_lazy_root_srvs(self, list);  // LOCAL stall: X2W_ROOT_SRV_LAZY
     const bool real_drawn = list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1);
     if (real_drawn) {
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);

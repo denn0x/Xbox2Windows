@@ -90,7 +90,7 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     D3D12_ROOT_PARAMETER root_cbv{};
     char cbv_mode[16]{};
     if (!textured && GetEnvironmentVariableA("X2W_TEST_ROOT_CBV", cbv_mode, sizeof(cbv_mode))) {
-        root_cbv.ParameterType = std::strcmp(cbv_mode, "wrong_type") == 0 ? D3D12_ROOT_PARAMETER_TYPE_SRV
+        root_cbv.ParameterType = (std::strcmp(cbv_mode, "wrong_type") == 0 || std::strcmp(cbv_mode, "root_srv") == 0) ? D3D12_ROOT_PARAMETER_TYPE_SRV
                                                                           : D3D12_ROOT_PARAMETER_TYPE_CBV;
         root_cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;

@@ -2029,6 +2029,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_root_cbv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" ${backend})
         set_tests_properties(startup_root_cbv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # LOCAL stall: X2W_ROOT_SRV_LAZY (list slot 44 copies nothing at record time; control without the switch)
+        add_test(NAME startup_root_srv_lazy_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_root_srv_lazy_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" ${backend})
+        set_tests_properties(startup_root_srv_lazy_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_address_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
