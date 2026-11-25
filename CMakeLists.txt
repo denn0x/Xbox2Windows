@@ -702,6 +702,17 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_dispatch_gpu-readback_${backend} COMMAND startup_indirect_dispatch ${backend} gpu)
     set_tests_properties(startup_indirect_dispatch_gpu-readback_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_INDIRECT_READBACK=8")
+    # LOCAL (scene): X2W_MESH_RECORD_TRACE in a traced frame (reset pass, raise pass, record at record / at end, writers);
+    # rectrace-off is the control without the switch (no such line).
+    foreach(mode IN ITEMS rectrace rectrace-off)
+        add_test(NAME startup_indirect_dispatch_${mode}_${backend} COMMAND startup_indirect_dispatch ${backend} ${mode})
+        set(rectrace_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_D3D12_TRACE_ALL=1")
+        if(mode STREQUAL "rectrace")
+            set(rectrace_env "${rectrace_env};X2W_MESH_RECORD_TRACE=1")
+        endif()
+        set_tests_properties(startup_indirect_dispatch_${mode}_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${rectrace_env}")
+    endforeach()
 endforeach()
 
 # LOCAL meshrt: DispatchMesh ExecuteIndirect through a translated mesh pipeline (d3d12_mesh.inl, X2W_MESH=1).

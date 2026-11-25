@@ -27,7 +27,17 @@
 //                executed" > 0. The counter is still 47: on one queue each call copies its record right before it
 //                reads it, so a reused slot is rewritten in order (the hazard is two queues at once, not tested).
 //   wrap-cap     X2W_INDIRECT_RING_TEST_CAP_CHUNKS=2 (8 slots): the calls past the cap are refused (skipped as
-//                no-ring): counter 7 + 6 = 13, refusals 34. The records in title memory must read what the writer stored (sentinels
+//                no-ring): counter 7 + 6 = 13, refusals 34.
+//
+// LOCAL (scene), X2W_MESH_RECORD_TRACE (d3d12_record_trace.inl) in a traced frame (X2W_D3D12_TRACE_ALL=1):
+//   rectrace      the title pattern behind a zero argument record. The CPU leaves {0, 1, 1} at offset 0. List 1:
+//                 the writer resets the record to {0, 1, 1} (Dispatch 1x1x1). List 2: the counter shader on the
+//                 record raises X by 3 (Dispatch 3x1x1, InterlockedAdd at offset 0), then ExecuteIndirect(args, 0)
+//                 runs 3 groups of the counter on the counter word: counter 3. Both lists are recorded before
+//                 either is submitted, so the record reads 0 at record time and 3 at frame end. The log must show
+//                 both dispatches with a root UAV range over the record (x2w-frame cx-uav), the record line
+//                 (at record 0 1 1, at end 3 1 1), the totals and the writers lines naming both pipelines.
+//   rectrace-off  the same without X2W_MESH_RECORD_TRACE (the control): counter 3, and none of those lines. The records in title memory must read what the writer stored (sentinels
 // for no-writer). Exit 0 pass, 77 capability skip (no adapter, or the adapter cannot open an
 // existing heap over process memory), other values name the failing step.
 #include <d3d12.h>
@@ -38,6 +48,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -47,6 +59,7 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) unsigned long long x2w_upload_ring_test(int what);  // LOCAL memcut: ring counters
+extern "C" __declspec(dllimport) void x2w_d3d12_record_trace_report();               // LOCAL scene: X2W_MESH_RECORD_TRACE
 
 namespace {
 using Word = std::uint64_t;
@@ -85,7 +98,9 @@ int main(int argc, char** argv)
         mode = "gpu";  // the gpu case, plus the extra calls below
     }
     const int extra_calls = wrap || wrap_legacy || wrap_cap ? 40 : 0;
-    if (mode != "gpu" && mode != "no-writer" && mode != "zero" && mode != "off" && !huge && !huge_product) return 2;
+    const bool rectrace = mode == "rectrace", rectrace_off = mode == "rectrace-off";
+    if (mode != "gpu" && mode != "no-writer" && mode != "zero" && mode != "off" && !huge && !huge_product && !rectrace && !rectrace_off)
+        return 2;
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
     ComPtr<IDXGIAdapter> adapter;
@@ -131,6 +146,8 @@ int main(int argc, char** argv)
     const std::wstring cache = std::wstring(temp) + L"x2w_indirect_" + std::to_wstring(GetCurrentProcessId());
     CreateDirectoryW(cache.c_str(), nullptr);
     SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str());
+    const std::wstring log_path = cache + L"\\trap.log";
+    if (rectrace || rectrace_off) SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
 
     D3D12_ROOT_PARAMETER parameters[2]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -173,7 +190,7 @@ int main(int argc, char** argv)
     if (!memory) return 10;
     unsigned char* const args_memory = memory + 0x1c20;
     auto* const counter_word = reinterpret_cast<volatile std::uint32_t*>(memory + 0x10000);
-    const std::uint32_t sentinel[2][3] = {{7, 1, 1}, {5, 1, 1}};
+    const std::uint32_t sentinel[2][3] = {{rectrace || rectrace_off ? 0u : 7u, 1, 1}, {5, 1, 1}};
     std::memcpy(args_memory, sentinel[0], 12);
     std::memcpy(args_memory + 0x14, sentinel[1], 12);
     D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 64, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
@@ -191,6 +208,78 @@ int main(int argc, char** argv)
         !ok(invoke(device, 73, arg(list_desc), arg(allocator), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list))))
         return 12;
 
+    if (rectrace || rectrace_off) {
+        const std::uint32_t reset[4] = {0, 1, 1, 0}, at_zero[4] = {0, 0, 0, 0}, at_counter[4] = {0, 0, 0, 0};
+        void *allocator2 = nullptr, *list2 = nullptr;
+        if (!ok(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, arg(&__uuidof(ID3D12CommandAllocator)), arg(&allocator2))) ||
+            !ok(invoke(device, 73, arg(list_desc), arg(allocator2), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&list2))))
+            return 12;
+        invoke(list, 139, arg(allocator));
+        invoke(list, 33, arg(root));
+        invoke(list, 25, arg(writer));
+        invoke(list, 45, 0, arg(args_memory));                             // root UAV over the record
+        invoke(list, 39, 1, 4, arg(reset), 0);
+        invoke(list, 14, 1, 1, 1);                                         // reset pass: {0, 1, 1} at offset 0
+        invoke(list, 9);
+        invoke(list2, 139, arg(allocator2));
+        invoke(list2, 33, arg(root));
+        invoke(list2, 25, arg(counter));
+        invoke(list2, 45, 0, arg(args_memory));
+        invoke(list2, 39, 1, 4, arg(at_zero), 0);
+        invoke(list2, 14, 3, 1, 1);                                        // raise pass: X += 3
+        invoke(list2, 45, 0, arg(memory + 0x10000));
+        invoke(list2, 39, 1, 4, arg(at_counter), 0);
+        invoke(list2, 61, arg(signature), 1, arg(args), 0, 0, 0);           // ExecuteIndirect(sig, 1, args, 0)
+        invoke(list2, 9);
+        for (int n = 0; n < 2; ++n) {
+            void* one[] = {n ? list2 : list};
+            invoke(queue, 10, 1, arg(one));
+            if (!ok(invoke(queue, 14, arg(fence), n + 1))) return 13;
+            const auto until = GetTickCount64() + 10000;
+            while (invoke(fence, 8) < static_cast<Word>(n + 1)) {
+                if (GetTickCount64() >= until) return 14;
+                Sleep(1);
+            }
+        }
+        x2w_d3d12_record_trace_report();
+        std::uint32_t record[3];
+        std::memcpy(record, args_memory, 12);
+        const std::uint32_t got = *counter_word;
+        std::printf("record in title memory: {%u %u %u}; counter %u (expected 3)\n", record[0], record[1], record[2], got);
+        if (record[0] != 3 || record[1] != 1 || record[2] != 1) return 15;
+        if (got != 3) return 16;
+        std::ifstream log_file(log_path, std::ios::binary);
+        const std::string log{std::istreambuf_iterator<char>(log_file), {}};
+        const auto count = [&](const std::string& text) {
+            std::size_t n = 0;
+            for (std::size_t at = log.find(text); at != std::string::npos; at = log.find(text, at + 1)) ++n;
+            return n;
+        };
+        char args_hex[32], args_ptr[32], writer_ptr[32], counter_ptr[32];
+        std::snprintf(args_hex, sizeof(args_hex), "0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(args_memory)));
+        std::snprintf(args_ptr, sizeof(args_ptr), "%p", static_cast<void*>(args_memory));
+        std::snprintf(writer_ptr, sizeof(writer_ptr), "%p", writer);
+        std::snprintf(counter_ptr, sizeof(counter_ptr), "%p", counter);
+        const std::string range = std::string(": run: R p0+0x0 ") + args_hex + " ";
+        const std::string writers = std::string("x2w-frame record writers args ") + args_ptr + ": ";
+        const std::size_t reset_lines = count(std::string("(1, 1, 1) pipeline ") + writer_ptr + range);
+        const std::size_t raise_lines = count(std::string("(3, 1, 1) pipeline ") + counter_ptr + range);
+        const std::size_t record_lines =
+            count(std::string(" args ") + args_ptr + "+0x0 (wrapper ") == 1 &&
+            count(": at record 00000000 00000001 00000001 00000000, at end 00000003 00000001 00000001 00000000") == 1;
+        const std::size_t totals = count("x2w-frame record totals type 2 dsv 0000000000000000: calls 1, X > 0 at record 0, at end 1, unreadable 0");
+        const std::size_t writers_head = count(writers + "1 records (X > 0 at end 1), ");
+        const std::size_t writer_reset = count(std::string(" pipeline ") + writer_ptr + " R p0+0x0 " + args_hex + " ") >= 1 ? 1 : 0;
+        const std::size_t writer_raise = count(std::string(" pipeline ") + counter_ptr + " R p0+0x0 " + args_hex + " ") >= 1 ? 1 : 0;
+        const std::size_t any = count("x2w-frame cx-uav ") + count("x2w-frame record ");
+        std::printf("%s: reset lines %zu, raise lines %zu, record %zu, totals %zu, writers %zu (reset %zu, raise %zu), trace lines %zu\n",
+                    mode.c_str(), reset_lines, raise_lines, record_lines, totals, writers_head, writer_reset, writer_raise, any);
+        if (rectrace && (reset_lines != 1 || raise_lines != 1 || !record_lines || totals != 1 || writers_head != 1 || !writer_reset || !writer_raise))
+            return 20;
+        if (rectrace_off && any) return 21;
+        std::printf("PASS %s\n", mode.c_str());
+        return 0;
+    }
     // huge: the first record has 70000 groups in x (over the desktop's 65535); huge-product: 512*256*256 =
     // 2^25 groups (each dimension legal, product over the guard's 2^24). The guard must zero the record on
     // the GPU, so only the second record ({1, 1, 1}) runs: counter 1.

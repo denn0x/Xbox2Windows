@@ -3109,6 +3109,10 @@ std::vector<IndirectCall>& indirect_trace()
     return calls;
 }
 void indirect_execute(Wrapper* self, void* signature, UINT max_count, Wrapper* arguments, u64 offset, Wrapper* count_resource, u64 count_offset);
+// LOCAL (scene): X2W_MESH_RECORD_TRACE (d3d12_record_trace.inl), traced frame only.
+void record_trace_indirect(Wrapper* self, UINT type, UINT stride, UINT max_count, Wrapper* arguments, u64 offset);
+void record_trace_dispatch(Wrapper* self, u64 key, UINT x, UINT y, UINT z, bool executed, int outcome);
+void record_trace_report(ID3D12CommandQueue* queue);
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT max_count, Wrapper* arguments, u64 offset,
                                      Wrapper* count_resource, u64 count_offset)
 {
@@ -3139,9 +3143,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT max_co
     AcquireSRWLockExclusive(&indirect_lock);
     indirect_trace().push_back(call);
     ReleaseSRWLockExclusive(&indirect_lock);
+    record_trace_indirect(self, call.type, info.stride, max_count, arguments, offset);  // LOCAL (scene)
 }
 void summarise_indirect_calls()
 {
+    record_trace_report(nullptr);  // LOCAL (scene): no-op when the busy-frame end already reported
     AcquireSRWLockExclusive(&indirect_lock);
     std::vector<IndirectCall> calls;
     calls.swap(indirect_trace());
@@ -3525,6 +3531,7 @@ bool execute_dispatch(Wrapper* self, UINT x, UINT y, UINT z, u64 key)
     dispatch_outcome = co_not_run;
     const bool executed = execute_dispatch_inner(self, x, y, z, key);
     const int outcome = dispatch_outcome >= 0 && dispatch_outcome < co_count ? dispatch_outcome : co_not_run;
+    if (trace_frame_active) record_trace_dispatch(self, key, x, y, z, executed, outcome);  // LOCAL (scene)
     AcquireSRWLockExclusive(&compute_lock);
     DispatchCount& count = dispatch_counts()[key];
     ++count.calls;
@@ -5182,6 +5189,7 @@ void draw_overlay(LONG frame, double seconds)
 #include "startup_stubs/d3d12_gpu_time.inl"
 #include "startup_stubs/d3d12_indirect.inl"
 #include "startup_stubs/d3d12_mesh.inl"  // LOCAL meshrt
+#include "startup_stubs/d3d12_record_trace.inl"  // LOCAL (scene): X2W_MESH_RECORD_TRACE
 #include "startup_stubs/d3d12_rawaddr.inl"
 #include "startup_stubs/d3d12_present.inl"
 #include "startup_stubs/d3d12_copy_buffer.inl"
@@ -5302,6 +5310,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             log("x2w-frame ---- end busy frame %ld", frame);
             // The target read-back stalls Present for about a second: only with X2W_D3D12_TRACE_TARGETS=1.
             static const bool targets = x2w_local::env_on("X2W_D3D12_TRACE_TARGETS");
+            record_trace_report(static_cast<ID3D12CommandQueue*>(self->own().real));  // LOCAL (scene): X2W_MESH_RECORD_TRACE
             if (targets) summarise_traced_targets(static_cast<ID3D12CommandQueue*>(self->own().real));
             summarise_indirect_calls();
             busy_end = 0;
