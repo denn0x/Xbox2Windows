@@ -1355,32 +1355,65 @@ extern "C" BOOL WINAPI x2w_xmem_page_event(const void* address, ULONG* event_kin
     return memory.views.count(at) != 0;
 }
 
-// LOCAL export (run 108): copies bytes to destination under memory.mutex when every byte of [destination,
-// destination + capacity) is committed read-write there, and returns TRUE; FALSE (nothing written) otherwise.
-// For a consumer whose own check found a title page unmapped: inside one map call a remap (page P -> Q) unmaps and
-// maps the address again, and a VirtualQuery from another thread in between sees it uncommitted. Under the mutex no
-// xmem call is in progress, so the answer is the settled one and the copy cannot meet that gap.
+// LOCAL (run 108): true when every byte of [start, start + bytes) is committed read-write.
+bool range_writable(ULONG_PTR start, SIZE_T bytes) noexcept
+{
+    for (ULONG_PTR cursor = start; cursor < start + bytes;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+            return false;
+        const DWORD protect = info.Protect & 0xFF;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
+            protect != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        const ULONG_PTR end = reinterpret_cast<ULONG_PTR>(info.BaseAddress) + info.RegionSize;
+        if (end <= cursor) return false;
+        cursor = end;
+    }
+    return true;
+}
+
+// LOCAL export (run 108): copies bytes to destination when every byte of [destination, destination + capacity) is
+// committed read-write, and returns TRUE; FALSE (nothing written) otherwise. A destination that touches one of the
+// stand-in's page reservations is checked AND copied under memory.mutex: inside one map call a remap (page P -> Q)
+// unmaps and maps the address again, and a check or copy from another thread in between sees it uncommitted (a
+// dropped read) or faults (a torn read). Under the mutex no xmem call is in progress. Other destinations (ordinary
+// committed memory that xmem never maps) are checked and copied without the lock, as before.
 extern "C" BOOL WINAPI x2w_xmem_write_settled(void* destination, const void* data, SIZE_T bytes, SIZE_T capacity)
 {
     if (!destination || (bytes && !data) || bytes > capacity) return FALSE;
     const auto start = reinterpret_cast<ULONG_PTR>(destination);
     if (capacity > std::numeric_limits<ULONG_PTR>::max() - start) return FALSE;
-    const std::lock_guard guard(memory.mutex);
-    for (ULONG_PTR cursor = start; cursor < start + capacity;) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT ||
-            (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
-            return FALSE;
-        const DWORD protect = info.Protect & 0xFF;
-        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
-            protect != PAGE_EXECUTE_WRITECOPY)
-            return FALSE;
-        const ULONG_PTR end = reinterpret_cast<ULONG_PTR>(info.BaseAddress) + info.RegionSize;
-        if (end <= cursor) return FALSE;
-        cursor = end;
-    }
+    const MappingThread marker;  // a fault in the copy is never retried by retry_remapped_page (it takes the mutex)
+    std::unique_lock guard(memory.mutex);
+    // Inside a recorded reservation, or one starts inside the destination.
+    const auto next = memory.reservations.upper_bound(start);
+    const bool ours = owned_reservation(start) != memory.reservations.end() ||
+                      (next != memory.reservations.end() && next->first < start + capacity);
+    if (!ours) guard.unlock();
+    if (!range_writable(start, capacity)) return FALSE;
     std::memcpy(destination, data, bytes);
     return TRUE;
+}
+
+// LOCAL export (run 108): x2w_xmem_write_settled, retried every 5 ms for up to wait_ms while the destination is not
+// writable (a read that runs before its destination page is mapped, or while it is between an unmap and a map, is
+// served once the title has mapped it). *waited_ms (optional) is the time spent waiting. The mutex is not held
+// while waiting.
+extern "C" BOOL WINAPI x2w_xmem_write_settled_wait(void* destination, const void* data, SIZE_T bytes, SIZE_T capacity,
+                                                   ULONG wait_ms, ULONG* waited_ms)
+{
+    const ULONG64 began = GetTickCount64();
+    for (;;) {
+        const BOOL ok = x2w_xmem_write_settled(destination, data, bytes, capacity);
+        const ULONG64 spent = GetTickCount64() - began;
+        if (ok || spent >= wait_ms) {
+            if (waited_ms) *waited_ms = static_cast<ULONG>(spent);
+            return ok;
+        }
+        Sleep(5);
+    }
 }
 
 // LOCAL export: the section (a 256 MiB slab, see section_for) and byte offset behind a mapped title
