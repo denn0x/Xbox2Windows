@@ -1199,22 +1199,6 @@ class Stage:
         self.set_s(d, '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2])))
         return None
 
-    def op_s_brev_b32(self, ops, mods):
-        """D = S0 with its 32 bits reversed (RDNA 2 ISA SOP1; SCC unchanged). Folded for a constant source: titles
-        build inline sampler words with it (s_brev_b32 s10, 40 = 0x14000000)."""
-        d, r = reg_range(ops[0]), reg_range(ops[1])
-        value = self.is_const(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
-        if value is None and not r:
-            try:
-                value = int(ops[1], 0) & 0xffffffff
-            except ValueError:
-                value = None
-        if value is not None and ops[1] not in FLOATS and d and d[0] == 's' and d[1] == d[2]:
-            folded = int('{:032b}'.format(value)[::-1], 2)
-            self.set_s(d[1], '0x%08xu' % folded, ('const', folded))
-            return None
-        return self.scalar('s_brev_b32', ops)
-
     def op_s_bfm_b64(self, ops, mods):
         """D[63:0] = ((1 << S0[5:0]) - 1) << S1[5:0]; SCC unchanged. Folded when both counts are constant."""
         d = reg_range(ops[0])[1]
