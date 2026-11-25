@@ -7,7 +7,8 @@ private memory that no resource covers (first dword 99), or stays free (membuf-l
 with its own memory copy, and a translated draw reads dword 0 of `srv 0 buf table 0 128` as its colour.
 X2W_DRAW_NULL_IDENTITY=1 is set in every mode, as in run 109: a null buffer then reads 1.0f (0x3f800000).
 
-- membuf (switch on): the memory SRV gets a stand-in, so slot 0 holds a token, the copy carries it, and the draw reads 99.
+- membuf (switch on): slot 0 gets the console V# of that memory (no stand-in wrapper: run 110), the copy carries it,
+  and the draw reads 99.
 - membuf-off (control, switch off): slot 70 refuses buffer_unavailable, slot 0 keeps its link 1, the entry is
   "00000001 0 0 0", and the draw reads the identity fill.
 - membuf-link (switch on, no slot-70 call): the entry is a free link and binds null (identity fill), and the log has the
@@ -51,13 +52,17 @@ def check(directory, consumer, backend):
     _, image, log = results["membuf"]
     if columns(image) != {VALUE}:
         raise AssertionError(f"membuf: pixels {image[:32].hex()} (expected 99 = {VALUE.hex()})\n{log[-4000:]}")
-    for needle in ("X2W_BUFFER_HEAP_INDEX=1", "x2w-memsrv stand-in buffer at", "membuf entry words: 56573258"):
-        if needle not in log:
-            raise AssertionError(f"membuf: log lacks {needle!r}\n{log[-4000:]}")
-    for mode in ("membuf-structured", "membuf-typed"):
+    # The destination holds the console V# (base = the private memory, so word 0 is neither a link, a token nor the
+    # marker); no stand-in wrapper is made (run 110).
+    for mode, layout in (("membuf", "stride 0, records 256, word 3 0x"), ("membuf-structured", "stride 16, records 4, word 3 0x"),
+                         ("membuf-typed", "stride 4, records 64, word 3 0x")):
         _, image, log = results[mode]
-        if columns(image) != {VALUE} or "membuf entry words: 56573258" not in log:
-            raise AssertionError(f"{mode}: pixels {image[:32].hex()} (expected 99)\n{log[-4000:]}")
+        words = re.search(r"^membuf entry words: (\w+) (\w+) (\w+) (\w+)$", log, re.M)
+        if columns(image) != {VALUE} or not words or words.group(1) in ("00000001", "56573258", "52463258") or words.group(4) == "00000000":
+            raise AssertionError(f"{mode}: pixels {image[:32].hex()} (expected 99), entry {words.group(0) if words else None}\n{log[-4000:]}")
+        written = re.search(r"^x2w-memsrv buffer descriptor written at .*$", log, re.M)
+        if "X2W_BUFFER_HEAP_INDEX=1" not in log or not written or layout not in written.group(0) or "stand-in buffer at" in log:
+            raise AssertionError(f"{mode}: descriptor line {written.group(0) if written else None} (expected {layout!r}), or a stand-in\n{log[-4000:]}")
     _, image, log = results["membuf-refused"]
     line = re.search(r"^x2w-frame srv-heapbuf .*$", log, re.M)
     if columns(image) != {IDENTITY} or "membuf entry words: 52463258" not in log or not line \

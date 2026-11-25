@@ -130,8 +130,9 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
     Wrapper* match = nullptr;
     AcquireSRWLockShared(&note_lock);
     for (const auto& [wrapper, info] : resource_infos()) {
-        // Stand-in buffers (standin_memory_buffer: no desktop resource) are found through their own map, by address:
-        // here they would make the scan grow with every stand-in and make real buffers they overlap ambiguous.
+        // Stand-in buffers (standin_memory_buffer, X2W_MEMORY_SRV_BUFFER: no desktop resource) are found through their
+        // own map, by address; here they would make real buffers they overlap ambiguous. (The walk itself still visits
+        // them: run 110, 65536 stand-ins, cost every call. X2W_BUFFER_HEAP_INDEX no longer makes stand-ins.)
         if (!wrapper->own().real && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) continue;
         if (info.placement != Placement::none ||
             info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
@@ -556,8 +557,8 @@ void __stdcall device_memory_uav(Wrapper* self, const D3D12_RESOURCE_DESC* resou
 // not), past the 2048-line refusal cap (these lines have no cap of their own). Lines, all cumulative:
 // "x2w-texcensus slot70 calls N (...)" and "x2w-texcensus slot70 refusals N (...), top classes:" (up to 24 classes)
 // with every 300-frame draw census line, and also at powers of two (calls from 1024, refusals from 256).
-enum MemorySrvOutcome { mso_linear, mso_announced, mso_tiled, mso_buffer, mso_standin, mso_refused, mso_detiled, mso_count };
-const char* const memory_srv_outcome_names[mso_count] = {"linear", "announced-linear", "tiled/bc64", "buffer", "stand-in buffer", "refused", "detiled"};
+enum MemorySrvOutcome { mso_linear, mso_announced, mso_tiled, mso_buffer, mso_standin, mso_refused, mso_detiled, mso_descriptor, mso_count };
+const char* const memory_srv_outcome_names[mso_count] = {"linear", "announced-linear", "tiled/bc64", "buffer", "stand-in buffer", "refused", "detiled", "buffer descriptor"};
 LONG64 memory_srv_outcomes[mso_count];
 std::mutex refusal_census_mutex;
 std::unordered_map<u64, LONG64> refusal_census;
@@ -586,8 +587,8 @@ void log_memory_srv_outcomes(const char* when)
     LONG64 total = 0;
     for (LONG64 n : memory_srv_outcomes) total += n;
     log("x2w-texcensus slot70 calls %lld (%s, cumulative): linear %lld, announced-linear %lld, tiled/bc64 %lld, buffer %lld, stand-in buffer %lld, "
-        "detiled %lld, refused %lld", total, when, memory_srv_outcomes[0], memory_srv_outcomes[1], memory_srv_outcomes[2], memory_srv_outcomes[3],
-        memory_srv_outcomes[4], memory_srv_outcomes[6], memory_srv_outcomes[5]);
+        "detiled %lld, refused %lld, buffer descriptor %lld", total, when, memory_srv_outcomes[0], memory_srv_outcomes[1], memory_srv_outcomes[2], memory_srv_outcomes[3],
+        memory_srv_outcomes[4], memory_srv_outcomes[6], memory_srv_outcomes[5], memory_srv_outcomes[7]);
 }
 void log_refusal_classes(const char* when)  // refusal_census_mutex held
 {
@@ -711,6 +712,41 @@ void mark_refused_destination(u64 destination, const char* reason)
         ReleaseSRWLockExclusive(&note_lock);
     }
 }
+// LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1. A slot-70 buffer SRV that no buffer resource covers: the destination gets
+// the V# a console view of that memory holds (gfx10_buffer_words: stride, records, word 3 from the view format; base =
+// address + FirstElement * element). Translated draws bind it through their hardware-descriptor branch (title memory at
+// the address, read at bind time like any title-written V#). Run 110 REFUTED the first version (a stand-in wrapper per
+// call): the title passes a new address almost every call, stand-ins reached 65536 and every slot-70 buffer call walked
+// them all (existing_memory_buffer), 291 us per view call instead of 13. This one keeps no state and touches no title
+// memory but the destination: one descriptor_ranges walk (title_backed) and one VirtualQuery (writable), as note_view
+// does for every view. The slot's shadow id is cleared (no view of ours is there). Heap (bindless) draws read view ids,
+// not V#s, so they still see no view there. False (nothing written) when the switch is off or the view is not a buffer.
+bool write_buffer_descriptor(u64 destination, const MemoryShaderResourceView* input)
+{
+    if (!buffer_heap_index_on() || !destination || !title_backed(destination, 32) || !x2w_local::writable(reinterpret_cast<void*>(destination), 32))
+        return false;
+    x2w_startup::BufferViewLayout l;
+    if (!x2w_startup::buffer_view_layout_from_desc(false, reinterpret_cast<const unsigned char*>(&input->view), 40, l) ||
+        l.kind == x2w_startup::BufferViewKind::unknown || !l.num_records)
+        return false;
+    std::uint32_t words[8];
+    x2w_startup::gfx10_buffer_words(l, words);
+    const u64 base = input->address + l.offset;
+    if (base >> 48) return false;
+    words[0] = static_cast<std::uint32_t>(base);
+    words[1] |= static_cast<std::uint32_t>(base >> 32) & 0xffff;
+    std::memcpy(reinterpret_cast<void*>(destination), words, sizeof(words));
+    if (const u64 desktop = desktop_cpu_handle(destination)) {
+        AcquireSRWLockExclusive(&note_lock);
+        if (std::uint32_t* slot = shadow_slot(desktop)) *slot = 0;
+        ReleaseSRWLockExclusive(&note_lock);
+    }
+    static LONG shown;
+    if (first_calls(shown, 8))
+        log("x2w-memsrv buffer descriptor written at 0x%llx (X2W_BUFFER_HEAP_INDEX): base 0x%llx, stride %u, records %u, word 3 0x%08x", destination,
+            base, l.index_stride, l.num_records, words[3]);
+    return true;
+}
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
                                  const MemoryShaderResourceView* input, u64 destination)
 {
@@ -780,8 +816,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
-        // LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1 takes this stand-in for SRVs too (slot 71 stays X2W_MEMORY_SRV_BUFFER's).
-        if ((!buffer || !info) && (memory_srv_buffer_on() || buffer_heap_index_on())) {
+        if ((!buffer || !info) && memory_srv_buffer_on()) {
             // LOCAL (video): no buffer resource covers the address; a stand-in whose title memory starts there.
             if (Wrapper* standin = standin_memory_buffer(input->address, *resource, span_bytes)) {
                 note_linear_form(lf_buffer_srv, destination);
@@ -793,6 +828,11 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         if (!buffer || !info ||
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
+            // LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1: the console V# instead (write_buffer_descriptor).
+            if ((!buffer || !info) && write_buffer_descriptor(destination, input)) {
+                census_memory_srv_outcome(mso_descriptor);
+                return;
+            }
             if (first_calls(refused, noop_census_enabled() ? 2048 : 8))
                 log_refused_memory_srv("unavailable buffer at the supplied address", "buffer_unavailable",
                                        resource, input, destination);

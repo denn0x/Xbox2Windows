@@ -527,8 +527,9 @@ void resolve_heap_index(u64 key, UINT srv, u64 entry, std::uint32_t* words)
 // hold 0x34, the link of heap 0 slot 0x33; c8d5a9b7 srv 11 holds 0x1ce9, the link of slot 0x1ce8. Both slots are
 // destinations of logged slot-70 buffer_unavailable refusals (509891 in run 109). ASSUMED for the rest, including
 // the mesh keys' per-draw srv 0 (source 0(1,128)).
-// With the switch: (1) a slot-70 buffer SRV no buffer resource covers gets the X2W_MEMORY_SRV_BUFFER stand-in, so its
-// destination holds a token and the title's copies carry it (d3d12_memory_srv.inl); any other refused slot-70 call
+// With the switch: (1) a slot-70 buffer SRV no buffer resource covers gets the console V# in its destination
+// (write_buffer_descriptor, d3d12_memory_srv.inl; run 110 refuted the stand-in wrapper used first), so the title's
+// copies carry it and the hardware-descriptor branch below binds the title memory; any other refused slot-70 call
 // writes the refused_view_magic marker and its reason there (mark_refused_destination). (2) A buffer entry still in
 // either link shape, or holding the marker, is bound as a null buffer, not as an address. On the console such a V# has
 // word 3 = 0 (no format, dst_sel 0) and reads zeros. (3) The traced frame (and the first 32 outside it) logs the entry
