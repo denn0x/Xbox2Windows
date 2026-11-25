@@ -1,7 +1,7 @@
 // LOCAL stall: a translated slot-67 compute dispatch (list slot 14) issued while its pipeline is not loaded yet
 // (d3d12_compute.inl, X2W_CX_ASYNC).
 //
-//   startup_cx_async <warp|hardware> <async|sync|known|seen>
+//   startup_cx_async <warp|hardware> <async|sync|known|seen|heap>
 //   (X2W_D3D12_RENDER=1 X2W_D3D12_PERMISSIVE=1 X2W_D3D12_LIST_NOOP=1 X2W_D3D12_DEBUG=1; async also X2W_CX_ASYNC=1;
 //    the test sets X2W_SHADER_CACHE, X2W_TRAP_LOG and X2W_CX_TEST_HOLD_EVENT itself)
 //
@@ -26,6 +26,10 @@
 //          1 with a translation"; the file becomes A, B and C.
 // All: the translation's "translated:" line; the hold line "released" in async / sync only; no debug-layer error
 // or corruption message, device not removed.
+//   heap (LOCAL meshrt, manifest `heap 1`, HeapMain, no hold): a 4-slot title view heap (128 bytes) with word A in
+//          slot 1 and word B just past its end; one dispatch stores heapmem's words 32 and 128: A and 0 (heapmem is a
+//          bounded view; an unbounded root SRV reads B), plus the "bounded heap views" line. WARP (view increment
+//          not 32): the dispatch is skipped by design, capability skip.
 // Exit 0 pass, 77 capability skip (no adapter, no existing-heap support), other values name the step.
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -40,6 +44,7 @@
 #include <string>
 
 #include "startup_cx_async_cs.h"
+#include "startup_cx_heap_cs.h"
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -83,8 +88,9 @@ int main(int argc, char** argv)
 {
     if (argc != 3) return 2;
     const std::string mode = argv[2];
-    if (mode != "async" && mode != "sync" && mode != "known" && mode != "seen") return 2;
+    if (mode != "async" && mode != "sync" && mode != "known" && mode != "seen" && mode != "heap") return 2;
     const bool async = mode == "async";
+    const bool heap = mode == "heap";  // LOCAL meshrt: `heap 1`, HeapMain, a 4-slot title view heap (no hold)
     const bool prewarm = mode == "known" || mode == "seen";  // X2W_CX_PREWARM_ALL (no hold)
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
@@ -138,7 +144,7 @@ int main(int argc, char** argv)
     const std::wstring event_name = L"Local\\x2w_cx_hold_" + tag;
     hold_event = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
     if (!hold_event) return 5;
-    if (!prewarm) SetEnvironmentVariableW(L"X2W_CX_TEST_HOLD_EVENT", event_name.c_str());
+    if (!prewarm && !heap) SetEnvironmentVariableW(L"X2W_CX_TEST_HOLD_EVENT", event_name.c_str());
 
     // The title's compute root signature (its bytes go into the key; the translated one comes from the manifest).
     D3D12_ROOT_PARAMETER title_params[1]{};
@@ -161,8 +167,9 @@ int main(int argc, char** argv)
         wchar_t name[24];
         swprintf(name, 24, L"%016llx", static_cast<unsigned long long>(k));
         const std::wstring base = cache + L"\\" + name;
-        const std::string manifest = "cs 1 1 1\nuav 0 buf root 0 0\n";
-        if (!write_file(base + L".cs.cso", startup_cx_async_cs, sizeof(startup_cx_async_cs)) ||
+        const std::string manifest = heap ? "cs 1 1 1\nuav 0 buf root 0 0\nheap 1\n" : "cs 1 1 1\nuav 0 buf root 0 0\n";
+        if (!(heap ? write_file(base + L".cs.cso", startup_cx_heap_cs, sizeof(startup_cx_heap_cs))
+                   : write_file(base + L".cs.cso", startup_cx_async_cs, sizeof(startup_cx_async_cs))) ||
             !write_file(base + L".cs.txt", manifest.data(), manifest.size()))
             return 5;
     }
@@ -243,6 +250,47 @@ int main(int argc, char** argv)
     };
 
     int failures = 0;
+    if (heap) {
+        // A shader-visible 4-slot title view heap at title + 1 MiB (128 bytes); word 0 of slot 1 = A, and word 0 of
+        // "slot 4", the first word past the heap, = B. heapmem is a bounded view of the heap, so the shader must
+        // read A and 0. (An unbounded root SRV, the earlier binding, reads B there.)
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            Word backing, bytes;
+        } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, arg(memory + 0x40000), 4 * 32};
+        void* view_heap = nullptr;
+        if (!ok(invoke(device, 14, arg(&heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&view_heap))) || !view_heap) return 12;
+        constexpr std::uint32_t A = 0xa1a1a1a1u, B = 0xb2b2b2b2u;
+        memory[0x40000 + 8] = A;   // slot 1 (byte 32)
+        memory[0x40000 + 32] = B;  // byte 128: past the heap
+        memory[1] = memory[2] = 0x11111111u;
+        if (!run_list(1)) return 14;
+        const std::string log = read_log(log_path);
+        const auto has = [&](const std::string& text) { return log.find(text) != std::string::npos; };
+        const bool skipped32 = has(std::string("x2w-cx ") + key_text + ": heap dispatch skipped: increment not 32");
+        std::printf("heap: in range %08x (want %08x), past the end %08x (want 00000000; unbounded would read %08x); increment skip %d\n",
+                    memory[1], A, memory[2], B, skipped32);
+        if (skipped32) {  // WARP: views are not 32 bytes apart, so `heap 1` dispatches are skipped by design
+            std::printf("heap dispatches need a 32-byte view increment: capability skip\n");
+            return memory[1] == 0x11111111u && memory[2] == 0x11111111u ? 77 : 16;
+        }
+        const bool bounded = has(std::string("x2w-cx ") + key_text + ": bounded heap views: heapmem 128 bytes (title heap 128), vinfo ");
+        std::printf("log: bounded heap views line %d\n", bounded);
+        if (memory[1] != A || memory[2] != 0 || !bounded) {
+            std::printf("FAIL: heapmem is not a bounded view of the 128-byte heap\n");
+            ++failures;
+        }
+        for (std::size_t p = log.find("x2w-d3d12-debug"); p != std::string::npos; p = log.find("x2w-d3d12-debug", p + 1)) {
+            const std::size_t end = log.find('\n', p);
+            const std::string line = log.substr(p, end == std::string::npos ? std::string::npos : end - p);
+            std::printf("%s\n", line.c_str());
+            if (line.find("sev=0 ") != std::string::npos || line.find("sev=1 ") != std::string::npos) ++failures;
+        }
+        std::printf("device removed reason: 0x%08lx\n", static_cast<unsigned long>(desktop->GetDeviceRemovedReason()));
+        if (desktop->GetDeviceRemovedReason() != S_OK) ++failures;
+        std::printf("%s\n", failures ? "FAIL" : "PASS");
+        return failures ? 16 : 0;
+    }
     if (mode == "sync") {
         if (const HANDLE t = CreateThread(nullptr, 0, release_later, nullptr, 0, nullptr)) CloseHandle(t);
         else return 13;

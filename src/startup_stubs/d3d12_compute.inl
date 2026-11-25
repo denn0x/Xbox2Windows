@@ -126,6 +126,7 @@ struct ComputeTranslation {
     ID3D12PipelineState* pso = nullptr;
     UINT threads[3] = {};
     bool heap = false;  // indexes the title's resource heap (SM 6.6 ResourceDescriptorHeap)
+    bool heap_views_logged = false;  // LOCAL meshrt: the "bounded heap views" line (once per key)
     LONG logged = 0;
     LONG entry_logged = 0;  // X2W_CX_ENTRY_LOG lines written
 };
@@ -211,13 +212,18 @@ void load_compute(u64 key, ComputeTranslation& tr)
         // [0] constants, [1] t0 space1 = the title heap's memory, [2] t1 space1 = per-view info, [3] the table
         D3D12_DESCRIPTOR_RANGE1 ranges1[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, n, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 0},
                                               {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, n, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, n}};
+        // LOCAL meshrt (meshhar 010400): [1] / [2] are one-descriptor tables of BOUNDED raw views (written per dispatch,
+        // NumElements = bytes / 4: a Load past the end reads 0), no longer root SRVs, which have no bounds.
+        const D3D12_DESCRIPTOR_RANGE1 bounded1[2] = {
+            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 0},
+            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 0}};
         D3D12_ROOT_PARAMETER1 p1[4]{};
         p1[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p1[0].Constants.Num32BitValues = parameters[0].Constants.Num32BitValues;
-        p1[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        p1[1].Descriptor = {0, 1, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE};
-        p1[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        p1[2].Descriptor = {1, 1, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE};
+        p1[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p1[1].DescriptorTable = {1, &bounded1[0]};
+        p1[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p1[2].DescriptorTable = {1, &bounded1[1]};
         p1[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         p1[3].DescriptorTable = {2, ranges1};
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC vd{};
@@ -1059,12 +1065,15 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
-    D3D12_GPU_VIRTUAL_ADDRESS heap_va = 0;
+    TitleHeapView heap_view;  // LOCAL meshrt: the bounded heapmem view (d3d12_draw.inl bounded_title_heap)
     if (tr.heap) {
         u64 heap_address = 0, heap_bytes = 0;
         static LONG logged_heap;
-        if (draw_heap_increment != 32 || !title_view_heap(pass, &heap_address, &heap_bytes) || !(heap_va = desktop_va(heap_address))) {
-            if (first_calls(logged_heap, 4)) log("x2w-cx %016llx: title view heap not reachable (increment %u)", key, draw_heap_increment);
+        const char* why = draw_heap_increment != 32 ? "increment not 32"
+                        : !title_view_heap(pass, &heap_address, &heap_bytes) ? "title view heap not reachable"
+                                                                             : bounded_title_heap(heap_address, heap_bytes, heap_view);
+        if (why) {
+            if (first_calls(logged_heap, 4)) log("x2w-cx %016llx: heap dispatch skipped: %s (increment %u)", key, why, draw_heap_increment);
             dispatch_outcome = co_c67_heap;
             ReleaseSRWLockExclusive(&draw_lock);
             return false;
@@ -1078,10 +1087,11 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
         }
     }
     const UINT n = static_cast<UINT>(tr.res.size());
-    UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(2 * n))) % draw_heap_size;
-    if (first + 2 * n > draw_heap_size) {
+    const UINT hv = tr.heap ? 2u : 0u;  // LOCAL meshrt: the bounded heapmem / vinfo views after the res table
+    UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(2 * n + hv))) % draw_heap_size;
+    if (first + 2 * n + hv > draw_heap_size) {
         first = 0;
-        InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(2 * n));
+        InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(2 * n + hv));
     }
     std::uint32_t strides[64] = {}, word3[64] = {}, bases[64] = {};
     bool bound_res[64] = {};
@@ -1278,8 +1288,21 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
     list->SetComputeRootSignature(tr.root);
     list->SetComputeRoot32BitConstants(0, tr.uds.empty() ? 1u : static_cast<UINT>(tr.uds.size()), values, 0);
     if (tr.heap) {
-        list->SetComputeRootShaderResourceView(1, heap_va);
-        list->SetComputeRootShaderResourceView(2, vinfo_buffer->GetGPUVirtualAddress());
+        const UINT h0 = first + 2 * n;
+        const SIZE_T cpu0 = draw_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+        const u64 gpu0 = draw_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+        const u64 vinfo_bytes = vinfo_buffer->GetDesc().Width;
+        bounded_raw_srv(heap_view.window, heap_view.offset, heap_view.bytes, D3D12_CPU_DESCRIPTOR_HANDLE{cpu0 + SIZE_T{h0} * draw_heap_increment});
+        bounded_raw_srv(vinfo_buffer, 0, vinfo_bytes, D3D12_CPU_DESCRIPTOR_HANDLE{cpu0 + SIZE_T{h0 + 1} * draw_heap_increment});
+        list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{gpu0 + u64{h0} * draw_heap_increment});
+        list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu0 + u64{h0 + 1} * draw_heap_increment});
+        if (!tr.heap_views_logged) {
+            tr.heap_views_logged = true;  // once per key (draw_lock held)
+            static LONG shown;
+            if (first_calls(shown, 256))
+                log("x2w-cx %016llx: bounded heap views: heapmem %llu bytes (title heap %llu), vinfo %llu", key, heap_view.bytes, heap_view.heap_bytes,
+                    vinfo_bytes);
+        }
         if (n) list->SetComputeRootDescriptorTable(3, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     } else if (n) {
         list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});

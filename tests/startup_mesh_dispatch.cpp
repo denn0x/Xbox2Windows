@@ -19,6 +19,9 @@
 // rtvuint also checks that req_<variant>.rtv was published with "rtv1 <key> 42". rtvvariant (R32_UINT target): the
 // cache also holds the RTV variant (key fnv("rtv1 <key> 42"), manifest with that line, pixel stage PixelUint which
 // packs the colour into one uint): the PSO is built from the variant, drawn 0x00ff40c0, no refusal line.
+// wordsoob (as words32, hardware): the 4-slot view heap is placed on test memory and slot 2's token + id are copied
+// to slot 4, one past its end; the shader reads slot 4. heapmem is a bounded view (128 bytes), so the read gives 0:
+// nothing drawn. (A root SRV, the earlier binding, has no bounds and would find the copied token and draw.)
 // rtvnops: no pixel stage (as depth) with an R32_UINT render target: issued from the base, no variant request, no refusal (hardware; WARP: capability skip, as depth).
 // uavtex / uavtexnoflag: `uav 0 tex2d table 1 <2 increments>` and pixel stage PixelStore (stores the colour to the texture
 // UAV, returns it): uavtex (RGBA8 texture with unordered access + UAV) binds the UAV and draws; uavtexnoflag (control: no
@@ -182,7 +185,7 @@ int main(int argc, char** argv)
     if (argc != 3) return 2;
     const std::string mode = argv[2];
     if (mode != "gpu" && mode != "derived" && mode != "zero" && mode != "huge" && mode != "off" && mode != "missing" && mode != "depth" &&
-        mode != "words16" && mode != "words32" && mode != "wordsraw" && mode != "fmaprecise" && mode != "fmabad" && mode != "notargets" &&
+        mode != "words16" && mode != "words32" && mode != "wordsraw" && mode != "wordsoob" && mode != "fmaprecise" && mode != "fmabad" && mode != "notargets" &&
         mode != "rtvuint" && mode != "smpheap" && mode != "smpheapswap" && mode != "statez" && mode != "statezge" && mode != "statezoff" &&
         mode != "statecull" && mode != "stateculloff" && mode != "statedepth" && mode != "statecullflip" && mode != "statecullnone" &&
         mode != "statezrepeat" && mode != "statezuncleared" && mode != "statezlateclear" && mode != "async" && mode != "asyncone" && mode != "rtvvariant" &&
@@ -518,7 +521,8 @@ int main(int argc, char** argv)
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word backing, bytes;
-    } view_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    } view_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+                     mode == "wordsoob" ? arg(memory + 0x60000) : Word{0}, mode == "wordsoob" ? Word{4 * 32} : Word{0}};
     void* view_heap = nullptr;
     if (!ok(invoke(device, 14, arg(&view_heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&view_heap)))) return 12;
     const Word view_cpu = invoke(view_heap, 9), view_gpu = invoke(view_heap, 10);
@@ -530,6 +534,8 @@ int main(int argc, char** argv)
     // words modes: a title buffer view in heap slot 2 (the stand-in writes its view token there), over a placed
     // buffer on the vertices: 16_16_FLOAT (words16), 32_32_FLOAT (words32) or raw (wordsraw: no typed format).
     constexpr std::uint32_t heap_slot = 2;
+    // wordsoob: the shader indexes slot 4, one past the 4-slot heap, where the test copied slot 2's token and id.
+    const std::uint32_t shader_slot = mode == "wordsoob" ? 4u : heap_slot;
     void* vertex_buffer = nullptr;
     if (words) {
         D3D12_RESOURCE_DESC vb{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
@@ -539,12 +545,13 @@ int main(int argc, char** argv)
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        view.Format = mode == "words16" ? DXGI_FORMAT_R16G16_FLOAT : mode == "words32" ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R32_TYPELESS;
+        view.Format = mode == "words16" ? DXGI_FORMAT_R16G16_FLOAT : mode == "words32" || mode == "wordsoob" ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R32_TYPELESS;
         view.Buffer.NumElements = mode == "wordsraw" ? 12 : 6;
         view.Buffer.Flags = mode == "wordsraw" ? D3D12_BUFFER_SRV_FLAG_RAW : D3D12_BUFFER_SRV_FLAG_NONE;
         invoke(device, 18, arg(vertex_buffer), arg(&view), view_cpu + 32 * heap_slot);
         std::uint32_t token[2] = {};
         std::memcpy(token, reinterpret_cast<const void*>(view_cpu + 32 * heap_slot), 8);
+        if (mode == "wordsoob") std::memcpy(reinterpret_cast<void*>(view_cpu + 32 * 4), reinterpret_cast<const void*>(view_cpu + 32 * heap_slot), 32);
         std::printf("heap slot %u: %08x %08x (view token X2WV = 56573258 + view id)\n", heap_slot, token[0], token[1]);
     }
     // smp modes: a 2x1 RGBA8 texture placed on title memory (the stand-in backs it with a desktop texture and uploads
@@ -645,7 +652,7 @@ int main(int argc, char** argv)
     invoke(list, 32, smp ? 2 : 1, arg(heaps));                             // SetDescriptorHeaps (smp: and the sampler heap)
     invoke(list, 36, 1, view_gpu);                                         // SetGraphicsRootDescriptorTable(1, heap start)
     invoke(list, 40, 2, 1, arg(&colour), 0);                               // SetGraphicsRoot32BitConstants(2, 1, &colour, 0)
-    if (words) invoke(list, 40, 0, 1, arg(&heap_slot), 0);                 // SetGraphicsRoot32BitConstants(0, 1, &slot, 0): entry value 2
+    if (words) invoke(list, 40, 0, 1, arg(&shader_slot), 0);                 // SetGraphicsRoot32BitConstants(0, 1, &slot, 0): entry value 2
     invoke(list, 25, arg(pipeline));                                       // SetPipelineState (the mesh pipeline)
     invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);               // ExecuteIndirect(mesh signature, 1, args, 0)
     if (mode == "async") {  // the worker's PSO line, then a second call
@@ -836,6 +843,14 @@ int main(int argc, char** argv)
         }
     }
     const bool skipped_32 = has(std::string("x2w-draw-rt ") + key_text + ": heap draw skipped: descriptor increment is not 32");
+    if (words && !words_skip) {  // the heap views are bounded: heapmem = the 4-slot title heap (128 bytes)
+        const bool bounded = has(std::string("x2w-draw-rt ") + key_text + ": bounded heap views: heapmem 128 bytes (title heap 128), vinfo ");
+        std::printf("log: bounded heap views line (heapmem 128 bytes) %d\n", bounded);
+        if (!bounded) {
+            std::printf("FAIL: no bounded heap views line for the key\n");
+            ++failures;
+        }
+    }
     if (words_skip) std::printf("log: heap draw skipped (increment not 32) %d\n", skipped_32);
     if (mode == "off"       ? any_mesh
         : mode == "missing" ? (!missing || issued || !bound_ok)

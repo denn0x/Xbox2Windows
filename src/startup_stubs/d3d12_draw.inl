@@ -24,6 +24,7 @@ struct Translation {
     UINT uav_parameter = 0;
     bool heap = false;                       // `heap 1`: heapmem, vinfo and the view-id region (root parameters heap_parameter..+2)
     UINT heap_parameter = 0;
+    bool heap_views_logged = false;          // LOCAL meshrt: the "bounded heap views" line (once per key)
     bool heapwords = false;                  // LOCAL meshrt `heapwords 1` (needs `heap 1`): vdesc, root SRV t2 space1 (d3d12_vdesc.inl)
     UINT vdesc_parameter = 0;
     x2w_startup::TranslatedSamplers samplers;
@@ -563,8 +564,8 @@ bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::
 
 // LOCAL draw-rt: the translated root signature. Without uav lines (or `heap 1`) it is exactly the shared
 // create_translated_root one. Otherwise the extra parameters follow the srv and sampler tables:
-// a table of the uavs (u0.., space0); for `heap 1` the title heap memory (root SRV t0 space1), the per-view
-// info (root SRV t1 space1) and one table over the view-id region with an unbounded SRV range per kind at
+// a table of the uavs (u0.., space0); for `heap 1` the title heap memory (t0 space1), the per-view info (t1
+// space1), each a one-descriptor table of a bounded raw view (LOCAL meshrt), and one table over the view-id region with an unbounded SRV range per kind at
 // offset 0: t0 in space 2 (Texture2D), 3 (Texture2DArray), 4 (Texture3D), 5 (Texture1D), 6 (raw buffer).
 HRESULT create_draw_root(Translation& tr)
 {
@@ -572,7 +573,8 @@ HRESULT create_draw_root(Translation& tr)
     if (!m && !tr.heap)
         return x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()), n, tr.samplers, &tr.root);
     // At most 9: constants, srv table, sampler table (smpheap), uav table, heapmem, vinfo, region table, vdesc
-    // (heapwords) = 2 + 1 + 1 + 3 + 1; root cost <= 32 + 4 tables + 3 root SRVs x 2 = 42 of 64 DWORDs.
+    // (heapwords) = 2 + 1 + 1 + 3 + 1; root cost <= 32 + 7 tables = 39 of 64 DWORDs (heapmem / vinfo / vdesc are
+    // one-descriptor tables of bounded views, LOCAL meshrt).
     D3D12_ROOT_PARAMETER parameters[9]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = static_cast<UINT>(tr.uds.size());
@@ -595,21 +597,25 @@ HRESULT create_draw_root(Translation& tr)
         ++count;
     }
     D3D12_DESCRIPTOR_RANGE heap_ranges[5]{};
+    // LOCAL meshrt (meshhar 010400): heapmem t0 / vinfo t1 / vdesc t2 in space1 are one-descriptor tables of BOUNDED
+    // raw views (draw_translated writes them per draw), no longer root SRVs: D3D range-checks a view, not a root SRV.
+    const D3D12_DESCRIPTOR_RANGE bounded_ranges[3] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 1, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 1, 0},
+                                                      {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 1, 0}};
     if (tr.heap) {
         tr.heap_parameter = count;
-        parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        parameters[count].Descriptor = {0, 1};
-        parameters[count + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        parameters[count + 1].Descriptor = {1, 1};
+        parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[count].DescriptorTable = {1, &bounded_ranges[0]};
+        parameters[count + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[count + 1].DescriptorTable = {1, &bounded_ranges[1]};
         for (UINT k = 0; k < 5; ++k) heap_ranges[k] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 2 + k, 0};
         parameters[count + 2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         parameters[count + 2].DescriptorTable = {5, heap_ranges};
         count += 3;
     }
-    if (tr.heap && tr.heapwords) {  // LOCAL meshrt: vdesc, root SRV t2 space1 (d3d12_vdesc.inl)
+    if (tr.heap && tr.heapwords) {  // LOCAL meshrt: vdesc, t2 space1 (d3d12_vdesc.inl), a bounded view as above
         tr.vdesc_parameter = count;
-        parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        parameters[count++].Descriptor = {2, 1};
+        parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[count++].DescriptorTable = {1, &bounded_ranges[2]};
     }
     const auto statics = x2w_startup::decode_statics(tr.samplers);
     const D3D12_ROOT_SIGNATURE_DESC desc{count, parameters, static_cast<UINT>(statics.size()), statics.data(), D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -2097,27 +2103,93 @@ extern UINT views_filled;
 extern ID3D12Resource* vdesc_buffer;  // LOCAL meshrt: d3d12_vdesc.inl
 bool ensure_vdesc();
 
-// LOCAL draw-rt (`heap 1`): the desktop address of the title view heap a draw indexes: the shader-visible view
-// heap the list set (SetDescriptorHeaps), else compute's choice. The address is resolved once per frame.
-D3D12_GPU_VIRTUAL_ADDRESS draw_title_heap(const Pass& pass)
+// LOCAL draw-rt (`heap 1`): the title view heap a draw indexes: the shader-visible view heap the list set
+// (SetDescriptorHeaps), else compute's choice. LOCAL meshrt (meshhar 010400): heapmem is a BOUNDED raw view (a
+// table SRV, NumElements = bytes / 4: a Load past the end reads 0) over [base, base + count x increment), clamped to
+// the end of the desktop window that holds the base. Resolved once per frame and heap; draw_lock held. Returns the
+// reason the draw is skipped, or nullptr.
+struct TitleHeapView {
+    D3D12_GPU_VIRTUAL_ADDRESS va = 0;  // the base's desktop address (log only)
+    ID3D12Resource* window = nullptr;  // the view: window + offset, bytes
+    u64 offset = 0, bytes = 0, heap_bytes = 0;
+};
+LONG rt_heap_clamped;  // views shortened to the end of the base's window (counted once per frame and heap)
+const char* bounded_title_heap(u64 address, u64 bytes, TitleHeapView& out);
+const char* draw_title_heap(const Pass& pass, TitleHeapView& out)
 {
     u64 address = 0, bytes = 0;
     if (pass.source_view_heap) {
         AcquireSRWLockShared(&note_lock);
         for (const HeapInfo& h : heap_infos())
-            if (h.wrapper == pass.source_view_heap && h.title_cpu) address = h.title_cpu;
+            if (h.wrapper == pass.source_view_heap && h.title_cpu) {
+                address = h.title_cpu;
+                bytes = u64{h.count} * h.increment;
+            }
         ReleaseSRWLockShared(&note_lock);
     }
-    if (!address && !title_view_heap(pass, &address, &bytes)) return 0;
-    static u64 last_address;
-    static D3D12_GPU_VIRTUAL_ADDRESS last_va;
+    if (!address && !title_view_heap(pass, &address, &bytes)) return "title view heap not reachable";
+    return bounded_title_heap(address, bytes, out);
+}
+
+// The bounded view over the title heap [address, address + bytes), for draws and translated dispatches
+// (d3d12_compute.inl). Cached per frame and heap; draw_lock held.
+const char* bounded_title_heap(u64 address, u64 bytes, TitleHeapView& out)
+{
+    static u64 last_address, last_bytes;
+    static TitleHeapView last;
+    static const char* last_why;
     static LONG last_frame = -1;
-    if (address != last_address || last_frame != frame_number) {
+    if (address != last_address || bytes != last_bytes || last_frame != frame_number) {
         last_address = address;
-        last_va = desktop_va(address);
+        last_bytes = bytes;
         last_frame = frame_number;
+        last = {};
+        last.heap_bytes = bytes;
+        last.va = desktop_va(address);
+        last_why = nullptr;
+        ID3D12Resource* window = nullptr;
+        u64 offset = 0, view_bytes = bytes;
+        if (!last.va) {
+            last_why = "title view heap not reachable";
+        } else if (!bytes) {
+            last_why = "title view heap size unknown";
+        } else if (!desktop_range(address, bytes, &window, &offset)) {
+            // The heap runs past the window that holds its base: the view ends at that window's end.
+            window = nullptr;
+            if (desktop_range(address, 16, &window, &offset)) {
+                const u64 width = window->GetDesc().Width;
+                view_bytes = width > offset ? width - offset : 0;
+                InterlockedIncrement(&rt_heap_clamped);
+                static LONG shown;
+                if (first_calls(shown, 4))
+                    log("x2w-draw-rt title heap 0x%llx (%llu bytes) runs past its window: view clamped to %llu bytes", address, bytes, view_bytes);
+            } else {
+                window = nullptr;
+            }
+        }
+        if (!last_why && (!window || view_bytes < 4)) last_why = "title view heap not in a desktop window";
+        else if (!last_why && (offset & 15)) last_why = "title view heap base not 16-byte aligned (bounded raw view)";
+        if (!last_why) {
+            last.window = window;
+            last.offset = offset;
+            last.bytes = view_bytes & ~u64{3};
+        }
     }
-    return last_va;
+    out = last;
+    return last_why;
+}
+
+// LOCAL meshrt: a bounded raw SRV (ByteAddressBuffer, NumElements = bytes / 4) at dest. offset 16-byte aligned.
+void bounded_raw_srv(ID3D12Resource* buffer, u64 offset, u64 bytes, D3D12_CPU_DESCRIPTOR_HANDLE dest)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+    d.Format = DXGI_FORMAT_R32_TYPELESS;
+    d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    d.Buffer.FirstElement = offset / 4;
+    d.Buffer.NumElements = static_cast<UINT>(bytes / 4 < UINT_MAX ? bytes / 4 : UINT_MAX);
+    d.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    device_of(the_device)->CreateShaderResourceView(buffer, &d, dest);
 }
 
 // gfx10 SQ_BUF_RSRC_WORD3 for a buffer view the title created (udsrc bufword3 / uavword3 of a view token): the
@@ -2416,11 +2488,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
-    D3D12_GPU_VIRTUAL_ADDRESS heap_va = 0;
+    TitleHeapView heap_view;
     if (tr->heap) {
         // LOCAL draw-rt: the title heap in place, and the view-id region filled up to the newest view.
-        const char* reason = draw_heap_increment != 32 ? "descriptor increment is not 32"
-            : !(heap_va = draw_title_heap(pass)) ? "title view heap not reachable" : nullptr;
+        const char* reason = draw_heap_increment != 32 ? "descriptor increment is not 32" : draw_title_heap(pass, heap_view);
         if (!reason) {
             fill_views(self);
             upload_heap_textures(self);  // LOCAL textures: X2W_HEAP_TEXTURE_UPLOAD
@@ -2438,10 +2509,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     const UINT n = static_cast<UINT>(tr->srvs.size());
     const UINT m = static_cast<UINT>(tr->uavs.size());  // LOCAL draw-rt: the uav table follows the srvs in the ring
-    UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n + m))) % draw_heap_size;
-    if (first + n + m > draw_heap_size) {
+    // LOCAL meshrt: then the bounded heap views (heapmem, vinfo, vdesc with `heapwords 1`), one table each.
+    const UINT hv = tr->heap ? (tr->heapwords ? 3u : 2u) : 0u;
+    UINT first = static_cast<UINT>(InterlockedExchangeAdd(&draw_heap_cursor, static_cast<LONG>(n + m + hv))) % draw_heap_size;
+    if (first + n + m + hv > draw_heap_size) {
         first = 0;
-        InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n + m));
+        InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n + m + hv));
     }
     std::uint32_t uav_word3[8] = {}, uav_bases[8] = {};
     ID3D12Resource* uav_textures[8] = {};
@@ -2821,14 +2894,30 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(n), samplers->GetGPUDescriptorHandleForHeapStart());
     if (m) list->SetGraphicsRootDescriptorTable(tr->uav_parameter, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first + n} * draw_heap_increment});
     if (tr->heap) {
-        list->SetGraphicsRootShaderResourceView(tr->heap_parameter, heap_va);
-        list->SetGraphicsRootShaderResourceView(tr->heap_parameter + 1, vinfo_buffer->GetGPUVirtualAddress());
-        if (tr->heapwords) list->SetGraphicsRootShaderResourceView(tr->vdesc_parameter, vdesc_buffer->GetGPUVirtualAddress());  // LOCAL meshrt
+        // LOCAL meshrt: bounded raw views (reads past the end give 0), written per draw in this draw's ring slots.
+        const UINT h0 = first + n + m;
+        const auto cpu = [&](UINT k) { return D3D12_CPU_DESCRIPTOR_HANDLE{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{h0 + k} * draw_heap_increment}; };
+        const auto gpu = [&](UINT k) { return D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{h0 + k} * draw_heap_increment}; };
+        const u64 vinfo_bytes = vinfo_buffer->GetDesc().Width;
+        const u64 vdesc_bytes = tr->heapwords ? vdesc_buffer->GetDesc().Width : 0;
+        bounded_raw_srv(heap_view.window, heap_view.offset, heap_view.bytes, cpu(0));
+        bounded_raw_srv(vinfo_buffer, 0, vinfo_bytes, cpu(1));
+        if (tr->heapwords) bounded_raw_srv(vdesc_buffer, 0, vdesc_bytes, cpu(2));
+        list->SetGraphicsRootDescriptorTable(tr->heap_parameter, gpu(0));
+        list->SetGraphicsRootDescriptorTable(tr->heap_parameter + 1, gpu(1));
+        if (tr->heapwords) list->SetGraphicsRootDescriptorTable(tr->vdesc_parameter, gpu(2));
+        if (!tr->heap_views_logged) {
+            tr->heap_views_logged = true;  // once per key (draw_lock held)
+            static LONG shown;
+            if (first_calls(shown, 256))
+                log("x2w-draw-rt %016llx: bounded heap views: heapmem %llu bytes (title heap %llu), vinfo %llu, vdesc %llu", tr->key,
+                    heap_view.bytes, heap_view.heap_bytes, vinfo_bytes, vdesc_bytes);
+        }
         // The region starts at the 8 empty views before id 0 (d3d12_compute.inl fill_views).
         list->SetGraphicsRootDescriptorTable(tr->heap_parameter + 2,
             D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{draw_heap_size} * draw_heap_increment});
         if (InterlockedIncrement(&rt_heap_draws) == 1)
-            log("x2w-draw-rt first heap draw: pipeline %016llx, title heap at desktop 0x%llx, views filled %u", tr->key, heap_va, views_filled);
+            log("x2w-draw-rt first heap draw: pipeline %016llx, title heap at desktop 0x%llx, views filled %u", tr->key, heap_view.va, views_filled);
     }
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;

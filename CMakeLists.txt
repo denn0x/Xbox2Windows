@@ -723,7 +723,7 @@ target_compile_features(startup_mesh_dispatch PRIVATE cxx_std_17)
 target_link_libraries(startup_mesh_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
     foreach(mode IN ITEMS gpu derived zero huge off missing depth words16 words32 wordsraw fmaprecise fmabad notargets rtvuint smpheap smpheapswap
-            statez statezge statezoff statecull stateculloff statedepth statecullflip statecullnone statezrepeat statezuncleared statezlateclear async asyncone rtvvariant uavtex uavtexnoflag rtvnops)
+            statez statezge statezoff statecull stateculloff statedepth statecullflip statecullnone statezrepeat statezuncleared statezlateclear async asyncone rtvvariant uavtex uavtexnoflag rtvnops wordsoob)
         add_test(NAME startup_mesh_dispatch_${mode}_${backend} COMMAND startup_mesh_dispatch ${backend} ${mode})
         set(mesh_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
         if(NOT mode STREQUAL "off")
@@ -754,12 +754,17 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CountMain -Vn startup_cx_async_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_async.hlsl"
     DEPENDS tests/startup_cx_async.hlsl VERBATIM)
-add_executable(startup_cx_async tests/startup_cx_async.cpp "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_cs.h"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E HeapMain -Vn startup_cx_heap_cs -Fh "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_cs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cx_async.hlsl"
+    DEPENDS tests/startup_cx_async.hlsl VERBATIM)
+add_executable(startup_cx_async tests/startup_cx_async.cpp "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_async_cs.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/startup_cx_heap_cs.h")
 target_include_directories(startup_cx_async PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(startup_cx_async PRIVATE cxx_std_17)
 target_link_libraries(startup_cx_async PRIVATE d3d12_xs_shim d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
-    foreach(mode IN ITEMS async sync known seen)
+    foreach(mode IN ITEMS async sync known seen heap)
         add_test(NAME startup_cx_async_${mode}_${backend} COMMAND startup_cx_async ${backend} ${mode})
         set(cx_async_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
         if(mode STREQUAL "async")
