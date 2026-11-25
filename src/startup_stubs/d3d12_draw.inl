@@ -1970,7 +1970,9 @@ struct FrameCopy {
     u64 offset = 0;
     ID3D12Resource* buffer = nullptr;  // LOCAL memcut: the upload ring chunk, valid while ring_touch(tag) says so
     RingTag tag;
-    std::vector<unsigned char> content;
+    // LOCAL stall: shared so that X2W_DRAW_LOCK_SPLIT's frame_copy_unlocked can compare against it after draw_lock
+    // is released (a later clear or insert_or_assign drops the map's reference, not the comparing thread's).
+    std::shared_ptr<const std::vector<unsigned char>> content;
 };
 std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
 LONG frame_copies_frame = -1;
@@ -2036,8 +2038,9 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset, ID3D12Resource** bu
     const u64 key = address * 1099511628211ull ^ bytes;
     const auto* title = reinterpret_cast<const unsigned char*>(address);
     const auto found = frame_copies().find(key);
-    const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
-    if (known && std::memcmp(found->second.content.data(), title, bytes) == 0 && ring_touch(found->second.tag)) {
+    const bool known = found != frame_copies().end() && found->second.address == address && found->second.content &&
+                       found->second.content->size() == bytes;
+    if (known && std::memcmp(found->second.content->data(), title, bytes) == 0 && ring_touch(found->second.tag)) {
         srvc_note(frame_copy_class, srvc_compared, bytes);  // LOCAL stall
         *offset = found->second.offset;
         *buffer = found->second.buffer;
@@ -2052,16 +2055,87 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset, ID3D12Resource** bu
     // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
     const unsigned char* source = title;
     try {
-        std::vector<unsigned char> content(title, title + bytes);
+        auto content = std::make_shared<const std::vector<unsigned char>>(title, title + bytes);
         // Use the stored snapshot to fill the ring so the GPU bytes and subsequent comparisons agree.
         auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, fresh, chunk, tag, std::move(content)});
-        source = entry.first->second.content.data();
+        source = entry.first->second.content->data();
     } catch (const std::bad_alloc&) {
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
     }
     std::memcpy(ring, source, bytes);
     x2w_memcut::note_copy(frame_number, bytes);  // LOCAL memcut
     if (known) {
+        static LONG refreshed;
+        if (first_calls(refreshed, 4))
+            log("x2w-draw frame copy of 0x%llx (%zu bytes) refreshed: the title changed it since an earlier draw of this frame", address, bytes);
+    }
+    *offset = fresh;
+    *buffer = chunk;
+    return true;
+}
+// LOCAL stall: X2W_DRAW_LOCK_SPLIT: frame_copy for a caller that does NOT hold draw_lock (draw_translated's srv
+// loop). draw_lock is taken for the map lookup (site lookup_line) and, after a miss, for the map update
+// (commit_line); the memcmp of a hit, the snapshot copy and the ring fill run without it.
+// - A hit compares the snapshot it holds a reference to with the title memory now. Equal: that snapshot's ring slice
+//   holds the same bytes, so it is bound if ring_touch (the ring's own lock) says its chunk was not recycled, whether
+//   or not another thread replaced the map entry meanwhile.
+// - A miss reserves ring space (the ring's own lock; the slice is held by this open list), copies the snapshot and
+//   the ring unlocked, then stores the entry if the frame has not changed meanwhile (else it is dropped: the map was
+//   cleared for the new frame).
+// Two threads missing on one range both copy; the later insert wins, and each binds its own slice.
+bool frame_copy_unlocked(u64 address, std::size_t bytes, u64* offset, ID3D12Resource** buffer, int lookup_line, int commit_line)
+{
+    const u64 key = address * 1099511628211ull ^ bytes;
+    const auto* title = reinterpret_cast<const unsigned char*>(address);
+    std::shared_ptr<const std::vector<unsigned char>> seen;
+    u64 seen_offset = 0;
+    ID3D12Resource* seen_buffer = nullptr;
+    RingTag seen_tag;
+    lock_draw(lookup_line);
+    if (frame_copies_frame != frame_number) {
+        frame_copies().clear();
+        frame_copies_frame = frame_number;
+    }
+    const LONG frame = frame_copies_frame;
+    if (const auto found = frame_copies().find(key); found != frame_copies().end() && found->second.address == address &&
+                                                     found->second.content && found->second.content->size() == bytes) {
+        seen = found->second.content;
+        seen_offset = found->second.offset;
+        seen_buffer = found->second.buffer;
+        seen_tag = found->second.tag;
+    }
+    ReleaseSRWLockExclusive(&draw_lock);
+    if (seen && std::memcmp(seen->data(), title, bytes) == 0 && ring_touch(seen_tag)) {
+        srvc_note(frame_copy_class, srvc_compared, bytes);
+        *offset = seen_offset;
+        *buffer = seen_buffer;
+        return true;
+    }
+    u64 fresh = 0;
+    ID3D12Resource* chunk = nullptr;
+    RingTag tag;
+    auto* ring = reserve_upload_ring(bytes, &fresh, &chunk, &tag);
+    if (!ring) return false;
+    srvc_note(frame_copy_class, srvc_copied, bytes);
+    std::shared_ptr<const std::vector<unsigned char>> content;
+    try {
+        content = std::make_shared<const std::vector<unsigned char>>(title, title + bytes);
+    } catch (const std::bad_alloc&) {
+        // The ring slice is already reserved: fill it from the title memory and keep no entry.
+    }
+    std::memcpy(ring, content ? content->data() : title, bytes);
+    x2w_memcut::note_copy(frame_number, bytes);  // LOCAL memcut
+    if (content) {
+        lock_draw(commit_line);
+        if (frame_copies_frame == frame) {
+            try {
+                frame_copies().insert_or_assign(key, FrameCopy{address, fresh, chunk, tag, std::move(content)});
+            } catch (const std::bad_alloc&) {
+            }
+        }
+        ReleaseSRWLockExclusive(&draw_lock);
+    }
+    if (seen) {
         static LONG refreshed;
         if (first_calls(refreshed, 4))
             log("x2w-draw frame copy of 0x%llx (%zu bytes) refreshed: the title changed it since an earlier draw of this frame", address, bytes);
@@ -2552,8 +2626,19 @@ std::uint32_t view_buffer_word3(const ViewRecord& record)
 // later draw reads what the GPU stored. Disjoint merged ranges, begin -> end; at most gpu_written_max, the lowest
 // other range is dropped beyond that (counted: rt_written_evicted). draw_lock held.
 std::map<u64, u64>& gpu_written() { static std::map<u64, u64> m; return m; }
+// LOCAL stall: the map has its own lock (exclusive to note, shared to look up), so draw_translated's srv loop can ask
+// without draw_lock under X2W_DRAW_LOCK_SPLIT. Order: draw_lock (when held) before gpu_written_lock; nothing else is
+// taken while gpu_written_lock is held.
+SRWLOCK gpu_written_lock = SRWLOCK_INIT;
 constexpr std::size_t gpu_written_max = 16384;
+void note_gpu_written_locked(u64 address, u64 bytes);
 void note_gpu_written(u64 address, u64 bytes)
+{
+    AcquireSRWLockExclusive(&gpu_written_lock);
+    note_gpu_written_locked(address, bytes);
+    ReleaseSRWLockExclusive(&gpu_written_lock);
+}
+void note_gpu_written_locked(u64 address, u64 bytes)
 {
     auto& m = gpu_written();
     u64 begin = address, end = address + bytes;
@@ -2578,12 +2663,20 @@ void note_gpu_written(u64 address, u64 bytes)
 }
 bool gpu_written_overlaps(u64 address, u64 bytes)
 {
+    AcquireSRWLockShared(&gpu_written_lock);
     const auto& m = gpu_written();
     auto it = m.lower_bound(address + bytes);
-    if (it == m.begin()) return false;
-    return (--it)->second > address;
+    const bool overlaps = it != m.begin() && (--it)->second > address;
+    ReleaseSRWLockShared(&gpu_written_lock);
+    return overlaps;
 }
-std::size_t gpu_written_count() { return gpu_written().size(); }
+std::size_t gpu_written_count()
+{
+    AcquireSRWLockShared(&gpu_written_lock);
+    const std::size_t n = gpu_written().size();
+    ReleaseSRWLockShared(&gpu_written_lock);
+    return n;
+}
 // An in-place srv on a window: shader-resource state in this list's tracked states, except when this list already
 // holds the window as UAV (the same 256 MiB window often carries the draw's own uav: one state cannot be both;
 // it stays UAV, as before this tracking existed).
@@ -3199,8 +3292,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             buffer_facts.token_magic = entry_ok && words[0] == view_token_magic;
             buffer_facts.token_known = buffer_token_known;
             buffer_facts.bound = bound;
-            SplitRelock relock(split, 100000 + __LINE__);
-            count_null_binding(x2w_local::classify_null_binding(buffer_facts));
+            count_null_binding(x2w_local::classify_null_binding(buffer_facts));  // interlocked counters: no draw_lock needed
         };
         if (placed.reject || (placed.owner && !InterlockedCompareExchange(&placed.owner->own().refs, 0, 0))) {
             buffer_view(dest, nullptr, 0, 0);
@@ -3254,11 +3346,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 log("x2w-draw   %016llx srv %u: 0x%llx (%zu bytes) not bound in place: %s; copied as before", tr->key, i, address, bytes,
                     in_window ? "window offset not 16-aligned" : "no single desktop window (desktop_range)");
         }
-        bool gpu_written_range = false;
-        if (address && bytes) {
-            SplitRelock relock(split, 100000 + __LINE__);
-            gpu_written_range = !gpu_written().empty() && gpu_written_overlaps(address, bytes);
-        }
+        const bool gpu_written_range = address && bytes && gpu_written_overlaps(address, bytes);  // its own lock
         if (gpu_written_range) {
             // LOCAL draw-rt: a translated draw or a GPU copy stores into this range: read it in place, not from a record-time copy.
             ID3D12Resource* window = nullptr;
@@ -3282,8 +3370,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         ID3D12Resource* chunk = nullptr;  // LOCAL memcut: the upload ring chunk of the copy
         bool have = false;
         if (address && bytes && readable_window(address, bytes) >= bytes) {
-            SplitRelock relock(split, 100000 + __LINE__);
-            have = frame_copy(address, bytes, &offset, &chunk);
+            if (split) {
+                // X2W_DRAW_LOCK_SPLIT: only the map lookup and update under draw_lock; the compare and copy outside it.
+                have = frame_copy_unlocked(address, bytes, &offset, &chunk, 100000 + __LINE__, 100001 + __LINE__);
+            } else {
+                have = frame_copy(address, bytes, &offset, &chunk);
+            }
         }
         frame_copy_class = 0;  // thread_local: no lock needed
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
