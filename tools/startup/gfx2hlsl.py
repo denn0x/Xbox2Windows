@@ -1216,7 +1216,7 @@ class Stage:
         # (image_sample_l and image_load_mip check their own modifier lists below.)
         allowed = ('dlc', 'glc', 'slc', 'a16') + (('unorm',) if how == 'load' else ())
         for m in mods:
-            if how in ('sample', 'lz', 'load', 'b') and not (m.startswith(('dim:', 'dmask:')) or m in allowed):
+            if how in ('sample', 'lz', 'load', 'b', 'd') and not (m.startswith(('dim:', 'dmask:')) or m in allowed):
                 raise Unsupported('image_%s modifier %s' % (how, m))
         a16 = 'a16' in mods
         bias = None
@@ -1227,6 +1227,17 @@ class Stage:
             if a16 or dmask == 0 or len(cs) != axes + 1:
                 raise Unsupported('image_sample_b form %s %s' % (', '.join(ops), ' '.join(mods)))
             bias, cs = cs[0], cs[1:]
+        grads = None
+        if how == 'd':
+            # image_sample_d: the gradients come first, d<c>dh for each coordinate c (s, t, r) then d<c>dv, and then
+            # the coordinates and the slice (LLVM IntrinsicsAMDGPU.td AMDGPUDimProps.GradientArgs, AddrArgs order
+            # ExtraAddrArgs, GradientArgs, CoordSliceArgs). h is the horizontal (x) and v the vertical (y) screen
+            # direction: SampleGrad's ddx and ddy. A 2D array has 2D gradients. With a16 the gradients would be
+            # packed too, not modelled here.
+            n = {'SQ_RSRC_IMG_1D': 1, 'SQ_RSRC_IMG_2D': 2, 'SQ_RSRC_IMG_3D': 3, 'SQ_RSRC_IMG_2D_ARRAY': 2}[dim]
+            if a16 or dmask == 0 or len(cs) != 2 * n + axes:
+                raise Unsupported('image_sample_d form %s %s' % (', '.join(ops), ' '.join(mods)))
+            grads, cs = (cs[:n], cs[n:2 * n]), cs[2 * n:]
         if a16:
             if len(cs) < (axes + 1) // 2:
                 raise Unsupported('a16 image address with %d registers' % len(cs))
@@ -1279,6 +1290,12 @@ class Stage:
                 if not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                     raise Unsupported('image_sample_b outside straight-line code with every lane active')
                 call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(bias))
+            elif how == 'd':
+                # explicit gradients: no implicit derivatives, so any control flow and any exec state
+                ddx, ddy = (', '.join(self.f(c) for c in g) for g in grads)
+                if len(grads[0]) > 1:
+                    ddx, ddy = 'float%d(%s)' % (len(grads[0]), ddx), 'float%d(%s)' % (len(grads[0]), ddy)
+                call = '%s.SampleGrad(%s, %s, %s, %s)' % (tex, smp, uv, ddx, ddy)
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
@@ -1407,6 +1424,9 @@ class Stage:
 
     def op_image_sample_b(self, ops, mods):
         self.image(ops, mods, 'b')
+
+    def op_image_sample_d(self, ops, mods):
+        self.image(ops, mods, 'd')
 
     def op_image_sample_lz(self, ops, mods):
         self.image(ops, mods, 'lz')
