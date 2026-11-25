@@ -2120,13 +2120,16 @@ class Stage:
                 # is the high half); neg()/abs() act on bit 15 of the selected value. S1 is the integer class mask
                 # through its own selection, as for f32. A constant S0 is refused: its f16 inline form is not modelled.
                 # The disassembly spells the modifiers -vN and |vN| on registers (neg(N)/abs(N) on constants).
-                mm = re.fullmatch(r'(?:(-)(\w+)|\|(\w+)\|)', a)
+                # -|vN| is abs then neg (SDWA applies abs before neg, as VOP3): bit 15 set.
+                mm = re.fullmatch(r'(-)?(?:\|(\w+)\||(\w+))', a)
                 src = (mm.group(2) or mm.group(3)) if mm else a
                 if src.startswith('sext(') or not reg_range(src):
                     raise Unsupported('%s with f16 value operand %s' % (base, a))
                 value = sdwa_source(self.u(src), fields['src0_sel'], False)
-                if mm:
-                    value = '(%s %s)' % (value, '^ 0x8000u' if mm.group(1) else '& 0x7fffu')
+                if mm and mm.group(2):
+                    value = '(%s %s)' % (value, '| 0x8000u' if mm.group(1) else '& 0x7fffu')
+                elif mm and mm.group(1):
+                    value = '(%s ^ 0x8000u)' % value
                 if b.startswith(('sext(', 'neg(', 'abs(')):
                     raise Unsupported('%s with a modified class mask %s' % (base, b))
                 expr = 'x2w_class_f16(%s, %s)' % (value, sdwa_source(self.u(b), fields['src1_sel'], False))

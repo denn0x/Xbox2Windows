@@ -60,9 +60,9 @@ def main():
     sels = {0: 'BYTE_0', 1: 'BYTE_1', 4: 'WORD_0', 5: 'WORD_1', 6: 'DWORD'}
     checked = 0
     for sel, name in sels.items():
-        for neg, ab in ((False, False), (True, False), (False, True)):
+        for neg, ab in ((False, False), (True, False), (False, True), (True, True)):
             text, body = one(vopc_sdwa(0x8f, 1, 2, 38, src0_sel=sel, neg0=neg, abs0=ab))
-            shown = '-v1' if neg else '|v1|' if ab else 'v1'
+            shown = '-|v1|' if neg and ab else '-v1' if neg else '|v1|' if ab else 'v1'
             assert text == 'v_cmp_class_f16_sdwa s38, %s, v2 src0_sel:%s src1_sel:DWORD' % (shown, name), text
             m = re.fullmatch(r's38 = (.*);', body)
             assert m and 'x2w_class_f16(' in body, body
@@ -72,7 +72,8 @@ def main():
                     off, width = G.SDWA_SEL[name]
                     field = (v1 >> off) & ((1 << width) - 1)
                     h = field & 0xffff
-                    h = h ^ 0x8000 if neg else h & 0x7fff if ab else h
+                    h = h & 0x7fff if ab else h  # abs first, then neg (-|x| is negative)
+                    h = h ^ 0x8000 if neg else h
                     for bit in range(10):
                         assert evaluate(m.group(1), v1, 1 << bit) == int(cls16(h) == bit), (name, neg, ab, hex(v1))
                         checked += 1
