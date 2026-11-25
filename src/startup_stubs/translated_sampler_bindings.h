@@ -19,9 +19,53 @@ constexpr UINT translated_sampler_space = 1;
 constexpr UINT translated_sampler_fallback = translated_sampler_count - 1;
 constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 
+// LOCAL (textures): X2W_SAMPLER_LOD=1 also carries the LOD and border fields of the S# words (sampler_lod_fields).
+// Off by default: fixtures and manifests written with word 1 = 0 would otherwise be limited to mip 0 (MAX_LOD 0).
+inline bool sampler_lod_fields_on()
+{
+    static const bool on = [] {
+        char value[4]{};
+        const DWORD saved = GetLastError();
+        const bool v = GetEnvironmentVariableA("X2W_SAMPLER_LOD", value, sizeof(value)) && value[0] == '1';
+        SetLastError(saved);
+        return v;
+    }();
+    return on;
+}
+
+struct SamplerLodFields {
+    float bias, min_lod, max_lod;
+    D3D12_STATIC_BORDER_COLOR border;
+    bool border_register;  // BORDER_COLOR_TYPE 3 (a border colour table entry): not translated, transparent black
+};
+
+// Field positions of SQ_IMG_SAMP_WORD1..3 (Mesa src/amd/registers/gfx10-rsrc.json, as cited in tools/pixel_aot.py):
+// word 1 bits 11:0 MIN_LOD and 23:12 MAX_LOD, unsigned 4.8 fixed point; word 2 bits 13:0 LOD_BIAS, signed 5.8
+// (bits 19:14 LOD_BIAS_SEC, the secondary bias, are not carried); word 3 bits 31:30 BORDER_COLOR_TYPE
+// (0 transparent black, 1 opaque black, 2 opaque white, 3 register), numbered as D3D12_STATIC_BORDER_COLOR 0..2.
+// MAX_LOD 0xfff (15.996) stays unlimited. D3D12 limits the bias to [-16, 15.99].
+inline SamplerLodFields sampler_lod_fields(const SamplerWords& words)
+{
+    SamplerLodFields f{};
+    int bias = static_cast<int>(words[2] & 0x3fff);
+    if (bias & 0x2000) bias -= 0x4000;
+    f.bias = static_cast<float>(bias) / 256.0f;
+    if (f.bias < D3D12_MIP_LOD_BIAS_MIN) f.bias = D3D12_MIP_LOD_BIAS_MIN;
+    if (f.bias > D3D12_MIP_LOD_BIAS_MAX) f.bias = D3D12_MIP_LOD_BIAS_MAX;
+    f.min_lod = static_cast<float>(words[1] & 0xfff) / 256.0f;
+    const UINT max_raw = (words[1] >> 12) & 0xfff;
+    f.max_lod = max_raw == 0xfff ? D3D12_FLOAT32_MAX : static_cast<float>(max_raw) / 256.0f;
+    if (f.max_lod < f.min_lod) f.max_lod = f.min_lod;
+    const UINT type = words[3] >> 30;
+    f.border_register = type == 3;
+    f.border = type == 3 ? D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK : static_cast<D3D12_STATIC_BORDER_COLOR>(type);
+    return f;
+}
+
 // comparison: the sampler is read through a SamplerComparisonState (manifest line smpc). SQ_IMG_SAMP_WORD0 bits
 // 14:12 hold SQ_TEX_DEPTH_COMPARE, which lists NEVER..ALWAYS in the order of D3D12_COMPARISON_FUNC minus one.
-inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false)
+inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false,
+                                                bool lod_fields = sampler_lod_fields_on())
 {
     static const D3D12_TEXTURE_ADDRESS_MODE modes[8] = {
         D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -43,6 +87,13 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
     }
     s.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     s.MaxLOD = D3D12_FLOAT32_MAX;
+    if (lod_fields) {
+        const auto f = sampler_lod_fields(words);
+        s.MipLODBias = f.bias;
+        s.MinLOD = f.min_lod;
+        s.MaxLOD = f.max_lod;
+        s.BorderColor = f.border;
+    }
     s.ShaderRegister = shader_register;
     s.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     return s;
@@ -168,16 +219,23 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
     return snapshot;
 }
 
-inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words)
+inline D3D12_SAMPLER_DESC dynamic_sampler(const SamplerWords& words, bool lod_fields = sampler_lod_fields_on())
 {
-    const auto s = decode_sampler(words, 0);
-    return {s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
-            {}, s.MinLOD, s.MaxLOD};
+    const auto s = decode_sampler(words, 0, false, lod_fields);
+    D3D12_SAMPLER_DESC d{s.Filter, s.AddressU, s.AddressV, s.AddressW, s.MipLODBias, s.MaxAnisotropy, s.ComparisonFunc,
+                         {}, s.MinLOD, s.MaxLOD};
+    if (lod_fields) {
+        const float rgb = s.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 1.0f : 0.0f;
+        const float alpha = s.BorderColor == D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK ? 0.0f : 1.0f;
+        d.BorderColor[0] = d.BorderColor[1] = d.BorderColor[2] = rgb;
+        d.BorderColor[3] = alpha;
+    }
+    return d;
 }
 
 inline D3D12_SAMPLER_DESC border_sampler()
 {
-    return dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0});
+    return dynamic_sampler({6u | (6u << 3) | (6u << 6), 0, 0, 0}, false);  // the fallback: no LOD limit, whatever the switch
 }
 
 struct NullSamplerCounts {

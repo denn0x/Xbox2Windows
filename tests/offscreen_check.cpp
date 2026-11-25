@@ -1106,10 +1106,10 @@ OperationResult run_startup_composite_provenance(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-template<bool Swapped>
+template<bool Swapped, int Words = 0>
 OperationResult run_startup_sampler_x(const OperationContext& ctx)
 {
-    return skip_if_false(check_startup_sampler_x(ctx.device, Swapped),
+    return skip_if_false(check_startup_sampler_x(ctx.device, Swapped, Words),
                          "skip: R32_FLOAT does not report filtered sampling with mips");
 }
 
@@ -1395,6 +1395,8 @@ const OperationSpec kOperations[] = {
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
+    {"--startup-sampler-x-words", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false, 1>},
+    {"--startup-sampler-x-words-dropped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false, 2>},
     {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
     {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
     {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},

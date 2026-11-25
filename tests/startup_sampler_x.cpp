@@ -3,6 +3,7 @@
 // translated sampler must reproduce: filter, per-axis address mode, border colour and LOD limits.
 #include "desktop_gpu.h"
 #include "startup_sampler_x_cs.h"
+#include "startup_stubs/translated_sampler_bindings.h"
 
 #include <algorithm>
 #include <array>
@@ -59,6 +60,15 @@ constexpr std::array<SamplerCase, 3> samplers{{
      D3D12_FLOAT32_MAX},
 }};
 constexpr UINT word_count = static_cast<UINT>(2 * point_probes.size() + linear_probes.size());
+// The three samplers above as SQ_IMG_SAMP words (word 0: CLAMP_X 2:0, CLAMP_Y 5:3; word 1: MIN_LOD 11:0, MAX_LOD 23:12,
+// u4.8; word 2: XY_MAG 21:20, XY_MIN 23:22, MIP 27:26; word 3: BORDER_COLOR_TYPE 31:30, 2 = opaque white), for the
+// words variants: the desktop samplers are then the translation (translated_sampler_bindings.h dynamic_sampler).
+constexpr std::uint32_t white = 2u << 30;
+constexpr std::array<x2w_startup::SamplerWords, 3> sampler_words{{
+    {0u | 1u << 3, 256u | 512u << 12, 0u, white},                        // wrap / mirror, LOD 1..2
+    {2u | 6u << 3, 0u, 0u, white},                                       // clamp / border, LOD 0..0
+    {2u | 2u << 3, 0xfffu << 12, 1u << 20 | 1u << 22 | 2u << 26, white},  // trilinear, clamp, no limit
+}};
 
 bool is_linear(const SamplerCase& s)
 {
@@ -219,7 +229,9 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device)
 }
 }
 
-bool check_startup_sampler_x(ID3D12Device* device, bool swapped)
+// words: 0 desktop samplers; 1 translated from sampler_words with the LOD and border fields; 2 translated without
+// them (the negative control: MIN_LOD, MAX_LOD and the white border are lost, so the readback must differ).
+bool check_startup_sampler_x(ID3D12Device* device, bool swapped, int words)
 {
     check_probe_coverage();
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_R32_FLOAT};
@@ -272,7 +284,7 @@ bool check_startup_sampler_x(ID3D12Device* device, bool swapped)
     for (UINT i = 0; i < samplers.size(); ++i) {
         auto handle = sampler_heap->GetCPUDescriptorHandleForHeapStart();
         handle.ptr += SIZE_T{bound_case(i)} * sampler_stride;
-        const auto desc = desktop_sampler(samplers[i]);
+        const auto desc = words ? x2w_startup::dynamic_sampler(sampler_words[i], words == 1) : desktop_sampler(samplers[i]);
         device->CreateSampler(&desc, handle);
     }
 
@@ -345,8 +357,8 @@ bool check_startup_sampler_x(ID3D12Device* device, bool swapped)
         }
         std::printf("\n");
     }
-    std::printf("startup_sampler_x swapped=%u mismatches=%u of %u\n", static_cast<unsigned>(swapped), mismatches,
-                word_count);
+    std::printf("startup_sampler_x swapped=%u words=%d mismatches=%u of %u\n", static_cast<unsigned>(swapped), words,
+                mismatches, word_count);
     if (mismatches) throw std::runtime_error("Sampler contract readback differs from reference");
     return true;
 }

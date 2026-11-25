@@ -1635,6 +1635,13 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_sampler_x_swapped_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "startup_sampler_x swapped=0")
+    # LOCAL (textures): the same probes with the samplers translated from S# words (the X2W_SAMPLER_LOD fields); the
+    # control drops the LOD and border fields and must mismatch.
+    add_test(NAME startup_sampler_lod_words_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-x-words)
+    add_test(NAME startup_sampler_lod_words_dropped_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-x-words-dropped)
+    set_tests_properties(startup_sampler_lod_words_${adapter} startup_sampler_lod_words_dropped_${adapter}
+        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(startup_sampler_lod_words_dropped_${adapter} PROPERTIES WILL_FAIL TRUE)
     add_test(NAME startup_cb_blend_${adapter} COMMAND offscreen_check ${adapter} --startup-cb-blend)
     add_test(NAME startup_cb_blend_swapped_${adapter} COMMAND offscreen_check ${adapter} --startup-cb-blend-swapped)
     set_tests_properties(startup_cb_blend_${adapter} startup_cb_blend_swapped_${adapter} PROPERTIES TIMEOUT 60)
