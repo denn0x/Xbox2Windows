@@ -76,6 +76,8 @@ std::vector<TracedRange>& traced_ranges() { static std::vector<TracedRange> v; r
 std::vector<TracedMeshRead>& traced_mesh_reads() { static std::vector<TracedMeshRead> v; return v; }
 // (d) texture UAVs bound by this frame's dispatches so far: title wrapper -> "key K #n state".
 std::map<const void*, std::string>& traced_image_writers() { static std::map<const void*, std::string> m; return m; }
+// (d) raw T# base -> (first resource starting there, how many): one resource walk per base per traced frame.
+std::map<u64, std::pair<Wrapper*, int>>& traced_tsharp_bases() { static std::map<u64, std::pair<Wrapper*, int>> m; return m; }
 LONG record_trace_seq, dispatch_trace_seq, record_trace_order;
 thread_local bool record_trace_dispatch_noted;  // set by record_trace_dispatch inside an indirect call
 
@@ -203,9 +205,15 @@ bool record_trace_image(const std::uint32_t* w, char* text, std::size_t room, Wr
     const u64 address = (static_cast<u64>(w[0]) | (static_cast<u64>(w[1] & 0xff) << 32)) << 8;
     const std::uint32_t width = (((w[1] >> 30) & 3) | ((w[2] & 0xfff) << 2)) + 1, height = ((w[2] >> 14) & 0x3fff) + 1;
     // The resource whose title memory starts at the T# base (a texture; several: the first, counted).
+    // One walk of the resources per distinct base in the traced frame (the cache is emptied at the report).
     Wrapper* resource = nullptr;
     int matches = 0;
-    if (address) {
+    bool cached = false;
+    AcquireSRWLockShared(&record_trace_lock);
+    if (const auto hit = traced_tsharp_bases().find(address); hit != traced_tsharp_bases().end())
+        cached = true, resource = hit->second.first, matches = hit->second.second;
+    ReleaseSRWLockShared(&record_trace_lock);
+    if (address && !cached) {
         AcquireSRWLockShared(&note_lock);
         for (const auto& [wrapper, info] : resource_infos())
             if (reinterpret_cast<u64>(wrapper->own().title_memory) == address && info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
@@ -214,6 +222,9 @@ bool record_trace_image(const std::uint32_t* w, char* text, std::size_t room, Wr
                 ++matches;
             }
         ReleaseSRWLockShared(&note_lock);
+        AcquireSRWLockExclusive(&record_trace_lock);
+        traced_tsharp_bases()[address] = {resource, matches};
+        ReleaseSRWLockExclusive(&record_trace_lock);
     }
     if (resource) record_trace_resource_text(resource, res, sizeof(res));
     else std::snprintf(res, sizeof(res), "no resource starts at the base");
@@ -493,6 +504,7 @@ void record_trace_report(ID3D12CommandQueue* queue)
     ranges.swap(traced_ranges());
     mesh_reads.swap(traced_mesh_reads());
     traced_image_writers().clear();
+    traced_tsharp_bases().clear();
     ReleaseSRWLockExclusive(&record_trace_lock);
     InterlockedExchange(&record_trace_seq, 0);
     InterlockedExchange(&dispatch_trace_seq, 0);
