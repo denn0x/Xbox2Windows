@@ -2055,7 +2055,11 @@ class Stage:
         elif dst in ('vcc', 'vcc_lo'):
             self.emit('vcc = %s;' % expr)
         else:
-            d = reg_range(dst)[1]
+            r = reg_range(dst)
+            if not r or r[0] != 's':
+                # e.g. vcc_hi or exec_hi as a carry-out / compare destination: not an SGPR the one-lane model holds
+                raise Unsupported('compare or carry destination %s' % dst)
+            d = r[1]
             self.set_s(d, expr)
             self.masks.add(d)
 
