@@ -1795,7 +1795,22 @@ class Stage:
             # mip filter clamps the LOD before rounding it to a level. c_lz samples level zero with MIN_LOD 0 (the
             # decoder refuses any other MIN_LOD), so no LOD reaches the mip selection and the bit cannot change the
             # result (ASSUMED from the field name and placement; not measured on hardware). Bits 29-31 stay refused.
+            # Mesa (bb59ce45 ac_build_sampler_descriptor) never sets the bit, so no open driver documents more.
             checked[2] &= ~(1 << 28)
+        clamp_xy = (words[0] & 7, words[0] >> 3 & 7)
+        if 6 in clamp_xy and set(clamp_xy) <= {2, 6}:
+            # SQ_TEX_CLAMP_BORDER (6, Mesa radv_sampler.c maps VK CLAMP_TO_BORDER to it) in X and/or Y: outside
+            # [0, 1] the texel is the border colour, BORDER_COLOR_TYPE (word 3 bits 31:30; 0 transparent black,
+            # 1 opaque black, 2 opaque white, Mesa ac_descriptors.c) and the comparison runs against its red
+            # channel; D3D12 BORDER with that static colour does the same (Vulkan orders texel replacement before
+            # the depth compare as well). Type 3 (a border colour table entry, BORDER_COLOR_PTR) is refused. The
+            # runtime carries the colour with X2W_SAMPLER_LOD=1 (sampler_lod_fields); without it the static
+            # sampler's border is transparent black, which is exact for type 0 only. The smpc manifest line keeps
+            # the original words (the runtime's decode_sampler maps 6 to D3D12_TEXTURE_ADDRESS_MODE_BORDER); the
+            # other fields of the contract (filters, compare, LOD, TRUNC_COORD) are checked with CLAMP_LAST_TEXEL.
+            if words[3] >> 30 == 3:
+                raise Unsupported('%s sampler: border colour from the border colour table (BORDER_COLOR_TYPE 3)' % base)
+            checked[0] = checked[0] & ~0x3f | 2 | 2 << 3
         try:
             pixel_aot.comparison_sampler_state(tuple(checked))
         except ValueError as error:
