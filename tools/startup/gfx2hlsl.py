@@ -889,6 +889,21 @@ class Stage:
                 self.set_s(d + 1, '0x%08xu' % ((value >> 32) & 0xffffffff), ('const', (value >> 32) & 0xffffffff))
             self.masks.discard(d)
             return None
+        if base in SCALAR_CONST_FOLD:
+            # Constant operands give a known word, so a descriptor built from them (an inline sampler: s_movk_i32,
+            # s_bfm_b32 (op_s_bfm_b32), s_mov_b32, s_brev_b32 into s[N:N+3]) is a constant descriptor.
+            def known(tok):
+                r = reg_range(tok)
+                if r and r[0] == 's' and r[1] == r[2]:
+                    return self.is_const(r[1])
+                if re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', tok) and tok not in FLOATS:
+                    return int(tok, 0) & 0xffffffff
+                return None
+            operands = [known(t) for t in srcs]
+            if None not in operands:
+                value = SCALAR_CONST_FOLD[base](*operands) & 0xffffffff
+                self.set_s(d, '0x%08xu' % value, ('const', value))
+                return None
         if base in ('s_mov_b64', 's_mov_b32') and srcs[0] in ('exec', 'exec_lo') and self.exec_known:
             self.set_s(d, 'exec')
             self.sym[d] = ('execcopy',)
@@ -2452,6 +2467,12 @@ LSHR64_HI = '((n & 63u) < 32u ? h >> (n & 63u) : 0u)'
 LSHL64_LO = '((n & 63u) < 32u ? l << (n & 63u) : 0u)'
 LSHL64_HI = ('((n & 63u) == 0u ? h : (n & 63u) < 32u ? (h << (n & 63u)) | (l >> (32u - (n & 63u))) : '
              'l << ((n & 63u) - 32u))')
+# SCA operations folded when every operand is a known constant (Stage.scalar), as their SCA texts compute them
+# (AMD RDNA ISA: S_BREV_B32 D.u[31:0] = S0.u[0:31], no SCC write). s_bfm_b32 has its own folding handler.
+SCALAR_CONST_FOLD = {
+    's_brev_b32': lambda a: int('{:032b}'.format(a)[::-1], 2),
+}
+
 HELPERS = {
     'x2w_mul_hi_u32': 'uint x2w_mul_hi_u32(uint a, uint b) { return %s; }' % MUL_HI_U32,
     'x2w_class_f32': 'uint x2w_class_f32(uint x, uint mask) { return (mask >> %s) & 1u; }' % CLASS_F32,
