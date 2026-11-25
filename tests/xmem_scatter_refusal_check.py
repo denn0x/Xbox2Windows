@@ -15,6 +15,9 @@ Cases:
   remap    thread A remaps one address between two pages (each call unmaps and maps it again), thread B checks it:
            a plain VirtualQuery sometimes sees it uncommitted (the gap; must be seen, or the case proves nothing),
            x2w_xmem_write_settled never refuses it, and x2w_xmem_page_event reports the last map / unmap.
+  wait     x2w_xmem_write_settled_wait with a 250 ms bound: a destination that a second thread maps 50 ms after the
+           write started is written (after >= 45 ms); the negative control, a destination never mapped, fails after
+           the bound (>= 250 ms) and writes nothing.
 --control: the same cases against a build without the fix (e.g. 08d2ca72): passes when the race case fails and
            the foreign / unowned cases leave no REFUSED line (the negative control trips); remap there only shows
            the gap (the build has no x2w_xmem_write_settled).
@@ -204,6 +207,31 @@ def child(case, dll, log):
                 remaps.value >= counts["remaps"] - 1 and view_after == 0 and kind.value == 2 and page.value == pages[1 + ((counts["remaps"] - 1) % 2)] >> 4
                 and view_never == 0 and never.value == 0)
         return 0 if good else 5
+    if case == "wait":
+        lib = C.WinDLL(str(Path(dll).resolve()), use_last_error=True, winmode=0x900)
+        wait = lib.x2w_xmem_write_settled_wait
+        wait.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_size_t, C.c_ulong, C.POINTER(C.c_ulong)]
+        wait.restype = C.c_int
+        ok, err = shim.scatter([shim.base + 0x3F0000000], [pages[5]])  # keeps the reservation from coalescing
+        assert ok, err
+        target, never = addresses[300], addresses[301]
+        payload = (C.c_ubyte * 16)(*range(0xA0, 0xB0))
+        def late_map():
+            time.sleep(0.05)
+            ok, err = shim.scatter([target], [pages[2]])
+            assert ok, err
+        mapper = threading.Thread(target=late_map)
+        waited = C.c_ulong()
+        mapper.start()
+        served = wait(target, payload, 16, PAGE, 250, C.byref(waited))
+        mapper.join()
+        content = bytes((C.c_ubyte * 16).from_address(target)) if served else b""
+        waited_never = C.c_ulong()
+        refused = not wait(never, payload, 16, PAGE, 250, C.byref(waited_never))
+        print(f"wait: late-mapped destination served={served} after {waited.value} ms content_ok={content == bytes(payload)}; "
+              f"never-mapped destination refused={refused} after {waited_never.value} ms")
+        good = served and 45 <= waited.value < 250 and content == bytes(payload) and refused and waited_never.value >= 250
+        return 0 if good else 6
     if case == "unowned":
         ok, err = shim.scatter([addresses[0], addresses[1]], [pages[0], (max(tokens) >> 4 << 4) + (1000 << 4)])
         print(f"unowned token: ok={ok} error={err}")
@@ -230,7 +258,8 @@ def main():
     control = "--control" in sys.argv
     logs = Path(os.environ.get("XMEM_CHECK_LOGS", Path(dll).parent))
     results = {}
-    for case in ("shape", "race", "foreign", "unowned", "remap"):
+    cases = ["shape", "race", "foreign", "unowned", "remap"] + ([] if control else ["wait"])
+    for case in cases:
         code, out, text = run(case, dll, logs / f"scatter_{case}.log")
         refused = [line for line in text.splitlines() if "x2w-xmem REFUSED" in line]
         results[case] = (code, out, refused, text)
@@ -251,7 +280,8 @@ def main():
         if not refused or "NOT granted" not in refused[0] or "not granted (era_physical::owns)" not in refused[0]:
             failures.append("unowned: REFUSED line missing or does not name the check")
         if results["remap"][0]: failures.append("remap: gap not seen, or a settled write / page event was wrong")
-        print("FAIL: " + "; ".join(failures) if failures else "PASS xmem_scatter_refusal (shape, race, foreign, unowned, remap)")
+        if results["wait"][0]: failures.append("wait: late map not served after the wait, or never-mapped not refused after the bound")
+        print("FAIL: " + "; ".join(failures) if failures else "PASS xmem_scatter_refusal (shape, race, foreign, unowned, remap, wait)")
     else:
         if results["shape"][0]: failures.append("shape refused on the control build too")
         if not results["race"][0]: failures.append("race did not fail on the control build")
