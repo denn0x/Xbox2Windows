@@ -84,6 +84,31 @@ int bind_heap_entry(void* guest, Word cpu)
     return 0;
 }
 
+// LOCAL (textures) mode heaptex: entry 0 is a shader-resource view of a plain 8x4 RGBA8 texture that no table
+// binds (only the heap references it); its title memory holds texel (x, y) = (10 + 20x, 30 + 40y, 7, 255) in the
+// desktop footprint (row pitch 256).
+int bind_heap_texture_entry(void* guest, Word cpu)
+{
+    auto* memory = reinterpret_cast<unsigned char*>(private_pages());
+    if (!memory) return 45;
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 8; ++x) {
+            unsigned char* t = memory + y * 256 + x * 4;
+            t[0] = static_cast<unsigned char>(10 + 20 * x);
+            t[1] = static_cast<unsigned char>(30 + 40 * y);
+            t[2] = 7;
+            t[3] = 255;
+        }
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 8, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+        D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    void* texture = placed(guest, memory, desc);
+    if (!texture) return 46;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    srv.Texture2D.MipLevels = 1;
+    invoke(guest, 18, ptr(texture), ptr(&srv), cpu);
+    return 0;
+}
+
 // A 64 KiB placed buffer over `memory` (title memory of a resource for CopyBufferRegion).
 void* memory_buffer(void* guest, void* memory)
 {
@@ -113,7 +138,8 @@ int draw_uav_stores(ID3D12Device* desktop, void* guest, void* list)
     D3D12_FEATURE_DATA_EXISTING_HEAPS heaps{};
     if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &heaps, sizeof(heaps))) || !heaps.Supported) return 77;
     GetEnvironmentVariableW(L"X2W_TEST_DRAW_UAV", uav_mode, 32);
-    const bool heap_mode = mode_is(L"heap");
+    const bool heap_texture_mode = mode_is(L"heaptex");  // LOCAL (textures)
+    const bool heap_mode = mode_is(L"heap") || heap_texture_mode;
     // Heap draws need the console's 32-byte view slots (the title's own shader arithmetic).
     std::printf("view increment %u\n", desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
     std::fflush(stdout);
@@ -122,7 +148,9 @@ int draw_uav_stores(ID3D12Device* desktop, void* guest, void* list)
     if (!heap) return 42;
     const Word cpu = invoke(heap, 9);
     if (!cpu) return 42;
-    if (std::wcsncmp(uav_mode, L"tex", 3) == 0) {
+    if (heap_texture_mode) {
+        if (const int rc = bind_heap_texture_entry(guest, cpu)) return rc;
+    } else if (std::wcsncmp(uav_mode, L"tex", 3) == 0) {
         if (const int rc = bind_texture_entry(guest, cpu)) return rc;
     } else if (heap_mode) {
         if (const int rc = bind_heap_entry(guest, cpu)) return rc;

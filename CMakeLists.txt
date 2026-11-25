@@ -2039,6 +2039,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_uav_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_draw_uav_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        # LOCAL (textures): X2W_HEAP_TEXTURE_UPLOAD; heap draws need 32-byte view slots (77 elsewhere, e.g. WARP).
+        add_test(NAME startup_heap_texture_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_heap_texture_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_heap_texture_${backend} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
