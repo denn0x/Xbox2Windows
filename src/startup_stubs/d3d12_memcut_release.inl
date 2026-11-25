@@ -51,7 +51,7 @@ struct MemcutRelease {
     std::unordered_map<Wrapper*, LONG> pending;         // wrapper -> frame of its release or last bind
     std::unordered_map<Wrapper*, MemcutHollow> hollow;  // wrappers whose real is a placeholder now
     std::unordered_map<Wrapper*, u64> list_epochs;      // list -> epoch at its last Reset
-    std::unordered_set<Wrapper*> refused;               // no placeholder could be made: never again
+    std::unordered_set<Wrapper*> refused;               // no placeholder could be made, or revived once: never again
     std::vector<MemcutRetiring> retiring;
     std::vector<std::pair<ID3D12Fence*, UINT64>> test_waits;  // fixtures: extra fences, as note_submits would add
     volatile LONG64 epoch = 0;
@@ -59,6 +59,7 @@ struct MemcutRelease {
     LONG last_hollow_frame = -1, last_report_frame = 0, lowest_frame = -1;
     u64 lowest = 0;  // lowest list Reset epoch, computed at lowest_frame
     u64 hollowed = 0, freed = 0, freed_bytes = 0, revived = 0, refused_count = 0, blocked = 0;
+    u64 reported_freed = 0, window_us = 0, window_max_us = 0;  // report bookkeeping, reaper cost since the last line
 };
 MemcutRelease& memcut_release_state()
 {
@@ -198,7 +199,9 @@ void memcut_revive(Wrapper* w)
     const u64 e = static_cast<u64>(InterlockedIncrement64(&s.epoch));
     s.lowest_frame = -1;  // as in memcut_reap: the next list check comes after this swap
     s.retiring.push_back({placeholder, e, 0, false, {}});
-    if (InterlockedCompareExchange(&w->own().refs, 0, 0) <= 0) s.pending[w] = frame_number;
+    // A texture bound after it was freed is one the title still draws: never hollow it again (no hollow/revive
+    // cycle, each of which would be a re-upload under draw_lock).
+    s.refused.insert(w);
     ++s.revived;
     ReleaseSRWLockExclusive(&s.lock);
     memcut_refill_views({w});
@@ -233,6 +236,8 @@ void memcut_reap()
     MemcutRelease& s = memcut_release_state();
     if (!InterlockedCompareExchange(&s.active, 0, 0) && s.retiring.empty()) return;
     if (!memcut_tiles_safe()) return;
+    LARGE_INTEGER started{};
+    QueryPerformanceCounter(&started);
     AcquireSRWLockExclusive(&s.lock);
     const LONG frame = frame_number;
     // 2. Hollow, once per frame.
@@ -328,15 +333,27 @@ void memcut_reap()
     }
     if (s.pending.empty() && s.hollow.empty()) InterlockedExchange(&s.active, 0);
     else InterlockedExchange(&s.active, 1);
-    const bool report = frame - s.last_report_frame >= 300 || (s.freed && s.freed <= 4);
-    if (report) s.last_report_frame = frame;
+    // Cost under draw_lock (this call, including the lock wait): max and total since the last report.
+    LARGE_INTEGER ended{}, hz{};
+    QueryPerformanceCounter(&ended);
+    QueryPerformanceFrequency(&hz);
+    const u64 us = static_cast<u64>((ended.QuadPart - started.QuadPart) * 1000000 / (hz.QuadPart ? hz.QuadPart : 1));
+    s.window_us += us;
+    if (us > s.window_max_us) s.window_max_us = us;
+    // Every 300 frames, and at each of the first 4 frees (once per new free, not at every submit).
+    const bool early = s.freed && s.freed <= 4 && s.freed != s.reported_freed;
+    const bool report = frame - s.last_report_frame >= 300 || early;
+    const u64 window_us = s.window_us, window_max_us = s.window_max_us;
+    if (report) s.last_report_frame = frame, s.reported_freed = s.freed, s.window_us = 0, s.window_max_us = 0;
     const u64 pending = s.pending.size(), hollow = s.hollow.size(), retiring = s.retiring.size();
     const u64 hollowed = s.hollowed, freed = s.freed, freed_mib = s.freed_bytes >> 20, revived = s.revived, refused = s.refused_count, blocked = s.blocked;
     ReleaseSRWLockExclusive(&s.lock);
     static LONG reports;
     if (report && first_calls(reports, 400))
         log("x2w-memcut release (frame %ld): pending %llu, hollow %llu, retiring %llu (%llu waiting for a list Reset), hollowed %llu, freed %llu = %llu MiB, "
-            "revived %llu, refused %llu", frame, pending, hollow, retiring, blocked, hollowed, freed, freed_mib, revived, refused);
+            "revived %llu, refused %llu; reaper under draw_lock since the last line: total %llu.%03llu ms, max %llu.%03llu ms",
+            frame, pending, hollow, retiring, blocked, hollowed, freed, freed_mib, revived, refused, window_us / 1000, window_us % 1000,
+            window_max_us / 1000, window_max_us % 1000);
 }
 }  // namespace
 
