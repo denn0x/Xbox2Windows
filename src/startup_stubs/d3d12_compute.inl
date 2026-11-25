@@ -568,6 +568,7 @@ void fill_views(Wrapper* self)
         const ViewRecord record = view_records()[i];
         ReleaseSRWLockShared(&note_lock);
         fill_view_kinds(self, draw_heap_size + 8 + 8 * i, &record);
+        note_heap_texture(record);  // LOCAL textures: X2W_HEAP_TEXTURE_UPLOAD (d3d12_draw.inl)
     }
     views_filled = count;
     if (count != from) {
@@ -1069,6 +1070,7 @@ bool execute_translated(Wrapper* self, ID3D12GraphicsCommandList* list, u64 key,
             return false;
         }
         fill_views(self);
+        upload_heap_textures(self);  // LOCAL textures: X2W_HEAP_TEXTURE_UPLOAD (d3d12_draw.inl)
         if (!vinfo_buffer) {
             dispatch_outcome = co_c67_heap;
             ReleaseSRWLockExclusive(&draw_lock);

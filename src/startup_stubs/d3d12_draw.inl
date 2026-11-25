@@ -2400,6 +2400,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : !(heap_va = draw_title_heap(pass)) ? "title view heap not reachable" : nullptr;
         if (!reason) {
             fill_views(self);
+            upload_heap_textures(self);  // LOCAL textures: X2W_HEAP_TEXTURE_UPLOAD
             if (!vinfo_buffer) reason = "no per-view info buffer";
             else if (tr->heapwords && !ensure_vdesc()) reason = "no view descriptor (vdesc) buffer";  // LOCAL meshrt
         }
