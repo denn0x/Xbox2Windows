@@ -504,12 +504,18 @@ class Stage:
         mask only when it is on every path.
         """
         sym = {}
+        self.execzero = {}  # conflict registers symbolic only on s_cbranch_execz edges -> exec_writes at the join
         for reg in set().union(*(s[0] for s in states)):
             values = [s[0].get(reg) for s in states]
             if all(v == values[0] for v in values):
                 sym[reg] = values[0]
             elif not all(v is None or v[0] in self.RUNTIME_BACKED for v in values):
+                # Symbolic only on s_cbranch_execz edges: the run-time variable is right wherever exec is 1, so an
+                # AND with exec before exec is written again may read it (see scalar); any other use refuses.
+                symbolic = [s for s, v in zip(states, values) if not (v is None or v[0] in self.RUNTIME_BACKED)]
                 sym[reg] = ('conflict',)
+                if all(any(s is e for e in getattr(self, 'execz_snaps', ())) for s in symbolic):
+                    self.execzero[reg] = getattr(self, 'exec_writes', 0)
         self.sym = sym
         self.masks = set().union(*(s[1] for s in states))
         self.exec_known = all(s[2] for s in states)
@@ -535,6 +541,7 @@ class Stage:
         self.cf_first = min([off for off, n, name, asm in self.ins if name.startswith('s_cbranch') or name == 's_branch']
                             + list(targets) + [1 << 32])
         self.blocks = []          # (offset, [lines], terminator)
+        self.execz_snaps = []     # the snapshots on taken s_cbranch_execz edges (see merge)
         self.uniform_v = set()    # VGPRs proven to hold one value in every lane (see set_v)
         self.partial_uniform = {}  # VGPRs holding one value in every lane active at their write (see set_v)
         self.shadow_v = set()     # shadow variables xvN that v_readfirstlane_b32 introduced
@@ -585,7 +592,10 @@ class Stage:
                 scc_unknown.add(off)
             previous = name
             if name.startswith('s_cbranch') or name == 's_branch':
-                incoming.setdefault(int(parse(asm)[1][0].split('_')[1], 16), []).append(self.snapshot())
+                snap = self.snapshot()
+                if name == 's_cbranch_execz':
+                    self.execz_snaps.append(snap)  # the taken edge: this lane's exec bit is 0 there (merge)
+                incoming.setdefault(int(parse(asm)[1][0].split('_')[1], 16), []).append(snap)
             if term:
                 self.blocks.append((start, self.lines, term))
                 self.lines, start = [], off + n
@@ -885,6 +895,19 @@ class Stage:
                 scc = None
         if dname == 'm0':
             return None
+        if base in ('s_and_b32', 's_and_b64') and any(t in ('exec', 'exec_lo') for t in srcs) and reg_range(dname):
+            # D = D & exec where D is symbolic only on s_cbranch_execz edges into a join (merge) and exec has not
+            # been written since: on those paths this lane's exec bit is 0, so the result is 0 whatever D held,
+            # and on the others D's run-time variable is its value.
+            d0 = reg_range(dname)[1]
+            regs = (d0, d0 + 1) if pair else (d0,)
+            def execzero(r):
+                return (self.sym.get(r) == ('conflict',) and
+                        getattr(self, 'execzero', {}).get(r, -1) == getattr(self, 'exec_writes', 0))
+            if dname in srcs and all(self.sym.get(r) is None or execzero(r) for r in regs) and any(
+                    self.sym.get(r) for r in regs):
+                for r in regs:
+                    self.sym.pop(r, None)
         syms = [self.sym.get(reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else None for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if word_complement:
@@ -3365,8 +3388,15 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         return message
     if fxc:
         import subprocess
+        # X2W_FXC_FLAGS: extra fxc options, for example /Od for a stage the default optimiser takes minutes on
+        # (the bytecode then runs unoptimised; the HLSL and so the result are the same). Default: none.
+        extra = os.environ.get('X2W_FXC_FLAGS', '').split()
+        if any(not re.fullmatch(r'/(Od|O[0-3]|Gfp)', flag) for flag in extra):
+            # (options that change results or layouts, /Gis /Gpp /Zpr /Zpc, are not taken)
+            raise SystemExit('X2W_FXC_FLAGS: only /Od, /O0-/O3 and /Gfp')
         for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
-            r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', name + '.%s.cso' % stage, name + '.%s.hlsl' % stage],
+            r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main'] + extra +
+                               ['/Fo', name + '.%s.cso' % stage, name + '.%s.hlsl' % stage],
                                capture_output=True, text=True)
             if r.returncode:
                 open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, r.stderr[-2000:]))
