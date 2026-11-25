@@ -2232,6 +2232,19 @@ extern "C" __declspec(dllexport) unsigned x2w_d3d12_traced_targets(unsigned* out
     ReleaseSRWLockShared(&traced_lock);
     return count;
 }
+void summarise_traced_targets(ID3D12CommandQueue* queue);
+// LOCAL meshrt, fixtures that never present: the end-of-frame read-back (x2w-frame target lines) on a queue of its own;
+// empties the noted list as at a present.
+extern "C" __declspec(dllexport) int x2w_d3d12_summarise_traced_targets()
+{
+    if (!the_device) return 0;
+    ID3D12CommandQueue* queue = nullptr;
+    const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    if (FAILED(device_of(the_device)->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)))) return 0;
+    summarise_traced_targets(queue);
+    queue->Release();
+    return 1;
+}
 void summarise_traced_targets(ID3D12CommandQueue* queue)
 {
     AcquireSRWLockExclusive(&traced_lock);

@@ -78,6 +78,7 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) unsigned x2w_d3d12_traced_targets(unsigned* out, unsigned capacity);
+extern "C" __declspec(dllimport) int x2w_d3d12_summarise_traced_targets();
 
 namespace {
 using Word = std::uint64_t;
@@ -928,6 +929,7 @@ int main(int argc, char** argv)
     // Traced frame (the trace_* tests run with X2W_D3D12_TRACE_ALL=1 X2W_D3D12_TRACE_TARGETS=1): one "x2w-frame mesh"
     // line per call with key, targets, depth target, viewport, scissor, depth state and record words, and the targets
     // noted for the read-back. Every other run is the negative control: no such line.
+    std::string log_tail;  // lines written by the read-back below (traced runs), for the debug-layer check
     char traced_env[8]{};
     const bool traced = GetEnvironmentVariableA("X2W_D3D12_TRACE_ALL", traced_env, sizeof(traced_env)) && traced_env[0] == '1';
     {
@@ -957,10 +959,39 @@ int main(int argc, char** argv)
             std::printf("FAIL: the traced-frame mesh line / noted targets do not match mode %s (traced %d)\n", mode.c_str(), traced);
             ++failures;
         }
+        // The end-of-frame read-back of the noted targets (as at the traced frame's present), from the snapshots:
+        // statez: target 0 (RGBA8, drawn: some texels non-zero) and target 1 (D32, cleared to 0.5 and drawn at 0.25:
+        // non-zero); notargets: no target line. Then the debug-layer check below covers the read-back too.
+        if (traced) {
+            x2w_d3d12_summarise_traced_targets();
+            std::ifstream again(log_path, std::ios::binary);
+            const std::string after{std::istreambuf_iterator<char>(again), {}};
+            const auto line_of = [&](const std::string& start) {
+                const std::size_t p = after.find(start);
+                return p == std::string::npos ? std::string() : after.substr(p, after.find('\n', p) - p);
+            };
+            const std::string t0 = line_of("x2w-frame target 0 "), t1 = line_of("x2w-frame target 1 ");
+            std::printf("log: read-back \"%s\" / \"%s\"\n", t0.c_str(), t1.c_str());
+            const auto nonzero_share = [](const std::string& line) {
+                const std::size_t p = line.find("non-zero texels ");
+                return p == std::string::npos ? -1.0 : std::atof(line.c_str() + p + 16);
+            };
+            const bool bad = after.find("not summarised") != std::string::npos || after.find("read-back timed out") != std::string::npos;
+            const bool read_ok = mode == "statez"
+                ? t0.find(" snapshot ") != std::string::npos && t0.find(" 32x32 fmt 28 draws 1:") != std::string::npos && nonzero_share(t0) > 0.0 &&
+                      t1.find(" snapshot ") != std::string::npos && t1.find(" 32x32 fmt 40 draws 1:") != std::string::npos && nonzero_share(t1) > 0.0
+                : t0.empty();
+            if (!read_ok || bad) {
+                std::printf("FAIL: the traced-target read-back does not match mode %s\n", mode.c_str());
+                ++failures;
+            }
+            log_tail = after.substr(log.size() < after.size() ? log.size() : after.size());
+        }
     }
-    for (std::size_t p = log.find("x2w-d3d12-debug"); p != std::string::npos; p = log.find("x2w-d3d12-debug", p + 1)) {
-        const std::size_t end = log.find('\n', p);
-        const std::string line = log.substr(p, end == std::string::npos ? std::string::npos : end - p);
+    const std::string debug_log = log + log_tail;
+    for (std::size_t p = debug_log.find("x2w-d3d12-debug"); p != std::string::npos; p = debug_log.find("x2w-d3d12-debug", p + 1)) {
+        const std::size_t end = debug_log.find('\n', p);
+        const std::string line = debug_log.substr(p, end == std::string::npos ? std::string::npos : end - p);
         std::printf("%s\n", line.c_str());
         if (line.find("sev=0 ") != std::string::npos || line.find("sev=1 ") != std::string::npos) ++failures;
     }
