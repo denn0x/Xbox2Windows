@@ -2,7 +2,8 @@
 //
 //   startup_mesh_dispatch <warp|hardware> <gpu|derived|zero|huge|off|missing|depth|words16|words32|wordsraw|
 //                                          fmaprecise|fmabad|notargets|rtvuint|smpheap|smpheapswap|
-//                                          statez|statezge|statezoff|statecull|stateculloff|statedepth>
+//                                          statez|statezge|statezoff|statecull|stateculloff|statedepth|statecullflip|
+//                                          statecullnone|statezrepeat|statezuncleared|statezlateclear|async|asyncone>
 // state modes (X2W_MESH_STATE, see main): statez drawn + depth 0.25 over a 0.5 clear; statezge nothing drawn, depth
 // 0.5; statezoff (switch unset) drawn, depth 0.5; statecull left (clockwise) culled, right (other winding) drawn; stateculloff
 // both drawn; statedepth (depth-only, hardware) depth 0.25 over a 1.0 clear.
@@ -173,7 +174,7 @@ int main(int argc, char** argv)
         mode != "words16" && mode != "words32" && mode != "wordsraw" && mode != "fmaprecise" && mode != "fmabad" && mode != "notargets" &&
         mode != "rtvuint" && mode != "smpheap" && mode != "smpheapswap" && mode != "statez" && mode != "statezge" && mode != "statezoff" &&
         mode != "statecull" && mode != "stateculloff" && mode != "statedepth" && mode != "statecullflip" && mode != "statecullnone" &&
-        mode != "statezrepeat")
+        mode != "statezrepeat" && mode != "statezuncleared" && mode != "statezlateclear" && mode != "async" && mode != "asyncone")
         return 2;
     // statecullflip: X2W_MESH_STATE_CULL_FLIP=1, the other triangle culled; statecullnone: X2W_MESH_STATE_NOCULL=1, both
     // drawn. statezrepeat: 32 calls with render target + depth, then 32 with the render target only: exactly two PSO
@@ -192,6 +193,16 @@ int main(int argc, char** argv)
     if (mode == "statecullflip") SetEnvironmentVariableW(L"X2W_MESH_STATE_CULL_FLIP", L"1");
     if (mode == "statecullnone") SetEnvironmentVariableW(L"X2W_MESH_STATE_NOCULL", L"1");
     const bool repeat = mode == "statezrepeat";
+    // async / asyncone: X2W_MESH_ASYNC=1, the first call hands its PSO to a worker and is skipped. async waits for the
+    // worker's PSO line, then records a second call: drawn. asyncone (control): only the first call: nothing drawn.
+    const bool async = mode.compare(0, 5, "async") == 0;
+    if (async) SetEnvironmentVariableW(L"X2W_MESH_ASYNC", L"1");
+    // The depth target of the z modes and statedepth is initialised by a FORWARDED guest clear (list slot 51,
+    // X2W_DRAW_STATE_DEPTH_CLEAR=1) over a different desktop pre-clear: renderstate 7c0d4cae applies no depth test to a
+    // target no forwarded clear has marked. statezuncleared (the control): no slot 51 clear, so the decoded LESS test
+    // and write stay off: drawn, depth unchanged at the pre-clear 0.5.
+    const bool guest_clear = (mode.compare(0, 6, "statez") == 0 && mode != "statezuncleared") || mode == "statedepth";
+    if (guest_clear) SetEnvironmentVariableW(L"X2W_DRAW_STATE_DEPTH_CLEAR", L"1");
     // smpheap / smpheapswap: the pixel stage samples title sampler-heap entry 65 (`smpheap 2048 1 fallback 2047`);
     // entry 65 is point and 64 linear (smpheap), or the other way round (smpheapswap, the control).
     const bool smp = mode.compare(0, 7, "smpheap") == 0;
@@ -456,10 +467,10 @@ int main(int argc, char** argv)
         void* dsv_heap = nullptr;
         if (!ok(invoke(device, 14, arg(&dsv_heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&dsv_heap)))) return 12;
         depth_handle = invoke(dsv_heap, 9);
-        if (!make_depth(depth_target, depth_handle, 0.5f)) return 12;
+        if (!make_depth(depth_target, depth_handle, guest_clear ? 0.0f : 0.5f)) return 12;  // guest clear: slot 51 sets 0.5
     }
     if (depth) {
-        if (!make_depth(target, target_handle, 1.0f)) return 12;
+        if (!make_depth(target, target_handle, guest_clear ? 0.0f : 1.0f)) return 12;  // statedepth: slot 51 sets 1.0
     } else {
         // rtvuint: an integer target (R32_UINT, 4 bytes per pixel like RGBA8): the call must be refused ("rtv variant").
         const DXGI_FORMAT format = mode == "rtvuint" ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -563,6 +574,14 @@ int main(int argc, char** argv)
         if (zmode) invoke(list, 50, 1, arg(&target_handle), 0, arg(&depth_handle));  // OMSetRenderTargets(1, &rtv, FALSE, &dsv)
         else if (mode != "notargets") invoke(list, 50, 1, arg(&target_handle));       // OMSetRenderTargets(1, &rtv); notargets: none
     }
+    const bool late_clear = mode == "statezlateclear";
+    const auto slot51_clear = [&] {
+        // List slot 51 ClearDepthStencilView, typed (the depth value is a float argument in xmm3, which invoke cannot pass).
+        using ClearDepth = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv{static_cast<SIZE_T>(depth ? target_handle : depth_handle)};
+        reinterpret_cast<ClearDepth>((*static_cast<void***>(list))[51])(list, dsv, D3D12_CLEAR_FLAG_DEPTH, depth ? 1.0f : 0.5f, 0, 0, nullptr);
+    };
+    if (guest_clear && !late_clear) slot51_clear();
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(size), static_cast<float>(size), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(size), static_cast<LONG>(size)};
     invoke(list, 21, 1, arg(&viewport));
@@ -575,6 +594,20 @@ int main(int argc, char** argv)
     if (words) invoke(list, 40, 0, 1, arg(&heap_slot), 0);                 // SetGraphicsRoot32BitConstants(0, 1, &slot, 0): entry value 2
     invoke(list, 25, arg(pipeline));                                       // SetPipelineState (the mesh pipeline)
     invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);               // ExecuteIndirect(mesh signature, 1, args, 0)
+    if (mode == "async") {  // the worker's PSO line, then a second call
+        bool compiled = false;
+        for (const auto until = GetTickCount64() + 20000; !compiled && GetTickCount64() < until; Sleep(10)) {
+            std::ifstream f(log_path, std::ios::binary);
+            const std::string text{std::istreambuf_iterator<char>(f), {}};
+            compiled = text.find("compiled in ") != std::string::npos && text.find("(X2W_MESH_ASYNC worker)") != std::string::npos;
+        }
+        std::printf("async: worker PSO line seen before the second call: %d\n", compiled);
+        invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);
+    }
+    if (late_clear) {  // the first call ran against the uncleared target (depth off); now the clear, then a second call
+        slot51_clear();
+        invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);
+    }
     if (repeat) {
         for (int i = 1; i < 32; ++i) invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);
         invoke(list, 50, 1, arg(&target_handle));                          // OMSetRenderTargets(1, &rtv): no depth view
@@ -613,7 +646,7 @@ int main(int argc, char** argv)
         ++failures;
     }
     const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || smp || mode == "statez" || mode == "statezoff" ||
-                                mode == "stateculloff" || mode == "statecullnone" || repeat || (!words_skip && (mode == "words16" || mode == "words32"));
+                                mode == "stateculloff" || mode == "statecullnone" || repeat || mode == "statezuncleared" || mode == "statezlateclear" || mode == "async" || (!words_skip && (mode == "words16" || mode == "words32"));
     // RGBA8 little-endian: R c0, G 40, B ff, A ff. words modes: G = the FORMAT code in vdesc word 3 (29 = 0x1d, 64 = 0x40).
     // smpheap: entry 65 point -> texel 0 (red ff0000ff); smpheapswap: entry 65 linear at u = 0.375 -> 0.75 red + 0.25
     // blue (R bf, B 40, A ff; filtering precision allows +-3 per channel).
@@ -661,7 +694,7 @@ int main(int argc, char** argv)
         if (!read_pixels(desktop.Get(), observer, depth_target.Get(), true, at, depth_words)) return 15;
         float values[3];
         std::memcpy(values, depth_words.data(), sizeof(values));
-        check_depth(values, 0.5f, mode == "statez" || repeat);
+        check_depth(values, 0.5f, mode == "statez" || repeat || late_clear);
     }
 
     // The log: the per-key lines and the debug layer.
@@ -698,12 +731,18 @@ int main(int argc, char** argv)
     }
     std::printf("log: issued %d, no translation %d, any x2w-mesh line %d, first bound line \"%s\"\n", issued, missing, any_mesh,
                 bound_line.c_str());
+    // async: exactly one PSO line for the two calls (the second takes the worker's PSO; the PSO key is the same).
+    int async_pso_lines = 0;
+    for (std::size_t p = log.find("x2w-mesh desktop pipeline for "); p != std::string::npos; p = log.find("x2w-mesh desktop pipeline for ", p + 1)) ++async_pso_lines;
+    if (async) std::printf("log: async PSO lines %d\n", async_pso_lines);
     const bool skipped_32 = has(std::string("x2w-draw-rt ") + key_text + ": heap draw skipped: descriptor increment is not 32");
     if (words_skip) std::printf("log: heap draw skipped (increment not 32) %d\n", skipped_32);
     if (mode == "off"       ? any_mesh
         : mode == "missing" ? (!missing || issued || !bound_ok)
         : refusal_mode      ? (issued || !bound_ok || !reason_ok)
         : words_skip        ? (issued || !bound_ok || !skipped_32)
+        : async             ? (issued != (mode == "async") || !bound_ok || (mode == "async" && (!has("(X2W_MESH_ASYNC worker)") || async_pso_lines != 1)) ||
+                               !has("x2w-mesh X2W_MESH_ASYNC=1: "))
                             : (!issued || !bound_ok)) {
         std::printf("FAIL: the x2w-mesh lines do not match mode %s\n", mode.c_str());
         ++failures;
@@ -740,7 +779,20 @@ int main(int argc, char** argv)
         // The binding's PSO serves the calls after the first of a pass: the once-per-process line, only with repeats.
         const bool reused = has(std::string("x2w-mesh pipeline ") + key_text + ": PSO kept with the binding reused");
         std::printf("log: binding PSO reused line %d\n", reused);
-        if (pso_lines != (repeat ? 2 : 1) || (repeat && !both_passes) || reused != repeat) {
+        // Depth state of the PSO: on where a forwarded clear marked the target, off on the uncleared control;
+        // statezlateclear: one call before the slot 51 clear (depth off), one after (a second PSO, depth on).
+        const bool depth_on_line = has(pso_line + "1 targets (format 28), dsv 40, depth 1,");
+        const bool depth_off_line = has(pso_line + "1 targets (format 28), dsv 40, depth 0,");
+        const bool late = mode == "statezlateclear";
+        if (zmode && state_on && !repeat) {
+            const bool want_on = mode != "statezuncleared", want_off = mode == "statezuncleared" || late;
+            std::printf("log: PSO depth on %d / off %d (want %d / %d)\n", depth_on_line, depth_off_line, want_on, want_off);
+            if (depth_on_line != want_on || depth_off_line != want_off) {
+                std::printf("FAIL: PSO depth state does not match mode %s\n", mode.c_str());
+                ++failures;
+            }
+        }
+        if (pso_lines != (repeat || late ? 2 : 1) || (repeat && !both_passes) || reused != repeat) {
             std::printf("FAIL: PSO lines do not match mode %s\n", mode.c_str());
             ++failures;
         }

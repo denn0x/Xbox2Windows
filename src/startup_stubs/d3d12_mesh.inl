@@ -34,7 +34,7 @@ bool mesh_enabled()
     return on;
 }
 
-enum MeshSkip { mesh_no_translation, mesh_failed, mesh_no_pso, mesh_no_targets, mesh_tier, mesh_no_record, mesh_rtv_variant, mesh_bind, mesh_skips };
+enum MeshSkip { mesh_no_translation, mesh_failed, mesh_no_pso, mesh_no_targets, mesh_tier, mesh_no_record, mesh_rtv_variant, mesh_bind, mesh_compiling, mesh_skips };
 LONG mesh_calls, mesh_issued, mesh_skipped[mesh_skips];
 void mesh_skip(MeshSkip why) { InterlockedIncrement(&mesh_skipped[why]); }
 
@@ -359,9 +359,26 @@ void mesh_state_desc(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHIC
     key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
-    key = fnv_bytes(&desc.BlendState, sizeof(desc.BlendState), key);
-    key = fnv_bytes(&desc.DepthStencilState, sizeof(desc.DepthStencilState), key);
-    key = fnv_bytes(&desc.RasterizerState, sizeof(desc.RasterizerState), key);
+    // Field by field: D3D12_DEPTH_STENCIL_DESC and D3D12_RENDER_TARGET_BLEND_DESC have padding after their UINT8 masks,
+    // and a struct copied from apply_draw_state's locals carries whatever was there, so hashing the bytes gave a new key
+    // for the same state (run 102: two PSO lines with the same state for 5ce5567f1f9b3707 and 7f8e1488ac1e336a).
+    const auto mix = [&key](u64 v) { key = fnv_bytes(&v, sizeof(v), key); };
+    const auto& b = desc.BlendState;
+    mix(b.AlphaToCoverageEnable), mix(b.IndependentBlendEnable);
+    for (const auto& t : b.RenderTarget) {
+        mix(t.BlendEnable), mix(t.LogicOpEnable), mix(t.SrcBlend), mix(t.DestBlend), mix(t.BlendOp), mix(t.SrcBlendAlpha);
+        mix(t.DestBlendAlpha), mix(t.BlendOpAlpha), mix(t.LogicOp), mix(t.RenderTargetWriteMask);
+    }
+    const auto& d = desc.DepthStencilState;
+    mix(d.DepthEnable), mix(d.DepthWriteMask), mix(d.DepthFunc), mix(d.StencilEnable), mix(d.StencilReadMask), mix(d.StencilWriteMask);
+    for (const auto* f : {&d.FrontFace, &d.BackFace})
+        mix(f->StencilFailOp), mix(f->StencilDepthFailOp), mix(f->StencilPassOp), mix(f->StencilFunc);
+    const auto& r = desc.RasterizerState;
+    mix(r.FillMode), mix(r.CullMode), mix(r.FrontCounterClockwise), mix(static_cast<u64>(static_cast<std::int64_t>(r.DepthBias)));
+    std::uint32_t bits;
+    std::memcpy(&bits, &r.DepthBiasClamp, 4), mix(bits);
+    std::memcpy(&bits, &r.SlopeScaledDepthBias, 4), mix(bits);
+    mix(r.DepthClipEnable), mix(r.MultisampleEnable), mix(r.AntialiasedLineEnable), mix(r.ForcedSampleCount), mix(r.ConservativeRaster);
 }
 
 template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, class Value>
@@ -409,31 +426,24 @@ ID3D12PipelineState* create_mesh_pso(const Translation& tr, const D3D12_GRAPHICS
     return SUCCEEDED(*result) ? pso : nullptr;
 }
 
-// The PSO for (entry, state of this call), compiled once per key without draw_lock (failures are kept).
-ID3D12PipelineState* mesh_pso(MeshEntry& e, const BoundPipeline& bound, const Pass& pass)
+// Compiles the slot's PSO (state 3 on entry) and publishes it: state 1 (ready) or 2 (failed, kept). The line gives the
+// driver compile time (run 102: compute compiles of up to 43 s in the frame path stalled the frame).
+void mesh_pso_compile(MeshEntry& e, MeshPso& slot, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                      const D3D12_GRAPHICS_PIPELINE_STATE_DESC& fallback, bool decoded, UINT target_count, DXGI_FORMAT format0, bool async)
 {
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc, fallback;
-    u64 key = 0;
-    bool decoded = false;
-    mesh_state_desc(bound, pass, desc, key, &decoded, &fallback);
-    AcquireSRWLockExclusive(&mesh_lock);
-    MeshPso& slot = e.psos[key];
-    while (slot.state == 3) SleepConditionVariableSRW(&mesh_loaded, &mesh_lock, INFINITE, 0);
-    if (slot.state == 1 || slot.state == 2) {
-        ID3D12PipelineState* pso = slot.pso;
-        ReleaseSRWLockExclusive(&mesh_lock);
-        return pso;
-    }
-    slot.state = 3;
-    ReleaseSRWLockExclusive(&mesh_lock);
+    LARGE_INTEGER t0, t1, f;
+    QueryPerformanceCounter(&t0);
     HRESULT hr = E_FAIL;
     ID3D12PipelineState* pso = create_mesh_pso(*e.tr, desc, &hr);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
     const auto& d = desc.DepthStencilState;
     log("x2w-mesh desktop pipeline for %016llx: %u targets (format %d), dsv %d, depth %d, pixel stage %s -> 0x%08lx; state %s: depth func %d "
-        "write %d stencil %d, cull %d ccw %d, blend rt0 %d mask 0x%x", e.tr->key, pass.target_count, pass.target_count ? pass.target_formats[0] : 0,
+        "write %d stencil %d, cull %d ccw %d, blend rt0 %d mask 0x%x; compiled in %lld ms%s", e.tr->key, target_count, static_cast<int>(format0),
         static_cast<int>(desc.DSVFormat), d.DepthEnable ? 1 : 0, e.tr->ps ? "yes" : "none", static_cast<unsigned long>(hr),
         decoded ? "decoded (X2W_MESH_STATE)" : "default", d.DepthFunc, d.DepthWriteMask, d.StencilEnable, desc.RasterizerState.CullMode,
-        desc.RasterizerState.FrontCounterClockwise, desc.BlendState.RenderTarget[0].BlendEnable, desc.BlendState.RenderTarget[0].RenderTargetWriteMask);
+        desc.RasterizerState.FrontCounterClockwise, desc.BlendState.RenderTarget[0].BlendEnable, desc.BlendState.RenderTarget[0].RenderTargetWriteMask,
+        static_cast<long long>((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart), async ? " (X2W_MESH_ASYNC worker)" : "");
     if (decoded) InterlockedIncrement(&mesh_state_changed);
     if (!pso && decoded) {
         // The decoded state was refused by the runtime: the default state instead (NOT exercised by a test).
@@ -447,6 +457,73 @@ ID3D12PipelineState* mesh_pso(MeshEntry& e, const BoundPipeline& bound, const Pa
     slot.state = pso ? 1 : 2;
     ReleaseSRWLockExclusive(&mesh_lock);
     WakeAllConditionVariable(&mesh_loaded);
+}
+
+// X2W_MESH_ASYNC=1: a call whose PSO is not compiled yet hands the compile to a thread-pool worker and is skipped
+// ("compiling"); the recording thread never compiles and never waits for a compile. Default off: compile in the call.
+bool mesh_async()
+{
+    static const bool on = [] {
+        // Also on with stall's X2W_CX_ASYNC=1 (compute and draws), unless X2W_MESH_ASYNC_OFF=1.
+        const bool v = x2w_local::env_on("X2W_MESH_ASYNC") || (x2w_local::env_on("X2W_CX_ASYNC") && !x2w_local::env_on("X2W_MESH_ASYNC_OFF"));
+        if (v) log("x2w-mesh X2W_MESH_ASYNC=1: mesh PSOs compile on a worker; calls are skipped until their PSO is ready");
+        return v;
+    }();
+    return on;
+}
+struct MeshPsoJob {
+    MeshEntry* e;
+    MeshPso* slot;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc, fallback;
+    bool decoded;
+    UINT target_count;
+    DXGI_FORMAT format0;
+};
+DWORD WINAPI mesh_pso_worker(void* p)
+{
+    MeshPsoJob* job = static_cast<MeshPsoJob*>(p);
+    mesh_pso_compile(*job->e, *job->slot, job->desc, job->fallback, job->decoded, job->target_count, job->format0, true);
+    delete job;
+    return 0;
+}
+
+// The PSO for (entry, state of this call), compiled once per key without draw_lock (failures are kept). With
+// X2W_MESH_ASYNC, null + *compiling while a worker compiles it.
+ID3D12PipelineState* mesh_pso(MeshEntry& e, const BoundPipeline& bound, const Pass& pass, bool* compiling = nullptr)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc, fallback;
+    u64 key = 0;
+    bool decoded = false;
+    mesh_state_desc(bound, pass, desc, key, &decoded, &fallback);
+    const bool async = mesh_async();
+    AcquireSRWLockExclusive(&mesh_lock);
+    MeshPso& slot = e.psos[key];
+    if (async && slot.state == 3) {
+        ReleaseSRWLockExclusive(&mesh_lock);
+        if (compiling) *compiling = true;
+        return nullptr;
+    }
+    while (slot.state == 3) SleepConditionVariableSRW(&mesh_loaded, &mesh_lock, INFINITE, 0);
+    if (slot.state == 1 || slot.state == 2) {
+        ID3D12PipelineState* pso = slot.pso;
+        ReleaseSRWLockExclusive(&mesh_lock);
+        return pso;
+    }
+    slot.state = 3;
+    ReleaseSRWLockExclusive(&mesh_lock);
+    const DXGI_FORMAT format0 = pass.target_count ? pass.target_formats[0] : DXGI_FORMAT_UNKNOWN;
+    if (async) {
+        auto* job = new MeshPsoJob{&e, &slot, desc, fallback, decoded, pass.target_count, format0};
+        if (QueueUserWorkItem(mesh_pso_worker, job, WT_EXECUTELONGFUNCTION)) {
+            if (compiling) *compiling = true;
+            return nullptr;
+        }
+        delete job;  // no worker: compile here
+    }
+    mesh_pso_compile(e, slot, desc, fallback, decoded, pass.target_count, format0, false);
+    AcquireSRWLockShared(&mesh_lock);
+    ID3D12PipelineState* pso = slot.pso;
+    ReleaseSRWLockShared(&mesh_lock);
     return pso;
 }
 
@@ -471,6 +548,9 @@ u64 mesh_pass_signature(const Pass& pass)
     for (UINT i = 0; i < pass.target_count; ++i) s = s * 1099511628211ull + static_cast<u64>(pass.target_formats[i]);
     s = s * 1099511628211ull + static_cast<u64>(pass.dsv_format);
     s = s * 1099511628211ull + (pass.dsv_read_only ? 1u : 0u) + (pass.topology == 0x11 ? 2u : 0u);
+    // renderstate 7c0d4cae: apply_draw_state keeps depth / stencil off on a depth target no forwarded slot 51 clear
+    // has initialised, so whether the bound target is cleared is part of the PSO (one shared-lock lookup, X2W_MESH_STATE only).
+    if (mesh_switches().depth && pass.dsv_resource && depth_target_cleared(pass.dsv_resource)) s = s * 1099511628211ull + 4u;
     return s | 1;  // never 0 (0 = no PSO cached)
 }
 
@@ -598,7 +678,9 @@ bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list)
         log("x2w-mesh pipeline %016llx: PSO kept with the binding reused (no state desc, hash or mesh_lock for this call; logged once)",
             static_cast<unsigned long long>(binding.key.key));
     if (!pso) {
-        pso = mesh_pso(e, *binding.bound, pass);
+        bool compiling = false;
+        pso = mesh_pso(e, *binding.bound, pass, &compiling);
+        if (compiling) return mesh_skip(mesh_compiling), false;
         if (pso) {
             AcquireSRWLockExclusive(&mesh_key_lock);
             MeshBinding& kept = mesh_bindings()[pass.pipeline];
@@ -662,10 +744,10 @@ void report_mesh(LONG frames)
     LONG accounted = issued;
     for (LONG v : s) accounted += v;
     log("x2w-mesh %ld frames: calls %ld issued %ld; skipped: no translation %ld, translation failed %ld, no PSO %ld, no targets %ld, "
-        "tier %ld; also no mesh record %ld, rtv variant %ld, bind refused %ld, refused by indirect after prepare %ld; "
-        "records keyed %ld unkeyed %ld (total)",
+        "tier %ld; also no mesh record %ld, rtv variant %ld, bind refused %ld, refused by indirect after prepare %ld, PSO compiling "
+        "(X2W_MESH_ASYNC) %ld; records keyed %ld unkeyed %ld (total)",
         frames, calls, issued, s[mesh_no_translation], s[mesh_failed], s[mesh_no_pso], s[mesh_no_targets], s[mesh_tier], s[mesh_no_record],
-        s[mesh_rtv_variant], s[mesh_bind], calls - accounted, mesh_records_keyed, mesh_records_unkeyed);
+        s[mesh_rtv_variant], s[mesh_bind], calls - accounted, s[mesh_compiling], mesh_records_keyed, mesh_records_unkeyed);
     // LOCAL meshrt: stand-in CPU per call (QueryPerformanceCounter around mesh_prepare and the bind).
     static const double us_per_tick = [] {
         LARGE_INTEGER f;
