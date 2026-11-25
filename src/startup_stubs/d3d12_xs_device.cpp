@@ -2182,7 +2182,9 @@ std::vector<TracedTarget>& traced_targets()
     return targets;
 }
 void require_state(Wrapper* self, ID3D12Resource* resource, D3D12_RESOURCE_STATES state);
-void note_traced_target(Wrapper* self, ID3D12Resource* target, bool drawn)
+// `after`: the state the target goes back to after a snapshot copy (LOCAL meshrt: DEPTH_WRITE for a depth target).
+void note_traced_target(Wrapper* self, ID3D12Resource* target, bool drawn,
+                        D3D12_RESOURCE_STATES after = D3D12_RESOURCE_STATE_RENDER_TARGET)
 {
     if (!target) return;
     AcquireSRWLockExclusive(&traced_lock);
@@ -2198,7 +2200,7 @@ void note_traced_target(Wrapper* self, ID3D12Resource* target, bool drawn)
     if (drawn && snapshots) {
         D3D12_RESOURCE_DESC desc = target->GetDesc();
         if (!found->snap && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1) {
-            desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            desc.Flags &= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;  // LOCAL meshrt: a depth target's copy keeps its depth format legal
             const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
             if (FAILED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
                                                                        nullptr, IID_PPV_ARGS(&found->snap))))
@@ -2208,10 +2210,27 @@ void note_traced_target(Wrapper* self, ID3D12Resource* target, bool drawn)
             auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
             require_state(self, target, D3D12_RESOURCE_STATE_COPY_SOURCE);
             list->CopyResource(found->snap, target);
-            require_state(self, target, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            require_state(self, target, after);
         }
     }
     ReleaseSRWLockExclusive(&traced_lock);
+}
+// LOCAL meshrt, fixtures: the targets noted in traced frames so far, first-use order, 4 words each (width, height,
+// format, drawn draws); returns how many are noted.
+extern "C" __declspec(dllexport) unsigned x2w_d3d12_traced_targets(unsigned* out, unsigned capacity)
+{
+    AcquireSRWLockShared(&traced_lock);
+    const auto& all = traced_targets();
+    for (unsigned i = 0; out && i < capacity && i < all.size(); ++i) {
+        const D3D12_RESOURCE_DESC desc = all[i].first->GetDesc();
+        out[4 * i] = static_cast<unsigned>(desc.Width);
+        out[4 * i + 1] = desc.Height;
+        out[4 * i + 2] = static_cast<unsigned>(desc.Format);
+        out[4 * i + 3] = static_cast<unsigned>(all[i].second);
+    }
+    const unsigned count = static_cast<unsigned>(all.size());
+    ReleaseSRWLockShared(&traced_lock);
+    return count;
 }
 void summarise_traced_targets(ID3D12CommandQueue* queue)
 {
@@ -2566,6 +2585,11 @@ struct Pass {
     ID3D12Resource* dsv_resource = nullptr;  // LOCAL (renderstate): desktop resource of the bound depth target
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
+    // LOCAL meshrt: every bound target's desktop resource and the first viewport / scissor the list set, for the
+    // traced-frame mesh lines (d3d12_mesh.inl mesh_trace_call). Valid for i < target_count.
+    ID3D12Resource* targets[8] = {};
+    D3D12_VIEWPORT viewport0 = {};
+    D3D12_RECT scissor0 = {};
     bool heap_set = false;
     x2w_startup::SamplerSource title_samplers;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
@@ -2820,6 +2844,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     for (UINT i = 0; i < count; ++i) {
         use_as_target(self, targets[i]);
         pass.target_formats[i] = formats[i];
+        pass.targets[i] = targets[i];
         if (i == 0) pass.target0 = targets[i];
     }
     if (dsv_target) require_state(self, dsv_target, dsv_state);
@@ -2866,6 +2891,7 @@ void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* v
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(viewports, count * sizeof(*viewports))) {
         list->RSSetViewports(count, viewports);
         pass_of(self).viewport_set = true;
+        pass_of(self).viewport0 = viewports[0];
         // LOCAL (video): a traced frame shows each viewport (letterbox questions).
         if (trace_frame_active)
             log("x2w-frame viewport list=%p count %u: x %.1f y %.1f w %.1f h %.1f", static_cast<void*>(self), count, viewports[0].TopLeftX,
@@ -2877,6 +2903,7 @@ void __stdcall list_scissors(Wrapper* self, UINT count, const D3D12_RECT* rects)
     if (auto* list = recording(self); list && count && count <= 16 && x2w_local::readable(rects, count * sizeof(*rects))) {
         list->RSSetScissorRects(count, rects);
         pass_of(self).scissor_set = true;
+        pass_of(self).scissor0 = rects[0];
         if (trace_frame_active)
             log("x2w-frame scissor list=%p count %u: %ld %ld %ld %ld", static_cast<void*>(self), count, rects[0].left, rects[0].top, rects[0].right,
                 rects[0].bottom);

@@ -136,6 +136,7 @@ using IndirectMeshHook = bool (*)(Wrapper* self, ID3D12GraphicsCommandList* list
 IndirectMeshHook indirect_mesh_hook = nullptr;
 // LOCAL meshrt (d3d12_mesh.inl): a DispatchMesh call that cannot be issued is refused before it is staged.
 bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list);
+void mesh_trace_call(Wrapper* self, bool drawn, const Translation* tr, const char* why);  // LOCAL meshrt: traced frame only
 
 // The private argument ring: default heap, rests in COMMON between calls. LOCAL memcut: a chain of chunks recycled
 // only after the lists that used them executed and their fences passed (d3d12_upload_ring.inl, indirect instance;
@@ -412,6 +413,10 @@ struct IndirectPending {
     D3D12_RESOURCE_STATES ring_state;
 };
 thread_local IndirectPending* indirect_current;
+// LOCAL meshrt: in a traced frame, the DispatchMesh call's record in title memory (CPU view at record time) for the
+// x2w-frame mesh line (d3d12_mesh.inl mesh_trace_call); null otherwise.
+thread_local const unsigned char* mesh_trace_record;
+thread_local UINT mesh_trace_stride, mesh_trace_max;
 
 bool indirect_pending(Wrapper* self) { return indirect_current && !indirect_current->issued && indirect_current->list == self; }
 
@@ -623,8 +628,18 @@ void indirect_run(Wrapper* self, ID3D12GraphicsCommandList* list, int type, Wrap
     if (!indirect_window(arguments, offset, u64{stride} * max_count, &p.args_window, &p.args_at) ||
         (count_resource && !indirect_window(count_resource, count_offset, 4, &p.count_window, &p.count_at)))
         return indirect_skip(type, skip_unresolved_buffer);
+    mesh_trace_record = nullptr;
+    if (type == itype_mesh && trace_frame_active) {  // LOCAL meshrt: traced frame only
+        mesh_trace_record = arguments->own().kind == resource_kind && arguments->own().title_memory
+                                ? static_cast<const unsigned char*>(arguments->own().title_memory) + offset : nullptr;
+        mesh_trace_stride = stride;
+        mesh_trace_max = max_count;
+    }
     if (type == itype_mesh && !mesh_prepare(self, list)) return indirect_skip(type, skip_no_pipeline);  // LOCAL meshrt: before staging
-    if (!indirect_stage(self, list, &p)) return indirect_skip(type, p.refused);
+    if (!indirect_stage(self, list, &p)) {
+        if (type == itype_mesh && trace_frame_active) mesh_trace_call(self, false, nullptr, indirect_skip_names[p.refused]);  // LOCAL meshrt
+        return indirect_skip(type, p.refused);
+    }
     indirect_current = &p;
     if (type == itype_dispatch) execute_dispatch(self, 0, 0, 0, compute_key_of(self));
     else if (type == itype_mesh) indirect_mesh_hook(self, list);

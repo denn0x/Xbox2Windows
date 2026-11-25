@@ -77,6 +77,7 @@
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+extern "C" __declspec(dllimport) unsigned x2w_d3d12_traced_targets(unsigned* out, unsigned capacity);
 
 namespace {
 using Word = std::uint64_t;
@@ -921,6 +922,39 @@ int main(int argc, char** argv)
         // Skipped (increment not 32): the root parameter exists, but no buffer is made and no view is filled.
         if (!root || (words_skip ? buffer || !view_line.empty() : !buffer || view_line.empty())) {
             std::printf("FAIL: the x2w-vdesc lines do not match mode %s\n", mode.c_str());
+            ++failures;
+        }
+    }
+    // Traced frame (the trace_* tests run with X2W_D3D12_TRACE_ALL=1 X2W_D3D12_TRACE_TARGETS=1): one "x2w-frame mesh"
+    // line per call with key, targets, depth target, viewport, scissor, depth state and record words, and the targets
+    // noted for the read-back. Every other run is the negative control: no such line.
+    char traced_env[8]{};
+    const bool traced = GetEnvironmentVariableA("X2W_D3D12_TRACE_ALL", traced_env, sizeof(traced_env)) && traced_env[0] == '1';
+    {
+        std::string frame_line;
+        if (const std::size_t p = log.find("x2w-frame mesh "); p != std::string::npos) frame_line = log.substr(p, log.find('\n', p) - p);
+        unsigned noted[4 * 8]{};
+        const unsigned notes = x2w_d3d12_traced_targets(noted, 8);
+        std::printf("log: traced %d, frame line \"%s\", targets noted %u", traced, frame_line.c_str(), notes);
+        for (unsigned i = 0; i < notes && i < 8; ++i) std::printf(" [%ux%u fmt %u draws %u]", noted[4 * i], noted[4 * i + 1], noted[4 * i + 2], noted[4 * i + 3]);
+        std::printf("\n");
+        bool trace_ok;
+        if (!traced) {
+            trace_ok = frame_line.empty() && notes == 0;
+        } else if (mode == "notargets") {  // refused before the bind: a NOT drawn line with the reason, nothing noted
+            trace_ok = frame_line.find(std::string("x2w-frame mesh NOT drawn key ") + key_text + " targets 0 dsv ") == 0 &&
+                       frame_line.find(" viewport 0.0 0.0 32.0 32.0 depth 0.00-1.00 scissor 0 0 32 32") != std::string::npos &&
+                       frame_line.find(": no targets") != std::string::npos && notes == 0;
+        } else if (mode == "statez") {  // drawn: RGBA8 target and D32 depth target, LESS + write (decoded), both noted once
+            trace_ok = frame_line.find(std::string("x2w-frame mesh drawn key ") + key_text + " targets 1 [0 ") == 0 &&
+                       frame_line.find(" 32x32 fmt 28] dsv ") != std::string::npos && frame_line.find(" fmt 40 viewport 0.0 0.0 32.0 32.0 depth 0.00-1.00 scissor 0 0 32 32 depth 1 func 2 write 1 stencil ") != std::string::npos &&
+                       frame_line.find(" record (max count 1, stride ") != std::string::npos &&
+                       notes == 2 && noted[0] == 32 && noted[1] == 32 && noted[2] == 28 && noted[3] == 1 && noted[4] == 32 && noted[6] == 40 && noted[7] == 1;
+        } else {
+            trace_ok = false;  // no trace expectation for this mode
+        }
+        if (!trace_ok) {
+            std::printf("FAIL: the traced-frame mesh line / noted targets do not match mode %s (traced %d)\n", mode.c_str(), traced);
             ++failures;
         }
     }

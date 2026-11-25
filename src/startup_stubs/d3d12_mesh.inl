@@ -36,7 +36,10 @@ bool mesh_enabled()
 
 enum MeshSkip { mesh_no_translation, mesh_failed, mesh_no_pso, mesh_no_targets, mesh_tier, mesh_no_record, mesh_rtv_variant, mesh_bind, mesh_compiling, mesh_skips };
 LONG mesh_calls, mesh_issued, mesh_skipped[mesh_skips];
-void mesh_skip(MeshSkip why) { InterlockedIncrement(&mesh_skipped[why]); }
+thread_local int mesh_last_skip = -1;  // LOCAL meshrt: this thread's last skip reason (traced-frame mesh lines)
+void mesh_skip(MeshSkip why) { InterlockedIncrement(&mesh_skipped[why]); mesh_last_skip = why; }
+constexpr const char* mesh_skip_names[mesh_skips] = {"no translation", "translation failed", "no PSO", "no targets", "tier",
+                                                     "no mesh record", "rtv variant", "bind refused", "PSO compiling"};
 
 // ---- Keys, at slot-57 creation --------------------------------------------------------------------------------
 
@@ -598,14 +601,78 @@ struct MeshReady {
 thread_local MeshReady mesh_ready;
 thread_local bool mesh_binding_now;  // inside draw_translated for the mesh call
 
+// LOCAL meshrt: in a traced frame (trace_frame_active), every mesh call takes part like an ordinary draw: its render
+// targets and depth target are noted for the end-of-frame read-back (X2W_D3D12_TRACE_TARGETS snapshots) and one
+// "x2w-frame mesh" line gives key, every target with size and format, depth target, the list's first viewport and
+// scissor, the decoded depth state of the PSO, the indirect record's first words in title memory at record time (the
+// GPU may write them later) and, when not drawn, the skip reason. Nothing of this runs outside a traced frame.
+thread_local u64 mesh_trace_key;              // the binding's key for this call (0: none yet)
+thread_local const BoundPipeline* mesh_trace_bound;
+void mesh_trace_call(Wrapper* self, bool drawn, const Translation* tr, const char* why)
+{
+    const Pass& pass = pass_of(self);
+    for (UINT i = 0; i < pass.target_count; ++i) note_traced_target(self, pass.targets[i], drawn);
+    if (pass.dsv_resource)
+        note_traced_target(self, pass.dsv_resource, drawn && !pass.dsv_read_only,
+                           pass.dsv_read_only ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    char text[900];
+    int n = 0;
+    const auto add = [&](const char* format, auto... args) {
+        if (n >= 0 && n < static_cast<int>(sizeof(text))) n += std::snprintf(text + n, sizeof(text) - n, format, args...);
+    };
+    add("x2w-frame mesh %s key %016llx", drawn ? "drawn" : "NOT drawn", static_cast<unsigned long long>(mesh_trace_key));
+    if (tr && tr->key != mesh_trace_key) add(" variant %016llx", static_cast<unsigned long long>(tr->key));
+    add(" targets %u", pass.target_count);
+    for (UINT i = 0; i < pass.target_count; ++i) {
+        const D3D12_RESOURCE_DESC rd = pass.targets[i] ? pass.targets[i]->GetDesc() : D3D12_RESOURCE_DESC{};
+        add(" [%u %p %llux%u fmt %d]", i, static_cast<void*>(pass.targets[i]), static_cast<unsigned long long>(rd.Width), rd.Height,
+            static_cast<int>(pass.target_formats[i]));
+    }
+    add(" dsv %p fmt %d%s", static_cast<void*>(pass.dsv_resource), static_cast<int>(pass.dsv_format), pass.dsv_read_only ? " read-only" : "");
+    if (pass.viewport_set)
+        add(" viewport %.1f %.1f %.1f %.1f depth %.2f-%.2f", pass.viewport0.TopLeftX, pass.viewport0.TopLeftY, pass.viewport0.Width,
+            pass.viewport0.Height, pass.viewport0.MinDepth, pass.viewport0.MaxDepth);
+    else
+        add(" viewport none");
+    if (pass.scissor_set)
+        add(" scissor %ld %ld %ld %ld", pass.scissor0.left, pass.scissor0.top, pass.scissor0.right, pass.scissor0.bottom);
+    else
+        add(" scissor none");
+    if (mesh_trace_bound) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+        u64 key = 0;
+        mesh_state_desc(*mesh_trace_bound, pass, desc, key);
+        const auto& d = desc.DepthStencilState;
+        add(" depth %d func %d write %d stencil %d", d.DepthEnable, static_cast<int>(d.DepthFunc), d.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL,
+            d.StencilEnable);
+    }
+    if (mesh_trace_record) {
+        const UINT words = mesh_trace_stride / 4 < 8 ? mesh_trace_stride / 4 : 8;
+        if (words && x2w_local::readable(mesh_trace_record, words * 4)) {
+            add(" record (max count %u, stride %u):", mesh_trace_max, mesh_trace_stride);
+            for (UINT i = 0; i < words; ++i) {
+                std::uint32_t w;
+                std::memcpy(&w, mesh_trace_record + 4 * i, 4);
+                add(" %08x", w);
+            }
+        } else {
+            add(" record unreadable");
+        }
+    }
+    if (!drawn) add(": %s", why ? why : "not issued");
+    log("%s", text);
+}
+
 // indirect_run (d3d12_indirect.inl), type DispatchMesh, before the record is staged. False: skip the call (counted
 // here by reason; indirect counts it as no-pipeline). No draw_lock held on entry.
 bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list);
 bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
 {
     const LONG64 t0 = mesh_now();
+    if (trace_frame_active) mesh_trace_key = 0, mesh_trace_bound = nullptr, mesh_last_skip = -1;
     const bool ok = mesh_prepare_body(self, list);
     InterlockedAdd64(&mesh_prepare_ticks, mesh_now() - t0);
+    if (!ok && trace_frame_active) mesh_trace_call(self, false, nullptr, mesh_last_skip >= 0 ? mesh_skip_names[mesh_last_skip] : "refused");
     return ok;
 }
 bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list)
@@ -630,6 +697,7 @@ bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list)
         ReleaseSRWLockExclusive(&mesh_key_lock);
     }
     if (!binding.mesh || !binding.key.keyed || !binding.bound) return mesh_skip(mesh_no_record), false;
+    if (trace_frame_active) mesh_trace_key = binding.key.key, mesh_trace_bound = binding.bound;
     // The key's entry is kept with the binding (map nodes do not move): loaded_mesh (mesh_lock + lookup) only for the
     // first call and, for a key without a translation, when its 5 s retry is due (racy reads of state / retry_at: at
     // worst one extra loaded_mesh).
@@ -738,6 +806,7 @@ bool mesh_hook(Wrapper* self, ID3D12GraphicsCommandList* list)
     InterlockedAdd64(&mesh_bind_ticks, mesh_now() - t0);
     InterlockedIncrement64(&mesh_bind_calls);
     mesh_binding_now = false;
+    if (trace_frame_active) mesh_trace_call(self, issued, mesh_ready.tr, "bind refused by draw_translated");
     MeshEntry* e = mesh_ready.entry;
     mesh_ready = {};
     if (!issued) {
