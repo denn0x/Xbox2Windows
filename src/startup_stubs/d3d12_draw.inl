@@ -2125,7 +2125,7 @@ const char* draw_title_heap(const Pass& pass, TitleHeapView& out)
         for (const HeapInfo& h : heap_infos())
             if (h.wrapper == pass.source_view_heap && h.title_cpu) {
                 address = h.title_cpu;
-                bytes = u64{h.count} * h.increment;
+                bytes = u64{h.logical_count} * h.increment;  // the title's count (count may be the driver-clamped one)
             }
         ReleaseSRWLockShared(&note_lock);
     }

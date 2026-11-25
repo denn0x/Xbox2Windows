@@ -597,7 +597,7 @@ bool title_view_heap(const Pass& pass, u64* address, u64* bytes)
     }
     if (best) {
         *address = best->title_cpu;
-        *bytes = u64{best->count} * best->increment;
+        *bytes = u64{best->logical_count} * best->increment;  // LOCAL meshrt: the title's heap (count may be driver-clamped)
     }
     ReleaseSRWLockShared(&note_lock);
     return best != nullptr;
