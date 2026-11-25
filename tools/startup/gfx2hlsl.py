@@ -1630,8 +1630,10 @@ class Stage:
         # refused, as is any modifier not named here.
         # (image_sample_l and image_load_mip check their own modifier lists below.)
         allowed = ('dlc', 'glc', 'slc', 'a16') + (('unorm',) if how == 'load' else ('d16',) if how in ('sample', 'lz') else ())
+        if how == 'get_lod':
+            allowed = ('dlc', 'glc', 'slc')
         for m in mods:
-            if how in ('sample', 'lz', 'load', 'b', 'd') and not (m.startswith(('dim:', 'dmask:')) or m in allowed):
+            if how in ('sample', 'lz', 'load', 'b', 'd', 'get_lod') and not (m.startswith(('dim:', 'dmask:')) or m in allowed):
                 raise Unsupported('image_%s modifier %s' % (how, m))
         a16 = 'a16' in mods
         bias = None
@@ -1710,6 +1712,21 @@ class Stage:
                         raise Unsupported('image_sample_b outside straight-line code with every lane active')
                     self.quad_divergent_used.append(self.pc)
                 call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(bias))
+            elif how == 'get_lod':
+                # image_get_lod: [0] the LOD the sample would use, clamped, [1] the computed LOD before the clamp
+                # (Mesa nir_texop_lod, which ACO emits as image_get_lod and returns as is; GLSL textureQueryLod x/y).
+                # HLSL CalculateLevelOfDetail / CalculateLevelOfDetailUnclamped (HLSL intrinsics, SM 4.1+). Both use implicit
+                # derivatives, so the control-flow rule of image_sample_b applies. Which clamps each side applies
+                # (sampler MIN/MAX_LOD, the view's mip range) is ASSUMED to agree; the runtime carries the sampler's
+                # LOD fields with X2W_SAMPLER_LOD=1.
+                if self.kind != 'ps' or dim != 'SQ_RSRC_IMG_2D' or dmask & ~3 or not dmask or len(cs) != 2 or a16:
+                    raise Unsupported('image_get_lod form %s %s' % (', '.join(ops), ' '.join(mods)))
+                if not self.exec_known or len(self.blocks) > 0:
+                    if not self.quad_divergent or self.has_loop:
+                        raise Unsupported('image_get_lod outside straight-line code with every lane active')
+                    self.quad_divergent_used.append(self.pc)
+                call = 'float4(%s.CalculateLevelOfDetail(%s, %s), %s.CalculateLevelOfDetailUnclamped(%s, %s), 0.0, 0.0)' % (
+                    tex, smp, uv, tex, smp, uv)
             elif how == 'd':
                 # explicit gradients: no implicit derivatives, so any control flow and any exec state
                 ddx, ddy = (', '.join(self.f(c) for c in g) for g in grads)
@@ -1898,6 +1915,9 @@ class Stage:
 
     def op_image_sample_lz(self, ops, mods):
         self.image(ops, mods, 'lz')
+
+    def op_image_get_lod(self, ops, mods):
+        self.image(ops, mods, 'get_lod')
 
     def op_image_sample_l(self, ops, mods):
         self.image(ops, mods, 'l')
