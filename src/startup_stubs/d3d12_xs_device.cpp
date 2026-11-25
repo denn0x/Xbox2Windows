@@ -1249,10 +1249,16 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
 ULONG __stdcall add_ref(Wrapper* self) { return static_cast<ULONG>(InterlockedIncrement(&self->own().refs)); }
 // The wrappers and their desktop objects stay alive for the process (experiment scope).
 void retire_placement(Wrapper* w);
+// LOCAL memcut: X2W_MEMCUT_RELEASE (d3d12_memcut_release.inl).
+void memcut_released(Wrapper* self);
+void memcut_list_reset(Wrapper* list);
+void memcut_reap();
+void memcut_revive(Wrapper* w);
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
     if (!refs && self->own().kind == resource_kind && self->own().title_memory) retire_placement(self);
+    if (!refs && self->own().kind == resource_kind) memcut_released(self);  // LOCAL memcut
     return static_cast<ULONG>(refs);
 }
 
@@ -1752,6 +1758,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         ReleaseSRWLockExclusive(&allocator_lock);
     }
     if (SUCCEEDED(hr)) {
+        memcut_list_reset(self);  // LOCAL memcut
         forget_list_dispatches(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
         gpu_time::reset(self);
         gpu_time::list_begin(self, static_cast<ID3D12GraphicsCommandList*>(self->own().real));  // LOCAL: X2W_GPU_TIME_CLASSES
@@ -3603,6 +3610,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             }
             retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
+            memcut_reap();  // LOCAL memcut (X2W_MEMCUT_RELEASE)
             gpu_time::submitted(queue, submitted);  // LOCAL: X2W_CX_GPU_TIME
             static const bool srv_report_submits = x2w_local::env_on("X2W_DRAW_SRV_STATS_SUBMITS");  // LOCAL stall: fixtures only
             if (srv_report_submits) report_srv_copies();
@@ -5446,6 +5454,7 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
 }
 }  // namespace
 #include "startup_stubs/d3d12_mem_counters.inl"  // LOCAL memcut: x2w_memory_counters export
+#include "startup_stubs/d3d12_memcut_release.inl"  // LOCAL memcut: X2W_MEMCUT_RELEASE
 
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {

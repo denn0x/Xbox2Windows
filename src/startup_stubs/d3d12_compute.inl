@@ -328,6 +328,7 @@ bool texture_view(Wrapper* self, const ComputeTranslation::Res& r, const ViewRec
 {
     Timed timed(time_cx_texture);
     Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
+    if (prepare && resource && resource->own().kind == resource_kind) memcut_revive(resource);  // LOCAL memcut: X2W_MEMCUT_RELEASE
     ID3D12Resource* texture = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
     if (!texture || record.desc_bytes < 24) return false;
     if (resource->own().refs <= 0) x2w_memcut::note_after_release(true);  // LOCAL memcut

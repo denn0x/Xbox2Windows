@@ -29,6 +29,7 @@ struct MemcutEntry {
     bool placement_known;
     signed char mapped;  // title address in MEM_MAPPED memory: -1 not asked yet, 0 no, 1 yes
     DXGI_FORMAT format;
+    bool reserved;       // a reserved resource (no memory of its own): counted with 0 bytes, not as unsized
 };
 struct MemcutTotals {
     u64 bytes[mc_count][2][2]{};  // [class][system][dead]
@@ -64,6 +65,10 @@ MemcutEntry memcut_classify(ID3D12Resource* resource, void* title)
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(the_device)->GetResourceAllocationInfo(0, 1, &desc);
     e.bytes = info.SizeInBytes == ~0ull ? 0 : info.SizeInBytes;
+    D3D12_HEAP_PROPERTIES props{};
+    D3D12_HEAP_FLAGS flags{};
+    e.reserved = FAILED(resource->GetHeapProperties(&props, &flags));  // reserved (X2W_MEMCUT_RELEASE placeholder): no memory
+    if (e.reserved) e.bytes = 0;
     e.system = memcut_system_heap(resource);
     e.format = desc.Format;
     e.title = reinterpret_cast<u64>(title);
@@ -95,7 +100,7 @@ bool memcut_texture(int cls) { return cls == mc_tex || cls == mc_tex_target || c
 
 void memcut_add(MemcutTotals& t, const MemcutEntry& e, bool dead)
 {
-    if (!e.bytes) ++t.unsized;
+    if (!e.bytes && !e.reserved) ++t.unsized;
     t.bytes[e.cls][e.system][dead] += e.bytes;
     ++t.count[e.cls][e.system][dead];
     if (!dead && !e.system && memcut_texture(e.cls)) {
