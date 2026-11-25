@@ -2373,7 +2373,53 @@ def buf_format_helper():
     return '\n'.join(lines)
 
 
-HELPERS['x2w_fmt_load'] = buf_format_helper()
+FMT_KIND = {'uint': 0, 'sint': 1, 'unorm': 2, 'snorm': 3, 'float': 4}
+
+
+def buf_format_word(code):
+    """x2w_fmt_tab entry: channel widths x, y, z, w in 6-bit fields [5:0] [11:6] [17:12] [23:18] (0 = absent), kind
+    in [26:24] (FMT_KIND); 0 for a code not in BUF_FORMATS."""
+    if code not in BUF_FORMATS:
+        return 0
+    widths, kind = BUF_FORMATS[code]
+    word = FMT_KIND[kind] << 24
+    for k, n in enumerate(widths):
+        word |= n << (6 * k)
+    return word
+
+
+def buf_format_helper_table():
+    """The same x2w_fmt_load as buf_format_helper, written once for every format: the format code indexes a constant
+    table of channel widths and kind, and one channel decoder serves all formats. Values are the same as the per-format
+    chain's (same field, sign extension, UNORM/SNORM divisor, binary16 widening), except that the UNORM/SNORM divisor
+    is a run-time value here rather than a literal, so the compiler cannot replace the division by a multiply."""
+    size = max(BUF_FORMATS) + 1
+    table = ', '.join('0x%08xu' % buf_format_word(c) for c in range(size))
+    return '\n'.join([
+        'static const uint x2w_fmt_tab[%d] = { %s };' % (size, table),
+        'uint x2w_fmt_chan(ByteAddressBuffer b, uint a, uint d, uint k, uint one) {',
+        '    uint n = (d >> (6u * k)) & 63u;',
+        '    if (n == 0u) return k == 3u ? one : 0u;',
+        '    uint pos = (k > 0u ? (d & 63u) : 0u) + (k > 1u ? ((d >> 6) & 63u) : 0u) + (k > 2u ? ((d >> 12) & 63u) : 0u);',
+        '    uint kind = (d >> 24) & 7u, sh = 32u - n;',
+        '    uint raw = n == 32u ? b.Load(a + pos / 8u) : ((ldu(b, a + 4u * (pos / 32u)) >> (pos % 32u)) & ((1u << n) - 1u));',
+        '    int sv = int(raw << sh) >> sh;',
+        '    if (kind == 0u || (kind == 4u && n == 32u)) return raw;',
+        '    if (kind == 1u) return uint(sv);',
+        '    if (kind == 2u) return U(float(raw) / float((1u << n) - 1u));',
+        '    if (kind == 3u) return U(max(float(sv) / float((1u << (n - 1u)) - 1u), -1.0));',
+        '    return U(f16tof32(n == 16u ? raw : raw << (15u - n))); }',
+        'uint x2w_fmt_load(ByteAddressBuffer b, uint a, uint w3, uint c) {',
+        '    uint f = (w3 >> 12) & 127u, s = (w3 >> (3u * c)) & 7u;',
+        '    uint d = f < %du ? x2w_fmt_tab[f] : 0u;' % size,
+        '    if (d == 0u || s == 0u || s == 2u || s == 3u) return 0u;',
+        '    uint one = ((d >> 24) & 7u) <= 1u ? 1u : 0x3f800000u;',
+        '    return s == 1u ? one : x2w_fmt_chan(b, a, d, s - 4u, one); }'])
+
+
+# The table form: fxc 10.0.26100 took 432.6 s for a vertex stage with two calls of the per-format chain and 0.6 s with
+# this one (translator_work NOTES round 5). buf_format_helper stays as the reference the check compares against.
+HELPERS['x2w_fmt_load'] = buf_format_helper_table()
 # VEC_U conversions whose result is a binary32 value, so the VOP3 output modifiers apply to it.
 FLOAT_RESULT_U = frozenset(('v_cvt_f32_u32', 'v_cvt_f32_i32', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1',
                             'v_cvt_f32_ubyte2', 'v_cvt_f32_ubyte3', 'v_cvt_f32_f16'))
