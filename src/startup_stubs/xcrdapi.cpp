@@ -171,28 +171,32 @@ static bool destination_writable(const void* destination, std::size_t bytes)
     return true;
 }
 
-// LOCAL (out/gamerun/xmem_work/NOTES.md, run 108): a destination that destination_writable refused is tried once more
-// through xmem (x2w_xmem_write_settled: check + copy under xmem's lock, so not inside the gap of a page remap that
-// another thread's map call is making). When it stays refused, one line says what Windows and xmem know about the
-// first unwritable page: never mapped by xmem, last unmapped (when, by which thread), or mapped by xmem's record.
-static bool write_destination_settled(void* destination, const void* data, std::size_t bytes, std::size_t capacity)
+// LOCAL (out/gamerun/xmem_work/NOTES.md, run 108): every read's copy into title memory goes through xmem's
+// x2w_xmem_write_settled (check + copy under xmem's lock when the destination is in xmem's page reservations, so it is
+// never inside the unmap/map gap of a page remap that another thread's map call is making: no dropped, no torn read).
+// A destination that is not writable is retried every 5 ms for up to X2W_DSTORAGE_DEST_WAIT_MS (default 250; 0 = no
+// wait) before the read is dropped: a read that runs before the title maps its destination is served after the wait.
+// "served after wait" and dropped reads are counted and logged with what Windows and xmem know about the first
+// unwritable page. Without the xmem exports: the plain check and copy as before.
+static volatile LONG destination_served_after_wait = 0, destination_dropped = 0;
+
+static ULONG destination_wait_ms() noexcept
 {
-    using WriteSettled = BOOL(WINAPI*)(void*, const void*, SIZE_T, SIZE_T);
+    static const ULONG value = [] {
+        char text[16]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_DSTORAGE_DEST_WAIT_MS", text, sizeof(text));
+        return n && n < sizeof(text) ? static_cast<ULONG>(std::strtoul(text, nullptr, 10)) : 250ul;
+    }();
+    return value;
+}
+
+static void log_unwritable(const char* what, const void* destination, std::size_t capacity, ULONG waited, LONG n)
+{
     using PageEvent = BOOL(WINAPI*)(const void*, ULONG*, ULONG64*, ULONG*, ULONG64*, ULONG64*, ULONG64*);
     static const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
-    static const auto write_settled =
-        xmem ? reinterpret_cast<WriteSettled>(GetProcAddress(xmem, "x2w_xmem_write_settled")) : nullptr;
     static const auto page_event = xmem ? reinterpret_cast<PageEvent>(GetProcAddress(xmem, "x2w_xmem_page_event")) : nullptr;
-    static volatile LONG served = 0, dropped = 0;
-    if (write_settled && write_settled(destination, data, bytes, capacity)) {
-        const LONG n = InterlockedIncrement(&served);
-        if (n <= 16 || (n & (n - 1)) == 0)
-            x2w_local::logf("x2w-dstorage   destination %p+0x%zx was not writable at first, writable once xmem had settled: "
-                            "read served (#%ld)", destination, capacity, n);
-        return true;
-    }
     const auto start = reinterpret_cast<std::uintptr_t>(destination);
-    std::uintptr_t bad = start;
+    std::uintptr_t bad = start;  // the first unwritable page now (for a served read: none, the start is shown)
     for (std::uintptr_t at = start & ~std::uintptr_t{0xFFFF}; at < start + capacity; at += 0x10000) {
         const std::uintptr_t from = at < start ? start : at;
         const std::uintptr_t to = at + 0x10000 < start + capacity ? at + 0x10000 : start + capacity;
@@ -207,14 +211,37 @@ static bool write_destination_settled(void* destination, const void* data, std::
     ULONG64 page = 0, age = 0, serial = 0, remaps = 0;
     const BOOL view = page_event ? page_event(reinterpret_cast<const void*>(bad), &kind, &page, &thread, &age, &serial, &remaps)
                                  : FALSE;
-    x2w_local::logf("x2w-dstorage   destination %p+0x%zx stays not writable (#%ld): first bad page %p state 0x%lx type 0x%lx "
-                    "protect 0x%lx allocation %p | xmem: %s, last event %s page 0x%llx thread %lu %llu ms ago (step %llu), "
-                    "%llu remaps so far", destination, capacity, InterlockedIncrement(&dropped), reinterpret_cast<void*>(bad),
-                    info.State, info.Type, info.Protect, info.AllocationBase,
+    x2w_local::logf("x2w-dstorage   destination %p+0x%zx %s after %lu ms (#%ld; wait bound %lu ms, "
+                    "X2W_DSTORAGE_DEST_WAIT_MS): page %p state 0x%lx type 0x%lx protect 0x%lx allocation %p | xmem: %s, "
+                    "last event %s page 0x%llx thread %lu %llu ms ago (step %llu), %llu remaps so far",
+                    destination, capacity, what, waited, n, destination_wait_ms(), reinterpret_cast<void*>(bad), info.State,
+                    info.Type, info.Protect, info.AllocationBase,
                     !page_event ? "no x2w_xmem_page_event" : view ? "view recorded" : "no view recorded",
                     kind == 1 ? "map" : kind == 2 ? "UNMAP" : "none (never mapped or unmapped by xmem)",
                     static_cast<unsigned long long>(page), thread, static_cast<unsigned long long>(age),
                     static_cast<unsigned long long>(serial), static_cast<unsigned long long>(remaps));
+}
+
+// Writes bytes of data to the title's destination (capacity bytes must be writable). False: nothing written.
+static bool write_destination(void* destination, const void* data, std::size_t bytes, std::size_t capacity)
+{
+    using WriteWait = BOOL(WINAPI*)(void*, const void*, SIZE_T, SIZE_T, ULONG, ULONG*);
+    static const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+    static const auto write_wait =
+        xmem ? reinterpret_cast<WriteWait>(GetProcAddress(xmem, "x2w_xmem_write_settled_wait")) : nullptr;
+    if (!write_wait) {
+        if (!destination_writable(destination, capacity)) return false;
+        std::memcpy(destination, data, bytes);
+        return true;
+    }
+    ULONG waited = 0;
+    if (write_wait(destination, data, bytes, capacity, 0, &waited)) return true;
+    if (write_wait(destination, data, bytes, capacity, destination_wait_ms(), &waited)) {
+        const LONG n = InterlockedIncrement(&destination_served_after_wait);
+        if (n <= 16 || (n & (n - 1)) == 0) log_unwritable("was not writable, SERVED after a wait", destination, capacity, waited, n);
+        return true;
+    }
+    log_unwritable("stays NOT writable, read dropped", destination, capacity, waited, InterlockedIncrement(&destination_dropped));
     return false;
 }
 
@@ -985,10 +1012,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 // The title's destination can be smaller in memory than its declared capacity (#870:
                 // a write fault inside this copy). Judge the whole declared capacity before the first
                 // byte is written, so a refusal leaves every page untouched.
-                if (destination_writable(destination, destination_capacity)) {
-                    std::memcpy(destination, data, decode_length);
-                } else if (write_destination_settled(destination, data, decode_length, destination_capacity)) {
-                    // served after xmem settled (logged there)
+                if (write_destination(destination, data, decode_length, destination_capacity)) {
+                    // written (through xmem's locked write when available)
                 } else {
                     outcome = "destination not writable";
                     data = nullptr;
@@ -1706,9 +1731,9 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld archive-shifted=%ld past-end=%ld stream-pieces=%ld found-on-disk=%ld rds5-slices=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
+                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s; destinations served after wait=%ld dropped=%ld", second, requests_done, requests_compressed,
                     requests_failed, requests_bcpack_blank, requests_archive_shifted, requests_archive_past_end, requests_stream_pieces, requests_pieces_found_on_disk, requests_interval_slices, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
-                    section_text);
+                    section_text, destination_served_after_wait, destination_dropped);
                 char tally[512];
                 int at = 0;
                 tally[0] = 0;
