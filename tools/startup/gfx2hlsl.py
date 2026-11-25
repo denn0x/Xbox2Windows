@@ -2744,7 +2744,16 @@ POS_FIXED_PT = 15
 # ac_nir_lower_intrinsics_to_args.c reads frag_coord x/y/z from POS_X/Y/Z_FLOAT and frag_coord_w_rcp from
 # POS_W_FLOAT; nir_builder.c nir_build_frag_coord makes gl_FragCoord.w = frcp(frag_coord_w_rcp), and D3D
 # SV_Position.w is 1 / gl_FragCoord.w (vkd3d-shader spirv.c frag_coord_fixup), so POS_W_FLOAT is SV_Position.w.
-PS_INPUT_HLSL = {8: 'U(i.pos.x)', 9: 'U(i.pos.y)', 10: 'U(i.pos.z)', 11: 'U(i.pos.w)'}
+PS_INPUT_HLSL = {8: 'U(i.pos.x)', 9: 'U(i.pos.y)', 10: 'U(i.pos.z)', 11: 'U(i.pos.w)',
+                 # FRONT_FACE is the float +1.0 (front) or -1.0 (back): Mesa nir_intrinsics.py front_face_fsign
+                 # "front_face ? 1.0 : -1.0", which ac_nir_lower_intrinsics_to_args.c loads as the front_face argument
+                 # itself (and load_front_face as fgt(arg, 0)). SV_IsFrontFace follows the PSO's FrontCounterClockwise,
+                 # which the runtime sets from the cull register (pipeline_state_decode.h); the manifest says
+                 # `frontface 1` so these keys can be found if that convention changes (X2W_DRAW_STATE_CULL_FLIP).
+                 12: 'U(i.ff ? 1.0 : -1.0)'}
+FRONT_FACE = 12
+# The SPI position inputs, which a per-sample stage would read at the sample (see PS_SAMPLE_RATE).
+PS_POSITION_INPUTS = (8, 9, 10, 11)
 # The *_sample barycentrics: the stage runs per sample and the position inputs are at the sample, which a plain
 # SV_Position input is not.
 PS_SAMPLE_RATE = (1 << 0) | (1 << 4)
@@ -2845,7 +2854,7 @@ class Pipeline:
             elif not self.ps_input_ena >> bit & 1:
                 self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x, allocated but not enabled'
                                          % (PS_INPUTS[bit][0], reg, off))
-            elif bit in PS_INPUT_HLSL and self.ps_input_ena & PS_SAMPLE_RATE:
+            elif bit in PS_POSITION_INPUTS and self.ps_input_ena & PS_SAMPLE_RATE:
                 self.ps_input_refusal = ('pixel stage reads SPI input %s (v%d) at %#x with per-sample barycentrics '
                                          'enabled (%#x)' % (PS_INPUTS[bit][0], reg, off, self.ps_input_ena))
             elif bit in PS_INPUT_HLSL:
@@ -2968,6 +2977,8 @@ class Pipeline:
             fields.append('    float4 loparam%d : LOPARAM%d;' % (p, p))
             fields.append('    float4 hiparam%d : HIPARAM%d;' % (p, p))
         fields.append('    float4 pos : SV_Position;')
+        if for_pixel and FRONT_FACE in getattr(self, 'ps_input_vgprs', {}).values():
+            fields.append('    bool ff : SV_IsFrontFace;')  # system-generated: pixel input only
         clip = self.vs.exports.get('clip')
         if clip:
             fields.append('    float%s clip0 : SV_ClipDistance0;' % ('' if clip == 1 else clip))
@@ -3052,6 +3063,8 @@ class Pipeline:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         if getattr(self, 'fma_rule', None) and self.fma_rule != 'legacy':
             lines.append('fma %s' % self.fma_rule)
+        if FRONT_FACE in getattr(self, 'ps_input_vgprs', {}).values():
+            lines.append('frontface 1')  # reads SV_IsFrontFace: depends on the PSO winding (see PS_INPUT_HLSL)
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
         lines.append('targets %s' % ' '.join(k[3:] for k in sorted(self.ps.exports) if k.startswith('mrt')))
         return '\n'.join(lines) + '\n'

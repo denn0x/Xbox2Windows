@@ -1814,7 +1814,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_image_sample_c COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_c_check.py")
     # Pixel-stage lowerings of mesh pairs (gfx2hlsl): translation checks with negative controls.
-    foreach(check IN ITEMS scalar_pack_hh quad_dpp spi_input mesh_spi_input image_sample_b image_sample_d interp_f16 round_mode)
+    foreach(check IN ITEMS scalar_pack_hh quad_dpp spi_input mesh_spi_input image_sample_b image_sample_d interp_f16 round_mode front_face)
         add_test(NAME startup_${check} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_${check}_check.py")
         set_tests_properties(startup_${check} PROPERTIES TIMEOUT 120)
@@ -1930,6 +1930,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_round_mode_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_round_mode_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        # FRONT_FACE as SV_IsFrontFace (+1.0 / -1.0), on the same renderer
+        add_test(NAME startup_front_face_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_front_face_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_front_face_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl per-lane bit operations: CPU evaluation of the translated text against an independent
     # reference with mutation controls, then a desktop draw of the translated pairs (FXC 5_1 and DXC 6_0).
