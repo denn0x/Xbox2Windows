@@ -359,6 +359,8 @@ class Stage:
             self.a_invariant = bool(m) and self.lane_invariant(m.group(1))
         if re.search(r'\bexec = ', text):
             self.exec_writes = getattr(self, 'exec_writes', 0) + 1
+        if re.search(r'\bt = ', text):
+            self.t_invariant = False  # image() marks its own result again (see there)
         self.lines.append(text)
 
     def lane_invariant(self, expr):
@@ -371,9 +373,14 @@ class Stage:
         """
         for m in re.finditer(r'\b[A-Za-z_]\w*', expr):
             name = m.group(0)
+            if name in ('x', 'y', 'z', 'w') and expr[m.start() - 1:m.start()] == '.' and \
+                    re.search(r'\bt\.$', expr[:m.start()]):
+                continue  # a component of the image result t (lane-invariant only when t is, checked as 't')
             if name in LANE_INVARIANT_NAMES or name.startswith('x2w_'):
                 continue
             if name == 'a' and getattr(self, 'a_invariant', False):
+                continue
+            if name == 't' and getattr(self, 't_invariant', False):
                 continue
             if re.fullmatch(r'xv\d+', name):  # assigned in every lane from a lane-invariant value (readfirstlane)
                 continue
@@ -1174,6 +1181,22 @@ class Stage:
         self.set_s(d, '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2])))
         return None
 
+    def op_s_brev_b32(self, ops, mods):
+        """D = S0 with its 32 bits reversed (RDNA 2 ISA SOP1; SCC unchanged). Folded for a constant source: titles
+        build inline sampler words with it (s_brev_b32 s10, 40 = 0x14000000)."""
+        d, r = reg_range(ops[0]), reg_range(ops[1])
+        value = self.is_const(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
+        if value is None and not r:
+            try:
+                value = int(ops[1], 0) & 0xffffffff
+            except ValueError:
+                value = None
+        if value is not None and ops[1] not in FLOATS and d and d[0] == 's' and d[1] == d[2]:
+            folded = int('{:032b}'.format(value)[::-1], 2)
+            self.set_s(d[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        return self.scalar('s_brev_b32', ops)
+
     def op_s_bfm_b64(self, ops, mods):
         """D[63:0] = ((1 << S0[5:0]) - 1) << S1[5:0]; SCC unchanged. Folded when both counts are constant."""
         d = reg_range(ops[0])[1]
@@ -1585,6 +1608,13 @@ class Stage:
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
         self.emit('t = %s;' % call)
+        # An image read with no implicit derivatives (load, level 0, explicit level) of a bound texture (rN) through a
+        # fixed sampler (qN), at lane-invariant coordinates, returns the same texel or filtered value in every lane.
+        if how in ('load', 'load_mip', 'lz', 'l') and hasattr(self, 'lane_s') and re.match(r'r\d+\b', call):
+            expr = re.sub(r'\bq\d+\b', '0', call)
+            expr = re.sub(r'\.(Load|SampleLevel)\(', '(', expr)
+            expr = re.sub(r'\b(int|uint|float)[234]\(', '(', expr)
+            self.t_invariant = self.lane_invariant(expr)
         n = dst[1]
         if 'd16' in mods:
             if self.round16:
