@@ -1955,7 +1955,7 @@ class Stage:
 
     def compare(self, base, ops, mods=()):
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32|f16)(_sdwa)?', base)
-        if not m or (m.group(4) and m.group(3) not in ('i32', 'u32') and (m.group(3), m.group(2)) != ('f32', 'class')) \
+        if not m or (m.group(4) and m.group(3) not in ('i32', 'u32') and m.group(2) != 'class') \
                 or (m.group(3) == 'f16' and m.group(2) != 'class'):
             if m and m.group(4) and m.group(3) == 'f32':
                 # The f32 predicates are verified on the plain and e64 forms only (#1920); the SDWA forms
@@ -1975,6 +1975,23 @@ class Stage:
             fields = dict(mod.partition(':')[::2] for mod in mods)
             if set(fields) != {'src0_sel', 'src1_sel'} or any(v not in SDWA_SEL for v in fields.values()):
                 raise Unsupported('%s with %s' % (base, mods))
+            if cond == 'class' and typ == 'f16':
+                # v_cmp_class_f16 SDWA: S0 is the selected field of a VGPR or SGPR, zero-extended, of which the op
+                # reads bits [15:0] as the binary16 value (SDWA source selection, AMD RDNA ISA 6.3.3; for WORD_1 that
+                # is the high half); neg()/abs() act on bit 15 of the selected value. S1 is the integer class mask
+                # through its own selection, as for f32. A constant S0 is refused: its f16 inline form is not modelled.
+                # The disassembly spells the modifiers -vN and |vN| on registers (neg(N)/abs(N) on constants).
+                mm = re.fullmatch(r'(?:(-)(\w+)|\|(\w+)\|)', a)
+                src = (mm.group(2) or mm.group(3)) if mm else a
+                if src.startswith('sext(') or not reg_range(src):
+                    raise Unsupported('%s with f16 value operand %s' % (base, a))
+                value = sdwa_source(self.u(src), fields['src0_sel'], False)
+                if mm:
+                    value = '(%s %s)' % (value, '^ 0x8000u' if mm.group(1) else '& 0x7fffu')
+                if b.startswith(('sext(', 'neg(', 'abs(')):
+                    raise Unsupported('%s with a modified class mask %s' % (base, b))
+                expr = 'x2w_class_f16(%s, %s)' % (value, sdwa_source(self.u(b), fields['src1_sel'], False))
+                return self.write_compare(writes_exec, dst, expr)
             if cond == 'class':
                 # v_cmp_class_f32 SDWA: S0 is the f32 value (whole dword only; neg()/abs() act on its sign bit as
                 # for the e64 form), S1 the integer class mask read through its selection (a compiler uses
