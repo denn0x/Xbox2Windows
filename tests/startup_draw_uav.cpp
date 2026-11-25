@@ -144,6 +144,57 @@ int bind_heap_texture_entry(void* guest, Word cpu)
     return 0;
 }
 
+// LOCAL (textures) modes membuf / membuf-off / membuf-link (X2W_BUFFER_HEAP_INDEX, tests/startup_buffer_heap_index_check.py).
+// Slots are `increment` bytes apart (the desktop increment: 32 like the console, 64 on WARP), five of them. The heap's
+// descriptor memory starts as the title's free list (slot M holds M + 1, as run 87 measured). Slot 1 is a decoy: a
+// raw buffer view of a placed buffer whose first dword is 55 (slot N of the link 1, never to be bound).
+// membuf / membuf-off: slot 0 is a memory SRV (device slot 70) of private memory no resource covers, first dword 99.
+// membuf-link: slot 0 stays free. Then the title copies slot 0 to byte 128 of the heap (slot 4, or 2 on WARP) with its
+// own memory copy; the draw's table entry is that slot (`srv 0 buf table 0 128`).
+int bind_memory_buffer_entries(void* guest, Word cpu, UINT increment)
+{
+    if (increment < 32 || 128 % increment) return 48;
+    auto* heap_bytes = reinterpret_cast<unsigned char*>(cpu);
+    for (std::uint32_t m = 0; m < 5; ++m) {
+        const std::uint32_t link = m + 1;
+        std::memset(heap_bytes + m * increment, 0, increment);
+        std::memcpy(heap_bytes + m * increment, &link, 4);
+    }
+    std::uint32_t* decoy = private_pages();
+    std::uint32_t* memory = private_pages();
+    if (!decoy || !memory) return 45;
+    decoy[0] = 55;
+    memory[0] = 99;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* buffer = placed(guest, decoy, desc);
+    if (!buffer) return 47;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    srv.Buffer.NumElements = 64;
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    invoke(guest, 18, ptr(buffer), ptr(&srv), cpu + increment);
+    if (!mode_is(L"membuf-link")) {
+        struct ViewAt {
+            D3D12_SHADER_RESOURCE_VIEW_DESC view;
+            Word address;
+            Word tail[2];
+        } v{};
+        static_assert(offsetof(ViewAt, address) == 0x28 && sizeof(ViewAt) == 0x40);
+        v.view = srv;
+        v.address = ptr(memory);
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+    }
+    std::memcpy(heap_bytes + 128, heap_bytes, 32);
+    std::uint32_t copied[4];
+    std::memcpy(copied, heap_bytes + 128, sizeof copied);
+    std::printf("membuf entry words: %08x %08x %08x %08x\n", copied[0], copied[1], copied[2], copied[3]);
+    std::fflush(stdout);
+    return 0;
+}
+
 // A 64 KiB placed buffer over `memory` (title memory of a resource for CopyBufferRegion).
 void* memory_buffer(void* guest, void* memory)
 {
@@ -176,16 +227,20 @@ int draw_uav_stores(ID3D12Device* desktop, void* guest, void* list)
     if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &heaps, sizeof(heaps))) || !heaps.Supported) return 77;
     GetEnvironmentVariableW(L"X2W_TEST_DRAW_UAV", uav_mode, 32);
     const bool heap_texture_mode = mode_is(L"heaptex");  // LOCAL (textures)
-    const bool heap_mode = mode_is(L"heap") || heap_texture_mode;
+    const bool membuf_mode = std::wcsncmp(uav_mode, L"membuf", 6) == 0;  // LOCAL (textures)
+    const bool heap_mode = mode_is(L"heap") || heap_texture_mode || membuf_mode;
     // Heap draws need the console's 32-byte view slots (the title's own shader arithmetic).
     std::printf("view increment %u\n", desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
     std::fflush(stdout);
     const bool copy_mode = std::wcsncmp(uav_mode, L"copy", 4) == 0;
-    void* heap = view_heap(guest, heap_mode ? private_pages() : nullptr, copy_mode ? 2 : 1);
+    void* heap = view_heap(guest, heap_mode ? private_pages() : nullptr, membuf_mode ? 5 : copy_mode ? 2 : 1);
     if (!heap) return 42;
     const Word cpu = invoke(heap, 9);
     if (!cpu) return 42;
-    if (heap_texture_mode) {
+    if (membuf_mode) {
+        if (const int rc = bind_memory_buffer_entries(guest, cpu, desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)))
+            return rc;
+    } else if (heap_texture_mode) {
         if (const int rc = bind_heap_texture_entry(guest, cpu)) return rc;
     } else if (std::wcsncmp(uav_mode, L"tex", 3) == 0) {
         if (const int rc = bind_texture_entry(guest, cpu)) return rc;

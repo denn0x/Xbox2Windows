@@ -123,6 +123,15 @@ HEAP_DETILE_HLSL = (
     "}\n"
 )
 
+# LOCAL (textures): modes membuf* (tests/startup_buffer_heap_index_check.py): the bytes of dword 0 of srv 0 as the colour.
+MEMBUF_HLSL = (
+    "ByteAddressBuffer t0 : register(t0);\n"
+    "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    "  uint v = t0.Load(0);\n"
+    "  return float4(v & 255u, (v >> 8) & 255u, (v >> 16) & 255u, v >> 24) / 255.0;\n"
+    "}\n"
+)
+
 COPY_ENV = {"copy-same": "gpu", "copy-two": "gpu", "copy-twice": "gpu", "copy-none": "gpu", "copy-cpu": "1"}
 
 
@@ -156,6 +165,8 @@ def run_mode(directory, consumer, backend, mode, extra_env=None):
         lines, hlsl = ["uav 0 buf table 0 0", f"udsrc {count} uavstride 0"], stride_hlsl(count)
     elif mode in HEAP_TEXTURE_MODES:  # LOCAL (textures): tests/startup_heap_texture_check.py
         lines, hlsl = ["heap 1"], HEAP_DETILE_HLSL if "detile" in mode else HEAP_TEXTURE_HLSL
+    elif mode.startswith("membuf"):
+        lines, hlsl = ["srv 0 buf table 0 128"], MEMBUF_HLSL
     else:
         base = mode == "uavbase"
         lines = ["uav 0 buf table 0 0", "srv 0 buf table 0 32" if mode in COPY_ENV else "srv 0 buf table 0 0", f"udsrc {count} uavword3 0", f"udsrc {count + 1} bufword3 0"]

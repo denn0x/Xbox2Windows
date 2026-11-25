@@ -518,6 +518,64 @@ void resolve_heap_index(u64 key, UINT srv, u64 entry, std::uint32_t* words)
     if (how) std::memcpy(words, out, sizeof(out));
 }
 
+// LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1 (default off). Run 109 (board 044600_scene, 045000_textures): 2569 buffer srvs
+// of one traced frame had table words "<N> 0 0 0" and 138 had "<N> 1 0x12 0"; the G-buffer draws read the
+// X2W_DRAW_NULL_IDENTITY fill or 18 junk bytes there. Neither is a heap index. N is the title's free-list link
+// (an untouched slot M holds M + 1, run 87). The first shape is a free slot. The second is a freed view token
+// (view id 1, slot 18) whose word 0 the free list replaced. Such a slot reaches a table when a creation into it wrote
+// nothing. MEASURED for one: the mesh keys' srv 0(0,1760) entry holds 0x34, the link of heap 0 slot 0x33, and slot 0x33
+// is the destination of a logged slot-70 buffer_unavailable refusal (509891 in run 109). ASSUMED for the rest.
+// With the switch: (1) a slot-70 buffer SRV no buffer resource covers gets the X2W_MEMORY_SRV_BUFFER stand-in, so its
+// destination holds a token and the title's copies carry it (d3d12_memory_srv.inl); (2) a buffer entry still in either
+// shape is bound as a null buffer, not as an address. On the console such a V# has word 3 = 0 (no format, dst_sel 0)
+// and reads zeros. (3) The traced frame (and the first 32 outside it) logs the entry with heap slots N-1 and N and
+// their shadow ids. Counted with or without the switch: "buffer links N (nulled M)" in the totals line. Slot N is never
+// bound: it belongs to another view.
+bool buffer_heap_index_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_BUFFER_HEAP_INDEX");
+        if (v) log("x2w-draw X2W_BUFFER_HEAP_INDEX=1: slot-70 buffers without a resource get a stand-in; free-list buffer entries bind null");
+        return v;
+    }();
+    return on;
+}
+LONG buffer_links, buffer_links_nulled;
+bool free_link_words(const std::uint32_t* w)
+{
+    if (!w[0] || w[0] == view_token_magic || w[3]) return false;
+    return (!w[1] && !w[2]) || (w[2] >= 17 && w[2] <= 22);
+}
+void log_buffer_link(u64 key, UINT srv, u64 entry, const std::uint32_t* words)
+{
+    AcquireSRWLockShared(&note_lock);
+    const std::vector<HeapInfo> heaps = heap_infos();
+    ReleaseSRWLockShared(&note_lock);
+    char where[96] = "in no title descriptor heap";
+    char slots[2][160] = {"", ""};
+    for (std::size_t h = 0; h < heaps.size(); ++h) {
+        const HeapInfo& heap = heaps[h];
+        if (!heap.title_cpu) continue;
+        const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
+        if (entry < heap.title_cpu || entry >= heap.title_cpu + u64{heap.count} * stride) continue;
+        std::snprintf(where, sizeof where, "index 0x%llx of heap %zu (count %u)", (entry - heap.title_cpu) / stride, h, heap.count);
+        for (int d = -1; d <= 0; ++d) {
+            const u64 slot = u64{words[0]} + d;
+            if (slot >= heap.count) continue;
+            const u64 at = heap.title_cpu + slot * stride;
+            std::uint32_t there[6]{};
+            const bool readable = x2w_local::readable(reinterpret_cast<const void*>(at), sizeof(there));
+            if (readable) std::memcpy(there, reinterpret_cast<const void*>(at), sizeof(there));
+            std::snprintf(slots[d + 1], sizeof slots[0], "slot %s 0x%llx %s %08x %08x %08x %08x %08x %08x shadow %u", d ? "N-1" : "N", slot,
+                          readable ? (there[0] == view_token_magic ? "token" : "words") : "unreadable", there[0], there[1], there[2], there[3],
+                          there[4], there[5], heap.shadow ? heap.shadow[slot] : 0u);
+        }
+        break;
+    }
+    log("x2w-frame srv-heapbuf %016llx %u frame %ld: entry 0x%llx words %08x %08x %08x %08x (%s) is %s; %s; %s; bound null", key, srv, frame_number,
+        entry, words[0], words[1], words[2], words[3], words[1] || words[2] ? "freed token" : "free link", where, slots[0], slots[1]);
+}
+
 u64 fnv_bytes(const void* data, std::size_t bytes, u64 hash = 1469598103934665603ull)
 {
     for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
@@ -2687,6 +2745,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             if (texture && !no_desc) fix_srv(desc, texture);
             device_of(the_device)->CreateShaderResourceView(texture, depth_desc ? &depth_default : no_desc ? nullptr : &desc, dest);
             continue;
+        }
+        // LOCAL (textures): X2W_BUFFER_HEAP_INDEX (buffer_heap_index_on): a free-list buffer entry binds null.
+        const bool buffer_link = srv.source == 0 && entry_ok && free_link_words(words);
+        if (buffer_link) {
+            InterlockedIncrement(&buffer_links);
+            if (buffer_heap_index_on()) {
+                static LONG link_lines;
+                if (trace_frame_active || first_calls(link_lines, 32)) log_buffer_link(tr->key, i, entry, words);
+                InterlockedIncrement(&buffer_links_nulled);
+                std::memset(words, 0, sizeof(words));
+                word3[i] = 0;
+            }
         }
         if (srv.source == 0 && words[0] == view_token_magic && entry) {
             // A view the title created: a constant buffer view names its memory directly; a buffer

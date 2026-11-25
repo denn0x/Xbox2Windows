@@ -761,7 +761,8 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
-        if ((!buffer || !info) && memory_srv_buffer_on()) {
+        // LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1 takes this stand-in for SRVs too (slot 71 stays X2W_MEMORY_SRV_BUFFER's).
+        if ((!buffer || !info) && (memory_srv_buffer_on() || buffer_heap_index_on())) {
             // LOCAL (video): no buffer resource covers the address; a stand-in whose title memory starts there.
             if (Wrapper* standin = standin_memory_buffer(input->address, *resource, span_bytes)) {
                 note_linear_form(lf_buffer_srv, destination);
