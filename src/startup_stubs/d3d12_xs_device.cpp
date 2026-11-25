@@ -5362,6 +5362,17 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 300 == 0) report_target_binds();
     if (render_mode() && frame % 300 == 0) report_draw_state();  // LOCAL (renderstate): d3d12_draw.inl
     if (frame % 300 == 0) draw_lock_times::report("300 frames");  // LOCAL stall: X2W_DRAW_LOCK_TIMES
+    if (x2w_local::probe_cache_on()) {  // LOCAL stall: X2W_PROBE_CACHE (local_log.h); entries also end at each present
+        x2w_local::invalidate_probe_cache();
+        if (frame % 300 == 0) {
+            x2w_local::ProbeCache& c = x2w_local::probe_cache();
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            log("x2w-probe cache (X2W_PROBE_CACHE, %llu ms, cleared at each present): since start %lld probes answered from the cache without a "
+                "fault, %lld faults (%lld VirtualQuery, %.1f ms), %lld unreadable ranges kept", x2w_local::probe_cache_ms(), c.hits, c.faults,
+                c.queries, static_cast<double>(c.query_ticks) * 1000.0 / static_cast<double>(f.QuadPart), c.cached);
+        }
+    }
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];

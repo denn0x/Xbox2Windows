@@ -756,6 +756,15 @@ foreach(backend IN ITEMS warp hardware)
     endforeach()
 endforeach()
 
+# LOCAL stall: probe_readable's unreadable-range cache (local_log.h, X2W_PROBE_CACHE; nocache = control). No GPU.
+add_executable(startup_probe_cache tests/startup_probe_cache.cpp)
+target_include_directories(startup_probe_cache PRIVATE src)
+target_compile_features(startup_probe_cache PRIVATE cxx_std_17)
+add_test(NAME startup_probe_cache_cache COMMAND startup_probe_cache cache)
+set_tests_properties(startup_probe_cache_cache PROPERTIES TIMEOUT 60 ENVIRONMENT "X2W_PROBE_CACHE=1;X2W_PROBE_CACHE_MS=100")
+add_test(NAME startup_probe_cache_nocache COMMAND startup_probe_cache nocache)
+set_tests_properties(startup_probe_cache_nocache PROPERTIES TIMEOUT 60)
+
 # LOCAL stall: draw_lock hold / wait time by site (d3d12_draw.inl, X2W_DRAW_LOCK_TIMES; off = control). No GPU.
 add_executable(startup_draw_lock_times tests/startup_draw_lock_times.cpp)
 target_compile_features(startup_draw_lock_times PRIVATE cxx_std_17)
