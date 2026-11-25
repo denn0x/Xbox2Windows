@@ -1455,6 +1455,7 @@ class MeshStage(G.Stage):
         """As the pipeline translator, plus: the offset is read once before the destination is written (the
         title's `s_buffer_load_dwordx2 s[4:5], s[16:19], s4` overwrote s4 before the second word), the
         instruction's offset:N is added, and the address is dword aligned (the hardware ignores bits 1:0)."""
+        G.smem_imm_refuse('s_buffer_load', ops, mods)
         extra = 0
         for m in mods:
             if m.startswith('offset:'):

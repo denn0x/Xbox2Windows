@@ -141,6 +141,17 @@ def smem_offset(tok):
     return '0' if tok == 'off' else tok
 
 
+def smem_imm_refuse(base, ops, mods):
+    """Refuse a negative SMEM immediate offset (upstream #1984 / ed7d09a4). OFFSET[20:0] is signed on RDNA 2:
+    disasm_rdna2 prints a negative one as -0x.., an older decoder as 0x100000..0x1fffff; either would otherwise
+    be added as a positive byte offset."""
+    toks = [ops[2]] if len(ops) > 2 else []
+    toks += [m[7:] for m in mods if m.startswith('offset:')]
+    for tok in toks:
+        if re.fullmatch(r'-?(0[xX][0-9a-fA-F]+|\d+)', tok) and not 0 <= int(tok, 0) <= 0xfffff:
+            raise Unsupported('%s: SMEM immediate offset %s' % (base, tok))
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
     uses_q = False
@@ -956,6 +967,7 @@ class Stage:
             self.set_s(d + 1, '0u')
 
     def op_s_load_dwordx4(self, ops, mods, count=4):
+        smem_imm_refuse('s_load', ops, mods)
         dst, base = reg_range(ops[0]), reg_range(ops[1])
         for n in range(dst[1], dst[2] + 1):
             getattr(self, 'masks', set()).discard(n)  # a loaded descriptor or value is not a lane mask (some paths below skip set_s)
@@ -1066,6 +1078,7 @@ class Stage:
         self.op_s_load_dwordx4(ops, mods, 1)
 
     def op_s_buffer_load_dword(self, ops, mods, count=1):
+        smem_imm_refuse('s_buffer_load', ops, mods)
         dst = reg_range(ops[0])
         buf = self.pipe.resource(self.descriptor(ops[1]), 'buf')
         token = smem_offset(ops[2])
