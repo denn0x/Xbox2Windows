@@ -282,31 +282,50 @@ auto owned_reservation(ULONG_PTR address)
     return address - it->first < it->second ? it : memory.reservations.end();
 }
 
-bool map_view(ULONG_PTR address, const Backing& backing)
+// LOCAL (xmem_work/NOTES.md): the Windows errors of the last refused view on this thread, each call's own (the
+// error a caller sees is only the last one): the first MapViewOfFile3, the placeholder split (VirtualFree
+// MEM_PRESERVE_PLACEHOLDER; 0 = not tried because the address is in no recorded reservation), the second map.
+struct MapErrors {
+    DWORD map = 0, split = 0, retry = 0;
+    bool split_tried = false;
+};
+thread_local MapErrors map_errors;
+
+// One view of bytes at address: replace the placeholder, or split it out of a bigger recorded placeholder first.
+bool map_placeholder(ULONG_PTR address, HANDLE section, ULONG64 section_offset, SIZE_T bytes)
 {
-    const HANDLE section = backing.section;
-    const ULONG64 section_offset = backing.offset;
     auto* target = reinterpret_cast<void*>(address);
     auto map = [&] {
-        return MapViewOfFile3(section, GetCurrentProcess(), target, section_offset,
-                              page_bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
+        return MapViewOfFile3(section, GetCurrentProcess(), target, section_offset, bytes, MEM_REPLACE_PLACEHOLDER,
+                              PAGE_READWRITE, nullptr, 0) != nullptr;
     };
+    map_errors = MapErrors{};
     if (map()) return true;
-    if (owned_reservation(address) == memory.reservations.end()) return false;
-    return VirtualFree(target, page_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) && map();
+    map_errors.map = GetLastError();
+    if (owned_reservation(address) == memory.reservations.end()) {
+        SetLastError(map_errors.map);
+        return false;
+    }
+    map_errors.split_tried = true;
+    if (!VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+        map_errors.split = GetLastError();
+        return false;
+    }
+    if (map()) return true;
+    map_errors.retry = GetLastError();
+    return false;
+}
+
+bool map_view(ULONG_PTR address, const Backing& backing)
+{
+    return map_placeholder(address, backing.section, backing.offset, page_bytes);
 }
 
 // Maps bytes of one section at address as a single view; falls back to one view per page when the
 // range is not inside a single placeholder.
 bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes, std::vector<std::pair<ULONG_PTR, SIZE_T>>& made)
 {
-    auto* target = reinterpret_cast<void*>(address);
-    auto map = [&] {
-        return MapViewOfFile3(backing.section, GetCurrentProcess(), target, backing.offset, bytes,
-                              MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
-    };
-    if (map() || (owned_reservation(address) != memory.reservations.end() &&
-                  VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) && map())) {
+    if (map_placeholder(address, backing.section, backing.offset, bytes)) {
         memory.runs[address] = bytes;
         made.emplace_back(address, bytes);
         return true;
@@ -645,33 +664,81 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail)
     return lost;
 }
 
+// LOCAL (xmem_work/NOTES.md): one line for a refused page mapping or unmapping, with everything needed to name the
+// cause: the check that refused it or each Windows call's own error, what Windows shows at the address, what the
+// registry holds there, and the state of the slabs. Called with memory.mutex held; error is left as the last error.
+void log_refusal(const char* what, bool mapping, ULONG_PTR count, ULONG_PTR index, ULONG_PTR address, ULONG_PTR page,
+                 const char* check, DWORD error, ULONG_PTR mapped_before, bool windows) noexcept
+{
+    MEMORY_BASIC_INFORMATION info{};
+    const bool queried = address && VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == sizeof(info);
+    const auto live = memory.views.find(address);
+    const auto reservation = owned_reservation(address);
+    char windows_text[160] = "";
+    if (windows)
+        std::snprintf(windows_text, sizeof(windows_text), " MapViewOfFile3 err %lu, split %s%lu, map again err %lu;",
+                      map_errors.map, map_errors.split_tried ? "err " : "not tried ", map_errors.split, map_errors.retry);
+    x2w_local::logf("x2w-xmem REFUSED %s (%s) thread %lu: entry %llu of %llu, address %p page 0x%llx (token 0x%llx, %s): %s, "
+                    "error %lu;%s %llu page(s) of the call mapped before it were taken back | Windows at the address: base %p "
+                    "allocation %p size 0x%llx state 0x%lx type 0x%lx protect 0x%lx%s | registry: %s 0x%llx, reservation %p+0x%llx | "
+                    "slabs %llu (%llu pool), %llu pages live, %llu free slots, budget %llu MiB",
+                    what, mapping ? "map" : "unmap", GetCurrentThreadId(), static_cast<unsigned long long>(index),
+                    static_cast<unsigned long long>(count), reinterpret_cast<void*>(address), static_cast<unsigned long long>(page),
+                    static_cast<unsigned long long>(page << 4), page && era_physical::owns(page) ? "granted" : "NOT granted",
+                    check, static_cast<unsigned long>(error), windows_text, static_cast<unsigned long long>(mapped_before),
+                    queried ? info.BaseAddress : nullptr, queried ? info.AllocationBase : nullptr,
+                    static_cast<unsigned long long>(queried ? info.RegionSize : 0), queried ? info.State : 0ul,
+                    queried ? info.Type : 0ul, queried ? info.Protect : 0ul, queried ? "" : " (VirtualQuery failed)",
+                    live != memory.views.end() ? "view of page" : "no view", static_cast<unsigned long long>(
+                        live != memory.views.end() ? live->second : 0),
+                    reservation != memory.reservations.end() ? reinterpret_cast<void*>(reservation->first) : nullptr,
+                    static_cast<unsigned long long>(reservation != memory.reservations.end() ? reservation->second : 0),
+                    static_cast<unsigned long long>(memory.slabs.size()), static_cast<unsigned long long>(memory.pool_slabs),
+                    static_cast<unsigned long long>(memory.backings.size()),
+                    static_cast<unsigned long long>(memory.free_slots.size()),
+                    static_cast<unsigned long long>(slab_budget_bytes() >> 20));
+    SetLastError(error);
+}
+
 // Destinations must be caller-owned, page-sized Windows placeholders. Live views
 // are owned by this shim until it unmaps them. The caller must not replace them.
+// Called with memory.mutex held and a MappingThread marker on this thread (map_pages, local_apply).
 template <typename AddressAt>
-BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at) noexcept
+BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at, bool share_views,
+                      const char* what) noexcept
 {
     if (!count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
     try {
-        const bool share_views = fault_retry.ready();
-        const MappingThread marker;
-        const std::lock_guard guard(memory.mutex);
         std::map<ULONG_PTR, ULONG_PTR> batch;
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto address = address_at(i);
             const auto live = memory.views.find(address);
-            if (!address || address % page_bytes ||
-                (tokens ? live != memory.views.end() || !era_physical::owns(tokens[i])
-                        : live == memory.views.end()))
+            const char* check = !address || address % page_bytes ? "address is zero or not 64 KiB aligned"
+                                : tokens && live != memory.views.end() ? "a view is already recorded at the address"
+                                : tokens && !era_physical::owns(tokens[i]) ? "the page is not granted (era_physical::owns)"
+                                : !tokens && live == memory.views.end() ? "no view is recorded at the address"
+                                                                         : nullptr;
+            if (!check && !batch.emplace(address, tokens ? tokens[i] : live->second).second)
+                check = "the address is named twice in the call";
+            if (check) {
+                log_refusal(what, tokens != nullptr, count, i, address,
+                            tokens ? tokens[i] : live != memory.views.end() ? live->second : 0, check,
+                            ERROR_INVALID_PARAMETER, 0, false);
                 return physical_result(era_physical::Status::invalid);
-            if (!batch.emplace(address, tokens ? tokens[i] : live->second).second)
-                return physical_result(era_physical::Status::invalid);
+            }
         }
         // Adjacent pages that are adjacent slots of one section share a single view (a "run"): a
         // multi-gigabyte batch then takes a few views instead of one per 64 KiB page.
         if (tokens) {
+            ULONG_PTR index = 0;
             for (const auto& [address, page] : batch) {
-                if (!section_for(page)) return FALSE;
+                if (!section_for(page)) {
+                    log_refusal(what, true, count, index, address, page, "no backing section for the page (section_for)",
+                                GetLastError(), 0, false);
+                    return FALSE;
+                }
+                ++index;
             }
             std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
             auto first = batch.begin();
@@ -685,8 +752,19 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                 }
                 if (!map_run(first->first, head, bytes, made)) {
                     const DWORD error = GetLastError();
+                    // The page map_run stopped at: the first page of the run that has no view.
+                    ULONG_PTR at = first->first;
+                    while (memory.runs.count(at) && at < first->first + bytes) at += page_bytes;
+                    const auto failed = batch.find(at);
+                    log_refusal(what, true, count, static_cast<ULONG_PTR>(std::distance(batch.begin(), failed)), at,
+                                failed != batch.end() ? failed->second : 0,
+                                "Windows refused the view (sorted entry; MapViewOfFile3 / placeholder split)", error,
+                                made.size(), true);
                     for (const auto& [base, size] : made) {
-                        UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER);
+                        if (!UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER))
+                            x2w_local::logf("x2w-xmem REFUSED %s: taking back the view %p+0x%llx failed (error %lu): a view the "
+                                            "registry does not know stays there", what, reinterpret_cast<void*>(base),
+                                            static_cast<unsigned long long>(size), GetLastError());
                         memory.runs.erase(base);
                     }
                     coalesce_unused(batch);
@@ -755,6 +833,17 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
         return physical_result(era_physical::Status::exhausted);
     }
     return physical_result(era_physical::Status::ok);
+}
+
+template <typename AddressAt>
+BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at, const char* what) noexcept
+{
+    if (!count || count > era_physical::capacity_pages)
+        return physical_result(era_physical::Status::invalid);
+    const bool share_views = fault_retry.ready();
+    const MappingThread marker;
+    const std::lock_guard guard(memory.mutex);
+    return map_pages_locked(count, tokens, address_at, share_views, what);
 }
 }
 
@@ -868,21 +957,25 @@ BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* p
     }
     BOOL ok = TRUE;
     DWORD error = 0;
-    if (!unmap.empty() && !map_pages(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; })) {
+    if (!unmap.empty() && !map_pages(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; }, what)) {
         ok = FALSE;
         error = GetLastError();
     }
     if (ok && !map_at.empty() &&
-        !map_pages(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; })) {
+        !map_pages(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; }, what)) {
         ok = FALSE;
         error = GetLastError();
     }
     static LONG calls;
     if (!ok || x2w_local::first_calls(calls, 16))
-        x2w_local::logf("x2w-xmem %s count=0x%llx first=%p map=%llu unmap=%llu -> %d (err %lu)", what,
-                        static_cast<unsigned long long>(count), count ? reinterpret_cast<void*>(addresses[0]) : nullptr,
-                        static_cast<unsigned long long>(map_at.size()), static_cast<unsigned long long>(unmap.size()), ok,
-                        static_cast<unsigned long>(error));
+        x2w_local::logf("x2w-xmem %s count=0x%llx first=%p map=%llu unmap=%llu -> %d (err %lu) thread %lu, %s, lowest %p "
+                        "highest %p%s", what, static_cast<unsigned long long>(count),
+                        count ? reinterpret_cast<void*>(addresses[0]) : nullptr, static_cast<unsigned long long>(map_at.size()),
+                        static_cast<unsigned long long>(unmap.size()), ok, static_cast<unsigned long>(error),
+                        GetCurrentThreadId(), ascending ? "ascending" : "unsorted",
+                        want.empty() ? nullptr : reinterpret_cast<void*>(want.front().first),
+                        want.empty() ? nullptr : reinterpret_cast<void*>(want.back().first),
+                        ok ? "" : " (the x2w-xmem REFUSED line above names the entry and the cause; no page of the refused step is mapped)");
     SetLastError(error);
     return ok;
 }
@@ -1082,7 +1175,7 @@ extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const 
         local_mirror(count, addresses.data(), pages.data());
         return base;
     }
-    return map_pages(count, tokens, [=](ULONG_PTR i) { return address + i * page_bytes; }) ? base : nullptr;
+    return map_pages(count, tokens, [=](ULONG_PTR i) { return address + i * page_bytes; }, "XMemMapPhysicalPages") ? base : nullptr;
 }
 
 extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG_PTR count,
@@ -1097,7 +1190,7 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
         local_mirror(count, reinterpret_cast<const ULONG_PTR*>(addresses), pages.data());
         return TRUE;
     }
-    return map_pages(count, tokens, [=](ULONG_PTR i) { return reinterpret_cast<ULONG_PTR>(addresses[i]); });
+    return map_pages(count, tokens, [=](ULONG_PTR i) { return reinterpret_cast<ULONG_PTR>(addresses[i]); }, "XMemMapPhysicalPagesScatter");
 }
 
 // Reserve+commit desktop profile for the startup blocks observed on #870: the pool loop asks
