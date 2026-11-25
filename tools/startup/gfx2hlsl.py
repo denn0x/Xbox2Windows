@@ -1468,6 +1468,41 @@ class Stage:
         self.emit('a = %s;' % address)
         self.emit(call if self.exec_known else 'if (exec & 1) %s' % call)
 
+    def op_v_pack_b32_f16(self, ops, mods):
+        """D[15:0] = S0.f16, D[31:16] = S1.f16 (AMD RDNA 2 ISA VOP3 V_PACK_B32_F16). op_sel[i] picks the high half of
+        source i (LLVM VOP3Instructions.td V_PACK_B32_F16, VOP3_OPSEL); the neg / abs source modifiers act on the
+        selected half's sign bit (bit 15). The halves are copied as bits: ASSUMED no f16 denormal flush (FLOAT_MODE
+        keeps f16 denormals in the measured programs) and no NaN quieting. A destination op_sel, clamp and an
+        op_sel on a constant are refused."""
+        sel = [0, 0, 0]
+        for m in mods:
+            if m.startswith('op_sel:[') and m.endswith(']'):
+                sel = [int(x) for x in m[len('op_sel:['):-1].split(',')]
+            else:
+                raise Unsupported('v_pack_b32_f16 modifier %s' % m)
+        if len(sel) != 3 or sel[2] or len(ops) != 3:
+            raise Unsupported('v_pack_b32_f16 form %s %s' % (', '.join(ops), ' '.join(mods)))
+        halves = []
+        for i, tok in enumerate(ops[1:3]):
+            neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+            if neg:
+                tok = tok[1:]
+            absolute = tok.startswith('|') and tok.endswith('|')
+            if absolute:
+                tok = tok[1:-1]
+            if reg_range(tok) and reg_range(tok)[1] == reg_range(tok)[2]:
+                half = '(%s >> 16)' % self.u(tok) if sel[i] else '(%s & 0xffffu)' % self.u(tok)
+            elif sel[i]:
+                raise Unsupported('v_pack_b32_f16 op_sel on %s' % tok)
+            else:
+                half = '(%s & 0xffffu)' % self.h(tok)
+            if absolute:
+                half = '(%s & 0x7fffu)' % half
+            if neg:
+                half = '(%s ^ 0x8000u)' % half
+            halves.append(half)
+        self.set_v(reg_range(ops[0])[1], '%s | (%s << 16)' % (halves[0], halves[1]))
+
     def format_store(self, ops, mods, count, name):
         """buffer_store_format_{x,xy,xyz,xyzw} to a typed buffer UAV, behind X2W_DRAW_FEATURES=uav,uavfmt.
 
