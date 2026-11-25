@@ -176,12 +176,14 @@ struct MeshPso {
     ID3D12PipelineState* pso = nullptr;
 };
 struct MeshEntry {
-    int state = 0;  // 0 new, 3 loading, 1 ready, 2 failed (never retried), 4 no manifest (checked again after 5 s)
-    ULONGLONG retry_at = 0;
+    volatile int state = 0;  // 0 new, 3 loading, 1 ready, 2 failed (never retried), 4 no manifest (checked again after 5 s)
+    volatile ULONGLONG retry_at = 0;
     Translation* tr = nullptr;
     std::unordered_map<u64, MeshPso> psos;  // by target formats, DSV format and fixed-function state
     bool issued_once = false;
     unsigned refusals_logged = 0;  // bit per MeshSkip: its "call refused" line was written (mesh_lock)
+    volatile LONG uses = 0;        // keyed calls since the last report (report_mesh_keys), counted without a lock
+    volatile LONG seen = 0;        // 1 once the "first bound" line was written
 };
 SRWLOCK mesh_lock = SRWLOCK_INIT;
 CONDITION_VARIABLE mesh_loaded = CONDITION_VARIABLE_INIT;
@@ -219,9 +221,11 @@ MeshEntry& loaded_mesh(u64 key)
         if (first && first_calls(shown, 1024)) log("x2w-mesh pipeline %016llx: no translation", key);
     }
     AcquireSRWLockExclusive(&mesh_lock);
-    e.state = state;
+    // tr and retry_at before state: mesh_prepare reads a kept entry's state without mesh_lock.
     e.tr = state == 1 ? tr : nullptr;
     e.retry_at = state == 4 ? GetTickCount64() + 5000 : 0;
+    MemoryBarrier();
+    e.state = state;
     ReleaseSRWLockExclusive(&mesh_lock);
     WakeAllConditionVariable(&mesh_loaded);
     return e;  // a failed Translation is kept (leaked) like draw translations: never retried
@@ -231,8 +235,11 @@ MeshEntry& loaded_mesh(u64 key)
 // another): "x2w-mesh pipeline K: call refused (<why>)", for the refusals that have no per-key line of their own
 // (no targets, rtv variant, no PSO, translation taken, bind refused). "no translation" and "translation failed (...)"
 // are written once per key by loaded_mesh / load_mesh_stages.
+// A refused call of a key whose line is out pays no lock (a racy read of the bit: at worst the lock is taken once more).
+bool mesh_refusal_logged(const MeshEntry& e, MeshSkip why) { return (e.refusals_logged & (1u << why)) != 0; }
 void mesh_refusal_line(MeshEntry& e, u64 key, MeshSkip why, const char* detail)
 {
+    if (mesh_refusal_logged(e, why)) return;
     AcquireSRWLockExclusive(&mesh_lock);
     const bool first = (e.refusals_logged & (1u << why)) == 0;
     e.refusals_logged |= 1u << why;
@@ -243,31 +250,28 @@ void mesh_refusal_line(MeshEntry& e, u64 key, MeshSkip why, const char* detail)
 
 // ---- Coverage: which mesh keys are bound (board/msgs/210900_mesh) ----------------------------------------------
 
-SRWLOCK mesh_use_lock = SRWLOCK_INIT;
-std::unordered_map<u64, LONG>& mesh_key_uses() { static std::unordered_map<u64, LONG> m; return m; }  // since the last line
-std::unordered_map<u64, bool>& mesh_keys_seen() { static std::unordered_map<u64, bool> m; return m; }
-
-// Every mesh call with a keyed record, after its translation lookup (state: 1 ok, 2 fail, 4 missing).
-void mesh_note_use(u64 key, int state)
+// Every mesh call with a keyed record, after its translation lookup (state: 1 ok, 2 fail, 4 missing). Counted in the
+// key's entry without a lock (the entry map is node-based; report_mesh_keys collects the counts).
+void mesh_note_use(MeshEntry& e, u64 key)
 {
-    AcquireSRWLockExclusive(&mesh_use_lock);
-    ++mesh_key_uses()[key];
-    const bool first = mesh_keys_seen().emplace(key, true).second;
-    ReleaseSRWLockExclusive(&mesh_use_lock);
+    InterlockedIncrement(&e.uses);
+    if (e.seen || InterlockedExchange(&e.seen, 1)) return;
     static LONG shown;
-    if (first && first_calls(shown, 4096))
-        log("x2w-mesh key %016llx first bound frame %ld (cache: %s)", key, frame_number, state == 1 ? "ok" : state == 2 ? "fail" : "missing");
+    if (first_calls(shown, 4096))
+        log("x2w-mesh key %016llx first bound frame %ld (cache: %s)", key, frame_number, e.state == 1 ? "ok" : e.state == 2 ? "fail" : "missing");
 }
 
 // "x2w-mesh N frames: keys n distinct, calls c; top: key:calls ..." (up to 64 keys, 32 per line; log lines are 1536 bytes).
 void report_mesh_keys(LONG frames)
 {
     std::vector<std::pair<u64, LONG>> uses;
-    AcquireSRWLockExclusive(&mesh_use_lock);
-    uses.assign(mesh_key_uses().begin(), mesh_key_uses().end());
-    mesh_key_uses().clear();
-    const std::size_t seen = mesh_keys_seen().size();
-    ReleaseSRWLockExclusive(&mesh_use_lock);
+    std::size_t seen = 0;
+    AcquireSRWLockShared(&mesh_lock);
+    for (auto& [key, e] : mesh_entries()) {
+        if (const LONG n = InterlockedExchange(&e.uses, 0)) uses.emplace_back(key, n);
+        if (e.seen) ++seen;
+    }
+    ReleaseSRWLockShared(&mesh_lock);
     LONG calls = 0;
     for (const auto& u : uses) calls += u.second;
     std::sort(uses.begin(), uses.end(), [](const auto& x, const auto& y) { return x.second != y.second ? x.second > y.second : x.first < y.first; });
@@ -294,9 +298,25 @@ void report_mesh_keys(LONG frames)
 // The fixed-function state of the mesh PSO: the default state (lead, 2026-11-24). Opaque blend, all channels
 // written: translation_for's blend decode (bound.blend) reads slot-57 state at the vertex-record offsets, and mesh
 // records keep their state 0x54 bytes later, so it is NOT used here. Depth-stencil only from a stream pipeline
-// (never a slot-57 record), else off; cull none. The decoded mesh state replaces this body when it lands; the key
-// covers all of it.
-void mesh_state_desc(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, u64& key)
+// (never a slot-57 record), else off; cull none. The key covers all of it.
+// LOCAL meshrt: X2W_MESH_STATE=1 puts the pipeline's own decoded state over that default: depth-stencil, rasterizer
+// and masked blend from state block A in the mesh layout (renderstate's decode_draw_state / apply_draw_state,
+// pipeline_state_decode.h) or the nearest slot 55 part. Unset (default): the default state as before, same PSO key.
+// The state is per title pipeline (BoundPipeline), so two pipelines of one key with different state get two PSOs.
+// *fallback (when not null) receives the default desc if the decoded state changed it, for a failed creation.
+const x2w_pipeline_state::Switches& mesh_switches()
+{
+    static const x2w_pipeline_state::Switches s = [] {
+        x2w_pipeline_state::Switches v;
+        if (x2w_local::env_on("X2W_MESH_STATE")) v.depth = v.cull = v.blend = true;
+        if (v.depth) log("x2w-mesh X2W_MESH_STATE=1: mesh PSOs take depth-stencil, rasterizer and blend from the pipeline's state block");
+        return v;
+    }();
+    return s;
+}
+LONG mesh_state_changed, mesh_state_fallback;  // PSOs whose decoded state differs from the default; created with the default after a failure
+void mesh_state_desc(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, u64& key,
+                     bool* decoded = nullptr, D3D12_GRAPHICS_PIPELINE_STATE_DESC* fallback = nullptr)
 {
     const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
     desc = {};
@@ -317,6 +337,13 @@ void mesh_state_desc(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHIC
     for (UINT i = 0; i < pass.target_count; ++i) desc.RTVFormats[i] = pass.target_formats[i];
     desc.DSVFormat = dsv_format;
     desc.SampleDesc.Count = 1;
+    const auto& s = mesh_switches();
+    if (s.depth || s.cull || s.blend) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC before = desc;
+        const bool changed = apply_draw_state(bound, pass, desc, s);
+        if (decoded) *decoded = changed;
+        if (changed && fallback) *fallback = before;
+    }
     key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
@@ -373,9 +400,10 @@ ID3D12PipelineState* create_mesh_pso(const Translation& tr, const D3D12_GRAPHICS
 // The PSO for (entry, state of this call), compiled once per key without draw_lock (failures are kept).
 ID3D12PipelineState* mesh_pso(MeshEntry& e, const BoundPipeline& bound, const Pass& pass)
 {
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc, fallback;
     u64 key = 0;
-    mesh_state_desc(bound, pass, desc, key);
+    bool decoded = false;
+    mesh_state_desc(bound, pass, desc, key, &decoded, &fallback);
     AcquireSRWLockExclusive(&mesh_lock);
     MeshPso& slot = e.psos[key];
     while (slot.state == 3) SleepConditionVariableSRW(&mesh_loaded, &mesh_lock, INFINITE, 0);
@@ -388,9 +416,19 @@ ID3D12PipelineState* mesh_pso(MeshEntry& e, const BoundPipeline& bound, const Pa
     ReleaseSRWLockExclusive(&mesh_lock);
     HRESULT hr = E_FAIL;
     ID3D12PipelineState* pso = create_mesh_pso(*e.tr, desc, &hr);
-    log("x2w-mesh desktop pipeline for %016llx: %u targets (format %d), dsv %d, depth %d, pixel stage %s -> 0x%08lx", e.tr->key,
-        pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<int>(desc.DSVFormat),
-        desc.DepthStencilState.DepthEnable ? 1 : 0, e.tr->ps ? "yes" : "none", static_cast<unsigned long>(hr));
+    const auto& d = desc.DepthStencilState;
+    log("x2w-mesh desktop pipeline for %016llx: %u targets (format %d), dsv %d, depth %d, pixel stage %s -> 0x%08lx; state %s: depth func %d "
+        "write %d stencil %d, cull %d ccw %d, blend rt0 %d mask 0x%x", e.tr->key, pass.target_count, pass.target_count ? pass.target_formats[0] : 0,
+        static_cast<int>(desc.DSVFormat), d.DepthEnable ? 1 : 0, e.tr->ps ? "yes" : "none", static_cast<unsigned long>(hr),
+        decoded ? "decoded (X2W_MESH_STATE)" : "default", d.DepthFunc, d.DepthWriteMask, d.StencilEnable, desc.RasterizerState.CullMode,
+        desc.RasterizerState.FrontCounterClockwise, desc.BlendState.RenderTarget[0].BlendEnable, desc.BlendState.RenderTarget[0].RenderTargetWriteMask);
+    if (decoded) InterlockedIncrement(&mesh_state_changed);
+    if (!pso && decoded) {
+        // The decoded state was refused by the runtime: the default state instead (NOT exercised by a test).
+        pso = create_mesh_pso(*e.tr, fallback, &hr);
+        InterlockedIncrement(&mesh_state_fallback);
+        log("x2w-mesh desktop pipeline for %016llx: decoded state refused, default state -> 0x%08lx", e.tr->key, static_cast<unsigned long>(hr));
+    }
     check_device("translated mesh CreatePipelineState", 0);
     AcquireSRWLockExclusive(&mesh_lock);
     slot.pso = pso;
@@ -408,7 +446,31 @@ struct MeshBinding {
     bool mesh = false;
     BoundPipeline* bound = nullptr;
     Translation* attached = nullptr;
+    MeshEntry* entry = nullptr;               // the key's entry once it is final (ready or failed): no loaded_mesh per call
+    u64 pso_signature = 0;                    // mesh_pass_signature of the pass pso was made for
+    ID3D12PipelineState* pso = nullptr;       // the last PSO of this pipeline: no state desc, hash or mesh_lock per call
 };
+
+// Everything of the pass that mesh_state_desc / apply_draw_state read: targets, DSV format, read-only DSV, rect
+// topology. Equal signatures give the same PSO key for the same title pipeline (its BoundPipeline state is fixed).
+u64 mesh_pass_signature(const Pass& pass)
+{
+    u64 s = 0x9e3779b97f4a7c15ull ^ pass.target_count;
+    for (UINT i = 0; i < pass.target_count; ++i) s = s * 1099511628211ull + static_cast<u64>(pass.target_formats[i]);
+    s = s * 1099511628211ull + static_cast<u64>(pass.dsv_format);
+    s = s * 1099511628211ull + (pass.dsv_read_only ? 1u : 0u) + (pass.topology == 0x11 ? 2u : 0u);
+    return s | 1;  // never 0 (0 = no PSO cached)
+}
+
+// LOCAL meshrt: stand-in CPU per mesh call (report_mesh): mesh_prepare and the bind through draw_translated (which
+// includes its draw_lock wait), QueryPerformanceCounter ticks.
+volatile LONG64 mesh_prepare_ticks, mesh_bind_ticks, mesh_bind_calls;
+LONG64 mesh_now()
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
 std::unordered_map<const Wrapper*, MeshBinding>& mesh_bindings() { static std::unordered_map<const Wrapper*, MeshBinding> m; return m; }
 
 bool mesh_tier_ok()
@@ -441,7 +503,15 @@ thread_local bool mesh_binding_now;  // inside draw_translated for the mesh call
 
 // indirect_run (d3d12_indirect.inl), type DispatchMesh, before the record is staged. False: skip the call (counted
 // here by reason; indirect counts it as no-pipeline). No draw_lock held on entry.
+bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list);
 bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
+{
+    const LONG64 t0 = mesh_now();
+    const bool ok = mesh_prepare_body(self, list);
+    InterlockedAdd64(&mesh_prepare_ticks, mesh_now() - t0);
+    return ok;
+}
+bool mesh_prepare_body(Wrapper* self, ID3D12GraphicsCommandList* list)
 {
     mesh_ready = {};
     InterlockedIncrement(&mesh_calls);
@@ -463,8 +533,20 @@ bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
         ReleaseSRWLockExclusive(&mesh_key_lock);
     }
     if (!binding.mesh || !binding.key.keyed || !binding.bound) return mesh_skip(mesh_no_record), false;
-    MeshEntry& e = loaded_mesh(binding.key.key);
-    mesh_note_use(binding.key.key, e.state);  // every keyed call, whatever is refused below (coverage)
+    // The key's entry is kept with the binding (map nodes do not move): loaded_mesh (mesh_lock + lookup) only for the
+    // first call and, for a key without a translation, when its 5 s retry is due (racy reads of state / retry_at: at
+    // worst one extra loaded_mesh).
+    MeshEntry* entry = binding.entry;
+    if (!entry || (entry->state != 1 && entry->state != 2 && GetTickCount64() >= entry->retry_at)) {
+        entry = &loaded_mesh(binding.key.key);
+        if (!binding.entry) {
+            AcquireSRWLockExclusive(&mesh_key_lock);
+            mesh_bindings()[pass.pipeline].entry = entry;
+            ReleaseSRWLockExclusive(&mesh_key_lock);
+        }
+    }
+    MeshEntry& e = *entry;
+    mesh_note_use(e, binding.key.key);  // every keyed call, whatever is refused below (coverage)
     if (!pass.targets_bound) {
         mesh_refusal_line(e, binding.key.key, mesh_no_targets, "no targets: no render target or depth view bound by the list");
         return mesh_skip(mesh_no_targets), false;
@@ -472,6 +554,7 @@ bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
     // Integer / 32-bit float targets need an RTV variant of the pixel stage (translation_for_targets); none exists
     // for mesh translations yet.
     if (std::any_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+        if (mesh_refusal_logged(e, mesh_rtv_variant)) return mesh_skip(mesh_rtv_variant), false;
         char detail[160];
         int n = std::snprintf(detail, sizeof(detail), "rtv variant: target formats");
         for (UINT i = 0; i < pass.target_count && n < 120; ++i) n += std::snprintf(detail + n, sizeof(detail) - n, " %d", static_cast<int>(pass.target_formats[i]));
@@ -496,7 +579,18 @@ bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list)
         mesh_bindings()[pass.pipeline].attached = e.tr;
         ReleaseSRWLockExclusive(&mesh_key_lock);
     }
-    ID3D12PipelineState* pso = mesh_pso(e, *binding.bound, pass);
+    const u64 signature = mesh_pass_signature(pass);
+    ID3D12PipelineState* pso = binding.pso && binding.pso_signature == signature ? binding.pso : nullptr;
+    if (!pso) {
+        pso = mesh_pso(e, *binding.bound, pass);
+        if (pso) {
+            AcquireSRWLockExclusive(&mesh_key_lock);
+            MeshBinding& kept = mesh_bindings()[pass.pipeline];
+            kept.pso = pso;
+            kept.pso_signature = signature;
+            ReleaseSRWLockExclusive(&mesh_key_lock);
+        }
+    }
     if (!pso) {
         mesh_refusal_line(e, binding.key.key, mesh_no_pso, "no PSO: CreatePipelineState failed, see its desktop pipeline line");
         return mesh_skip(mesh_no_pso), false;
@@ -511,7 +605,10 @@ bool mesh_hook(Wrapper* self, ID3D12GraphicsCommandList* list)
 {
     if (mesh_ready.list != self || !mesh_ready.pso || !list) return false;
     mesh_binding_now = true;
+    const LONG64 t0 = mesh_now();
     const bool issued = draw_translated(self, false, 0, 0, 0, 0, 0);
+    InterlockedAdd64(&mesh_bind_ticks, mesh_now() - t0);
+    InterlockedIncrement64(&mesh_bind_calls);
     mesh_binding_now = false;
     MeshEntry* e = mesh_ready.entry;
     mesh_ready = {};
@@ -553,5 +650,17 @@ void report_mesh(LONG frames)
         "records keyed %ld unkeyed %ld (total)",
         frames, calls, issued, s[mesh_no_translation], s[mesh_failed], s[mesh_no_pso], s[mesh_no_targets], s[mesh_tier], s[mesh_no_record],
         s[mesh_rtv_variant], s[mesh_bind], calls - accounted, mesh_records_keyed, mesh_records_unkeyed);
+    // LOCAL meshrt: stand-in CPU per call (QueryPerformanceCounter around mesh_prepare and the bind).
+    static const double us_per_tick = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return 1e6 / static_cast<double>(f.QuadPart);
+    }();
+    const LONG64 prepare = InterlockedExchange64(&mesh_prepare_ticks, 0), bind = InterlockedExchange64(&mesh_bind_ticks, 0);
+    const LONG64 binds = InterlockedExchange64(&mesh_bind_calls, 0);
+    log("x2w-mesh %ld frames cpu: prepare %.1f us/call over %ld calls (%.0f ms), bind %.1f us/call over %lld binds (%.0f ms; draw_translated "
+        "including its draw_lock wait); PSOs with decoded state %ld, of them on the default state after a refusal %ld (total)", frames,
+        calls ? prepare * us_per_tick / calls : 0.0, calls, prepare * us_per_tick / 1000.0, binds ? bind * us_per_tick / binds : 0.0,
+        static_cast<long long>(binds), bind * us_per_tick / 1000.0, mesh_state_changed, mesh_state_fallback);
     report_mesh_keys(frames);
 }

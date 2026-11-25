@@ -1,7 +1,11 @@
 // DispatchMesh ExecuteIndirect (list slot 61) through a translated mesh pipeline (d3d12_mesh.inl).
 //
 //   startup_mesh_dispatch <warp|hardware> <gpu|derived|zero|huge|off|missing|depth|words16|words32|wordsraw|
-//                                          fmaprecise|fmabad|notargets|rtvuint|smpheap|smpheapswap>
+//                                          fmaprecise|fmabad|notargets|rtvuint|smpheap|smpheapswap|
+//                                          statez|statezge|statezoff|statecull|stateculloff|statedepth>
+// state modes (X2W_MESH_STATE, see main): statez drawn + depth 0.25 over a 0.5 clear; statezge nothing drawn, depth
+// 0.5; statezoff (switch unset) drawn, depth 0.5; statecull left (clockwise) culled, right (other winding) drawn; stateculloff
+// both drawn; statedepth (depth-only, hardware) depth 0.25 over a 1.0 clear.
 // smpheap / smpheapswap (`smpheap 2048 1 fallback 2047`, PixelSampler): a title sampler heap of 128 raw S# entries
 // bound with SetDescriptorHeaps; the pixel stage samples entry 65 over a 2x1 texture (srv 1, placed on title memory:
 // texel 0 red, texel 1 blue) at u = 0.375. smpheap: 65 point, 64 linear -> red ff0000ff; smpheapswap (control): 65
@@ -41,6 +45,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -166,12 +171,24 @@ int main(int argc, char** argv)
     const std::string mode = argv[2];
     if (mode != "gpu" && mode != "derived" && mode != "zero" && mode != "huge" && mode != "off" && mode != "missing" && mode != "depth" &&
         mode != "words16" && mode != "words32" && mode != "wordsraw" && mode != "fmaprecise" && mode != "fmabad" && mode != "notargets" &&
-        mode != "rtvuint" && mode != "smpheap" && mode != "smpheapswap")
+        mode != "rtvuint" && mode != "smpheap" && mode != "smpheapswap" && mode != "statez" && mode != "statezge" && mode != "statezoff" &&
+        mode != "statecull" && mode != "stateculloff" && mode != "statedepth")
         return 2;
+    // state modes: the slot-57 record carries a state block A in the mesh layout (A+0x004 = 6, fields 0x54 later).
+    // statez / statezge / statezoff: render target + D32 depth cleared to 0.5; DB_DEPTH_CONTROL test + write, LESS
+    // (statez, statezoff) or GEQUAL (statezge); the triangles are at z 0.25. statecull / stateculloff: cull back, the
+    // right triangle wound the other way. statedepth: the depth-only pipeline, LESS + write over a depth of 1.0.
+    // X2W_MESH_STATE=1 except in the *off modes. The UNSHIFTED offsets hold contradicting values (ZFUNC NEVER, cull
+    // front), so a decode that misses the shift fails.
+    const bool state_mode = mode.compare(0, 5, "state") == 0;
+    const bool state_on = state_mode && mode != "statezoff" && mode != "stateculloff";
+    const bool zmode = mode.compare(0, 6, "statez") == 0;  // render target and depth target
+    const bool cullmode = mode.compare(0, 9, "statecull") == 0;
+    if (state_on) SetEnvironmentVariableW(L"X2W_MESH_STATE", L"1");
     // smpheap / smpheapswap: the pixel stage samples title sampler-heap entry 65 (`smpheap 2048 1 fallback 2047`);
     // entry 65 is point and 64 linear (smpheap), or the other way round (smpheapswap, the control).
     const bool smp = mode.compare(0, 7, "smpheap") == 0;
-    const bool depth = mode == "depth";
+    const bool depth = mode == "depth" || mode == "statedepth";  // depth-only pipeline, depth target only
     const bool words = mode.compare(0, 5, "words") == 0;  // heap descriptor + vdesc (`heap 1`, `heapwords 1`)
     UINT view_increment = 0;
     ComPtr<IDXGIFactory6> factory;
@@ -243,7 +260,9 @@ int main(int argc, char** argv)
     // Shader cache and log of this process.
     wchar_t temp[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, temp)) return 5;
-    const std::wstring cache = std::wstring(temp) + L"x2w_mesh_" + std::to_wstring(GetCurrentProcessId());
+    // Process id + tick count: a reused process id must not find an earlier run's manifest (mode missing failed so).
+    const std::wstring cache = std::wstring(temp) + L"x2w_mesh_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+                               std::to_wstring(GetTickCount64());
     CreateDirectoryW(cache.c_str(), nullptr);
     SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str());
     const std::wstring log_path = cache + L"\\trap.log";
@@ -325,6 +344,23 @@ int main(int argc, char** argv)
     record_words[0] = arg(title_root);
     if (!depth) record_words[5] = arg(pixel_code), record_words[6] = sizeof(pixel_code);
     record_words[13] = arg(mesh_code), record_words[14] = sizeof(mesh_code);
+    // state modes: state block A at [1]/[2] (pipeline_state_decode.h read_words; REG_LAYOUT 2a).
+    alignas(4) static unsigned char state_a[0x180];
+    if (state_mode) {
+        const auto put = [](std::size_t at, std::uint32_t v) { std::memcpy(state_a + at, &v, 4); };
+        constexpr std::size_t shift = 0x54;
+        put(0x004, 6);                                   // mesh layout
+        put(0x078 + shift, 0xf);                         // CB_SHADER_MASK: target 0 all channels
+        put(0x0cc + shift, 0xf);                         // CB_TARGET_MASK
+        put(0x0d0 + shift, 0);                           // CB_BLEND0: blend off
+        put(0x09c + shift, 0);                           // PA_CL_CLIP_CNTL: depth clip on
+        // DB_DEPTH_CONTROL: Z_ENABLE (1) | Z_WRITE_ENABLE (2) | ZFUNC (4-6): 1 LESS, 6 GEQUAL; none in the cull modes.
+        put(0x0b8 + shift, cullmode ? 0u : 0x2u | 0x4u | ((mode == "statezge" ? 6u : 1u) << 4));
+        put(0x0a0 + shift, cullmode ? 0x2u : 0u);        // PA_SU_SC_MODE_CNTL: CULL_BACK (bit 1), FACE 0
+        put(0x0b8, 0x2u);                                // unshifted: Z on, ZFUNC NEVER (a missed shift draws nothing)
+        put(0x0a0, 0x1u);                                // unshifted: cull front
+        record_words[1] = arg(state_a), record_words[2] = sizeof(state_a);
+    }
     std::memcpy(record, record_words, sizeof(record_words));
     if (!ok(invoke(device, 57, arg(record), arg(&__uuidof(ID3D12PipelineState)), arg(&pipeline)))) return 8;
     if (mode == "derived") {
@@ -355,6 +391,10 @@ int main(int argc, char** argv)
     const float vertices[12] = {-0.9f, -0.9f, -0.9f, 0.9f, -0.1f, 0.0f, 0.1f, 0.0f, 0.9f, 0.9f, 0.9f, -0.9f};
     unsigned char* const vertex_memory = memory + 0x30000;
     std::memcpy(vertex_memory, vertices, sizeof(vertices));
+    if (cullmode) {  // the right triangle's last two vertices swapped: the other winding
+        const float swapped[4] = {0.9f, -0.9f, 0.9f, 0.9f};
+        std::memcpy(vertex_memory + 32, swapped, sizeof(swapped));
+    }
     if (mode == "words16") {  // the same positions as half2 (all exactly representable: +-0.875, +-0.125, 0)
         const float halves[12] = {-0.875f, -0.875f, -0.875f, 0.875f, -0.125f, 0.0f, 0.125f, 0.0f, 0.875f, 0.875f, 0.875f, -0.875f};
         std::uint16_t packed[12];
@@ -379,23 +419,40 @@ int main(int argc, char** argv)
     const Word target_handle = invoke(target_heap, 9);
     Observer observer;
     if (!observer.open(desktop.Get())) return 12;
-    if (depth) {
+    // A D32 depth texture with a view made through the stand-in at `handle`, cleared to `value` on the test's own
+    // queue (the stand-in drops depth clears by default).
+    const auto make_depth = [&](ComPtr<ID3D12Resource>& texture, Word handle, float value) {
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, size, size, 1, 1, DXGI_FORMAT_D32_FLOAT, {1, 0},
                                        D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
-        const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_D32_FLOAT, {1.0f, 0}};
+        const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_D32_FLOAT, {value, 0}};
         if (FAILED(desktop->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, &clear,
-                                                    IID_PPV_ARGS(&target)))) return 12;
+                                                    IID_PPV_ARGS(&texture)))) return false;
         D3D12_DEPTH_STENCIL_VIEW_DESC view{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2D};
-        invoke(device, 21, arg(target.Get()), arg(&view), target_handle);
-        // Clear to 1.0 on the test's own queue (the stand-in has no depth clear slot in render mode).
+        invoke(device, 21, arg(texture.Get()), arg(&view), handle);
         ComPtr<ID3D12DescriptorHeap> own_dsv;
         const D3D12_DESCRIPTOR_HEAP_DESC own_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
-        if (FAILED(desktop->CreateDescriptorHeap(&own_desc, IID_PPV_ARGS(&own_dsv)))) return 12;
-        desktop->CreateDepthStencilView(target.Get(), &view, own_dsv->GetCPUDescriptorHandleForHeapStart());
-        barrier(observer.list.Get(), target.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        observer.list->ClearDepthStencilView(own_dsv->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        barrier(observer.list.Get(), target.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON);
-        if (!observer.run()) return 12;
+        if (FAILED(desktop->CreateDescriptorHeap(&own_desc, IID_PPV_ARGS(&own_dsv)))) return false;
+        desktop->CreateDepthStencilView(texture.Get(), &view, own_dsv->GetCPUDescriptorHandleForHeapStart());
+        barrier(observer.list.Get(), texture.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        observer.list->ClearDepthStencilView(own_dsv->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, value, 0, 0, nullptr);
+        barrier(observer.list.Get(), texture.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON);
+        return observer.run();
+    };
+    // z modes: a depth target next to the render target, cleared to 0.5.
+    ComPtr<ID3D12Resource> depth_target;
+    Word depth_handle = 0;
+    if (zmode) {
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            Word backing, bytes;
+        } dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1}, 0, 0};
+        void* dsv_heap = nullptr;
+        if (!ok(invoke(device, 14, arg(&dsv_heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&dsv_heap)))) return 12;
+        depth_handle = invoke(dsv_heap, 9);
+        if (!make_depth(depth_target, depth_handle, 0.5f)) return 12;
+    }
+    if (depth) {
+        if (!make_depth(target, target_handle, 1.0f)) return 12;
     } else {
         // rtvuint: an integer target (R32_UINT, 4 bytes per pixel like RGBA8): the call must be refused ("rtv variant").
         const DXGI_FORMAT format = mode == "rtvuint" ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -496,7 +553,8 @@ int main(int argc, char** argv)
         invoke(list, 50, 0, 0, 0, arg(&target_handle));                    // OMSetRenderTargets(0, null, FALSE, &dsv)
     } else {
         invoke(list, 52, target_handle, arg(clear_colour));                // ClearRenderTargetView
-        if (mode != "notargets") invoke(list, 50, 1, arg(&target_handle)); // OMSetRenderTargets(1, &rtv); notargets: none bound
+        if (zmode) invoke(list, 50, 1, arg(&target_handle), 0, arg(&depth_handle));  // OMSetRenderTargets(1, &rtv, FALSE, &dsv)
+        else if (mode != "notargets") invoke(list, 50, 1, arg(&target_handle));       // OMSetRenderTargets(1, &rtv); notargets: none
     }
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(size), static_cast<float>(size), 0, 1};
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(size), static_cast<LONG>(size)};
@@ -542,7 +600,8 @@ int main(int argc, char** argv)
         std::printf("the record in title memory is not what the writer stored\n");
         ++failures;
     }
-    const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || smp || (!words_skip && (mode == "words16" || mode == "words32"));
+    const bool drawn_expected = mode == "gpu" || mode == "derived" || mode == "fmaprecise" || smp || mode == "statez" || mode == "statezoff" ||
+                                mode == "stateculloff" || (!words_skip && (mode == "words16" || mode == "words32"));
     // RGBA8 little-endian: R c0, G 40, B ff, A ff. words modes: G = the FORMAT code in vdesc word 3 (29 = 0x1d, 64 = 0x40).
     // smpheap: entry 65 point -> texel 0 (red ff0000ff); smpheapswap: entry 65 linear at u = 0.375 -> 0.75 red + 0.25
     // blue (R bf, B 40, A ff; filtering precision allows +-3 per channel).
@@ -555,18 +614,41 @@ int main(int argc, char** argv)
         }
         return true;
     };
+    // Depth values: left, right, outside, against what the mode wants (statez / statedepth: the triangles wrote 0.25).
+    const auto check_depth = [&](const float (&values)[3], float cleared, bool written) {
+        const float want = written ? 0.25f : cleared;
+        const bool good = std::fabs(values[0] - want) < 1e-4f && std::fabs(values[1] - want) < 1e-4f && values[2] == cleared;
+        std::printf("depth: left %g right %g outside %g (cleared %g; want %g under the triangles)\n", values[0], values[1], values[2], cleared, want);
+        if (!good) {
+            std::printf("FAIL: depth values do not match mode %s\n", mode.c_str());
+            ++failures;
+        }
+    };
     if (depth) {
         float values[3];
         std::memcpy(values, pixels.data(), sizeof(values));
-        std::printf("depth: left %g right %g outside %g (cleared 1; today's default state has depth off, so not checked)\n", values[0],
-                    values[1], values[2]);
+        if (mode == "statedepth") check_depth(values, 1.0f, true);
+        else std::printf("depth: left %g right %g outside %g (cleared 1; the default state has depth off, so not checked)\n", values[0],
+                         values[1], values[2]);
     } else {
         std::printf("pixels: left %08x right %08x outside %08x (drawn = %08x, cleared = 00000000)\n", pixels[0], pixels[1], pixels[2], drawn);
         const std::uint32_t want = drawn_expected ? drawn : 0u;
-        if (!matches(pixels[0], want) || !matches(pixels[1], want) || pixels[2] != 0) {
-            std::printf("FAIL: expected left and right %08x, outside 00000000\n", want);
+        // statecull: MODE CULL_BACK + FACE 0 decodes to D3D12_CULL_MODE_BACK + FrontCounterClockwise TRUE. As seen on
+        // the target (+y up), the left triangle (-0.9,-0.9) (-0.9,0.9) (-0.1,0) is clockwise = back face: culled; the
+        // right one (last two vertices swapped) is counter-clockwise = front: drawn. stateculloff draws both.
+        const std::uint32_t want_right = mode == "statecull" ? drawn : want;
+        const std::uint32_t want_left = mode == "statecull" ? 0u : want;
+        if (!matches(pixels[0], want_left) || !matches(pixels[1], want_right) || pixels[2] != 0) {
+            std::printf("FAIL: expected left %08x right %08x, outside 00000000\n", want_left, want_right);
             ++failures;
         }
+    }
+    if (zmode) {
+        std::vector<std::uint32_t> depth_words;
+        if (!read_pixels(desktop.Get(), observer, depth_target.Get(), true, at, depth_words)) return 15;
+        float values[3];
+        std::memcpy(values, depth_words.data(), sizeof(values));
+        check_depth(values, 0.5f, mode == "statez");
     }
 
     // The log: the per-key lines and the debug layer.
@@ -619,6 +701,15 @@ int main(int argc, char** argv)
         std::printf("log: sampler heap line \"%s\"\n", sampler_line.c_str());
         if (sampler_line.find("null_sampler_unbound=0 ") == std::string::npos || sampler_line.find("null_sampler_unreadable=0 ") == std::string::npos) {
             std::printf("FAIL: the sampler heap was not built from the title's sampler heap\n");
+            ++failures;
+        }
+    }
+    if (state_mode) {  // the PSO line says which state it was made with; the switch line only with X2W_MESH_STATE=1
+        const bool switch_line = has("x2w-mesh X2W_MESH_STATE=1: ");
+        const bool decoded_line = has(std::string("x2w-mesh desktop pipeline for ") + key_text) && has("; state decoded (X2W_MESH_STATE)");
+        std::printf("log: X2W_MESH_STATE line %d, PSO with decoded state %d\n", switch_line, decoded_line);
+        if (switch_line != state_on || decoded_line != state_on) {
+            std::printf("FAIL: the X2W_MESH_STATE lines do not match mode %s\n", mode.c_str());
             ++failures;
         }
     }
