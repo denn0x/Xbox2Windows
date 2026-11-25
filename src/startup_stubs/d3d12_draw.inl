@@ -1509,7 +1509,8 @@ LONG frame_copies_frame = -1;
 // X2W_DRAW_SRV_IN_PLACE. Reported every 5 s when X2W_DRAW_SRV_STATS=1 or X2W_DRAW_SRV_IN_PLACE is set.
 enum { srvc_compared, srvc_copied, srvc_in_place, srvc_kinds };
 volatile LONG64 srvc_bytes[3][srvc_kinds], srvc_calls[3][srvc_kinds];
-volatile LONG64 srvc_in_place_missed[3];  // over the threshold, but no 16-aligned desktop window: copied as before
+// Over the threshold but copied as before: [class][0] no single desktop window (desktop_range), [1] not 16-aligned.
+volatile LONG64 srvc_in_place_missed[3][2];
 thread_local int frame_copy_class;
 void srvc_note(int cls, int kind, std::size_t bytes)
 {
@@ -1526,6 +1527,13 @@ std::size_t srv_in_place_min()
     }();
     return min;
 }
+// X2W_DRAW_SRV_IN_PLACE_ALL=1: plain translated draws too. Default: mesh calls only (plain draws rewrite reused vertex
+// ranges between draws of a frame, which a record-time copy keeps; run 98's copy peak without mesh was 16 MiB).
+bool srv_in_place_all()
+{
+    static const bool all = x2w_local::env_on("X2W_DRAW_SRV_IN_PLACE_ALL");
+    return all;
+}
 void report_srv_copies()  // the 5 s report (d3d12_xs_device.cpp)
 {
     static const bool on = srv_in_place_min() || x2w_local::env_on("X2W_DRAW_SRV_STATS");
@@ -1536,13 +1544,15 @@ void report_srv_copies()  // the 5 s report (d3d12_xs_device.cpp)
     for (int c = 0; c < 3; ++c) {
         LONG64 b[srvc_kinds], n[srvc_kinds];
         for (int k = 0; k < srvc_kinds; ++k) b[k] = InterlockedExchange64(&srvc_bytes[c][k], 0), n[k] = InterlockedExchange64(&srvc_calls[c][k], 0);
-        const LONG64 missed = InterlockedExchange64(&srvc_in_place_missed[c], 0);
-        used += std::snprintf(text + used, sizeof(text) - used, "%s%s: compared %lld MiB/%lld, copied %lld MiB/%lld, in place %lld MiB/%lld, in-place misses %lld",
+        const LONG64 no_window = InterlockedExchange64(&srvc_in_place_missed[c][0], 0), unaligned = InterlockedExchange64(&srvc_in_place_missed[c][1], 0);
+        used += std::snprintf(text + used, sizeof(text) - used,
+                              "%s%s: compared %lld MiB/%lld, copied %lld MiB/%lld, in place %lld MiB/%lld, in-place misses no window %lld unaligned %lld",
                               c ? "; " : "", names[c], b[srvc_compared] >> 20, n[srvc_compared], b[srvc_copied] >> 20, n[srvc_copied],
-                              b[srvc_in_place] >> 20, n[srvc_in_place], missed);
+                              b[srvc_in_place] >> 20, n[srvc_in_place], no_window, unaligned);
         if (used >= static_cast<int>(sizeof(text))) used = static_cast<int>(sizeof(text)) - 1;
     }
-    log("x2w-draw srv copies since the last report (X2W_DRAW_SRV_IN_PLACE=%zu): %s", srv_in_place_min(), text);
+    log("x2w-draw srv copies since the last report (X2W_DRAW_SRV_IN_PLACE=%zu%s): %s", srv_in_place_min(),
+        srv_in_place_all() ? ", _ALL: plain draws too" : ", mesh calls only", text);
 }
 
 // Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
@@ -2428,12 +2438,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             buffer_view(dest, placed.alias, address - reinterpret_cast<u64>(placed.owner->own().title_memory), bytes);
             continue;
         }
-        if (address && srv_in_place_min() && bytes >= srv_in_place_min()) {
+        if (address && srv_in_place_min() && bytes >= srv_in_place_min() && (mesh || srv_in_place_all())) {
             // LOCAL stall: X2W_DRAW_SRV_IN_PLACE: a large buffer srv reads the title memory in place (the GPU sees it at
             // execution time, as on the console) instead of a record-time copy compared or made on every call.
             ID3D12Resource* window = nullptr;
             u64 at = 0;
-            if (desktop_range(address, bytes, &window, &at) && at % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0) {
+            const bool in_window = desktop_range(address, bytes, &window, &at);
+            if (in_window && at % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0) {
                 // States: only a window this list already tracks is transitioned (window_read_state). An untracked window
                 // gets no barrier, as translated compute binds windows in place (implicit buffer promotion): the indirect
                 // stage and compute may have it promoted to UNORDERED_ACCESS, which a COMMON-based barrier would contradict.
@@ -2449,7 +2460,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                         address, bytes, static_cast<void*>(window), at);
                 continue;
             }
-            InterlockedIncrement64(&srvc_in_place_missed[mesh ? 2 : 1]);
+            InterlockedIncrement64(&srvc_in_place_missed[mesh ? 2 : 1][in_window ? 1 : 0]);
+            static LONG missed_shown;
+            if (first_calls(missed_shown, 8))
+                log("x2w-draw   %016llx srv %u: 0x%llx (%zu bytes) not bound in place: %s; copied as before", tr->key, i, address, bytes,
+                    in_window ? "window offset not 16-aligned" : "no single desktop window (desktop_range)");
         }
         if (address && bytes && !gpu_written().empty() && gpu_written_overlaps(address, bytes)) {
             // LOCAL draw-rt: a translated draw or a GPU copy stores into this range: read it in place, not from a record-time copy.
