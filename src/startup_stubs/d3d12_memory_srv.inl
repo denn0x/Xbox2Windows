@@ -721,18 +721,36 @@ void mark_refused_destination(u64 destination, const char* reason)
 // memory but the destination: one descriptor_ranges walk (title_backed) and one VirtualQuery (writable), as note_view
 // does for every view. The slot's shadow id is cleared (no view of ours is there). Heap (bindless) draws read view ids,
 // not V#s, so they still see no view there. False (nothing written) when the switch is off or the view is not a buffer.
-bool write_buffer_descriptor(u64 destination, const MemoryShaderResourceView* input)
+// Run 112: 126231 written, still 881503 buffer_unavailable. Deduced from this code: those had a buffer
+// (existing_memory_buffer found one) at an offset that is not a multiple of the view's element (resolve_buffer_srv_desc,
+// e.g. 104-byte records anywhere in the title's view-heap region). A V# needs no such alignment, so found_buffer calls
+// are served too. Counted by case at powers of two: "x2w-memsrv buffer descriptors: written N (no buffer A, buffer at an
+// offset the view cannot name B), not written: destination not title memory C, view not encodable D".
+LONG64 vdesc_no_buffer, vdesc_unaligned, vdesc_no_destination, vdesc_layout;
+bool write_buffer_descriptor(u64 destination, const MemoryShaderResourceView* input, bool found_buffer)
 {
-    if (!buffer_heap_index_on() || !destination || !title_backed(destination, 32) || !x2w_local::writable(reinterpret_cast<void*>(destination), 32))
+    if (!buffer_heap_index_on()) return false;
+    const auto counted = [](LONG64& which) {
+        InterlockedIncrement64(&which);
+        const LONG64 n = vdesc_no_buffer + vdesc_unaligned + vdesc_no_destination + vdesc_layout;
+        if ((n & (n - 1)) == 0)
+            log("x2w-memsrv buffer descriptors: written %lld (no buffer %lld, buffer at an offset the view cannot name %lld), not written: "
+                "destination not title memory %lld, view not encodable %lld", vdesc_no_buffer + vdesc_unaligned, vdesc_no_buffer,
+                vdesc_unaligned, vdesc_no_destination, vdesc_layout);
+    };
+    if (!destination || !title_backed(destination, 32) || !x2w_local::writable(reinterpret_cast<void*>(destination), 32)) {
+        counted(vdesc_no_destination);
         return false;
+    }
     x2w_startup::BufferViewLayout l;
     if (!x2w_startup::buffer_view_layout_from_desc(false, reinterpret_cast<const unsigned char*>(&input->view), 40, l) ||
-        l.kind == x2w_startup::BufferViewKind::unknown || !l.num_records)
+        l.kind == x2w_startup::BufferViewKind::unknown || !l.num_records || ((input->address + l.offset) >> 48)) {
+        counted(vdesc_layout);
         return false;
+    }
     std::uint32_t words[8];
     x2w_startup::gfx10_buffer_words(l, words);
     const u64 base = input->address + l.offset;
-    if (base >> 48) return false;
     words[0] = static_cast<std::uint32_t>(base);
     words[1] |= static_cast<std::uint32_t>(base >> 32) & 0xffff;
     std::memcpy(reinterpret_cast<void*>(destination), words, sizeof(words));
@@ -741,10 +759,11 @@ bool write_buffer_descriptor(u64 destination, const MemoryShaderResourceView* in
         if (std::uint32_t* slot = shadow_slot(desktop)) *slot = 0;
         ReleaseSRWLockExclusive(&note_lock);
     }
+    counted(found_buffer ? vdesc_unaligned : vdesc_no_buffer);
     static LONG shown;
     if (first_calls(shown, 8))
-        log("x2w-memsrv buffer descriptor written at 0x%llx (X2W_BUFFER_HEAP_INDEX): base 0x%llx, stride %u, records %u, word 3 0x%08x", destination,
-            base, l.index_stride, l.num_records, words[3]);
+        log("x2w-memsrv buffer descriptor written at 0x%llx (X2W_BUFFER_HEAP_INDEX): base 0x%llx, stride %u, records %u, word 3 0x%08x%s", destination,
+            base, l.index_stride, l.num_records, words[3], found_buffer ? " (a buffer is there, at an offset the view cannot name)" : "");
     return true;
 }
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
@@ -829,7 +848,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
             // LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1: the console V# instead (write_buffer_descriptor).
-            if ((!buffer || !info) && write_buffer_descriptor(destination, input)) {
+            if (write_buffer_descriptor(destination, input, buffer && info)) {
                 census_memory_srv_outcome(mso_descriptor);
                 return;
             }

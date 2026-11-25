@@ -17,6 +17,9 @@ X2W_DRAW_NULL_IDENTITY=1 is set in every mode, as in run 109: a null buffer then
   view forms of run 109's refusals: 99.
 - membuf-refused (switch on): the slot-70 call has a null address and is refused (null_address); its destination gets
   the refused-view marker, the copied entry carries it, binds null, and the srv-heapbuf line names the reason.
+- membuf-unaligned (switch on): as run 112's remaining buffer_unavailable calls, a placed buffer covers the memory but
+  the view starts 20 bytes in with 12-byte records (no FirstElement names it): the V# is written anyway, 99, and the
+  counter line names the case. membuf-unaligned-off (control, switch off): refused buffer_unavailable, identity fill.
 - In no mode does the draw read the decoy at slot N (55).
 """
 from pathlib import Path
@@ -30,7 +33,8 @@ IDENTITY = bytes((0, 0, 0x80, 0x3F))
 VALUE = bytes((99, 0, 0, 0))
 DECOY = bytes((55, 0, 0, 0))
 ON = {"X2W_BUFFER_HEAP_INDEX": "1"}
-MODES = {"membuf": ON, "membuf-off": {}, "membuf-link": ON, "membuf-structured": ON, "membuf-typed": ON, "membuf-refused": ON}
+MODES = {"membuf": ON, "membuf-off": {}, "membuf-link": ON, "membuf-structured": ON, "membuf-typed": ON, "membuf-refused": ON,
+         "membuf-unaligned": ON, "membuf-unaligned-off": {}}
 
 
 def columns(image):
@@ -55,7 +59,8 @@ def check(directory, consumer, backend):
     # The destination holds the console V# (base = the private memory, so word 0 is neither a link, a token nor the
     # marker); no stand-in wrapper is made (run 110).
     for mode, layout in (("membuf", "stride 0, records 256, word 3 0x"), ("membuf-structured", "stride 16, records 4, word 3 0x"),
-                         ("membuf-typed", "stride 4, records 64, word 3 0x")):
+                         ("membuf-typed", "stride 4, records 64, word 3 0x"),
+                         ("membuf-unaligned", "stride 12, records 4, word 3 0x")):
         _, image, log = results[mode]
         words = re.search(r"^membuf entry words: (\w+) (\w+) (\w+) (\w+)$", log, re.M)
         if columns(image) != {VALUE} or not words or words.group(1) in ("00000001", "56573258", "52463258") or words.group(4) == "00000000":
@@ -63,6 +68,13 @@ def check(directory, consumer, backend):
         written = re.search(r"^x2w-memsrv buffer descriptor written at .*$", log, re.M)
         if "X2W_BUFFER_HEAP_INDEX=1" not in log or not written or layout not in written.group(0) or "stand-in buffer at" in log:
             raise AssertionError(f"{mode}: descriptor line {written.group(0) if written else None} (expected {layout!r}), or a stand-in\n{log[-4000:]}")
+    _, image, log = results["membuf-unaligned"]
+    if "(a buffer is there, at an offset the view cannot name)" not in log \
+            or "buffer descriptors: written 1 (no buffer 0, buffer at an offset the view cannot name 1)" not in log:
+        raise AssertionError(f"membuf-unaligned: the found-buffer case is not named\n{log[-4000:]}")
+    _, image, log = results["membuf-unaligned-off"]
+    if columns(image) != {IDENTITY} or "reason=buffer_unavailable" not in log or "buffer descriptor written" in log:
+        raise AssertionError(f"membuf-unaligned-off: pixels {image[:32].hex()} (expected the identity fill)\n{log[-4000:]}")
     _, image, log = results["membuf-refused"]
     line = re.search(r"^x2w-frame srv-heapbuf .*$", log, re.M)
     if columns(image) != {IDENTITY} or "membuf entry words: 52463258" not in log or not line \

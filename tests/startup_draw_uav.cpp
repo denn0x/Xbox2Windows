@@ -193,6 +193,17 @@ int bind_memory_buffer_entries(void* guest, Word cpu, UINT increment)
         } else if (mode_is(L"membuf-typed")) {  // as run 109's first logged refusals (typed; R32_UINT here)
             v.view.Format = DXGI_FORMAT_R32_UINT;
             v.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+        } else if (std::wcsncmp(uav_mode, L"membuf-unaligned", 16) == 0) {
+            // As run 112's buffer_unavailable calls: a placed buffer covers the memory, but the view starts 20 bytes in
+            // with 12-byte records, so no FirstElement of that buffer names it. Dword 5 (byte 20) is 99.
+            memory[0] = 0;
+            memory[5] = 99;
+            if (!placed(guest, memory, desc)) return 47;
+            v.address = ptr(memory) + 20;
+            v.view.Format = DXGI_FORMAT_UNKNOWN;
+            v.view.Buffer.NumElements = 4;
+            v.view.Buffer.StructureByteStride = 12;
+            v.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
         }
         invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
     }
