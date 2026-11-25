@@ -20,6 +20,9 @@ X2W_DRAW_NULL_IDENTITY=1 is set in every mode, as in run 109: a null buffer then
 - membuf-unaligned (switch on): as run 112's remaining buffer_unavailable calls, a placed buffer covers the memory but
   the view starts 20 bytes in with 12-byte records (no FirstElement names it): the V# is written anyway, 99, and the
   counter line names the case. membuf-unaligned-off (control, switch off): refused buffer_unavailable, identity fill.
+- membuf-rewrite (switch on, X2W_MARKER_REWRITE_LOG=1): refused as membuf-refused, then the fixture patches the V# base
+  into words 0/1 of the destination; the draw flags the rewritten marker with its description and that base.
+  membuf-refused runs with X2W_MARKER_REWRITE_LOG=1 too, as the control: an intact marker is not flagged.
 - In no mode does the draw read the decoy at slot N (55).
 """
 from pathlib import Path
@@ -33,8 +36,9 @@ IDENTITY = bytes((0, 0, 0x80, 0x3F))
 VALUE = bytes((99, 0, 0, 0))
 DECOY = bytes((55, 0, 0, 0))
 ON = {"X2W_BUFFER_HEAP_INDEX": "1"}
-MODES = {"membuf": ON, "membuf-off": {}, "membuf-link": ON, "membuf-structured": ON, "membuf-typed": ON, "membuf-refused": ON,
-         "membuf-unaligned": ON, "membuf-unaligned-off": {}}
+REWRITE_LOG = dict(ON, X2W_MARKER_REWRITE_LOG="1")
+MODES = {"membuf": ON, "membuf-off": {}, "membuf-link": ON, "membuf-structured": ON, "membuf-typed": ON, "membuf-refused": REWRITE_LOG,
+         "membuf-unaligned": ON, "membuf-unaligned-off": {}, "membuf-rewrite": REWRITE_LOG}
 
 
 def columns(image):
@@ -84,6 +88,22 @@ def check(directory, consumer, backend):
             or not re.search(r"refused view: fmt \d+ layout 0x[0-9a-f]+ dim 1 mips \d+ [1-9]\d*x1x1 address 0x0 unreadable, detile: -$",
                              line.group(0)):
         raise AssertionError(f"membuf-refused: pixels {image[:32].hex()}, line {line.group(0) if line else None}\n{log[-4000:]}")
+    # membuf-refused is also the negative control of X2W_MARKER_REWRITE_LOG: an intact marker is not flagged.
+    if "rewritten refused-view marker" in log or "X2W_MARKER_REWRITE_LOG=1" not in log:
+        raise AssertionError(f"membuf-refused: an intact marker was flagged as rewritten, or the switch line is missing\n{log[-4000:]}")
+    # membuf-rewrite: the title patches word 0 / word 1 bits 0-15 of the refused destination with a V# base after the
+    # call; the copied entry is flagged, with the description and the base read back from the rewritten words.
+    _, image, log = results["membuf-rewrite"]
+    entry = re.search(r"^membuf entry words: ([0-9a-f]{8}) ([0-9a-f]{8}) ([0-9a-f]{8}) ([0-9a-f]{8})$", log, re.M)
+    line = re.search(r"^x2w-draw rewritten refused-view marker .*$", log, re.M)
+    if not entry or not line:
+        raise AssertionError(f"membuf-rewrite: entry {entry.group(0) if entry else None}, line {line.group(0) if line else None}\n{log[-4000:]}")
+    base = int(entry.group(1), 16) | (int(entry.group(2), 16) & 0xFFFF) << 32
+    if entry.group(1) == "52463258" or f"as a V# 0x{base:x}" not in line.group(0) \
+            or not re.search(r"described as fmt \d+ layout 0x[0-9a-f]+ dim 1 mips \d+ [1-9]\d*x1x1 address 0x0 unreadable, detile: -;",
+                             line.group(0)) \
+            or "x2w-draw rewritten refused-view markers 1" not in log:
+        raise AssertionError(f"membuf-rewrite: base 0x{base:x}, line {line.group(0)}\n{log[-4000:]}")
     _, image, log = results["membuf-off"]
     if columns(image) != {IDENTITY} or "membuf entry words: 00000001 00000000 00000000 00000000" not in log \
             or "reason=buffer_unavailable" not in log or "X2W_BUFFER_HEAP_INDEX" in log:

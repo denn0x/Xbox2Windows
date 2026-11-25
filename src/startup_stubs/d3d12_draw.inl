@@ -760,6 +760,43 @@ bool refused_marker_description(const std::uint32_t* w, char* out, std::size_t s
     std::snprintf(out, size, "refused: %s; %s", refusal_name(w[1]), d);
     return true;
 }
+// LOCAL (textures): X2W_MARKER_REWRITE_LOG=1 (default off; meaningful with X2W_BUFFER_HEAP_INDEX, which writes the
+// markers). Does the title patch a descriptor it created in place, e.g. the T# base of a view created with a null
+// address once a streamed texture is placed? A refused-view marker whose word 0 is no longer the magic but whose
+// description words are intact says so. Counted ("x2w-draw rewritten refused-view markers N" at powers of two, and in
+// the totals line) and the first 8 logged with their words, the decoded description and the base the rewritten words
+// would hold as a T# (words 0/1 bits 0-7, << 8) and as a V# (words 0/1 bits 0-15). Read in the draw srv loops only.
+LONG marker_rewrites;
+bool marker_rewrite_on()
+{
+    static const bool on = [] {
+        const bool v = x2w_local::env_on("X2W_MARKER_REWRITE_LOG");
+        if (v) log("x2w-draw X2W_MARKER_REWRITE_LOG=1: table entries holding a refused-view marker whose first word was rewritten are counted and logged");
+        return v;
+    }();
+    return on;
+}
+// The description's fixed shape (describe_marker): bit 31 set, bits 28-30 clear, a decline in range, a dimension
+// 1-4, a nonzero width, word 5 bits 18-31 clear; and word 0 neither the marker nor a token.
+bool rewritten_marker_words(const std::uint32_t* w)
+{
+    const unsigned dim = (w[2] >> 17) & 7;
+    return w[0] != refused_view_magic && w[0] != view_token_magic && (w[2] >> 31) && !((w[2] >> 28) & 7) &&
+           ((w[2] >> 24) & 15) < std::size(detile_declines) && dim >= 1 && dim <= 4 && w[3] && !(w[5] >> 18);
+}
+void note_rewritten_marker(u64 key, UINT srv, u64 entry, const std::uint32_t* w)
+{
+    if (!marker_rewrite_on() || !rewritten_marker_words(w)) return;
+    const LONG n = InterlockedIncrement(&marker_rewrites);
+    if ((n & (n - 1)) == 0) log("x2w-draw rewritten refused-view markers %ld", n);
+    static LONG shown;
+    if (!first_calls(shown, 8)) return;
+    char d[160];
+    describe_marker(w, d, sizeof d);
+    log("x2w-draw rewritten refused-view marker %016llx srv %u frame %ld: entry 0x%llx words %08x %08x %08x %08x %08x %08x %08x %08x; "
+        "described as %s; reason code %u if word 1 is intact; base as a T# 0x%llx, as a V# 0x%llx", key, srv, frame_number, entry, w[0], w[1], w[2],
+        w[3], w[4], w[5], w[6], w[7], d, w[1], (u64{w[0]} | u64{w[1] & 0xff} << 32) << 8, u64{w[0]} | u64{w[1] & 0xffff} << 32);
+}
 bool free_link_words(const std::uint32_t* w)
 {
     if (w[0] == refused_view_magic) return true;
@@ -2944,6 +2981,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                                    srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
             // LOCAL (video): X2W_DRAW_TEXTURE_HEAP_INDEX=1 reads an "integer + 7 zero words" entry as an
             // index into the heap that holds the entry (HYPOTHESIS from run 84, see note_null_texture).
+            // LOCAL (textures): X2W_MARKER_REWRITE_LOG. Takes no lock (the entry words are this call's copy; counters
+            // are interlocked, the names table is const), so it runs before the relock and without draw_lock under
+            // X2W_DRAW_LOCK_SPLIT.
+            if (entry_ok) note_rewritten_marker(tr->key, i, entry, words);
             SplitRelock relock(split, 100000 + __LINE__);  // the rest of the texture bind (memcut revive, uploads, counters)
             if (entry_ok && words[0] != view_token_magic) resolve_heap_index(tr->key, i, entry, words);
             // A texture: the title's descriptor memory carries the id of the view it created there.
@@ -3032,6 +3073,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             continue;
         }
         // LOCAL (textures): X2W_BUFFER_HEAP_INDEX (buffer_heap_index_on): a free-list buffer entry binds null.
+        if (srv.source == 0 && entry_ok) note_rewritten_marker(tr->key, i, entry, words);  // LOCAL (textures): X2W_MARKER_REWRITE_LOG
         const bool buffer_link = srv.source == 0 && entry_ok && free_link_words(words);
         if (buffer_link) {
             InterlockedIncrement(words[0] == refused_view_magic ? &buffer_refused_views : &buffer_links);

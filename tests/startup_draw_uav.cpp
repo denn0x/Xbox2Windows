@@ -184,7 +184,8 @@ int bind_memory_buffer_entries(void* guest, Word cpu, UINT increment)
         } v{};
         static_assert(offsetof(ViewAt, address) == 0x28 && sizeof(ViewAt) == 0x40);
         v.view = srv;
-        v.address = mode_is(L"membuf-refused") ? 0 : ptr(memory);  // membuf-refused: null address, refused null_address
+        // membuf-refused / membuf-rewrite: null address, refused null_address
+        v.address = mode_is(L"membuf-refused") || mode_is(L"membuf-rewrite") ? 0 : ptr(memory);
         if (mode_is(L"membuf-structured")) {  // as run 109's slot 0x33: structured, one record (here 4 of 16 bytes)
             v.view.Format = DXGI_FORMAT_UNKNOWN;
             v.view.Buffer.NumElements = 4;
@@ -206,6 +207,16 @@ int bind_memory_buffer_entries(void* guest, Word cpu, UINT increment)
             v.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
         }
         invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        if (mode_is(L"membuf-rewrite")) {
+            // The title patches the descriptor it created in place: the V# base (word 0, word 1 bits 0-15) of the
+            // memory, the rest as it was (with X2W_BUFFER_HEAP_INDEX, the refused-view marker's description).
+            const std::uint64_t base = ptr(memory);
+            std::uint32_t w[2];
+            std::memcpy(w, heap_bytes, sizeof w);
+            w[0] = static_cast<std::uint32_t>(base);
+            w[1] = (w[1] & 0xffff0000u) | static_cast<std::uint32_t>((base >> 32) & 0xffff);
+            std::memcpy(heap_bytes, w, sizeof w);
+        }
     }
     std::memcpy(heap_bytes + 128, heap_bytes, 32);
     std::uint32_t copied[4];
