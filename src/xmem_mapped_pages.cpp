@@ -1225,3 +1225,41 @@ extern "C" BOOL WINAPI x2w_xmem_gpu_location(const void* address, HANDLE* sectio
     *offset = backing->second.offset + at % page_bytes;
     return TRUE;
 }
+
+// LOCAL memcut (X2W_MEMCUT_ALIAS_SLABS in d3d12_xs): the pool section and byte offset behind [address, address +
+// bytes) when that whole range is mapped pages of ONE long-lived pool section (X2W_XMEM_GPU_POOL=all) at consecutive
+// offsets, so that one buffer placed on a heap over the section covers exactly the title's pages. Never moves a slab
+// (file-backed and fresh pagefile slabs answer FALSE: a fresh section opened as a heap would stay charged after the
+// run). address must be page aligned.
+extern "C" BOOL WINAPI x2w_xmem_pool_run(const void* address, SIZE_T bytes, HANDLE* section, ULONG64* offset)
+{
+    if (!section || !offset || !bytes) return FALSE;
+    const auto at = reinterpret_cast<ULONG_PTR>(address);
+    if (at % page_bytes) return FALSE;
+#ifdef X2W_XMEM_TEST_CONTROLS
+    // Test build only: any slab counts as a pool section (a fixture must not claim the real pool).
+    static const bool any_slab = x2w_local::env_on("X2W_XMEM_TEST_POOL_ANY");
+#else
+    constexpr bool any_slab = false;
+#endif
+    const std::lock_guard guard(memory.mutex);
+    HANDLE first_section = nullptr;
+    ULONG64 first_offset = 0;
+    for (SIZE_T done = 0; done < bytes; done += page_bytes) {
+        const auto view = memory.views.find(at + done);
+        if (view == memory.views.end()) return FALSE;
+        const auto backing = memory.backings.find(view->second);
+        if (backing == memory.backings.end()) return FALSE;
+        const HANDLE s = backing->second.section;
+        if (!done) {
+            if (!memory.pool_views.count(s) && !any_slab) return FALSE;  // not a pool section
+            first_section = s;
+            first_offset = backing->second.offset;
+        } else if (s != first_section || backing->second.offset != first_offset + done) {
+            return FALSE;  // the pages are not consecutive in one section
+        }
+    }
+    *section = first_section;
+    *offset = first_offset;
+    return TRUE;
+}

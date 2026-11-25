@@ -1254,6 +1254,7 @@ void memcut_released(Wrapper* self);
 void memcut_list_reset(Wrapper* list);
 void memcut_reap();
 void memcut_revive(Wrapper* w);
+ID3D12Heap* memcut_slab_heap(void* address, UINT64 bytes, UINT64* offset);  // X2W_MEMCUT_ALIAS_SLABS
 ULONG __stdcall release(Wrapper* self)
 {
     const auto refs = InterlockedDecrement(&self->own().refs);
@@ -4249,11 +4250,36 @@ std::vector<VaWindow>& va_windows()
 }
 LONG va_mapped, va_failed;
 ID3D12Heap* existing_heap(void* base);  // opens (once) the desktop heap over a private allocation
+// A chunk section opened once as a desktop heap (nullptr when it cannot be); shared by section_va and, with
+// X2W_MEMCUT_ALIAS_SLABS, by placed buffers over pool slabs (device slot 133).
+ID3D12Heap* section_heap(HANDLE section)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::vector<std::pair<HANDLE, ID3D12Heap*>> heaps;
+    AcquireSRWLockExclusive(&lock);
+    for (const auto& [h, hp] : heaps)
+        if (h == section) {
+            ReleaseSRWLockExclusive(&lock);
+            return hp;
+        }
+    ID3D12Heap* heap = nullptr;
+    ID3D12Device3* device3 = nullptr;
+    HRESULT hr = device_of(the_device)->QueryInterface(IID_PPV_ARGS(&device3));
+    if (SUCCEEDED(hr)) {
+        hr = device3->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&heap));
+        device3->Release();
+    }
+    log("x2w-va heap over chunk section %p -> 0x%08lx size 0x%llx", section, static_cast<unsigned long>(hr),
+        SUCCEEDED(hr) ? heap->GetDesc().SizeInBytes : 0ull);
+    if (FAILED(hr)) heap = nullptr;
+    heaps.emplace_back(section, heap);
+    ReleaseSRWLockExclusive(&lock);
+    return heap;
+}
 // A chunk section opened once as a desktop heap; buffers placed on it in 256 MiB steps (512 MiB long).
 D3D12_GPU_VIRTUAL_ADDRESS section_va(HANDLE section, ULONG64 offset)
 {
     static SRWLOCK lock = SRWLOCK_INIT;
-    static std::vector<std::pair<HANDLE, ID3D12Heap*>> heaps;
     static std::vector<std::tuple<HANDLE, ULONG64, ID3D12Resource*>> windows;
     const ULONG64 start = offset & ~((1ull << 28) - 1);
     AcquireSRWLockExclusive(&lock);
@@ -4263,22 +4289,8 @@ D3D12_GPU_VIRTUAL_ADDRESS section_va(HANDLE section, ULONG64 offset)
             ReleaseSRWLockExclusive(&lock);
             return va;
         }
-    ID3D12Heap* heap = nullptr;
-    for (const auto& [h, hp] : heaps)
-        if (h == section) heap = hp;
+    ID3D12Heap* heap = section_heap(section);
     HRESULT hr = S_OK;
-    if (!heap) {
-        ID3D12Device3* device3 = nullptr;
-        hr = device_of(the_device)->QueryInterface(IID_PPV_ARGS(&device3));
-        if (SUCCEEDED(hr)) {
-            hr = device3->OpenExistingHeapFromFileMapping(section, IID_PPV_ARGS(&heap));
-            device3->Release();
-        }
-        log("x2w-va heap over chunk section %p -> 0x%08lx size 0x%llx", section, static_cast<unsigned long>(hr),
-            SUCCEEDED(hr) ? heap->GetDesc().SizeInBytes : 0ull);
-        heaps.emplace_back(section, SUCCEEDED(hr) ? heap : nullptr);
-        if (FAILED(hr)) heap = nullptr;
-    }
     ID3D12Resource* buffer = nullptr;
     if (heap) {
         const UINT64 size = heap->GetDesc().SizeInBytes;
@@ -4482,10 +4494,15 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
              VirtualQuery(cursor, &region, sizeof(region)) && region.AllocationBase == base && region.State == MEM_COMMIT;
              cursor += region.RegionSize)
             allocation_bytes += region.RegionSize;
-    if (rejected || offset > allocation_bytes || desc->Width > allocation_bytes - offset) hr = E_INVALIDARG;
+    // LOCAL memcut: X2W_MEMCUT_ALIAS_SLABS=1 places a buffer over pool-slab pages on the slab's section heap.
+    UINT64 slab_offset = 0;
+    ID3D12Heap* const slab_heap = info.Type == MEM_MAPPED && initial_state != D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE
+                                      ? memcut_slab_heap(address, desc->Width, &slab_offset) : nullptr;
+    if (!slab_heap && (rejected || offset > allocation_bytes || desc->Width > allocation_bytes - offset)) hr = E_INVALIDARG;
     query_time.stop();
     TimedPart create_time(time_placed_create);
-    if (SUCCEEDED(hr)) {
+    if (slab_heap) heap = slab_heap;
+    else if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
         for (auto& [known, h] : existing_heaps)
             if (known == base) heap = h;
@@ -4507,12 +4524,12 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                                                    D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
     ID3D12Resource* resource = nullptr;
     if (SUCCEEDED(hr))
-        hr = device_of(self)->CreatePlacedResource(heap, offset, &copy, initial_state, nullptr,
+        hr = device_of(self)->CreatePlacedResource(heap, slab_heap ? slab_offset : offset, &copy, initial_state, nullptr,
                                                    IID_PPV_ARGS(&resource));
     // A buffer that spans several allocations (adjacent placeholder pieces) cannot be placed on one
     // existing heap. Fallback: a committed default-heap buffer, not aliased with the title memory.
     const bool aliased = SUCCEEDED(hr);
-    const char* placement = "aliased";
+    const char* placement = slab_heap && aliased ? "aliased slab" : "aliased";  // LOCAL memcut: "aliased slab"
     if (FAILED(hr)) {
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
         copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -5455,6 +5472,7 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
 }  // namespace
 #include "startup_stubs/d3d12_mem_counters.inl"  // LOCAL memcut: x2w_memory_counters export
 #include "startup_stubs/d3d12_memcut_release.inl"  // LOCAL memcut: X2W_MEMCUT_RELEASE
+#include "startup_stubs/d3d12_memcut_alias.inl"  // LOCAL memcut: X2W_MEMCUT_ALIAS_SLABS
 
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {
