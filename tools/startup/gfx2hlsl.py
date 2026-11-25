@@ -530,6 +530,44 @@ class Stage:
         self.exec_known = all(s[2] for s in states)
         self.lane_s = set().union(*(s[3] for s in states))  # lane-dependent on any incoming path
 
+    # Instructions whose SGPR result is a lane mask (bit i = lane i): compares into an SGPR pair, save-exec forms,
+    # wrexec forms and a copy of exec.
+    LOOP_MASK_WRITER = re.compile(r'^v_cmpx?_|saveexec|wrexec')
+
+    def loop_writes(self, head, last):
+        """(SGPRs written, SGPRs written by something other than a lane-mask writer, exec written) over the
+        instructions at offsets [head, last]."""
+        written, non_mask, exec_written = set(), set(), False
+        for off, n, name, asm in self.ins:
+            if not head <= off <= last:
+                continue
+            _, writes = sgpr_access(name, asm)
+            ops = parse(asm)[1]
+            first = ops[0] if ops else ''
+            if writes:
+                written |= writes
+                mask = self.LOOP_MASK_WRITER.search(name) or (
+                    name.startswith('s_mov_b') and len(ops) > 1 and ops[1].startswith('exec'))
+                if not mask:
+                    non_mask |= writes
+            if (first.startswith('exec') and name.startswith('s_')) or re.search(r'saveexec|wrexec|^v_cmpx_', name):
+                exec_written = True
+        return written, non_mask, exec_written
+
+    def forget_loop_writes(self, head, last):
+        """At a loop head: drop what the entry state says about registers the loop body writes (see translate)."""
+        written, non_mask, exec_written = self.loop_writes(head, last)
+        for reg in written:
+            value = self.sym.pop(reg, None)
+            if value is not None and value[0] not in self.RUNTIME_BACKED:
+                # The entry value lives only in the symbolic state (a descriptor, a pointer): its HLSL variable was
+                # never assigned, so a first-pass read of the run-time variable would be wrong. As at a forward
+                # join of a symbolic and a run-time value, any use refuses.
+                self.sym[reg] = ('conflict',)
+        self.masks -= non_mask
+        if exec_written:
+            self.exec_known = False
+
     def translate(self):
         targets, sources = set(), {}
         for off, n, name, asm in self.ins:
@@ -569,13 +607,26 @@ class Stage:
                 self.lines, start = [], off
             # The scan is linear, so at a join the state left by the instruction above is only one of the
             # incoming paths (and none after an unconditional branch). Merge the states of every incoming
-            # edge when they are all forward; a loop head keeps the linear state.
+            # edge when they are all forward; a loop head merges its entry edges and forgets the body's writes.
             if off in targets and all(src < off for src in sources[off]):
                 states = list(incoming.get(off, []))
                 if previous not in (None, 's_branch', 's_endpgm'):
                     states.append(self.snapshot())
                 if states:
                     self.merge(states)
+            elif off in targets:
+                # A loop head: the entry edges (fall-through and forward branches) are merged as at any join, and
+                # the back edges carry whatever the loop body left. Every SGPR the body writes anywhere in
+                # [head, last back-edge source] loses its symbolic value (a constant known on entry is the first
+                # pass's value only: a counter `s14 = 0` must not fold into `0 + 1` on every pass), a register the
+                # body writes with anything but a lane mask stops being a mask, and exec is no longer the entry
+                # mask if the body writes it.
+                states = list(incoming.get(off, []))
+                if previous not in (None, 's_branch', 's_endpgm'):
+                    states.append(self.snapshot())
+                if states:
+                    self.merge(states)
+                self.forget_loop_writes(off, max(sources[off]))
             if off in targets:
                 # Lane invariance is not merged across edges for VGPRs; at a loop head the linear state misses the
                 # back edges, so every SGPR becomes suspect until it is written again.
@@ -583,6 +634,7 @@ class Stage:
                 self.splat.clear()
                 self.partial_uniform.clear()
                 self.a_invariant = False
+                self.t_invariant = False
                 if not all(src < off for src in sources[off]):
                     self.lane_s = set(range(128))
                 else:
