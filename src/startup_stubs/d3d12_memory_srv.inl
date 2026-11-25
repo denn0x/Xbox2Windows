@@ -127,6 +127,44 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
             return nullptr;
         return const_cast<Wrapper*>(placed.owner);
     }
+    // LOCAL (textures): X2W_BUFFER_ADDRESS_INDEX=1 answers from buffer_address_index (d3d12_capture.inl) instead of the
+    // walk below; =check runs both and counts disagreements (logged at powers of two, first 8 with both answers).
+    static const int index_mode = [] {
+        char v[16]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_BUFFER_ADDRESS_INDEX", v, sizeof(v));
+        const int mode = n && n < sizeof(v) ? (std::strcmp(v, "1") == 0 ? 1 : std::strcmp(v, "check") == 0 ? 2 : 0) : 0;
+        if (mode) log("x2w-memsrv X2W_BUFFER_ADDRESS_INDEX=%s: memory buffer lookups use the address index%s", v,
+                      mode == 2 ? ", checked against the walk on every call" : "");
+        return mode;
+    }();
+    // The walk's filters, applied to each candidate either way.
+    const auto eligible = [](const Wrapper* wrapper, const ResourceInfo& info) {
+        return !(!wrapper->own().real && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) &&
+               info.placement == Placement::none && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+               !(info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+               InterlockedCompareExchange(&const_cast<Wrapper*>(wrapper)->own().refs, 0, 0) > 0;
+    };
+    Wrapper* indexed = nullptr;
+    if (index_mode) {
+        AcquireSRWLockShared(&note_lock);
+        bool ambiguous = false;
+        buffer_address_index().containing(address, bytes, [&](const Wrapper* wrapper, u64 base, u64) {
+            const auto found = resource_infos().find(wrapper);
+            if (found == resource_infos().end() || !eligible(wrapper, found->second)) return true;
+            // As the walk: the record's current base and width decide (the index holds them as noted).
+            const u64 now = reinterpret_cast<u64>(wrapper->own().title_memory), width = found->second.console.Width;
+            if (now != base || address < now || address - now >= width || bytes > width - (address - now)) return true;
+            if (indexed) {
+                ambiguous = true;
+                return false;
+            }
+            indexed = const_cast<Wrapper*>(wrapper);
+            return true;
+        });
+        ReleaseSRWLockShared(&note_lock);
+        if (ambiguous) indexed = nullptr;
+        if (index_mode == 1) return indexed;
+    }
     Wrapper* match = nullptr;
     AcquireSRWLockShared(&note_lock);
     for (const auto& [wrapper, info] : resource_infos()) {
@@ -150,6 +188,17 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
         match = const_cast<Wrapper*>(wrapper);
     }
     ReleaseSRWLockShared(&note_lock);
+    if (index_mode == 2) {
+        static LONG64 checked, differed;
+        const LONG64 n = InterlockedIncrement64(&checked);
+        const bool same = indexed == match;
+        const LONG64 d = same ? differed : InterlockedIncrement64(&differed);
+        static LONG shown;
+        if (!same && first_calls(shown, 8))
+            log("x2w-memsrv buffer address index DIFFERS at 0x%llx (%llu bytes): index %p, walk %p", address, bytes, static_cast<void*>(indexed),
+                static_cast<void*>(match));
+        if ((n & (n - 1)) == 0) log("x2w-memsrv buffer address index checked %lld lookups against the walk: %lld differ", n, d);
+    }
     return match;
 }
 

@@ -35,7 +35,7 @@ from startup_draw_uav_check import run_mode
 IDENTITY = bytes((0, 0, 0x80, 0x3F))
 VALUE = bytes((99, 0, 0, 0))
 DECOY = bytes((55, 0, 0, 0))
-ON = {"X2W_BUFFER_HEAP_INDEX": "1"}
+ON = {"X2W_BUFFER_HEAP_INDEX": "1", "X2W_BUFFER_ADDRESS_INDEX": "check"}
 REWRITE_LOG = dict(ON, X2W_MARKER_REWRITE_LOG="1")
 MODES = {"membuf": ON, "membuf-off": {}, "membuf-link": ON, "membuf-structured": ON, "membuf-typed": ON, "membuf-refused": REWRITE_LOG,
          "membuf-unaligned": ON, "membuf-unaligned-off": {}, "membuf-rewrite": REWRITE_LOG}
@@ -60,6 +60,11 @@ def check(directory, consumer, backend):
     _, image, log = results["membuf"]
     if columns(image) != {VALUE}:
         raise AssertionError(f"membuf: pixels {image[:32].hex()} (expected 99 = {VALUE.hex()})\n{log[-4000:]}")
+    # The switch-on modes run X2W_BUFFER_ADDRESS_INDEX=check: the index answers as the walk (here: no buffer).
+    for mode in ("membuf", "membuf-structured", "membuf-typed"):
+        lines = re.findall(r"^x2w-memsrv buffer address index checked (\d+) lookups against the walk: (\d+) differ$", results[mode][2], re.M)
+        if not lines or any(d != "0" for _, d in lines) or "DIFFERS" in results[mode][2]:
+            raise AssertionError(f"{mode}: address index check lines {lines}\n{results[mode][2][-3000:]}")
     # The destination holds the console V# (base = the private memory, so word 0 is neither a link, a token nor the
     # marker); no stand-in wrapper is made (run 110).
     for mode, layout in (("membuf", "stride 0, records 256, word 3 0x"), ("membuf-structured", "stride 16, records 4, word 3 0x"),

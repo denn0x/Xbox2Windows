@@ -150,11 +150,29 @@ PlacementIndex& placement_group(u64 width)
     return placement_index[width > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT];
 }
 
+// LOCAL (textures): every buffer record that is not a placement (note_resource, or retire_placement turning one into
+// a plain record), by title-memory range. existing_memory_buffer queries it under note_lock shared instead of walking
+// resource_infos() when X2W_BUFFER_ADDRESS_INDEX=1. It is maintained whether or not the switch is on (one map
+// insert per buffer creation, under the exclusive lock already held), so the switch only picks the reader.
+x2w_startup::AddressIndex<const Wrapper*>& buffer_address_index()
+{
+    static x2w_startup::AddressIndex<const Wrapper*> index;
+    return index;
+}
+void index_buffer_record(const Wrapper* w, const ResourceInfo& info)  // note_lock exclusive held
+{
+    const u64 base = reinterpret_cast<u64>(w->own().title_memory);
+    if (info.placement == Placement::none && info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && base)
+        buffer_address_index().insert(w, base, info.console.Width);
+    else
+        buffer_address_index().erase(w);
+}
 void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
 {
     if (!w || !console) return;
     x2w_startup::ExclusiveNoteLock guard(note_lock);
-    resource_infos()[w] = ResourceInfo{*console, bytes};
+    const ResourceInfo& info = resource_infos()[w] = ResourceInfo{*console, bytes};
+    index_buffer_record(w, info);
 }
 void retire_placement(Wrapper* w)
 {
@@ -171,6 +189,7 @@ void retire_placement(Wrapper* w)
             }
         }
         found->second.placement = Placement::none;
+        index_buffer_record(w, found->second);  // LOCAL (textures): now a plain record, as the walk sees it
     }
     ReleaseSRWLockExclusive(&note_lock);
 }

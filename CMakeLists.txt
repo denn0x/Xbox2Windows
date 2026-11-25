@@ -1582,6 +1582,14 @@ add_test(NAME gfx10_layout_tail_control COMMAND gfx10_layout_check "${_gfx10_gol
 set_tests_properties(gfx10_layout_floor_control gfx10_layout_tail_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME gfx10_layout_addrlib COMMAND gfx10_layout_check --addrlib)
 set_tests_properties(gfx10_layout_addrlib PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+# LOCAL (textures): the address index of memory buffer lookups (src/startup_stubs/buffer_address_index.h) against a
+# brute-force walk; the mutated window is the negative control.
+add_executable(buffer_address_index_check tests/buffer_address_index_check.cpp)
+target_compile_features(buffer_address_index_check PRIVATE cxx_std_17)
+target_include_directories(buffer_address_index_check PRIVATE src)
+add_test(NAME buffer_address_index COMMAND buffer_address_index_check)
+add_test(NAME buffer_address_index_control COMMAND buffer_address_index_check --mutate)
+set_tests_properties(buffer_address_index_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME xg_bc64_tiling_reference COMMAND xg_swizzle_select_check --bc64-tiling)
 set_tests_properties(xg_bc64_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 # Which descriptions take the 64 KiB standard BC chain (src/startup_stubs/bc64_chain.h), without addrlib
