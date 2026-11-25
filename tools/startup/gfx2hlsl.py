@@ -480,6 +480,14 @@ class Stage:
                 sources.setdefault(target, []).append(off)
         # The first branch or branch target: before it the program is one straight-line path (op_s_round_mode).
         self.uses_round_mode = any(name == 's_round_mode' for off, n, name, asm in self.ins)
+        # X2W_PS_QUAD_DIVERGENT=1 (default off, read when the stage is built): quad reads (DPP quad_perm) and
+        # image_sample_b are also lowered where a lane may skip them in forward control flow. That is exact only
+        # where the four lanes of each quad take the same path (D3D leaves quad reads and implicit derivatives
+        # undefined otherwise, while the hardware reads the inactive lanes, fi:1); loops stay refused. Each use is
+        # listed in quad_divergent_used and the manifest says `quaddivergent 1`.
+        self.quad_divergent = self.kind == 'ps' and os.environ.get('X2W_PS_QUAD_DIVERGENT') == '1'
+        self.quad_divergent_used = []
+        self.has_loop = any(src >= t for t, srcs in sources.items() for src in srcs)
         self.cf_first = min([off for off, n, name, asm in self.ins if name.startswith('s_cbranch') or name == 's_branch']
                             + list(targets) + [1 << 32])
         self.blocks = []          # (offset, [lines], terminator)
@@ -725,6 +733,9 @@ class Stage:
                 seen.add(off)
                 nxt = successors(off)
                 if not nxt:
+                    if self.quad_divergent:
+                        self.quad_divergent_used.append(target)
+                        break
                     raise Unsupported('quad read (DPP) at %#x is skipped on a path to %#x' % (target, off))
                 todo.extend(nxt)
 
@@ -1459,8 +1470,13 @@ class Stage:
             elif how == 'b':
                 # SampleBias takes implicit derivatives like Sample, so it is lowered only where Sample is (below);
                 # the level-0 fallback Sample uses elsewhere would ignore the bias.
-                if not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
+                if self.kind != 'ps':
                     raise Unsupported('image_sample_b outside straight-line code with every lane active')
+                if not self.exec_known or len(self.blocks) > 0:
+                    # X2W_PS_QUAD_DIVERGENT=1 (see quad_divergent): taken in forward control flow, not in a loop
+                    if not self.quad_divergent or self.has_loop:
+                        raise Unsupported('image_sample_b outside straight-line code with every lane active')
+                    self.quad_divergent_used.append(self.pc)
                 call = '%s.SampleBias(%s, %s, %s)' % (tex, smp, uv, self.f(bias))
             elif how == 'd':
                 # explicit gradients: no implicit derivatives, so any control flow and any exec state
@@ -1994,6 +2010,7 @@ class Stage:
     ROUND16_LOWERED = ('v_fma_mixlo_f16', 'v_fma_mixhi_f16', 'v_cvt_f16_f32', 'v_interp_p2_f16')
     round16 = 0  # the class defaults, for a Stage built without __init__ (the operand-count probe)
     uses_round_mode = False
+    quad_divergent = has_loop = False
 
     def op_s_round_mode(self, ops, mods):
         value = int(ops[0], 0) if ops and re.fullmatch(r'(0x[0-9a-f]+|\d+)', ops[0]) else None
@@ -3063,6 +3080,9 @@ class Pipeline:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         if getattr(self, 'fma_rule', None) and self.fma_rule != 'legacy':
             lines.append('fma %s' % self.fma_rule)
+        if getattr(self.ps, 'quad_divergent_used', None):
+            # X2W_PS_QUAD_DIVERGENT lowered a quad read or image_sample_b a lane may skip (Stage.translate)
+            lines.append('quaddivergent 1')
         if FRONT_FACE in getattr(self, 'ps_input_vgprs', {}).values():
             lines.append('frontface 1')  # reads SV_IsFrontFace: depends on the PSO winding (see PS_INPUT_HLSL)
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
