@@ -195,21 +195,30 @@ int main(int argc, char** argv)
         const char* name;
         std::vector<std::pair<unsigned, std::uint32_t>> words;
         bool far_second;    // also draw the far red triangle after the near green one, same state
-        UINT guest_clear = 0;  // depth pre-cleared to 0 on the desktop, then list slot 51 with these flags and depth 1
+        UINT guest_clear = 0;  // list slot 51 with these flags and guest_depth, after the desktop pre-clear
+        float desktop_depth = 1.0f;
+        float guest_depth = 1.0f;
     };
+    // The depth target is one resource for all cases and the shim never forgets a cleared target, so the cases that
+    // must see it uncleared run first.
     const Case cases[] = {
-        {"depth", with({{a_depth, z_less_write}}), true},
+        // Run 100: depth test on a target no guest clear initialised. The shim keeps the test off: the near triangle
+        // draws over a desktop depth of 0. With X2W_DRAW_STATE_DEPTH_UNCLEARED=1 (negative control) LESS fails.
+        {"uncleared", with({{a_depth, z_less_write}}), false, 0, 0.0f},
+        // A stencil-only clear on a D32 target does not initialise depth: same as uncleared.
+        {"guest_clear_stencil_only", with({{a_depth, z_less_write}}), false, D3D12_CLEAR_FLAG_STENCIL, 0.0f},
+        {"depth", with({{a_depth, z_less_write}}), true, D3D12_CLEAR_FLAG_DEPTH},
         // Negative control: bits 30-31 make the decoder refuse the word, so the draw keeps the state of before.
-        {"depth_refused", with({{a_depth, z_less_write | 1u << 30}}), true},
+        {"depth_refused", with({{a_depth, z_less_write | 1u << 30}}), true, D3D12_CLEAR_FLAG_DEPTH},
         {"no_state", with({}), true},
         {"cull_back", with({{a_mode, cull_back}}), false},
         {"cull_front", with({{a_mode, cull_front}}), false},
         {"cull_back_face1", with({{a_mode, cull_back | face_cw}}), false},
         {"mask_rg", {{a_shader_mask, 0xF}, {a_target_mask, 0x3}}, false},
         // List slot 51: a forwarded depth clear to 1 lets the near triangle pass LESS over a depth of 0.
-        {"guest_clear", with({{a_depth, z_less_write}}), false, D3D12_CLEAR_FLAG_DEPTH},
-        // Negative control: a stencil-only clear on a D32 target clears nothing, depth stays 0.
-        {"guest_clear_stencil_only", with({{a_depth, z_less_write}}), false, D3D12_CLEAR_FLAG_STENCIL},
+        {"guest_clear", with({{a_depth, z_less_write}}), false, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 1.0f},
+        // Negative control: a forwarded clear to 0 over a desktop depth of 1 makes LESS fail, so the value is forwarded.
+        {"guest_clear0", with({{a_depth, z_less_write}}), false, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0.0f},
     };
     std::vector<Slot57> keep(2 * std::size(cases));
     std::vector<std::pair<void*, void*>> psos;
@@ -262,7 +271,7 @@ int main(int argc, char** argv)
 
     UINT64 fence_value = 0;
     for (std::size_t i = 0; i < std::size(cases); ++i) {
-        if (const int rc = clear_depth_desktop(desktop.Get(), depth_tex.Get(), cases[i].guest_clear ? 0.0f : 1.0f)) return rc;
+        if (const int rc = clear_depth_desktop(desktop.Get(), depth_tex.Get(), cases[i].desktop_depth)) return rc;
         if (FAILED(static_cast<HRESULT>(invoke(state.allocator, 8)))) return 24;
         if (FAILED(static_cast<HRESULT>(invoke(state.list, 139, ptr_arg(state.allocator))))) return 25;
         invoke(state.list, 52, rtv.ptr, ptr_arg(clear_color));
@@ -274,7 +283,7 @@ int main(int argc, char** argv)
             // Typed call: the depth value is a float argument (xmm3), which invoke cannot pass.
             using ClearDepth = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
             reinterpret_cast<ClearDepth>((*static_cast<void***>(state.list))[51])(state.list, dsv, static_cast<D3D12_CLEAR_FLAGS>(cases[i].guest_clear),
-                                                                                   1.0f, 0, 0, nullptr);
+                                                                                   cases[i].guest_depth, 0, 0, nullptr);
         }
         invoke(state.list, 25, ptr_arg(psos[i].first));
         invoke(state.list, 12, 3, 1);

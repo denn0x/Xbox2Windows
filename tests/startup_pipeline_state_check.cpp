@@ -309,6 +309,13 @@ void switch_cases()
     check(s.depth_clear && !s.depth, "depth clears on their own switch");
     s = parse_switches("0", nullptr, nullptr, nullptr, nullptr, "1");
     check(!s.depth_clear, "X2W_DRAW_STATE=0 turns depth clears off");
+    check(!s.uncleared, "uncleared depth tests default off");
+    s = parse_switches(nullptr, "1", nullptr, nullptr, nullptr, nullptr, "1");
+    check(s.depth && s.uncleared, "uncleared depth tests on with depth");
+    s = parse_switches(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "1");
+    check(!s.uncleared, "uncleared depth tests need the depth group");
+    s = parse_switches("0", "1", nullptr, nullptr, nullptr, nullptr, "1");
+    check(!s.uncleared, "X2W_DRAW_STATE=0 turns uncleared depth tests off");
 }
 }  // namespace
 

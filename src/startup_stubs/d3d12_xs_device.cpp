@@ -2561,6 +2561,7 @@ struct Pass {
     DXGI_FORMAT target_formats[8] = {};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     bool dsv_read_only = false;          // LOCAL (renderstate): the bound depth target is a read-only view (d3d12_draw.inl drops depth writes)
+    ID3D12Resource* dsv_resource = nullptr;  // LOCAL (renderstate): desktop resource of the bound depth target
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     bool heap_set = false;
@@ -2740,6 +2741,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target0 = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
     pass.dsv_read_only = false;
+    pass.dsv_resource = nullptr;
     static LONG refused;
     const auto refuse = [](TargetBind why) { InterlockedIncrement(&target_binds[why]); };
     if (!list) return refuse(bind_not_recording);
@@ -2821,6 +2823,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target_count = count;
     pass.dsv_format = dsv_format;
     pass.dsv_read_only = dsv_state == D3D12_RESOURCE_STATE_DEPTH_READ;
+    pass.dsv_resource = dsv_target;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
     InterlockedIncrement(&target_binds[single_range ? bind_single_range_bound : bind_bound]);
@@ -2893,6 +2896,24 @@ void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
 // as well, the run 78 trace fits: rdx a handle, r8 flags 2, r9 unrelated). noop_slot forwards integer
 // registers only, so this entry bypasses it and keeps its slot counters itself. Desktop resources rest in
 // COMMON here: the target goes to DEPTH_WRITE for the clear and back to the state this list had it in.
+// Depth targets a forwarded slot 51 clear has initialised (recording order, not GPU order). The depth
+// group applies a depth / stencil test only on these (run 100: the setup pages bind a depth target that is
+// never cleared through slot 51, and a LESS test against its uninitialised contents hid the drawing).
+// Entries are never removed: a new resource at a freed one's address counts as cleared (accepted).
+SRWLOCK cleared_depth_lock = SRWLOCK_INIT;
+std::unordered_set<const ID3D12Resource*>& cleared_depth_targets()
+{
+    static std::unordered_set<const ID3D12Resource*> s;
+    return s;
+}
+bool depth_target_cleared(const ID3D12Resource* resource)
+{
+    if (!resource) return false;
+    AcquireSRWLockShared(&cleared_depth_lock);
+    const bool found = cleared_depth_targets().count(resource) != 0;
+    ReleaseSRWLockShared(&cleared_depth_lock);
+    return found;
+}
 LONG depth_clears[5];  // [0] forwarded, [1] list not open, [2] view not a known depth view, [3] depth value outside [0, 1], [4] nothing left to clear
 void __stdcall list_clear_depth(Wrapper* self, u64 handle, UINT flags, float depth, UINT stencil, UINT rect_count, const D3D12_RECT* rects)
 {
@@ -2924,6 +2945,12 @@ void __stdcall list_clear_depth(Wrapper* self, u64 handle, UINT flags, float dep
     list->ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(resolved)}, static_cast<D3D12_CLEAR_FLAGS>(clear), depth,
                                 static_cast<UINT8>(stencil & 0xFF), rect_count, rect_count ? rects : nullptr);
     if (known && before != D3D12_RESOURCE_STATE_DEPTH_WRITE) require_state(self, target, before);  // a read-only bind stays valid
+    // Only a depth clear initialises the depth plane; marked at record time, never unmarked (a freed and reused address stays marked).
+    if (clear & D3D12_CLEAR_FLAG_DEPTH) {
+        AcquireSRWLockExclusive(&cleared_depth_lock);
+        cleared_depth_targets().insert(target);
+        ReleaseSRWLockExclusive(&cleared_depth_lock);
+    }
     InterlockedIncrement(&depth_clears[0]);
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).

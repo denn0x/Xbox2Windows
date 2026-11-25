@@ -64,7 +64,7 @@ enum Counter {
     decoded, decoded_mesh, class_depth_off, class_depth_read, class_depth_write, class_stencil, class_cull, class_blend, class_masked,
     class_dual, refused_depth, refused_raster, refused_blend, derived_ds, derived_rs, derived_invalid, depth_bounds_ignored,
     stencil_masks_differ, clip_split, bias_rounded, conservative_dropped, pso_new, pso_failed_fallback, pso_failed_both,
-    draws_depth_no_target, draws_stencil_no_plane, draws_read_only, draws_rect_cull_off, dual_multi_target, count
+    draws_depth_no_target, draws_stencil_no_plane, draws_read_only, draws_rect_cull_off, dual_multi_target, draws_depth_uncleared, count
 };
 LONG n[count];
 void add(Counter c) { InterlockedIncrement(&n[c]); }
@@ -92,12 +92,13 @@ void report_draw_state()
         "depth-stencil %ld rasterizer %ld invalid %ld; flagged: depth bounds ignored %ld, stencil back masks differ %ld, one zclip "
         "%ld, bias rounded %ld, conservative dropped %ld; PSOs new-state %ld, failed->old state %ld, failed both %ld; draws: depth/"
         "stencil test without depth target %ld, stencil without plane %ld, read-only target writes off %ld, rect list cull off %ld, "
-        "dual-source with >1 target %ld",
+        "dual-source with >1 target %ld, depth/stencil test on a never-cleared depth target off %ld",
         s.depth, s.cull, s.flip, s.blend, v[decoded], v[decoded_mesh], v[class_depth_off], v[class_depth_read], v[class_depth_write],
         v[class_stencil], v[class_cull], v[class_blend], v[class_masked], v[class_dual], v[refused_depth], v[refused_raster],
         v[refused_blend], v[derived_ds], v[derived_rs], v[derived_invalid], v[depth_bounds_ignored], v[stencil_masks_differ],
         v[clip_split], v[bias_rounded], v[conservative_dropped], v[pso_new], v[pso_failed_fallback], v[pso_failed_both],
-        v[draws_depth_no_target], v[draws_stencil_no_plane], v[draws_read_only], v[draws_rect_cull_off], v[dual_multi_target]);
+        v[draws_depth_no_target], v[draws_stencil_no_plane], v[draws_read_only], v[draws_rect_cull_off], v[dual_multi_target],
+        v[draws_depth_uncleared]);
     if (s.depth_clear)
         log("x2w-draw-state 300 frames: depth clears (slot 51) forwarded %ld; dropped: list not open %ld, not a depth view %ld, depth "
             "outside [0, 1] %ld, nothing to clear %ld", InterlockedExchange(&depth_clears[0], 0), InterlockedExchange(&depth_clears[1], 0),
@@ -929,13 +930,17 @@ void decode_draw_state(BoundPipeline& bound, Wrapper* pipeline, const PipelineIn
     static LONG logged_state;
     if (first_calls(logged_state, 16)) {
         const auto& r = bound.rs.desc;
+        char derived_rs[96] = "";
+        if (bound.derived_rs)  // the slot 55 rasterizer part replaces the register state under _CULL
+            std::snprintf(derived_rs, sizeof(derived_rs), " (derived part wins: fill %d cull %d ccw %d clip %d)", bound.patch_rs.FillMode,
+                          bound.patch_rs.CullMode, bound.patch_rs.FrontCounterClockwise, bound.patch_rs.DepthClipEnable);
         log("x2w-draw-state pipeline %p%s: DB_DEPTH_CONTROL %08x STENCIL %08x REFMASK %08x/%08x -> %s depth %d write %d func %d "
-            "stencil %d%s; MODE %08x CLIP %08x bias %g/%g/%g -> %s cull %d ccw %d bias %d/%g/%g clip %d; masks %08x & %08x -> "
+            "stencil %d%s; MODE %08x CLIP %08x bias %g/%g/%g -> %s cull %d ccw %d bias %d/%g/%g clip %d%s; masks %08x & %08x -> "
             "rt0 0x%x%s%s", static_cast<void*>(pipeline), words.mesh ? " (mesh layout)" : "", words.depth, words.stencil, words.refmask,
             words.refmask_bf, bound.ds.ok ? "ok" : bound.ds.reason, d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable,
             bound.derived_ds ? " (derived part)" : "", words.mode, words.clip, words.bias_clamp, words.bias_scale, words.bias_offset,
             bound.rs.ok ? "ok" : bound.rs.reason, r.CullMode, r.FrontCounterClockwise, r.DepthBias, r.DepthBiasClamp, r.SlopeScaledDepthBias,
-            r.DepthClipEnable, words.target_mask, words.shader_mask, bound.masked_blend.desc.RenderTarget[0].RenderTargetWriteMask,
+            r.DepthClipEnable, derived_rs, words.target_mask, words.shader_mask, bound.masked_blend.desc.RenderTarget[0].RenderTargetWriteMask,
             bound.masked_blend.dual_source ? " dual-source" : "", bound.masked_blend.ok ? "" : " (blend refused)");
     }
 }
@@ -1113,8 +1118,13 @@ bool apply_draw_state(const BoundPipeline& bound, const Pass& pass, D3D12_GRAPHI
     }
     if (s.depth && !bound.has_depth_stencil && (bound.derived_ds || (bound.has_words && bound.ds.ok))) {
         D3D12_DEPTH_STENCIL_DESC d = bound.derived_ds ? bound.patch_ds : bound.ds.desc;
-        const unsigned adjusted = adjust_for_target(d, dsv_format != DXGI_FORMAT_UNKNOWN, format_has_stencil(dsv_format), pass.dsv_read_only);
-        if (adjusted & adjust_no_target) draw_state::add(draw_state::draws_depth_no_target);
+        // A depth target no forwarded slot 51 clear has initialised holds undefined depth: no test against it
+        // (unless X2W_DRAW_STATE_DEPTH_UNCLEARED=1); the draw keeps depth and stencil off, as before.
+        const bool target = dsv_format != DXGI_FORMAT_UNKNOWN;
+        const bool uncleared = target && !s.uncleared && !depth_target_cleared(pass.dsv_resource);
+        if (uncleared && (d.DepthEnable || d.StencilEnable)) draw_state::add(draw_state::draws_depth_uncleared);
+        const unsigned adjusted = adjust_for_target(d, target && !uncleared, format_has_stencil(dsv_format), pass.dsv_read_only);
+        if ((adjusted & adjust_no_target) && !uncleared) draw_state::add(draw_state::draws_depth_no_target);
         if (adjusted & adjust_no_stencil) draw_state::add(draw_state::draws_stencil_no_plane);
         if (adjusted & adjust_read_only) draw_state::add(draw_state::draws_read_only);
         desc.DepthStencilState = d;

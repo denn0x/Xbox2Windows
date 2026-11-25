@@ -343,16 +343,18 @@ inline unsigned adjust_for_target(D3D12_DEPTH_STENCIL_DESC& d, bool has_target, 
 //   rasterizer parts; X2W_DRAW_STATE_CULL_FLIP=1 inverts the front-face convention.
 // X2W_DRAW_STATE_BLEND=1: CB_TARGET_MASK & CB_SHADER_MASK as write masks, dual-source blend on target 0.
 // X2W_DRAW_STATE_DEPTH_CLEAR=1: list slot 51 (ClearDepthStencilView) forwarded instead of dropped.
+// X2W_DRAW_STATE_DEPTH_UNCLEARED=1: also test against depth targets no forwarded clear has initialised
+//   (default: such draws keep depth and stencil off, as before; the run 100 setup pages need that).
 // X2W_DRAW_STATE=0 turns all of them off whatever the others say.
 struct Switches {
-    bool depth = false, cull = false, flip = false, blend = false, depth_clear = false;
+    bool depth = false, cull = false, flip = false, blend = false, depth_clear = false, uncleared = false;
 };
 
 inline bool is_one(const char* v) { return v && v[0] == '1' && v[1] == 0; }
 inline bool is_zero(const char* v) { return v && v[0] == '0' && v[1] == 0; }
 
 inline Switches parse_switches(const char* all, const char* depth, const char* cull, const char* blend, const char* flip,
-                               const char* depth_clear = nullptr)
+                               const char* depth_clear = nullptr, const char* uncleared = nullptr)
 {
     Switches s;
     if (is_zero(all)) return s;
@@ -361,20 +363,22 @@ inline Switches parse_switches(const char* all, const char* depth, const char* c
     s.flip = s.cull && is_one(flip);
     s.blend = is_one(blend);
     s.depth_clear = is_one(depth_clear);
+    s.uncleared = s.depth && is_one(uncleared);
     return s;
 }
 
 #ifdef _WIN32
 inline Switches switches_from_env()
 {
-    constexpr int n = 6;
+    constexpr int n = 7;
     char v[n][8] = {};
     const char* names[n] = {"X2W_DRAW_STATE",       "X2W_DRAW_STATE_DEPTH",     "X2W_DRAW_STATE_CULL",
-                            "X2W_DRAW_STATE_BLEND", "X2W_DRAW_STATE_CULL_FLIP", "X2W_DRAW_STATE_DEPTH_CLEAR"};
+                            "X2W_DRAW_STATE_BLEND", "X2W_DRAW_STATE_CULL_FLIP", "X2W_DRAW_STATE_DEPTH_CLEAR",
+                            "X2W_DRAW_STATE_DEPTH_UNCLEARED"};
     const char* p[n] = {};
     for (int i = 0; i < n; ++i)
         if (GetEnvironmentVariableA(names[i], v[i], sizeof(v[i])) && v[i][0]) p[i] = v[i];
-    return parse_switches(p[0], p[1], p[2], p[3], p[4], p[5]);
+    return parse_switches(p[0], p[1], p[2], p[3], p[4], p[5], p[6]);
 }
 #endif
 

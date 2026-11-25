@@ -3,9 +3,11 @@ apply_draw_state in d3d12_draw.inl), switched by X2W_DRAW_STATE_DEPTH / _CULL / 
 
 usage: startup_draw_state_check.py <startup_draw_state> <warp|hardware>
 
-The same program runs four times: switches off (the default), all on, on without X2W_DRAW_STATE_DEPTH_CLEAR,
-and all on with X2W_DRAW_STATE=0. List slot 51 (ClearDepthStencilView) is forwarded only with _DEPTH_CLEAR: the
-guest clears a depth of 0 to 1, so the near triangle passes LESS; without the clear it fails (blue).
+The same program runs five times: switches off (the default), all on, on without X2W_DRAW_STATE_DEPTH_CLEAR, all
+on with X2W_DRAW_STATE_DEPTH_UNCLEARED=1, and all on with X2W_DRAW_STATE=0. List slot 51 (ClearDepthStencilView)
+is forwarded only with _DEPTH_CLEAR. A depth target that no forwarded depth clear initialised gets no depth or
+stencil test (run 100: the test against undefined depth hid 2D draws); _DEPTH_UNCLEARED=1 keeps the test, and the
+"uncleared" case (desktop depth 0, LESS) then loses its near triangle (blue).
 Off and master-off must draw as before: no depth test (the far red triangle drawn second covers the near
 green one), no culling, every channel written. On: DB_DEPTH_CONTROL LESS + write keeps the near green,
 PA_SU_SC_MODE_CNTL culls (FACE 0 taken as counter-clockwise front faces: the test triangle, NDC (-1,-1)
@@ -27,18 +29,29 @@ from startup_stream_draw_check import pixel
 
 GREEN, RED, BLUE, CYAN = (0, 255, 0, 255), (255, 0, 0, 255), (0, 0, 255, 255), (0, 255, 255, 255)
 SWITCHES = ("X2W_DRAW_STATE", "X2W_DRAW_STATE_DEPTH", "X2W_DRAW_STATE_CULL", "X2W_DRAW_STATE_BLEND", "X2W_DRAW_STATE_CULL_FLIP",
-            "X2W_DRAW_STATE_DEPTH_CLEAR")
+            "X2W_DRAW_STATE_DEPTH_CLEAR", "X2W_DRAW_STATE_DEPTH_UNCLEARED")
 GROUPS = {"X2W_DRAW_STATE_DEPTH": "1", "X2W_DRAW_STATE_CULL": "1", "X2W_DRAW_STATE_BLEND": "1"}
 MODES = {
     "off": {},
     "on": dict(GROUPS, X2W_DRAW_STATE_DEPTH_CLEAR="1"),
     "on-noclear": GROUPS,
+    "on-uncleared": dict(GROUPS, X2W_DRAW_STATE_DEPTH_CLEAR="1", X2W_DRAW_STATE_DEPTH_UNCLEARED="1"),
     "master-off": dict(GROUPS, X2W_DRAW_STATE="0", X2W_DRAW_STATE_DEPTH_CLEAR="1"),
 }
-BEFORE = {"depth": RED, "depth_refused": RED, "no_state": RED, "cull_back": GREEN, "cull_front": GREEN, "cull_back_face1": GREEN,
-          "mask_rg": GREEN, "guest_clear": GREEN, "guest_clear_stencil_only": GREEN}
-DECODED = dict(BEFORE, depth=GREEN, cull_front=BLUE, cull_back_face1=BLUE, mask_rg=CYAN, guest_clear_stencil_only=BLUE)
-EXPECTED = {"off": BEFORE, "on": DECODED, "on-noclear": dict(DECODED, guest_clear=BLUE), "master-off": BEFORE}
+BEFORE = {"uncleared": GREEN, "guest_clear_stencil_only": GREEN, "depth": RED, "depth_refused": RED, "no_state": RED,
+          "cull_back": GREEN, "cull_front": GREEN, "cull_back_face1": GREEN, "mask_rg": GREEN, "guest_clear": GREEN,
+          "guest_clear0": GREEN}
+DECODED = dict(BEFORE, depth=GREEN, cull_front=BLUE, cull_back_face1=BLUE, mask_rg=CYAN, guest_clear0=BLUE)
+EXPECTED = {
+    "off": BEFORE,
+    "on": DECODED,
+    # Nothing forwards the guest clears, so no depth target counts as initialised and every depth test stays off.
+    "on-noclear": dict(DECODED, depth=RED, guest_clear0=GREEN),
+    # Negative control (run 100): testing against the never-cleared depth of 0 hides the near triangle.
+    "on-uncleared": dict(DECODED, uncleared=BLUE, guest_clear_stencil_only=BLUE),
+    "master-off": BEFORE,
+}
+CLEARS = ["flags 0x2 depth 1 ", "flags 0x1 depth 1 ", "flags 0x1 depth 1 ", "flags 0x1 depth 1 ", "flags 0x1 depth 0 "]
 
 
 def left(pixels, name):
@@ -94,8 +107,8 @@ def check(directory, program, backend):
         assert switch_line, f"{mode}: no switch line"
         assert ("depth 1 cull 1" in switch_line[0]) == on, f"{mode}: {switch_line[0]}"
         clears = [line for line in run.stderr.splitlines() if "x2w-render ClearDepthStencilView" in line]
-        if mode == "on":
-            assert len(clears) == 2 and "flags 0x1 depth 1 " in clears[0] and "flags 0x2 depth 1 " in clears[1], clears
+        if mode in ("on", "on-uncleared"):
+            assert len(clears) == len(CLEARS) and all(c in line for c, line in zip(CLEARS, clears)), clears
         else:
             assert not clears, f"{mode}: slot 51 forwarded: {clears}"
         assert (decoded_psos > 0) == on, f"{mode}: {decoded_psos} pipelines with decoded state"
@@ -107,7 +120,8 @@ def check(directory, program, backend):
     print(f"startup_draw_state: PASS on {backend} (off and X2W_DRAW_STATE=0 draw as before; on: depth LESS keeps near green, "
           f"CULL_FRONT and FACE 1 + CULL_BACK cull the counter-clockwise triangle, CULL_BACK keeps it, target mask 0x3 keeps "
           f"blue; refused depth word draws as before; slot 51 depth clear forwarded only with X2W_DRAW_STATE_DEPTH_CLEAR=1, "
-          f"stencil-only clear on D32 clears nothing)")
+          f"a clear to 0 makes LESS fail; no depth test against a target no forwarded depth clear initialised, "
+          f"X2W_DRAW_STATE_DEPTH_UNCLEARED=1 restores it and hides the near triangle)")
     return 0
 
 
