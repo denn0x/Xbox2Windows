@@ -2918,12 +2918,17 @@ class Pipeline:
         if slot >= len(self.rtv_formats):
             return 'float'
         fmt = self.rtv_formats[slot]
+        # R32_UINT / R32_SINT (42 / 43) are verified by a draw (tests/startup_mrt_check.py). The other formats with
+        # 32 bits per channel (R32G32B32A32 3 / 4, R32G32B32 7 / 8, R32G32 17 / 18) take the same uncompressed
+        # export words unconverted, only with more channels (D3D drops the components a format lacks, as the
+        # colour buffer does): ASSUMED equal, not drawn. Narrower integer targets convert in the colour buffer
+        # (clamp or wrap, not checked) and stay refused.
         if fmt in UINT_RTVS:
-            if fmt != 42:
+            if fmt not in (3, 7, 17, 42):
                 raise Unsupported('unverified UINT RTV format %d' % fmt)
             return 'uint'
         if fmt in SINT_RTVS:
-            if fmt != 43:
+            if fmt not in (4, 8, 18, 43):
                 raise Unsupported('unverified SINT RTV format %d' % fmt)
             return 'int'
         return 'bits' if fmt in FLOAT32_RTVS else 'float'
