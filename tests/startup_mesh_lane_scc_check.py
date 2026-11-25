@@ -195,6 +195,25 @@ ANDN2_D = PROLOGUE + [
     ('s_cbranch_scc0 AFTER', 'scc0'),
     ('v_mov_b32_e32 v1, 60', lambda: ins('vop1', 'v_mov_b32_e32', d=1, s0='60')),
 ] + EPILOGUE
+# Program E: nested group-uniform execz ranges (both write a scalar read after them), so the outer skip jumps over
+# the inner range's publish barrier (a barrier the translation adds). N = 50 * (g & 3): group 0 has no active lane
+# at all (the group skips the outer range), group 1 has none in wave 1. Expected param0.x per wave (s40 + s41):
+# no lane v0 < N: 300; lanes v0 < N but none < 20: 209; lanes v0 < 20 (and < N): 16.
+NESTED_E = PROLOGUE[:7] + [
+    ('s_and_b32 s21, s20, 3', lambda: ins('sop2', 's_and_b32', d=21, s0='s20', s1='3')),
+    ('s_mul_i32 s21, s21, 50', lambda: ins('sop2', 's_mul_i32', d=21, s0='s21', s1='50')),
+    ('s_mov_b32 s40, 0x64', lambda: ins('sop1', 's_mov_b32', d=40, s0='100')),
+    ('s_mov_b32 s41, 0xc8', lambda: ins('sop1', 's_mov_b32', d=41, s0='200')),
+    ('v_cmpx_gt_u32_e32 s21, v0', lambda: ins('vopc', 'v_cmpx_gt_u32_e32', s0='s21', s1='v0')),
+    ('s_cbranch_execz AFTER', 'execz'),
+    ('s_mov_b32 s40, 9', lambda: ins('sop1', 's_mov_b32', d=40, s0='9')),
+    ('v_cmpx_gt_u32_e32 20, v0', lambda: ins('vopc', 'v_cmpx_gt_u32_e32', s0='20', s1='v0')),
+    ('s_cbranch_execz AFTER', 'execz'),
+    ('s_mov_b32 s41, 7', lambda: ins('sop1', 's_mov_b32', d=41, s0='7')),
+    EPILOGUE[0], EPILOGUE[1],
+    ('s_add_u32 s42, s40, s41', lambda: ins('sop2', 's_add_u32', d=42, s0='s40', s1='s41')),
+    ('v_mov_b32_e32 v1, s42', lambda: ins('vop1', 'v_mov_b32_e32', d=1, s0='s42')),
+] + EPILOGUE[2:]
 PROLOGUE_C = PROLOGUE[:-1] + [
     ('s_mul_i32 s22, s22, 30', lambda: ins('sop2', 's_mul_i32', d=22, s0='s22', s1='30')),
 ]
@@ -307,6 +326,7 @@ def translate(env):
     e.pop('X2W_MESH_TEST_DROP', None)
     e.pop('X2W_MESH_JOIN_TAINT', None)
     e.pop('X2W_MESH_CONFINED_SCC', None)
+    e.pop('X2W_MESH_SKIP_ADDED', None)
     e.update(env)
     r = subprocess.run([sys.executable, '-B', '-c', child, BIN], capture_output=True, text=True, env=e)
     if r.returncode:
@@ -388,6 +408,21 @@ def main():
     check('D negative control: X2W_MESH_CONFINED_SCC=0 takes the branch per lane (no publish)',
           loose.startswith('OK') and 'x2w_sany' not in loose, loose[:200])
     print('program D written to %s (difftest also with X2W_MESH_CONFINED_SCC=0: must FAIL)' % BIN)
+    # program E: nested group-uniform ranges; the outer skip jumps over the inner publish barrier
+    code_e, texts_e = program(NESTED_E)
+    BIN = os.path.join(out_dir, 'lane_scc_nested.bin')
+    with open(BIN, 'wb') as f:
+        f.write(code_e)
+    got = decoded(code_e)
+    check('E decodes to the intended %d instructions' % len(texts_e), [t for _, t in got] == [t for _, t in texts_e],
+          ' | '.join('%x %s / %s' % (o, t, g) for (o, t), (_, g) in zip(texts_e, got) if t != g))
+    on = translate({})
+    check('E translates: two group branches, s40 and s41 restored',
+          on.startswith('OK') and 'x2w_any[1][wave] = 1u' in on and ') s40 = ' in on and ') s41 = ' in on, on[:300])
+    old = translate({'X2W_MESH_SKIP_ADDED': '0'})
+    check('E negative control: X2W_MESH_SKIP_ADDED=0 refuses (barrier inside the outer range)',
+          old.startswith('REFUSED s_barrier inside a group-uniform execz range'), old[:200])
+    print('program E written to %s (difftest also with X2W_MESH_TEST_DROP=restore: must FAIL)' % BIN)
     if failures:
         print('%d check(s) failed' % len(failures))
         return 1

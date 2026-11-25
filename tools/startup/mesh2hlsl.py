@@ -112,6 +112,10 @@ JOIN_TAINT = os.environ.get('X2W_MESH_JOIN_TAINT', '1') != '0'
 # The per-lane shortcut for an active-uniform lane-mask SCC with lanes off needs a mask result confined to the
 # active lanes (MeshStage.one_body): on unless X2W_MESH_CONFINED_SCC=0 (tests only: the unrestricted shortcut).
 CONFINED_SCC = os.environ.get('X2W_MESH_CONFINED_SCC', '1') != '0'
+# A group-uniform execz skip may jump over every barrier the translation added (readfirstlane broadcasts, inner
+# group-branch publishes, lane-mask SCC publishes), never over the program's s_barrier: on unless
+# X2W_MESH_SKIP_ADDED=0 (then only lane-mask SCC publishes may be skipped, as at 135ee723).
+SKIP_ADDED = os.environ.get('X2W_MESH_SKIP_ADDED', '1') != '0'
 
 
 class LaneScc(Unsupported):
@@ -329,7 +333,11 @@ class MeshStage(G.Stage):
                 raise Unsupported('block graph too deep')
             cmemo[i] = ()
             off, lines, term = blocks[i]
-            here = 1 if term and term[0] == 'barrier' and term[1:2] != ('lane-scc',) else 0
+            # only the program's s_barrier: the translation's own barriers (lane-mask SCC publish, readfirstlane
+            # broadcast, group-branch publish) are reached or skipped by the whole group together
+            here = 1 if term and term[0] == 'barrier' and term[1:2] == ('console',) and SKIP_ADDED else 0
+            if term and term[0] == 'barrier' and not SKIP_ADDED and term[1:2] != ('lane-scc',):
+                here = 1
             nxt = [i + 1] if (term is None or term[0] in ('barrier', 'branch')) and i + 1 < len(blocks) else []
             if term and term[0] in ('jump', 'branch'):
                 if term[0] == 'jump':
@@ -358,7 +366,9 @@ class MeshStage(G.Stage):
                 # only barriers this translation added (lane-mask SCC publishes) may be skipped: a console
                 # s_barrier inside the range would be skipped by a wave without active lanes on the hardware
                 if console(i + 1) != console(index[term[-1]]):
-                    raise Unsupported('s_barrier inside a group-uniform execz range at %#x' % int(off))
+                    raise Unsupported('s_barrier inside a group-uniform execz range at %#x (console barriers ahead %s '
+                                      'through, %s skipping)' % (int(off), list(console(i + 1)),
+                                                                list(console(index[term[-1]]))))
                 memo[i] = through
                 return through
             nxt = []
@@ -545,7 +555,7 @@ class MeshStage(G.Stage):
             if self.pc < self.divergent_until:
                 raise Unsupported('s_barrier inside a per-lane skipped range at %#x' % self.pc)
             self.lds_written_in_phase = False
-            return ('barrier',)
+            return ('barrier', 'console')   # the program's own barrier (others are added by the translation)
         if base in ('s_waitcnt_vmcnt', 's_waitcnt_lgkmcnt', 's_waitcnt_expcnt', 's_waitcnt_vscnt'):
             return None
         # Every scalar destination stops being a lane mask unless the handler marks it again (the base
