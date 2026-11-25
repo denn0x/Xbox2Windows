@@ -310,7 +310,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             print('%s launch FLOAT_MODE 0xcc, no s_round_mode: %s' % (kind, EXPECTED), flush=True)
             # informational, not asserted: how this adapter's own f32tof16 rounds (the helpers replaced by it).
             # MEASURED on WARP and an RX 9070 XT (fxc ps_5_1, dxc ps_6_0): toward zero.
-            raw = plain_text.replace('x2w_f32tof16_rne(F(', 'f32tof16((')
+            raw = plain_text.replace('x2w_f32tof16_rne(F(', 'f32tof16(F(')
             assert raw != plain_text
             run = draw(renderer, adapter, vs, build('ps_raw', raw, ps_profile), EXPECTED)
             print('%s HLSL f32tof16 alone: %s' % (kind, 'toward zero (matches the truncated words)' if run.returncode == 0
