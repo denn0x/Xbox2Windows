@@ -70,7 +70,9 @@ def check(directory, consumer, backend):
             raise AssertionError(f"{mode}: descriptor line {written.group(0) if written else None} (expected {layout!r}), or a stand-in\n{log[-4000:]}")
     _, image, log = results["membuf-unaligned"]
     if "(a buffer is there, at an offset the view cannot name)" not in log \
-            or "buffer descriptors: written 1 (no buffer 0, buffer at an offset the view cannot name 1)" not in log:
+            or "buffer descriptors: written 1 (no buffer 0, buffer at an offset the view cannot name 1)" not in log \
+            or not re.search(r"per written call: buffer lookup \d+\.\d\d us, destination checks \d+\.\d\d us, shadow clear \d+\.\d\d us "
+                             r"\(lock taken [01]\)", log):
         raise AssertionError(f"membuf-unaligned: the found-buffer case is not named\n{log[-4000:]}")
     _, image, log = results["membuf-unaligned-off"]
     if columns(image) != {IDENTITY} or "reason=buffer_unavailable" not in log or "buffer descriptor written" in log:

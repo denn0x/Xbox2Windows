@@ -797,22 +797,43 @@ void mark_refused_destination(u64 destination, const char* reason, const D3D12_R
 // e.g. 104-byte records anywhere in the title's view-heap region). A V# needs no such alignment, so found_buffer calls
 // are served too. Counted by case at powers of two: "x2w-memsrv buffer descriptors: written N (no buffer A, buffer at an
 // offset the view cannot name B), not written: destination not title memory C, view not encodable D".
-LONG64 vdesc_no_buffer, vdesc_unaligned, vdesc_no_destination, vdesc_layout;
-bool write_buffer_descriptor(u64 destination, const MemoryShaderResourceView* input, bool found_buffer)
+// Run 113 (view calls 16.3 us, 112: 6.3): where a written descriptor's call spends its time, in QPC ticks summed over
+// the calls that wrote one: [0] the buffer lookup before (existing_memory_buffer: the placed-range check, else a walk
+// of every resource), [1] the destination checks (title_backed, writable), [2] the shadow-id clear (note_lock
+// exclusive, taken only when the slot holds an id). Printed per call with the counter line.
+LONG64 vdesc_no_buffer, vdesc_unaligned, vdesc_no_destination, vdesc_layout, vdesc_ticks[3], vdesc_lock_taken;
+LONG64 qpc_now()
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+bool write_buffer_descriptor(u64 destination, const MemoryShaderResourceView* input, bool found_buffer, LONG64 lookup_ticks)
 {
     if (!buffer_heap_index_on()) return false;
     const auto counted = [](LONG64& which) {
         InterlockedIncrement64(&which);
         const LONG64 n = vdesc_no_buffer + vdesc_unaligned + vdesc_no_destination + vdesc_layout;
-        if ((n & (n - 1)) == 0)
+        if ((n & (n - 1)) == 0) {
+            static const double us_per_tick = [] {
+                LARGE_INTEGER f;
+                QueryPerformanceFrequency(&f);
+                return 1e6 / static_cast<double>(f.QuadPart);
+            }();
+            const double written = static_cast<double>((std::max)(1ll, vdesc_no_buffer + vdesc_unaligned));
             log("x2w-memsrv buffer descriptors: written %lld (no buffer %lld, buffer at an offset the view cannot name %lld), not written: "
-                "destination not title memory %lld, view not encodable %lld", vdesc_no_buffer + vdesc_unaligned, vdesc_no_buffer,
-                vdesc_unaligned, vdesc_no_destination, vdesc_layout);
+                "destination not title memory %lld, view not encodable %lld; per written call: buffer lookup %.2f us, destination checks "
+                "%.2f us, shadow clear %.2f us (lock taken %lld)", vdesc_no_buffer + vdesc_unaligned, vdesc_no_buffer, vdesc_unaligned,
+                vdesc_no_destination, vdesc_layout, vdesc_ticks[0] * us_per_tick / written, vdesc_ticks[1] * us_per_tick / written,
+                vdesc_ticks[2] * us_per_tick / written, vdesc_lock_taken);
+        }
     };
+    const LONG64 t0 = qpc_now();
     if (!destination || !title_backed(destination, 32) || !x2w_local::writable(reinterpret_cast<void*>(destination), 32)) {
         counted(vdesc_no_destination);
         return false;
     }
+    const LONG64 t1 = qpc_now();
     x2w_startup::BufferViewLayout l;
     if (!x2w_startup::buffer_view_layout_from_desc(false, reinterpret_cast<const unsigned char*>(&input->view), 40, l) ||
         l.kind == x2w_startup::BufferViewKind::unknown || !l.num_records || ((input->address + l.offset) >> 48)) {
@@ -826,10 +847,18 @@ bool write_buffer_descriptor(u64 destination, const MemoryShaderResourceView* in
     words[1] |= static_cast<std::uint32_t>(base >> 32) & 0xffff;
     std::memcpy(reinterpret_cast<void*>(destination), words, sizeof(words));
     if (const u64 desktop = desktop_cpu_handle(destination)) {
-        AcquireSRWLockExclusive(&note_lock);
-        if (std::uint32_t* slot = shadow_slot(desktop)) *slot = 0;
-        ReleaseSRWLockExclusive(&note_lock);
+        // Most slots hold no id (the title rewrites the same slots with V#s): look under the shared lock first.
+        if (shadow_id(desktop)) {
+            InterlockedIncrement64(&vdesc_lock_taken);
+            AcquireSRWLockExclusive(&note_lock);
+            if (std::uint32_t* slot = shadow_slot(desktop)) *slot = 0;
+            ReleaseSRWLockExclusive(&note_lock);
+        }
     }
+    const LONG64 t2 = qpc_now();
+    InterlockedAdd64(&vdesc_ticks[0], lookup_ticks);
+    InterlockedAdd64(&vdesc_ticks[1], t1 - t0);
+    InterlockedAdd64(&vdesc_ticks[2], t2 - t1);
     counted(found_buffer ? vdesc_unaligned : vdesc_no_buffer);
     static LONG shown;
     if (first_calls(shown, 8))
@@ -912,7 +941,9 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         const u64 elem_bytes = x2w_startup::buffer_srv_element_bytes(input->view);
         const u64 span_bytes = (input->view.Buffer.FirstElement + input->view.Buffer.NumElements) * elem_bytes;
+        const LONG64 lookup_start = buffer_heap_index_on() ? qpc_now() : 0;
         Wrapper* buffer = existing_memory_buffer(self, input->address, span_bytes);
+        const LONG64 lookup_ticks = buffer_heap_index_on() ? qpc_now() - lookup_start : 0;
         const ResourceInfo* info = buffer ? resource_info(buffer) : nullptr;
         D3D12_SHADER_RESOURCE_VIEW_DESC adjusted{};
         if ((!buffer || !info) && memory_srv_buffer_on()) {
@@ -928,7 +959,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             !x2w_startup::resolve_buffer_srv_desc(reinterpret_cast<u64>(buffer->own().title_memory),
                                                   info->console.Width, input->address, input->view, adjusted)) {
             // LOCAL (textures): X2W_BUFFER_HEAP_INDEX=1: the console V# instead (write_buffer_descriptor).
-            if (write_buffer_descriptor(destination, input, buffer && info)) {
+            if (write_buffer_descriptor(destination, input, buffer && info, lookup_ticks)) {
                 census_memory_srv_outcome(mso_descriptor);
                 return;
             }

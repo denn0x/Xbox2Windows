@@ -1909,9 +1909,9 @@ LONG frame_copies_frame = -1;
 // bytes memcmp'd on a frame_copy hit, bytes copied on a miss (twice: snapshot + ring), bytes bound in place by
 // X2W_DRAW_SRV_IN_PLACE. Reported every 5 s when X2W_DRAW_SRV_STATS=1 or X2W_DRAW_SRV_IN_PLACE is set.
 enum { srvc_compared, srvc_copied, srvc_in_place, srvc_kinds };
-volatile LONG64 srvc_bytes[3][srvc_kinds], srvc_calls[3][srvc_kinds];
+volatile LONG64 srvc_bytes[4][srvc_kinds], srvc_calls[4][srvc_kinds];  // LOCAL (textures): class 3 = a table entry holding a V# (title-written or X2W_BUFFER_HEAP_INDEX)
 // Over the threshold but copied as before: [class][0] no single desktop window (desktop_range), [1] not 16-aligned.
-volatile LONG64 srvc_in_place_missed[3][2];
+volatile LONG64 srvc_in_place_missed[4][2];
 thread_local int frame_copy_class;
 void srvc_note(int cls, int kind, std::size_t bytes)
 {
@@ -1939,10 +1939,10 @@ void report_srv_copies()  // the 5 s report (d3d12_xs_device.cpp)
 {
     static const bool on = srv_in_place_min() || x2w_local::env_on("X2W_DRAW_SRV_STATS");
     if (!on) return;
-    char text[640];
+    char text[960];
     int used = 0;
-    static const char* const names[3] = {"other", "draw", "mesh"};
-    for (int c = 0; c < 3; ++c) {
+    static const char* const names[4] = {"other", "draw", "mesh", "table V#"};
+    for (int c = 0; c < 4; ++c) {
         LONG64 b[srvc_kinds], n[srvc_kinds];
         for (int k = 0; k < srvc_kinds; ++k) b[k] = InterlockedExchange64(&srvc_bytes[c][k], 0), n[k] = InterlockedExchange64(&srvc_calls[c][k], 0);
         const LONG64 no_window = InterlockedExchange64(&srvc_in_place_missed[c][0], 0), unaligned = InterlockedExchange64(&srvc_in_place_missed[c][1], 0);
@@ -3147,7 +3147,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             }
             InterlockedIncrement(&rt_srv_stale_copy);
         }
-        frame_copy_class = mesh ? 2 : 1;  // LOCAL stall: srv copy counters
+        // LOCAL stall: srv copy counters. LOCAL (textures): a table V# (run 113: 373777 more written by
+        // X2W_BUFFER_HEAP_INDEX) counts in its own class, so its record-time copies are measured apart.
+        frame_copy_class = srv.source == 0 && entry && words[0] && words[0] != view_token_magic ? 3 : mesh ? 2 : 1;
         ID3D12Resource* chunk = nullptr;  // LOCAL memcut: the upload ring chunk of the copy
         bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset, &chunk);
         frame_copy_class = 0;
