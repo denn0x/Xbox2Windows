@@ -86,8 +86,24 @@ def main():
             raise AssertionError('no refusal without the table entry')
     finally:
         G.SCA['s_pack_hh_b32_b16'] = saved
+    # a lane-mask source (s0 written by a compare, or vcc_lo as ssrc1 = 106) is refused, not packed per lane
+    s = stage()
+    s.masks.add(0)
+    try:
+        run(s, op)
+        raise AssertionError('lane mask packed')
+    except G.Unsupported as e:
+        assert str(e) == 's_pack_hh_b32_b16 of a lane mask', e
+    _, _, name, vtext = G.decode(struct.pack('<I', 0x80000000 | op << 23 | 2 << 16 | 106 << 8 | 0))[0]
+    assert vtext == 's_pack_hh_b32_b16 s2, s0, vcc_lo', vtext
+    try:
+        stage().one(name, vtext)
+        raise AssertionError('vcc packed')
+    except G.Unsupported as e:
+        assert str(e) == 's_pack_hh_b32_b16 of a lane mask', e
     print('s_pack_hh_b32_b16: opcode %#x, %d inputs match (S0 >> 16) | (S1 & 0xffff0000), no SCC write; '
-          'control refuses without the entry, swapped halves mismatch' % (op, len(GRID) ** 2))
+          'control refuses without the entry, swapped halves mismatch; lane-mask sources refused'
+          % (op, len(GRID) ** 2))
 
 
 if __name__ == '__main__':

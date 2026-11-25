@@ -744,6 +744,11 @@ class Stage:
             else:
                 self.sym[d] = ('descnum',)
             return None
+        if base == 's_pack_hh_b32_b16' and any(
+                t.startswith(('exec', 'vcc')) or (reg_range(t) and reg_range(t)[0] == 's' and reg_range(t)[1] in self.masks)
+                for t in srcs):
+            # a lane mask is one bit per lane in the one-lane model: its high half has no per-lane value
+            raise Unsupported('s_pack_hh_b32_b16 of a lane mask')
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
         if dname in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
