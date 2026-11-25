@@ -76,7 +76,7 @@ def mix(op, vdst, src0):
 ROUND_MODE = 0xbfa40000  # SOPP opcode 0x24 (rdna2_tools_check: 0900a4bf is s_round_mode 0x9)
 
 
-def pixel_words(mode=0xc, branch=False, add_f16=False):
+def pixel_words(mode=0xc, branch=False, add_f16=False, pkrtz=False):
     w = b''
     if branch:
         w += struct.pack('<I', 0xbf840000)  # s_cbranch_scc0 to the next instruction: control flow before the mode
@@ -87,6 +87,8 @@ def pixel_words(mode=0xc, branch=False, add_f16=False):
     w += mix(0x21, 4, 10) + mix(0x22, 4, 11)
     w += struct.pack('<I', 0x7e000000 | 5 << 17 | 0x0a << 9 | 256 + 12)  # v_cvt_f16_f32_e32 v5, v12
     w += mix(0x22, 5, 13)
+    if pkrtz:
+        w += struct.pack('<I', 0x2f << 25 | 15 << 17 | 7 << 9 | 256 + 6)  # v_cvt_pkrtz_f16_f32_e32 v15, v6, v7
     if add_f16:
         # v_cvt_f16_f32_sdwa v14, v12 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD (src0 0xf9 = SDWA;
         # second dword: src0 [7:0], dst_sel [10:8], dst_unused [12:11], src0_sel [18:16])
@@ -121,6 +123,12 @@ def controls():
     plain = pipe(pixel_words(mode=None)).hlsl_ps()
     assert '    v2 = (v2 & 0xffff0000u) | f32tof16(F(v6) * 1.0 + F(0x00000000u));' in plain and 'x2w_f32tof16_rtz' not in plain, plain
     assert 'x2w_f32tof16_rtz' not in pipe(pixel_words(mode=0)).hlsl_ps()  # 0: nearest even, as without it
+    # v_cvt_pkrtz_f16_f32 rounds toward zero in every mode (its definition), through the helper
+    for m in (None, 0xc):
+        g = G.decode(pixel_words(mode=m, pkrtz=True))
+        assert g[-3][3] == 'v_cvt_pkrtz_f16_f32_e32 v15, v6, v7', g[-3]
+        text = pipe(pixel_words(mode=m, pkrtz=True)).hlsl_ps()
+        assert '    v15 = x2w_f32tof16_rtz(F(v6)) | (x2w_f32tof16_rtz(F(v7)) << 16);' in text, text
     # v_interp_p2_f16 rounds its f32 interpolant to binary16 too (startup_interp_f16_check's stage, mode first)
     import startup_interp_f16_check as I
     interp = I.pipe(struct.pack('<I', ROUND_MODE | 0xc) + I.pixel_words()).hlsl_ps()

@@ -2039,7 +2039,12 @@ class Stage:
         self.mix(ops, mods, 'hi')
 
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
-        self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
+        # Round toward zero whatever MODE says (the "rtz" of the name; LLVM int_amdgcn_cvt_pkrtz; Mesa
+        # nir_opt_algebraic.py turns pack_half_2x16_split into pack_half_2x16_rtz_split only for backends with
+        # has_pack_half_2x16_rtz, the rounding being the difference). HLSL f32tof16 does not promise that rounding (MEASURED toward zero
+        # on WARP, startup_round_mode_check), so both halves go through x2w_f32tof16_rtz.
+        self.set_v(reg_range(ops[0])[1], 'x2w_f32tof16_rtz(%s) | (x2w_f32tof16_rtz(%s) << 16)'
+                   % (self.f(ops[1]), self.f(ops[2])))
 
     def pknorm(self, ops, mods, kind):
         # S0 packs into D[15:0] and S1 into D[31:16] (per Mesa ACO selection: pack_[us]norm_2x16 of (x, y) is
