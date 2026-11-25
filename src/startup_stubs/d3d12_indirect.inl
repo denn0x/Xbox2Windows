@@ -137,45 +137,14 @@ IndirectMeshHook indirect_mesh_hook = nullptr;
 // LOCAL meshrt (d3d12_mesh.inl): a DispatchMesh call that cannot be issued is refused before it is staged.
 bool mesh_prepare(Wrapper* self, ID3D12GraphicsCommandList* list);
 
-// The private argument ring: default heap, rests in COMMON between calls.
-constexpr u64 indirect_ring_bytes = u64{16} << 20, indirect_ring_slot = 256;
-ID3D12Resource* indirect_ring;
-volatile LONG64 indirect_ring_cursor;
-bool ensure_indirect_ring()
+// The private argument ring: default heap, rests in COMMON between calls. LOCAL memcut: a chain of chunks recycled
+// only after the lists that used them executed and their fences passed (d3d12_upload_ring.inl, indirect instance;
+// X2W_INDIRECT_RING=legacy = the old 16 MiB ring). The chunk is per call: IndirectPending::ring.
+constexpr u64 indirect_ring_max_take = u64{1} << 20;  // one call's record + count, as before (a sixteenth of 16 MiB)
+// The chunk holding `bytes` (whole 256-byte slots) at *offset, or nullptr when refused (too large, or the cap).
+ID3D12Resource* indirect_ring_take(u64 bytes, u64* offset)
 {
-    static SRWLOCK lock = SRWLOCK_INIT;
-    static bool failed;
-    if (indirect_ring) return true;
-    AcquireSRWLockExclusive(&lock);
-    if (!indirect_ring && !failed) {
-        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-        D3D12_RESOURCE_DESC desc{};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = indirect_ring_bytes;
-        desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
-        desc.SampleDesc.Count = 1;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;  // the guard pass rewrites records in place
-        ID3D12Resource* created = nullptr;
-        const HRESULT hr = device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
-                                                                          nullptr, IID_PPV_ARGS(&created));
-        log("x2w-indirect argument ring %llu MiB -> 0x%08lx", indirect_ring_bytes >> 20, static_cast<unsigned long>(hr));
-        if (SUCCEEDED(hr)) indirect_ring = created;
-        else failed = true;
-    }
-    ReleaseSRWLockExclusive(&lock);
-    return indirect_ring != nullptr;
-}
-// A ring offset for `bytes` (whole slots, contiguous), or ~0 when it does not fit a sixteenth of the ring.
-u64 indirect_ring_take(u64 bytes)
-{
-    const u64 slots = (bytes + indirect_ring_slot - 1) / indirect_ring_slot;
-    if (!slots || slots * indirect_ring_slot > indirect_ring_bytes / 16) return ~0ull;
-    const u64 total = indirect_ring_bytes / indirect_ring_slot;
-    for (;;) {
-        const u64 first = static_cast<u64>(InterlockedExchangeAdd64(&indirect_ring_cursor, static_cast<LONG64>(slots))) % total;
-        if (first + slots <= total) return first * indirect_ring_slot;
-    }
+    return bytes && bytes <= indirect_ring_max_take ? reserve_indirect_ring(bytes, offset) : nullptr;
 }
 
 // ---- Argument guard ----------------------------------------------------------------------------
@@ -341,7 +310,7 @@ bool ensure_indirect_guard()
     return indirect_guard_pso != nullptr;
 }
 // Records the guard pass over `records` records at ring offset `slot` (ring in UNORDERED_ACCESS).
-void indirect_guard(ID3D12GraphicsCommandList* list, int type, u64 slot, UINT stride, UINT records)
+void indirect_guard(ID3D12GraphicsCommandList* list, ID3D12Resource* ring, int type, u64 slot, UINT stride, UINT records)
 {
     const IndirectBounds& b = indirect_bounds();
     const bool groups = type == itype_dispatch || type == itype_mesh;
@@ -350,7 +319,7 @@ void indirect_guard(ID3D12GraphicsCommandList* list, int type, u64 slot, UINT st
                                b.instances, 0};
     list->SetPipelineState(indirect_guard_pso);
     list->SetComputeRootSignature(indirect_guard_root);
-    list->SetComputeRootUnorderedAccessView(0, indirect_ring->GetGPUVirtualAddress() + slot);
+    list->SetComputeRootUnorderedAccessView(0, ring->GetGPUVirtualAddress() + slot);
     list->SetComputeRootUnorderedAccessView(1, indirect_guard_counter->GetGPUVirtualAddress());
     list->SetComputeRoot32BitConstants(2, 8, constants, 0);
     // LOCAL: the guard pass is a Dispatch op in DRED too; record it so the report's Dispatch op count matches.
@@ -438,6 +407,7 @@ struct IndirectPending {
     // Set by indirect_stage: the record (and count) sit in the ring at `slot`, checked by the guard; the
     // ring is in `ring_state` on this list until indirect_issue / indirect_unstage returns it to COMMON.
     bool staged;
+    ID3D12Resource* ring;  // LOCAL memcut: the argument ring chunk holding the record
     u64 slot, ring_count_at;
     D3D12_RESOURCE_STATES ring_state;
 };
@@ -468,8 +438,9 @@ bool indirect_stage(Wrapper* self, ID3D12GraphicsCommandList* list, IndirectPend
     }
     const u64 record_bytes = u64{p->stride} * p->max_count;
     const u64 count_at = (record_bytes + 15) & ~u64{15};
-    const u64 slot = indirect_ring_take(count_at + (p->count_window ? 16 : 0));
-    if (slot == ~0ull) {
+    u64 slot = 0;
+    ID3D12Resource* const indirect_ring = indirect_ring_take(count_at + (p->count_window ? 16 : 0), &slot);
+    if (!indirect_ring) {
         p->refused = skip_no_ring;
         return false;
     }
@@ -490,7 +461,7 @@ bool indirect_stage(Wrapper* self, ID3D12GraphicsCommandList* list, IndirectPend
     b[n - 1].Transition.StateAfter = guard ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : ring_state;
     list->ResourceBarrier(n, b);
     if (guard) {
-        indirect_guard(list, p->type, slot, p->stride, p->max_count);
+        indirect_guard(list, indirect_ring, p->type, slot, p->stride, p->max_count);
         D3D12_RESOURCE_BARRIER after;
         indirect_transition(after, indirect_ring, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, ring_state);
         list->ResourceBarrier(1, &after);
@@ -498,6 +469,7 @@ bool indirect_stage(Wrapper* self, ID3D12GraphicsCommandList* list, IndirectPend
         if (pass.pipeline_real && pass.pipeline) list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
     }
     p->staged = true;
+    p->ring = indirect_ring;
     p->slot = slot;
     p->ring_count_at = count_at;
     p->ring_state = ring_state;
@@ -508,7 +480,7 @@ void indirect_unstage(ID3D12GraphicsCommandList* list, IndirectPending* p)
 {
     if (!p->staged) return;
     D3D12_RESOURCE_BARRIER b;
-    indirect_transition(b, indirect_ring, p->ring_state, D3D12_RESOURCE_STATE_COMMON);
+    indirect_transition(b, p->ring, p->ring_state, D3D12_RESOURCE_STATE_COMMON);
     list->ResourceBarrier(1, &b);
     p->staged = false;
 }
@@ -521,6 +493,7 @@ bool indirect_issue(Wrapper* self, ID3D12GraphicsCommandList* list)
     if (!p || p->issued || !p->staged || p->list != self || !list) return false;
     const u64 record_bytes = u64{p->stride} * p->max_count;
     const u64 slot = p->slot, count_at = p->ring_count_at;
+    ID3D12Resource* const indirect_ring = p->ring;
     const D3D12_RESOURCE_STATES ring_state = p->ring_state;
     const bool readback = (ring_state & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0;
     list->ExecuteIndirect(p->signature, p->max_count, indirect_ring, slot, p->count_window ? indirect_ring : nullptr,
@@ -651,7 +624,6 @@ void indirect_run(Wrapper* self, ID3D12GraphicsCommandList* list, int type, Wrap
         (count_resource && !indirect_window(count_resource, count_offset, 4, &p.count_window, &p.count_at)))
         return indirect_skip(type, skip_unresolved_buffer);
     if (type == itype_mesh && !mesh_prepare(self, list)) return indirect_skip(type, skip_no_pipeline);  // LOCAL meshrt: before staging
-    if (!ensure_indirect_ring()) return indirect_skip(type, skip_no_ring);
     if (!indirect_stage(self, list, &p)) return indirect_skip(type, p.refused);
     indirect_current = &p;
     if (type == itype_dispatch) execute_dispatch(self, 0, 0, 0, compute_key_of(self));

@@ -17,7 +17,17 @@
 //      and ExecuteIndirect(..., args, 0x14): every group adds 1 to the counter.
 //
 // Expected counter after the fence: gpu 3*2*1 + 1 = 7; zero 0; no-writer 7 + 5 = 12 (the sentinels);
-// off 0 (nothing executed). The records in title memory must read what the writer stored (sentinels
+// off 0 (nothing executed).
+//
+// LOCAL memcut, the argument ring (d3d12_upload_ring.inl, indirect instance) with a 1 KiB test ring
+// (X2W_INDIRECT_RING_TEST_KIB=1, set here): gpu mode plus 40 more ExecuteIndirect calls on the second record, all in
+// ONE list, so the 42 records (256 bytes each) need ten times the ring.
+//   wrap         chain: counter 7 + 40 = 47; chunks made >= 10; no slot reused while held; would-have-wrapped > 0.
+//   wrap-legacy  X2W_INDIRECT_RING=legacy, the negative control: "slots reused while a list holding them had not
+//                executed" > 0. The counter is still 47: on one queue each call copies its record right before it
+//                reads it, so a reused slot is rewritten in order (the hazard is two queues at once, not tested).
+//   wrap-cap     X2W_INDIRECT_RING_TEST_CAP_CHUNKS=2 (8 slots): the calls past the cap are refused (skipped as
+//                no-ring): counter 7 + 6 = 13, refusals 34. The records in title memory must read what the writer stored (sentinels
 // for no-writer). Exit 0 pass, 77 capability skip (no adapter, or the adapter cannot open an
 // existing heap over process memory), other values name the failing step.
 #include <d3d12.h>
@@ -36,6 +46,7 @@
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+extern "C" __declspec(dllimport) unsigned long long x2w_upload_ring_test(int what);  // LOCAL memcut: ring counters
 
 namespace {
 using Word = std::uint64_t;
@@ -63,8 +74,17 @@ bool write_file(const std::wstring& path, const void* data, std::size_t bytes)
 int main(int argc, char** argv)
 {
     if (argc != 3) return 2;
-    const std::string mode = argv[2];
+    std::string mode = argv[2];
     const bool huge = mode == "huge", huge_product = mode == "huge-product";
+    const bool wrap = mode == "wrap", wrap_legacy = mode == "wrap-legacy", wrap_cap = mode == "wrap-cap";
+    const std::string ring_mode = mode;
+    if (wrap || wrap_legacy || wrap_cap) {
+        SetEnvironmentVariableA("X2W_INDIRECT_RING_TEST_KIB", "1");
+        if (wrap_legacy) SetEnvironmentVariableA("X2W_INDIRECT_RING", "legacy");
+        if (wrap_cap) SetEnvironmentVariableA("X2W_INDIRECT_RING_TEST_CAP_CHUNKS", "2");
+        mode = "gpu";  // the gpu case, plus the extra calls below
+    }
+    const int extra_calls = wrap || wrap_legacy || wrap_cap ? 40 : 0;
     if (mode != "gpu" && mode != "no-writer" && mode != "zero" && mode != "off" && !huge && !huge_product) return 2;
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 3;
@@ -194,6 +214,7 @@ int main(int argc, char** argv)
     invoke(list, 39, 1, 4, arg(count_at), 0);
     invoke(list, 61, arg(signature), 1, arg(args), 0, 0, 0);               // ExecuteIndirect(sig, 1, args, 0, null, 0)
     invoke(list, 61, arg(signature), 1, arg(args), 0x14, 0, 0);            // ExecuteIndirect(sig, 1, args, 0x14, null, 0)
+    for (int i = 0; i < extra_calls; ++i) invoke(list, 61, arg(signature), 1, arg(args), 0x14, 0, 0);
     invoke(list, 9);                                                       // Close
     void* lists[] = {list};
     invoke(queue, 10, 1, arg(lists));
@@ -208,7 +229,8 @@ int main(int argc, char** argv)
     std::memcpy(records[0], args_memory, 12);
     std::memcpy(records[1], args_memory + 0x14, 12);
     const std::uint32_t got = *counter_word;
-    const std::uint32_t wanted = mode == "gpu" ? 7 : mode == "no-writer" ? 12 : huge || huge_product ? 1 : 0;
+    std::uint32_t wanted = mode == "gpu" ? 7 : mode == "no-writer" ? 12 : huge || huge_product ? 1 : 0;
+    if (extra_calls) wanted += wrap_cap ? 6 : extra_calls;
     std::printf("records in title memory: {%u %u %u} {%u %u %u}\n", records[0][0], records[0][1], records[0][2], records[1][0],
                 records[1][1], records[1][2]);
     std::printf("counter: %u (expected %u)\n", got, wanted);
@@ -223,5 +245,20 @@ int main(int argc, char** argv)
     ComPtr<ID3D12Device> desktop;
     if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop))))
         std::printf("device removed reason: 0x%08lx\n", static_cast<unsigned long>(desktop->GetDeviceRemovedReason()));
-    return got == wanted ? 0 : 16;
+    if (got != wanted) return 16;
+    if (extra_calls) {
+        // Indirect ring counters (x2w_upload_ring_test 100 + index): reserved bytes, refusals at the cap, slot bytes
+        // reused while held (legacy), would-have-wrapped bytes, chunks made, legacy flag.
+        const auto counter_of = [](int what) { return x2w_upload_ring_test(100 + what); };
+        const unsigned long long reserved = counter_of(0), refused = counter_of(1), reused = counter_of(2), would = counter_of(3),
+                                 made = counter_of(8), legacy = counter_of(6);
+        std::printf("%s: indirect ring reserved %llu bytes, refused %llu, reused while held %llu bytes, would have wrapped %llu "
+                    "bytes, chunks made %llu, legacy %llu\n",
+                    ring_mode.c_str(), reserved, refused, reused, would, made, legacy);
+        if (wrap && (legacy || refused || reused || !would || made < 10 || reserved != 42 * 256)) return 17;
+        if (wrap_legacy && (!legacy || refused || !reused)) return 18;  // the control: the old ring reuses held slots
+        if (wrap_cap && (legacy || refused != 34 || made != 2)) return 19;
+        std::printf("PASS %s\n", ring_mode.c_str());
+    }
+    return 0;
 }

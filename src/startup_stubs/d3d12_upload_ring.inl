@@ -18,6 +18,11 @@
 // X2W_UPLOAD_RING=legacy: today's ring (one 256 MiB buffer, wraps regardless), tracked as 4 segments with the same
 // rules, so the report says how many bytes were written over data the GPU had not read yet. For one run.
 // Fixtures only: X2W_UPLOAD_RING_TEST_KIB=<n> makes the legacy ring / a chain chunk n KiB.
+//
+// The same chain serves d3d12_indirect.inl's argument ring (indirect_ring_state: default heap, 4 MiB chunks, cap
+// X2W_INDIRECT_RING_CAP_MIB 256, X2W_INDIRECT_RING=legacy = the old 16 MiB ring). There each call's record is copied
+// by the GPU on the list that reads it, so on one queue a wrap stays ordered; what the chain prevents is a slot
+// reused while another queue's list holding it may still be executing.
 namespace {
 struct RingTag {
     UINT chunk = ~0u;
@@ -40,6 +45,10 @@ struct RingList {
 };
 struct UploadRing {
     SRWLOCK lock = SRWLOCK_INIT;
+    // 0: the upload ring (mapped upload heap). 1: the indirect argument ring (d3d12_indirect.inl): default heap with
+    // unordered access, never mapped, written by GPU copies recorded on the list that reads it.
+    int which = 0;
+    u64 old_ring = 0;  // size of the ring this replaces (would-have-wrapped)
     bool ready = false, legacy = false;
     u64 chunk_bytes = 0, cap_bytes = 0;
     std::vector<RingChunk> chunks;
@@ -57,6 +66,16 @@ UploadRing& upload_ring_state()
     static UploadRing r;
     return r;
 }
+UploadRing& indirect_ring_state()
+{
+    static UploadRing r = [] {
+        UploadRing made;
+        made.which = 1;
+        return made;
+    }();
+    return r;
+}
+const char* ring_name(const UploadRing& r) { return r.which ? "indirect" : "upload"; }
 // Cap refusals on this thread: draw_translated compares it before and after its copies and does not issue a draw
 // whose copy was refused.
 thread_local u64 ring_cap_refusals;
@@ -67,20 +86,11 @@ u64 ring_env(const char* name, u64 fallback)
     return n && n < sizeof(value) ? std::strtoull(value, nullptr, 0) : fallback;
 }
 
-// Size of the old ring: 256 MiB, or X2W_UPLOAD_RING_TEST_KIB in fixtures.
-u64 ring_env_test_ring()
+// r.lock held. Upload ring: a mapped upload buffer. Indirect ring (gpu): a default-heap buffer with unordered access
+// (the argument guard rewrites records in place), resting in COMMON, not mapped.
+bool ring_make_buffer(u64 bytes, bool gpu, ID3D12Resource** buffer, unsigned char** mapped)
 {
-    static const u64 bytes = [] {
-        const u64 kib = ring_env("X2W_UPLOAD_RING_TEST_KIB", 0);
-        return kib ? kib << 10 : u64{256} << 20;
-    }();
-    return bytes;
-}
-
-// r.lock held.
-bool ring_make_buffer(u64 bytes, ID3D12Resource** buffer, unsigned char** mapped)
-{
-    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_HEAP_PROPERTIES heap{gpu ? D3D12_HEAP_TYPE_DEFAULT : D3D12_HEAP_TYPE_UPLOAD};
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Width = bytes;
@@ -89,12 +99,14 @@ bool ring_make_buffer(u64 bytes, ID3D12Resource** buffer, unsigned char** mapped
     desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (gpu) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ID3D12Resource* created = nullptr;
     void* base = nullptr;
-    if (FAILED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+    if (FAILED(device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                              gpu ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_GENERIC_READ,
                                                               nullptr, IID_PPV_ARGS(&created))))
         return false;
-    if (FAILED(created->Map(0, nullptr, &base))) {
+    if (!gpu && FAILED(created->Map(0, nullptr, &base))) {
         created->Release();
         return false;
     }
@@ -103,23 +115,30 @@ bool ring_make_buffer(u64 bytes, ID3D12Resource** buffer, unsigned char** mapped
     return true;
 }
 
-// r.lock held.
+// r.lock held. Upload ring: X2W_UPLOAD_RING[=legacy], _CHUNK_MIB (64), _CAP_MIB (2048), old ring 256 MiB.
+// Indirect ring: X2W_INDIRECT_RING[=legacy], _CHUNK_MIB (4), _CAP_MIB (256), old ring 16 MiB.
+// Fixtures: X2W_<ring>_RING_TEST_KIB (the old ring / a chunk in KiB), X2W_<ring>_RING_TEST_CAP_CHUNKS.
 void ring_setup(UploadRing& r)
 {
     r.ready = true;
+    const bool gpu = r.which == 1;
+    const auto env = [&](const char* upload_name, const char* indirect_name, u64 fallback) {
+        return ring_env(gpu ? indirect_name : upload_name, fallback);
+    };
     char mode[16]{};
-    GetEnvironmentVariableA("X2W_UPLOAD_RING", mode, sizeof(mode));
+    GetEnvironmentVariableA(gpu ? "X2W_INDIRECT_RING" : "X2W_UPLOAD_RING", mode, sizeof(mode));
     r.legacy = !std::strcmp(mode, "legacy");
-    const u64 test_kib = ring_env("X2W_UPLOAD_RING_TEST_KIB", 0);
+    const u64 test_kib = env("X2W_UPLOAD_RING_TEST_KIB", "X2W_INDIRECT_RING_TEST_KIB", 0);
+    r.old_ring = test_kib ? test_kib << 10 : (gpu ? u64{16} : u64{256}) << 20;
     if (r.legacy) {
-        const u64 ring = test_kib ? test_kib << 10 : u64{256} << 20;
+        const u64 ring = r.old_ring;
         ID3D12Resource* buffer = nullptr;
         unsigned char* mapped = nullptr;
-        if (ring_make_buffer(ring, &buffer, &mapped)) {
+        if (ring_make_buffer(ring, gpu, &buffer, &mapped)) {
             for (UINT i = 0; i < 4; ++i) {
                 RingChunk c;
                 c.buffer = buffer;
-                c.mapped = mapped + i * (ring / 4);
+                c.mapped = mapped ? mapped + i * (ring / 4) : nullptr;
                 c.base = i * (ring / 4);
                 c.bytes = ring / 4;
                 r.chunks.push_back(c);
@@ -128,13 +147,15 @@ void ring_setup(UploadRing& r)
         }
         r.cap_bytes = ring;
     } else {
-        r.chunk_bytes = test_kib ? test_kib << 10 : ring_env("X2W_UPLOAD_RING_CHUNK_MIB", 64) << 20;
-        r.cap_bytes = ring_env("X2W_UPLOAD_RING_CAP_MIB", 2048) << 20;
-        if (const u64 cap_chunks = ring_env("X2W_UPLOAD_RING_TEST_CAP_CHUNKS", 0)) r.cap_bytes = cap_chunks * r.chunk_bytes;
+        r.chunk_bytes = test_kib ? test_kib << 10 : env("X2W_UPLOAD_RING_CHUNK_MIB", "X2W_INDIRECT_RING_CHUNK_MIB", gpu ? 4 : 64) << 20;
+        r.cap_bytes = env("X2W_UPLOAD_RING_CAP_MIB", "X2W_INDIRECT_RING_CAP_MIB", gpu ? 256 : 2048) << 20;
+        if (const u64 cap_chunks = env("X2W_UPLOAD_RING_TEST_CAP_CHUNKS", "X2W_INDIRECT_RING_TEST_CAP_CHUNKS", 0))
+            r.cap_bytes = cap_chunks * r.chunk_bytes;
         if (r.cap_bytes < r.chunk_bytes) r.cap_bytes = r.chunk_bytes;
     }
-    log("x2w-upload ring: %s, %llu KiB chunks, cap %llu MiB%s", r.legacy ? "legacy (one ring, wraps without a fence check; tracked as 4 segments)"
-                                                                         : "chain (a chunk is reused only after its lists executed and their fences passed)",
+    log("x2w-%s ring: %s, %llu KiB chunks, cap %llu MiB%s", ring_name(r),
+        r.legacy ? "legacy (one ring, wraps without a fence check; tracked as 4 segments)"
+                 : "chain (a chunk is reused only after its lists executed and their fences passed)",
         r.chunk_bytes >> 10, r.cap_bytes >> 20, r.legacy && r.chunks.empty() ? ": ring buffer FAILED" : "");
 }
 
@@ -229,7 +250,7 @@ UINT ring_next_chunk(UploadRing& r)
     if (live + r.chunk_bytes > r.cap_bytes) return ~0u;
     RingChunk c;
     c.bytes = r.chunk_bytes;
-    if (!ring_make_buffer(c.bytes, &c.buffer, &c.mapped)) return ~0u;
+    if (!ring_make_buffer(c.bytes, r.which == 1, &c.buffer, &c.mapped)) return ~0u;
     ++r.made;
     for (UINT i = 0; i < r.chunks.size(); ++i)
         if (!r.chunks[i].buffer) {  // reuse a released slot (keeps its generation counting up)
@@ -244,31 +265,33 @@ UINT ring_next_chunk(UploadRing& r)
 
 // A slice of `bytes` for copies the GPU reads from a list recorded now. Returns its CPU address and sets the
 // buffer and offset to bind (and the tag frame_copy keeps), or nullptr when refused.
-unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** buffer, RingTag* tag)
+// Both rings: a slice of `bytes` rounded to `align`. Returns false when refused (size, or the cap: counted, logged).
+bool ring_reserve(UploadRing& r, std::size_t bytes, u64 align, u64* offset, ID3D12Resource** buffer, unsigned char** cpu_out, RingTag* tag)
 {
-    UploadRing& r = upload_ring_state();
+    const bool upload = r.which == 0;
     AcquireSRWLockExclusive(&r.lock);
     if (!r.ready) ring_setup(r);
-    const u64 rounded = (bytes + 511) & ~u64{511};  // 512: texture footprints are placed in the ring too
+    const u64 rounded = (bytes + align - 1) & ~(align - 1);
     if (!bytes || rounded > r.chunk_bytes || (r.legacy && r.chunks.empty())) {
         ++r.refused_size;
         ReleaseSRWLockExclusive(&r.lock);
-        x2w_memcut::note_ring_refused();
-        return nullptr;
+        if (upload) x2w_memcut::note_ring_refused();
+        return false;
     }
     if (r.current == ~0u || r.chunks[r.current].used + rounded > r.chunks[r.current].bytes) {
         const UINT next = ring_next_chunk(r);
         if (next == ~0u) {
-            ++ring_cap_refusals;
+            if (upload) ++ring_cap_refusals;  // draw_translated: the draw is not issued
             ++r.refused_cap;
             r.refused_cap_bytes += rounded;
             const u64 refused = r.refused_cap;
             ReleaseSRWLockExclusive(&r.lock);
-            x2w_memcut::note_ring_refused();
+            if (upload) x2w_memcut::note_ring_refused();
             if (refused <= 8 || refused % 4096 == 0)
-                log("x2w-upload ring: refused %zu bytes at frame %ld: the chain is at its cap (X2W_UPLOAD_RING_CAP_MIB) and no chunk "
-                    "is free yet; the copy fails (refusal %llu)", bytes, frame_number, refused);
-            return nullptr;
+                log("x2w-%s ring: refused %zu bytes at frame %ld: the chain is at its cap (X2W_%s_RING_CAP_MIB) and no chunk is free "
+                    "yet; %s (refusal %llu)", ring_name(r), bytes, frame_number, upload ? "UPLOAD" : "INDIRECT",
+                    upload ? "the copy fails" : "the indirect call is skipped (no-ring)", refused);
+            return false;
         }
         r.current = next;
         RingChunk& c = r.chunks[next];
@@ -286,22 +309,39 @@ unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resourc
     if (c.unsafe) r.overwritten += rounded, ++r.overwritten_uses;
     const u64 in_use = ring_in_use(r);
     if (in_use > r.peak_in_use) r.peak_in_use = in_use;
-    // The old ring (256 MiB, or the test size) would have overwritten data the GPU had not read.
-    const u64 old_ring = ring_env_test_ring();
-    const bool first_wrap = !r.legacy && in_use > old_ring && !r.would_wrap;
-    if (!r.legacy && in_use > old_ring) r.would_wrap += rounded;
+    // The old ring (its size, or the test size) would have handed out unread / unexecuted space here.
+    const bool first_wrap = !r.legacy && in_use > r.old_ring && !r.would_wrap;
+    if (!r.legacy && in_use > r.old_ring) r.would_wrap += rounded;
     *offset = c.base + at;
     *buffer = c.buffer;
     if (tag) *tag = RingTag{r.current, c.generation};
-    unsigned char* cpu = c.mapped + at;
+    if (cpu_out) *cpu_out = c.mapped ? c.mapped + at : nullptr;
     ReleaseSRWLockExclusive(&r.lock);
-    x2w_memcut::note_ring(frame_number, rounded);  // LOCAL memcut
+    if (upload) x2w_memcut::note_ring(frame_number, rounded);  // LOCAL memcut
     if (first_overwrite)
-        log("x2w-upload ring (legacy): first copy written over ring data the GPU had not read yet (frame %ld, %zu bytes)", frame_number, bytes);
+        log(upload ? "x2w-upload ring (legacy): first copy written over ring data the GPU had not read yet (frame %ld, %zu bytes)"
+                   : "x2w-indirect ring (legacy): first slot reused while a list holding it had not executed or its fence had not passed "
+                     "(frame %ld, %zu bytes)",
+            frame_number, bytes);
     if (first_wrap)
-        log("x2w-upload ring (chain): first copy past the old ring's size while all of it is still unread (frame %ld): the old ring "
-            "would have overwritten unread data here", frame_number);
-    return cpu;
+        log("x2w-%s ring (chain): first %s past the old ring's size while all of it is still unread (frame %ld): the old ring "
+            "would have reused unread space here", ring_name(r), upload ? "copy" : "record", frame_number);
+    return true;
+}
+
+unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** buffer, RingTag* tag)
+{
+    unsigned char* cpu = nullptr;
+    // 512: texture footprints are placed in the ring too
+    return ring_reserve(upload_ring_state(), bytes, 512, offset, buffer, &cpu, tag) ? cpu : nullptr;
+}
+
+// d3d12_indirect.inl: ring space for one call's record (+ count), in 256-byte slots. The chunk to copy into and to
+// read the arguments from, or nullptr when refused (the call is skipped as no-ring).
+ID3D12Resource* reserve_indirect_ring(u64 bytes, u64* offset)
+{
+    ID3D12Resource* buffer = nullptr;
+    return ring_reserve(indirect_ring_state(), static_cast<std::size_t>(bytes), 256, offset, &buffer, nullptr, nullptr) ? buffer : nullptr;
 }
 
 // frame_copy cache hit: the slice may be bound again only while its chunk was not recycled. Marks the use.
@@ -346,32 +386,41 @@ void ring_draw_refused(u64 key)
 }
 
 // Hooks: list Reset / Close succeeded, lists executed (draw_lock held, after note_submits), list destroyed.
+// Each hook updates both rings (the upload ring and the indirect argument ring).
 void ring_list_reset(Wrapper* list)
 {
-    UploadRing& r = upload_ring_state();
-    AcquireSRWLockExclusive(&r.lock);
-    RingList& l = r.lists[list];
-    l.reset = ++r.seq;
-    l.close = 0;
-    ReleaseSRWLockExclusive(&r.lock);
+    for (UploadRing* r : {&upload_ring_state(), &indirect_ring_state()}) {
+        AcquireSRWLockExclusive(&r->lock);
+        RingList& l = r->lists[list];
+        l.reset = ++r->seq;
+        l.close = 0;
+        ReleaseSRWLockExclusive(&r->lock);
+    }
 }
 void ring_list_close(Wrapper* list)
 {
-    UploadRing& r = upload_ring_state();
-    AcquireSRWLockExclusive(&r.lock);
-    if (const auto l = r.lists.find(list); l != r.lists.end()) l->second.close = ++r.seq;
-    ReleaseSRWLockExclusive(&r.lock);
+    for (UploadRing* r : {&upload_ring_state(), &indirect_ring_state()}) {
+        AcquireSRWLockExclusive(&r->lock);
+        if (const auto l = r->lists.find(list); l != r->lists.end()) l->second.close = ++r->seq;
+        ReleaseSRWLockExclusive(&r->lock);
+    }
 }
 void ring_list_gone(Wrapper* list)
 {
-    UploadRing& r = upload_ring_state();
-    AcquireSRWLockExclusive(&r.lock);
-    r.lists.erase(list);
-    ReleaseSRWLockExclusive(&r.lock);
+    for (UploadRing* r : {&upload_ring_state(), &indirect_ring_state()}) {
+        AcquireSRWLockExclusive(&r->lock);
+        r->lists.erase(list);
+        ReleaseSRWLockExclusive(&r->lock);
+    }
 }
+void ring_submitted_one(UploadRing& r, const std::vector<Wrapper*>& lists);
 void ring_submitted(const std::vector<Wrapper*>& lists)
 {
-    UploadRing& r = upload_ring_state();
+    ring_submitted_one(upload_ring_state(), lists);
+    ring_submitted_one(indirect_ring_state(), lists);
+}
+void ring_submitted_one(UploadRing& r, const std::vector<Wrapper*>& lists)
+{
     AcquireSRWLockExclusive(&r.lock);
     for (Wrapper* w : lists)
         if (const auto l = r.lists.find(w); l != r.lists.end()) {
@@ -394,30 +443,37 @@ void ring_submitted(const std::vector<Wrapper*>& lists)
             free_count += c.state == RingChunk::free_;
             held += c.state == RingChunk::in_use && ring_held_by_lists(r, c);
         }
-        const u64 total_mib = r.legacy ? (r.chunks.empty() ? 0 : 4 * r.chunk_bytes) >> 20 : total * r.chunk_bytes >> 20;
+        // Upload ring in MiB; the indirect ring (256-byte records) in KiB.
+        const int shift = r.which ? 10 : 20;
+        const char* unit = r.which ? "KiB" : "MiB";
+        const u64 total_bytes = r.legacy ? (r.chunks.empty() ? 0 : 4 * r.chunk_bytes) : total * r.chunk_bytes;
         std::snprintf(line, sizeof(line),
-                      "x2w-upload ring (frame %ld, %s): chunks %u (%llu MiB: in use %u, %llu of them held by unexecuted lists, waiting for "
-                      "fences %u, free %u), peak in use %llu MiB, reserved %llu MiB since the last line (%llu MiB total), refused at "
-                      "the cap %llu (%llu MiB, draws not issued %llu), refused over the chunk size %llu, written over data the GPU had not read %llu MiB in %llu "
-                      "copies, would have wrapped in the old ring %llu MiB, re-executed recordings %llu, stale cache hits %llu, chunks "
+                      "x2w-%s ring (frame %ld, %s): chunks %u (%llu %s: in use %u, %llu of them held by unexecuted lists, waiting for "
+                      "fences %u, free %u), peak in use %llu %s, reserved %llu %s since the last line (%llu %s total), refused at "
+                      "the cap %llu (%llu %s, draws not issued %llu), refused over the chunk size %llu, %s %llu %s in %llu "
+                      "uses, would have wrapped in the old ring %llu %s, re-executed recordings %llu, stale cache hits %llu, chunks "
                       "made %llu released %llu, lists %zu, kept for a queue without a fence %llu",
-                      frame, r.legacy ? "legacy" : "chain", total, total_mib, in_use, held, fenced, free_count, r.peak_in_use >> 20,
-                      (r.reserved - r.last_reserved) >> 20, r.reserved >> 20, r.refused_cap, r.refused_cap_bytes >> 20, r.draws_refused, r.refused_size,
-                      r.overwritten >> 20, r.overwritten_uses, r.would_wrap >> 20, r.reexecuted, r.cache_stale, r.made, r.released,
-                      r.lists.size(), r.unfenced);
+                      ring_name(r), frame, r.legacy ? "legacy" : "chain", total, total_bytes >> shift, unit, in_use, held, fenced, free_count,
+                      r.peak_in_use >> shift, unit, (r.reserved - r.last_reserved) >> shift, unit, r.reserved >> shift, unit, r.refused_cap,
+                      r.refused_cap_bytes >> shift, unit, r.draws_refused, r.refused_size,
+                      r.which ? "slots reused while a list holding them had not executed" : "written over data the GPU had not read",
+                      r.overwritten >> shift, unit, r.overwritten_uses, r.would_wrap >> shift, unit, r.reexecuted, r.cache_stale, r.made,
+                      r.released, r.lists.size(), r.unfenced);
         r.last_reserved = r.reserved;
     }
     ReleaseSRWLockExclusive(&r.lock);
-    static LONG reports;
-    if (report && first_calls(reports, 400)) log("%s", line);
+    static LONG reports[2];
+    if (report && first_calls(reports[r.which], 400)) log("%s", line);
 }
 
 // Fixtures (export x2w_upload_ring_test, after the file's namespace): counters by index (0 reserved, 1 refused at
 // the cap, 2 overwritten bytes, 3 would-wrap bytes, 4 chunks with a buffer, 5 stale cache hits, 6 legacy, 7 draws
-// not issued, 8 chunks made, 9 fenced chunks re-pinned by a cache hit).
+// not issued, 8 chunks made, 9 fenced chunks re-pinned by a cache hit). 100 + index: the same for the indirect ring
+// (2 = slot bytes reused while a list holding them had not executed, in legacy mode).
 unsigned long long upload_ring_counter(int what)
 {
-    UploadRing& r = upload_ring_state();
+    UploadRing& r = what >= 100 ? indirect_ring_state() : upload_ring_state();
+    if (what >= 100) what -= 100;
     AcquireSRWLockShared(&r.lock);
     u64 v = 0;
     switch (what) {

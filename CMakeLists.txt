@@ -688,7 +688,8 @@ target_include_directories(startup_indirect_dispatch PRIVATE "${CMAKE_CURRENT_BI
 target_compile_features(startup_indirect_dispatch PRIVATE cxx_std_17)
 target_link_libraries(startup_indirect_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
-    foreach(mode IN ITEMS gpu no-writer zero off huge huge-product)
+    # wrap / wrap-legacy / wrap-cap (LOCAL memcut): the argument ring chain, its legacy control and its cap.
+    foreach(mode IN ITEMS gpu no-writer zero off huge huge-product wrap wrap-legacy wrap-cap)
         add_test(NAME startup_indirect_dispatch_${mode}_${backend} COMMAND startup_indirect_dispatch ${backend} ${mode})
         set(indirect_env "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
         if(mode STREQUAL "off")
