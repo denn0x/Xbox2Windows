@@ -48,6 +48,20 @@ def buffer_hlsl(count, base):
     )
 
 
+def stride_hlsl(count):
+    """LOCAL pstrans (udsrc uavstride): two records written with idxen addressing, index 0 and 1, at index * stride."""
+    uds = " ".join(f"uint ud{i};" for i in range(count + 1))
+    return (
+        f"cbuffer entry : register(b0) {{ {uds} }};\n"
+        "RWByteAddressBuffer u0 : register(u0);\n"
+        "float4 main(float4 p : SV_Position) : SV_Target {\n"
+        f"  u0.Store(0u * ud{count}, 111u);\n"
+        f"  u0.Store(1u * ud{count}, 222u);\n"
+        "  return float4(0, 1, 0, 1);\n"
+        "}\n"
+    )
+
+
 TEX_HLSL = (
     "RWTexture2D<float4> u0 : register(u0);\n"
     "float4 main(float4 p : SV_Position) : SV_Target {\n"
@@ -138,6 +152,8 @@ def run_mode(directory, consumer, backend, mode, extra_env=None):
         lines, hlsl = ["uav 0 tex2d table 0 0"], TEX_HLSL
     elif mode == "heap":
         lines, hlsl = ["heap 1"], HEAP_HLSL
+    elif mode.startswith("stride"):
+        lines, hlsl = ["uav 0 buf table 0 0", f"udsrc {count} uavstride 0"], stride_hlsl(count)
     elif mode in HEAP_TEXTURE_MODES:  # LOCAL (textures): tests/startup_heap_texture_check.py
         lines, hlsl = ["heap 1"], HEAP_DETILE_HLSL if "detile" in mode else HEAP_TEXTURE_HLSL
     else:
@@ -173,7 +189,8 @@ def need(log, mode, *needles):
 
 def check(directory, consumer, backend):
     results = {}
-    for mode in ("aligned", "misaligned", "uavbase", "tex", "tex-noflag", "tex-uint", "heap", "copy-same", "copy-two", "copy-twice", "copy-none", "copy-cpu"):
+    for mode in ("aligned", "misaligned", "uavbase", "tex", "tex-noflag", "tex-uint", "heap", "copy-same", "copy-two", "copy-twice", "copy-none", "copy-cpu",
+                 "stride16", "stride0"):
         got = run_mode(directory, consumer, backend, mode)
         if got is None:
             print("no existing-heap support or no adapter: skip")
@@ -263,6 +280,16 @@ def check(directory, consumer, backend):
                 raise AssertionError(f"{mode}: copy fell back\n{log[-3000:]}")
         elif mode == "copy-cpu":
             need(log, mode, "copies title memory at record time")
+    # stride16 / stride0 (LOCAL pstrans, udsrc uavstride): the entry value is the descriptor's record stride. With
+    # 16 the two records land at dwords 16 and 20; the negative control (stride 0) has the second overwrite the first.
+    for mode, want in (("stride16", {16: 111, 20: 222}), ("stride0", {16: 222})):
+        memory, image, log = results[mode]
+        expected = [want.get(i, 0) for i in range(64)]
+        if memory != expected:
+            raise AssertionError(f"{mode}: memory {memory}\nexpected {expected}")
+        need(log, mode, "from descriptor", "first draw with uavs")
+    print(f"{backend}: udsrc uavstride passes the descriptor's record stride (16: two idxen records both land; "
+          f"stride 0 control: the second overwrites the first)")
     print(f"{backend}: CopyBufferRegion on the GPU in list order (same window, two windows, copy-draw-copy-draw): each draw reads the "
           f"bytes the draw before it stored; controls without the copy and with the record-time copy read zeros")
     print(f"{backend}: draw UAV buffer stores reach title memory (aligned, in-place re-read, uavbase; misaligned "

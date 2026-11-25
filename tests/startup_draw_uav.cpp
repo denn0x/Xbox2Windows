@@ -154,10 +154,12 @@ void* memory_buffer(void* guest, void* memory)
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     return placed(guest, memory, desc);
 }
-void hardware_descriptor(Word cpu, Word base)
+void hardware_descriptor(Word cpu, Word base, std::uint32_t stride = 0)
 {
-    // gfx10 buffer descriptor: base [47:0], stride 0, 256 records (bytes), word 3 a marker the shader checks.
-    const std::uint32_t words[8] = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32) & 0xffff, 256, 0x12345678u};
+    // gfx10 buffer descriptor: base [47:0], stride [61:48] (0 unless given), 256 records, word 3 a marker the shader
+    // checks. With a stride the record count is in records: 16 records of `stride` bytes.
+    const std::uint32_t words[8] = {static_cast<std::uint32_t>(base), (static_cast<std::uint32_t>(base >> 32) & 0xffff) | stride << 16,
+                                    stride ? 16u : 256u, 0x12345678u};
     std::memcpy(reinterpret_cast<void*>(cpu), words, sizeof(words));
 }
 void* copy_dest;
@@ -206,7 +208,9 @@ int draw_uav_stores(ID3D12Device* desktop, void* guest, void* list)
     } else {
         uav_memory = private_pages();
         if (!uav_memory) return 45;
-        hardware_descriptor(cpu, ptr(uav_memory) + (mode_is(L"aligned") ? 64 : 68));
+        // LOCAL pstrans: stride16 / stride0 (udsrc uavstride): title + 64 with a record stride of 16 or 0 bytes.
+        const bool stride_mode = std::wcsncmp(uav_mode, L"stride", 6) == 0;
+        hardware_descriptor(cpu, ptr(uav_memory) + (mode_is(L"aligned") || stride_mode ? 64 : 68), mode_is(L"stride16") ? 16u : 0u);
     }
     invoke(list, 32, 1, ptr(&heap));
     invoke(list, 36, 0, invoke(heap, 10));

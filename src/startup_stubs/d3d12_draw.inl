@@ -11,7 +11,7 @@
 
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
-    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, buf_word3, uav_word3, uav_base };
+    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, buf_word3, uav_word3, uav_base, uav_stride };
     struct Ud { int kind, a, b; };
     // LOCAL draw-rt: kind 0 raw buffer (RWByteAddressBuffer), 1 2D texture (RWTexture2D<float4>); source 0 table(param a, byte b), 2 root parameter a
     struct Uav { int kind, source, a, b; };
@@ -801,6 +801,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             else if (!std::strcmp(source, "bufword3")) ud.kind = Translation::buf_word3;  // word 3 of srv a's descriptor
             else if (!std::strcmp(source, "uavword3")) ud.kind = Translation::uav_word3;  // word 3 of uav a's descriptor
+            else if (!std::strcmp(source, "uavstride") && x >= 0 && x < 8) ud.kind = Translation::uav_stride;  // LOCAL pstrans: uav a's record stride
             else if (!std::strcmp(source, "uavbase") && x >= 0 && x < 8) {
                 ud.kind = Translation::uav_base;
                 tr.uav_base_wanted |= 1u << x;
@@ -838,7 +839,8 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     // LOCAL draw-rt off switch (X2W_DRAW_RT_OFF=1): translations that use these features stay unavailable.
     static const bool rt_off = x2w_local::env_on("X2W_DRAW_RT_OFF");
     if (rt_off && (!tr.uavs.empty() || tr.heap || std::any_of(tr.uds.begin(), tr.uds.end(), [](const Translation::Ud& ud) {
-            return ud.kind == Translation::buf_word3 || ud.kind == Translation::uav_word3 || ud.kind == Translation::uav_base; }))) {
+            return ud.kind == Translation::buf_word3 || ud.kind == Translation::uav_word3 || ud.kind == Translation::uav_base ||
+                   ud.kind == Translation::uav_stride; }))) {
         log("x2w-draw-rt %016llx: not used (X2W_DRAW_RT_OFF)", tr.key);
         return;
     }
@@ -2279,9 +2281,10 @@ u64 uav_entry(const Pass& pass, const Translation::Uav& uav, std::uint32_t (&wor
     return entry;
 }
 
-// Binds buffer uav j at dest. word3 / base: the entry values `uavword3` and `uavbase`. draw_lock held.
+// Binds buffer uav j at dest. word3 / base / stride: the entry values `uavword3`, `uavbase` and `uavstride` (LOCAL
+// pstrans: the record stride a translated idxen store multiplies the index by; 0 where none is known). draw_lock held.
 void bind_uav_buffer(const Pass& pass, const Translation& tr, UINT j, D3D12_CPU_DESCRIPTOR_HANDLE dest, std::uint32_t* word3, std::uint32_t* base,
-                     ID3D12Resource** bound_window)
+                     ID3D12Resource** bound_window, std::uint32_t* record_stride)
 {
     const Translation::Uav& uav = tr.uavs[j];
     std::uint32_t words[8] = {};
@@ -2321,6 +2324,8 @@ void bind_uav_buffer(const Pass& pass, const Translation& tr, UINT j, D3D12_CPU_
             Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
             const bool raw = (flags & 1) || format == DXGI_FORMAT_R32_TYPELESS;
             const UINT element = stride ? stride : raw || format == DXGI_FORMAT_UNKNOWN ? 4 : x2w_startup::typed_buffer_format_bytes(format);
+            // A structured view's stride, or a typed view's element size; a raw view has no record stride.
+            *record_stride = stride ? stride : raw || format == DXGI_FORMAT_UNKNOWN ? 0 : element;
             if (dimension == 1 && element && resource && resource->own().title_memory) {
                 address = reinterpret_cast<u64>(resource->own().title_memory) + first_element * element;
                 bytes = std::size_t{count} * element;
@@ -2332,6 +2337,7 @@ void bind_uav_buffer(const Pass& pass, const Translation& tr, UINT j, D3D12_CPU_
         const std::uint32_t stride = (words[1] >> 16) & 0x3fff;
         bytes = static_cast<std::size_t>(stride ? stride : 1) * words[2];
         *word3 = words[3];
+        *record_stride = stride;
         from = "descriptor";
     }
     if (bytes > (256u << 20)) bytes = 256u << 20;
@@ -2516,13 +2522,13 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         first = 0;
         InterlockedExchange(&draw_heap_cursor, static_cast<LONG>(n + m + hv));
     }
-    std::uint32_t uav_word3[8] = {}, uav_bases[8] = {};
+    std::uint32_t uav_word3[8] = {}, uav_bases[8] = {}, uav_strides[8] = {};
     ID3D12Resource* uav_textures[8] = {};
     ID3D12Resource* uav_windows[8] = {};
     UavTextureSkip skip = tex_ok;
     for (UINT j = 0; j < m && skip == tex_ok; ++j) {
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + n + j} * draw_heap_increment};
-        if (tr->uavs[j].kind == 0) bind_uav_buffer(pass, *tr, j, dest, &uav_word3[j], &uav_bases[j], &uav_windows[j]);
+        if (tr->uavs[j].kind == 0) bind_uav_buffer(pass, *tr, j, dest, &uav_word3[j], &uav_bases[j], &uav_windows[j], &uav_strides[j]);
         else skip = bind_uav_texture(pass, *tr, j, dest, &uav_textures[j]);
         if (tr->uavs[j].kind == 1) InterlockedIncrement(&rt_uav_tex[skip]);
     }
@@ -2851,7 +2857,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a]
             : ud.kind == Translation::buf_word3 && ud.a >= 0 && ud.a < 32 ? word3[ud.a]
             : ud.kind == Translation::uav_word3 && ud.a >= 0 && ud.a < 8 ? uav_word3[ud.a]
-            : ud.kind == Translation::uav_base && ud.a >= 0 && ud.a < 8 ? uav_bases[ud.a] : 0;
+            : ud.kind == Translation::uav_base && ud.a >= 0 && ud.a < 8 ? uav_bases[ud.a]
+            : ud.kind == Translation::uav_stride && ud.a >= 0 && ud.a < 8 ? uav_strides[ud.a] : 0;
         if (ud.kind == Translation::buf_word3) {
             InterlockedIncrement(values[i] ? &rt_word3_set : &rt_word3_zero);
             static LONG shown;
